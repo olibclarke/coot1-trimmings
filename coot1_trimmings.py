@@ -1886,18 +1886,24 @@ def cycle_rep_up(mol_id,flag):
     graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
     cycle_rep_flag[mol_id]=2
   elif cycle_rep_flag[mol_id]==2:
-    graphics_to_rainbow_representation(mol_id)
+    graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
     cycle_rep_flag[mol_id]=3
   elif cycle_rep_flag[mol_id]==3:
-    graphics_to_bonds_representation(mol_id)
+    graphics_to_rainbow_representation(mol_id)
     cycle_rep_flag[mol_id]=4
   elif cycle_rep_flag[mol_id]==4:
+    graphics_to_bonds_representation(mol_id)
+    cycle_rep_flag[mol_id]=5
+  elif cycle_rep_flag[mol_id]==5:
+    graphics_to_b_factor_representation(mol_id)
+    cycle_rep_flag[mol_id]=6
+  elif cycle_rep_flag[mol_id]==6:
     try:
       graphics_to_user_defined_atom_colours_representation(mol_id)
-      cycle_rep_flag[mol_id]=5
+      cycle_rep_flag[mol_id]=7
     except NameError:
       cycle_rep_flag[mol_id]=0
-  elif cycle_rep_flag[mol_id]==5:
+  elif cycle_rep_flag[mol_id]==7:
     try:
       graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
       cycle_rep_flag[mol_id]=0
@@ -1927,7 +1933,10 @@ def cycle_rep_up(mol_id,flag):
 def cycle_rep_down(mol_id,flag):
   global cycle_rep_flag
   cycle_rep_flag[mol_id]=flag
-  if cycle_rep_flag[mol_id]==3:
+  if cycle_rep_flag[mol_id]==4:
+    graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
+    cycle_rep_flag[mol_id]=3
+  elif cycle_rep_flag[mol_id]==3:
     graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
     cycle_rep_flag[mol_id]=2
   elif cycle_rep_flag[mol_id]==2:
@@ -1938,19 +1947,22 @@ def cycle_rep_down(mol_id,flag):
       graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
       cycle_rep_flag[mol_id]=0
     except NameError:
-      cycle_rep_flag[mol_id]=5
+      cycle_rep_flag[mol_id]=7
   elif cycle_rep_flag[mol_id]==0:
     try:
       graphics_to_user_defined_atom_colours_representation(mol_id)
-      cycle_rep_flag[mol_id]=5
+      cycle_rep_flag[mol_id]=7
     except NameError:
-      cycle_rep_flag[mol_id]=5
-  elif cycle_rep_flag[mol_id]==5:
+      cycle_rep_flag[mol_id]=7
+  elif cycle_rep_flag[mol_id]==7:
+    graphics_to_b_factor_representation(mol_id)
+    cycle_rep_flag[mol_id]=6
+  elif cycle_rep_flag[mol_id]==6:
     graphics_to_bonds_representation(mol_id)
-    cycle_rep_flag[mol_id]=4
-  elif cycle_rep_flag[mol_id]==4:
+    cycle_rep_flag[mol_id]=5
+  elif cycle_rep_flag[mol_id]==5:
     graphics_to_rainbow_representation(mol_id)
-    cycle_rep_flag[mol_id]=3
+    cycle_rep_flag[mol_id]=4
 
 
 def cycle_rep_up_current():
