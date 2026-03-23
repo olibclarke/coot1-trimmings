@@ -149,6 +149,7 @@ Notes:
 - Long-range backbone `N···O` hydrogen-bond restraints are preserved, including inter-strand and inter-chain contacts.
 - It excludes same-residue contacts.
 - The idea is to maintain local geometry restraints within secondary structural elements, while allowing them to move around with respect to one another.
+- _Caveat: on Mac there is currently a bug where after applying self restraints (either custom or native), applying Keyboard Mutate will cause Coot to crash. This is the case on 1.1.20, might be fixed in daily build._
 
 ### Saving and history
 
