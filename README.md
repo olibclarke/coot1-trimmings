@@ -12,6 +12,8 @@ And a demonstration of keyboard copy/paste of ligand/solvent molecules is here:
 
 https://www.dropbox.com/scl/fi/fj4nod1axb4vhvz0tewtc/smart_copy_paste.mov?rlkey=b8p7funnrexxfojytlww1obde&dl=0
 
+_Note: if you are looking for trimmings for Coot 0.9, you are in the wrong place - please go here instead: https://github.com/olibclarke/coot-trimmings_
+
 ## Install
 
 Copy ￼`coot1_trimmings.py`￼ into Coot's startup-script directory (e.g. ~/.config/Coot/ on Mac) and restart Coot.
