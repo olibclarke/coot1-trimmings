@@ -8,6 +8,10 @@ A quick demo of some of the keyboard actions is here:
 
 https://www.dropbox.com/scl/fi/1wytsp29147x5yt83coz9/coot1_trimmings_demo.mov?rlkey=7gjcty91ucuphhcoml14863gy&dl=0
 
+And a demonstration of keyboard copy/paste of ligand/solvent molecules is here:
+
+https://www.dropbox.com/scl/fi/fj4nod1axb4vhvz0tewtc/smart_copy_paste.mov?rlkey=b8p7funnrexxfojytlww1obde&dl=0
+
 ## Install
 
 Copy ￼`coot1_trimmings.py`￼ into Coot's startup-script directory (e.g. ~/.config/Coot/ on Mac) and restart Coot.
