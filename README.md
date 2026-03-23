@@ -36,15 +36,15 @@ The script changes a few defaults at startup, including:
 
 ## Example use case/Tutorial
 1. Load up an EM-map and model (e.g. 8HEZ & EMD-34705)
-2. Adjust the contour - **"Shift-1" - "Shift-9"** set the level from 1 to 9 sigma respectively, and **"+"** and **"_"** nudge the contour level up and down.
-3. Zoom in - you might notice the mesh is a bit coarse, which can make fine details difficult to interpret. This is a 2.8Å structure, but was solved at 1.1Å/pixel. Let's try resampling and brightening things up a bit to make it easier to see. to do this press the **"C"** shortcut key.
-4. Try adjusting the clipping - use **"-"** to increase the clipping (making the slab tighter around the center of rotation), and **"="** to make it wider. Use **";"** and **"'"** to adjust the radius of the map in local mode.
-5. The local mesh is great for looking at a local region - say a few sidechains - but what if we want to see features of the global map? To switch to a surface view of the whole map, press **"G"**. Press **"G"** again to switch back to the local view. When in global mode, you can also use **":"** and **"** to adjust the opacity.
-6. Sometimes, you want to quickly toggle the model off to better see the map, or vice-versa. To toggle the model on/off, press **"/"**; to switch between multiple models, press **"Shift-/"**. To toggle the map, press **"\`"**; To switch between multiple maps, press **"Shift-\`"**.
-7. Try cycling the representation of the model - press the **"\["** and **"\]"** keys to move back and forward between the different modes (e.g. CA-only and all atom).
-8. Try cylinder refine - center on an atom, and press **"a"**. It will refine +/- 5 residues around the center, and all segments within 4Å of the primary range.
-9. Try quick refine zone - press **"A"**, then click two atoms to define a range and refine.
-10. Try copy/pasting a ligand - center on a ligand or solvent molecule, and press **"c"**. A status message in the lower bar should indicate that the molecule has been copied. Move somewhere else, and press **"v"**. A copy should be pasted and merged into the active molecule. You can repeat this operation multiple times.
+2. Adjust the contour - `"Shift-1"` - `"Shift-9"` set the level from 1 to 9 sigma respectively, and `"+"` and `"_"` nudge the contour level up and down.
+3. Zoom in - you might notice the mesh is a bit coarse, which can make fine details difficult to interpret. This is a 2.8Å structure, but was solved at 1.1Å/pixel. Let's try resampling and brightening things up a bit to make it easier to see. to do this press the `"C"` shortcut key.
+4. Try adjusting the clipping - use `"-"` to increase the clipping (making the slab tighter around the center of rotation), and `"="` to make it wider. Use `";"` and `" ' "` to adjust the radius of the map in local mode.
+5. The local mesh is great for looking at a local region - say a few sidechains - but what if we want to see features of the global map? To switch to a surface view of the whole map, press `"G"**. Press `"G"` again to switch back to the local view. When in global mode, you can also use `":"` and `" " "` to adjust the opacity.
+6. Sometimes, you want to quickly toggle the model off to better see the map, or vice-versa. To toggle the model on/off, press `"/"`; to switch between multiple models, press `"Shift-/"`. To toggle the map, press `"\`"`; To switch between multiple maps, press `"Shift-\`"`.
+7. Try cycling the representation of the model - press the `"\["` and `"\]"` keys to move back and forward between the different modes (e.g. CA-only and all atom).
+8. Try cylinder refine - center on an atom, and press `"a"`. It will refine +/- 5 residues around the center, and all segments within 4Å of the primary range.
+9. Try quick refine zone - press `"A"`, then click two atoms to define a range and refine.
+10. Try copy/pasting a ligand - center on a ligand or solvent molecule, and press `"c"`. A status message in the lower bar should indicate that the molecule has been copied. Move somewhere else, and press `"v"`. A copy should be pasted and merged into the active molecule. You can repeat this operation multiple times.
 
 ## Custom keybindings
 
