@@ -23,6 +23,7 @@ Example:
 ```bash
 cp coot1_trimmings.py ~/.config/Coot/
 ```
+(I don't know the location on Linux or Windows, but it will be wherever your `coot_preferences.py` file for Coot 1 resides.)
 
 ## Startup behavior
 
