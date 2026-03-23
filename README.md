@@ -32,7 +32,6 @@ _Note: If you see an errror like <!DOCTYPE html> ^ SyntaxError: invalid syntax, 
 The script changes a few defaults at startup, including:
 
 - Left mouse button used for view rotation
-- Mouse wheel map scrolling disabled (doesn't work well on Mac trackpad) - you can re-enable by changing `set_scroll_by_wheel_mouse(0)` to `set_scroll_by_wheel_mouse(1)` in the script. Otherwise, I have included shortcuts described below for keyboard adjustment of contour.
 - Brighter symmetry molecule colours
 - Disabled dragged map and smooth recentering.
 
