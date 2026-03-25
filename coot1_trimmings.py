@@ -27,6 +27,7 @@ MAP_LOCAL_APPEARANCE_STATE = {}
 SMART_COPY_TEMPLATE_IMOL = None
 SMART_COPY_SOURCE_CENTRE = None
 SMART_COPY_RESIDUE_NAME = None
+MODEL_AMBIENT_LIGHTING_ENABLED = False
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
 EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
 EM_TARGET_PIXEL_SIZE = 0.5
@@ -58,7 +59,15 @@ STARTUP_TERMINAL_RIGID_BODY_REFINE = 0
 STARTUP_MUTATE_AUTO_FIT_POST_REFINE = 1
 STARTUP_SYMMETRY_SIZE = 30
 STARTUP_NOMENCLATURE_ERRORS_MODE = "ignore"
+STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE = 0.15
+STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
 DEFAULT_NEW_HELIX_CHAIN_ID = "A"
+MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
+MODEL_NORMAL_DIFFUSE = (0.75, 0.75, 0.75, 1.0)
+MODEL_NORMAL_SPECULAR = (0.20, 64.0)
+MODEL_AMBIENT_ONLY_AMBIENT = (1.0, 1.0, 1.0, 1.0)
+MODEL_AMBIENT_ONLY_DIFFUSE = (0.0, 0.0, 0.0, 1.0)
+MODEL_AMBIENT_ONLY_SPECULAR = (0.0, 64.0)
 
 POLYMER_RESIDUE_NAMES = {
   # Standard RNA/DNA.
@@ -162,6 +171,12 @@ def _apply_startup_settings():
   set_mutate_auto_fit_do_post_refine(STARTUP_MUTATE_AUTO_FIT_POST_REFINE)
   set_symmetry_size(STARTUP_SYMMETRY_SIZE)
   set_nomenclature_errors_on_read(STARTUP_NOMENCLATURE_ERRORS_MODE)
+  set_user_defined_rotation_centre_crosshairs_size_scale_factor(
+    STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE
+  )
+  set_rotation_centre_cross_hairs_colour(
+    *STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR
+  )
 
 
 def _active_residue_or_status():
@@ -476,7 +491,7 @@ lambda: using_active_atom(fill_partial_residue,"aa_imol","aa_chain_id","aa_res_n
 
 #place water without refinement
 add_key_binding("Add Water","w",
-lambda: place_typed_atom_at_pointer("Water"))
+lambda: place_water_in_active_molecule())
 
 #place water with refinement
 add_key_binding("Add Water +","W",
@@ -636,6 +651,26 @@ lambda: widen_clipping_symmetric())
 
   
 #****Misc. functions (for keybindings and scripting****
+# def toggle_all_models_ambient_lighting():
+#   global MODEL_AMBIENT_LIGHTING_ENABLED
+#   if MODEL_AMBIENT_LIGHTING_ENABLED:
+#     ambient = MODEL_NORMAL_AMBIENT
+#     diffuse = MODEL_NORMAL_DIFFUSE
+#     specular = MODEL_NORMAL_SPECULAR
+#     status_message = "Set all models to normal lighting"
+#   else:
+#     ambient = MODEL_AMBIENT_ONLY_AMBIENT
+#     diffuse = MODEL_AMBIENT_ONLY_DIFFUSE
+#     specular = MODEL_AMBIENT_ONLY_SPECULAR
+#     status_message = "Set all models to ambient lighting"
+#   for imol in model_molecule_number_list():
+#     set_model_material_ambient(imol, ambient[0], ambient[1], ambient[2], ambient[3])
+#     set_model_material_diffuse(imol, diffuse[0], diffuse[1], diffuse[2], diffuse[3])
+#     set_model_material_specular(imol, specular[0], specular[1])
+#   MODEL_AMBIENT_LIGHTING_ENABLED = not MODEL_AMBIENT_LIGHTING_ENABLED
+#   add_status_bar_text(status_message)
+
+
 def jiggle_fit_active_non_polymer_residue():
   residue = _active_residue_or_status()
   if not residue:
@@ -731,40 +766,45 @@ def go_to_nearest_density_peak():
   if map_id is None:
     return None
   centre = _rotation_centre_xyz()
-  sigma = get_contour_level_in_sigma(map_id)
-  search_radius = 8.0
-  peak_list = map_peaks_near_point_py(
-    map_id,
-    sigma,
-    centre[0],
-    centre[1],
-    centre[2],
-    search_radius,
-  )
-  if not peak_list:
-    add_status_bar_text("No nearby density peak above current contour")
-    return None
-
-  nearest_peak = None
-  nearest_peak_distance_sq = None
-  for peak in peak_list:
-    if not isinstance(peak, (list, tuple)) or len(peak) < 3:
-      continue
+  def density_here(point):
     try:
-      peak_xyz = [float(peak[0]), float(peak[1]), float(peak[2])]
-    except (TypeError, ValueError):
-      continue
-    distance_sq = _distance_sq(peak_xyz, centre)
-    if nearest_peak is None or distance_sq < nearest_peak_distance_sq:
-      nearest_peak = peak_xyz
-      nearest_peak_distance_sq = distance_sq
+      return density_at_point(map_id, point[0], point[1], point[2])
+    except Exception:
+      return None
 
-  if nearest_peak is None:
-    add_status_bar_text("No nearby density peak above current contour")
+  peak_point = [centre[0], centre[1], centre[2]]
+  peak_density = density_here(peak_point)
+  if peak_density is None:
+    add_status_bar_text("Unable to evaluate map density at the current position")
     return None
 
-  set_rotation_centre(nearest_peak[0], nearest_peak[1], nearest_peak[2])
-  return nearest_peak
+  for step_size in [0.5, 0.25, 0.1, 0.05]:
+    for _step_index in range(40):
+      best_point = peak_point
+      best_density = peak_density
+      for dx in [-step_size, 0.0, step_size]:
+        for dy in [-step_size, 0.0, step_size]:
+          for dz in [-step_size, 0.0, step_size]:
+            if dx == 0.0 and dy == 0.0 and dz == 0.0:
+              continue
+            trial_point = [peak_point[0] + dx, peak_point[1] + dy, peak_point[2] + dz]
+            trial_density = density_here(trial_point)
+            if trial_density is None:
+              continue
+            if trial_density > best_density:
+              best_point = trial_point
+              best_density = trial_density
+      if best_point == peak_point:
+        break
+      peak_point = best_point
+      peak_density = best_density
+
+  if _distance_sq(peak_point, centre) > 4.0 * 4.0:
+    add_status_bar_text("No nearby density peak within 4 A")
+    return None
+
+  set_rotation_centre(peak_point[0], peak_point[1], peak_point[2])
+  return peak_point
 
 
 def _generate_smart_local_extra_restraints_for_mol(mol_id, show_start_message=True):
@@ -975,14 +1015,15 @@ def flip_active_peptide():
 
 
 def add_water_and_refine():
-  place_typed_atom_at_pointer("Water")
-  residue = _active_residue_or_status()
-  if not residue:
+  mol_id = place_water_in_active_molecule()
+  if mol_id is None:
     return None
   if imol_refinement_map()==-1:
     add_status_bar_text("You need to set a refinement map")
     return None
-  mol_id = residue[0]
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
   ch_id = residue[1]
   resno = residue[2]
   altloc = residue[5]
@@ -993,6 +1034,23 @@ def add_water_and_refine():
     accept_regularizement()
   finally:
     set_refinement_immediate_replacement(previous_immediate_replacement)
+
+
+def place_water_in_active_molecule():
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  mol_id = residue[0]
+  try:
+    set_pointer_atom_molecule(mol_id)
+  except Exception:
+    pass
+  try:
+    set_go_to_atom_molecule(mol_id)
+  except Exception:
+    pass
+  place_typed_atom_at_pointer("Water")
+  return mol_id
 
 
 def undo_symmetry_view_safe():
@@ -2426,6 +2484,27 @@ def auto_refine():
               expanded_specs.add((segment_chain_id, fill_residue, ""))
     return expanded_specs
 
+  def expand_polymer_contact_windows(molecule_id, polymer_specs, window_size):
+    expanded_specs = set()
+    polymer_by_chain = {}
+    for chain_id, residue_no, ins_code in polymer_specs:
+      if ins_code == "":
+        polymer_by_chain.setdefault(chain_id, set()).add(residue_no)
+      else:
+        expanded_specs.add((chain_id, residue_no, ins_code))
+    for chain_id, residue_numbers in polymer_by_chain.items():
+      fpr = first_polymer_residue(molecule_id, chain_id)
+      lpr = last_polymer_residue(molecule_id, chain_id)
+      if fpr == -10000 or lpr == -10000:
+        continue
+      for residue_no in residue_numbers:
+        res_start = max(fpr, residue_no - window_size)
+        res_end = min(lpr, residue_no + window_size)
+        for resn in range(res_start, res_end + 1):
+          if residue_exists_qm(molecule_id, chain_id, resn, ""):
+            expanded_specs.add((chain_id, resn, ""))
+    return expanded_specs
+
   def prune_small_polymer_fragments(molecule_id, polymer_specs, minimum_fragment_size):
     kept_specs = set()
     polymer_by_chain = {}
@@ -2454,35 +2533,44 @@ def auto_refine():
     return kept_specs
 
   active_ins_code = residue[3]
-  centre_residue_spec = nearest_polymer_residue(mol_id, ch_id, resno, active_ins_code)
-  if centre_residue_spec is None:
-    add_status_bar_text("No nearby polymer residue for local cylinder refinement")
-    return None
-  centre_chain_id, centre_residue, _centre_ins_code = centre_residue_spec
-  ch_id = centre_chain_id
-  fpr=first_polymer_residue(mol_id,ch_id)
-  lpr=last_polymer_residue(mol_id,ch_id)
-  res_start=max(fpr, centre_residue-half_window)
-  res_end=min(lpr, centre_residue+half_window)
-
   main_range_specs = set()
   seed_residue_specs = []
-  for resn in range(res_start, res_end+1):
-    if residue_exists_qm(mol_id,ch_id,resn,""):
-      spec=(ch_id,resn,"")
-      seed_residue_specs.append([ch_id,resn,""])
-      main_range_specs.add(spec)
+
+  if _residue_is_polymer(mol_id, ch_id, resno, active_ins_code):
+    centre_residue_spec = (ch_id, resno, active_ins_code)
+    fpr=first_polymer_residue(mol_id,ch_id)
+    lpr=last_polymer_residue(mol_id,ch_id)
+    res_start=max(fpr, resno-half_window)
+    res_end=min(lpr, resno+half_window)
+
+    for resn in range(res_start, res_end+1):
+      if residue_exists_qm(mol_id,ch_id,resn,""):
+        spec=(ch_id,resn,"")
+        seed_residue_specs.append([ch_id,resn,""])
+        main_range_specs.add(spec)
+  else:
+    centre_residue_spec = (ch_id, resno, active_ins_code)
+    if not residue_exists_qm(mol_id, ch_id, resno, active_ins_code):
+      add_status_bar_text("No active residue for local cylinder refinement")
+      return None
+    seed_residue_specs.append([ch_id, resno, active_ins_code])
+    main_range_specs.add(centre_residue_spec)
 
   secondary_residue_specs = set()
+  direct_non_polymer_contact_specs = set()
   for spec in seed_residue_specs:
     for nearby_residue in residues_near_residue(mol_id, spec, contact_radius):
       if nearby_residue and len(nearby_residue) == 3:
         nearby_spec = tuple(nearby_residue)
         if nearby_spec not in main_range_specs:
           secondary_residue_specs.add(nearby_spec)
+          if not is_polymer_residue_spec(mol_id, nearby_spec):
+            direct_non_polymer_contact_specs.add(nearby_spec)
 
   secondary_polymer_specs = {spec for spec in secondary_residue_specs if is_polymer_residue_spec(mol_id, spec)}
-  secondary_non_polymer_specs = secondary_residue_specs - secondary_polymer_specs
+  secondary_non_polymer_specs = (secondary_residue_specs - secondary_polymer_specs) | direct_non_polymer_contact_specs
+  if not _residue_is_polymer(mol_id, ch_id, resno, active_ins_code):
+    secondary_polymer_specs = expand_polymer_contact_windows(mol_id, secondary_polymer_specs, 1)
   secondary_polymer_specs = fill_short_polymer_gaps(mol_id, secondary_polymer_specs)
   secondary_polymer_specs = prune_small_polymer_fragments(mol_id, secondary_polymer_specs, 3)
 
@@ -2671,7 +2759,7 @@ def jiggle_fit_active_mol():
 #Clear labels and distances
 def clear_distances_and_labels():
   remove_all_atom_labels()
-  clear_simple_distances()
+  clear_measure_distances()
   
 #Delete hydrogens from active molecule
 def delete_h_active():
