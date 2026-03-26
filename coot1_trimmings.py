@@ -5505,30 +5505,456 @@ def change_hires_limit():
     generic_single_entry("New high-res limit for map?",
     "5.0","Change high resolution limit for active map",change_hires_by_entry)
     
-#Make a button list for inserting common monomers
-COMMON_MONOMERS = [
-  ("Acetate", "ACT"),
-  ("Ethylene glycol", "EDO"),
-  ("Glycerol", "GOL"),
-  ("DMSO", "DMS"),
-  ("DDM", "LMT"),
-  ("DM", "DMU"),
-  ("OG", "HSH"),
-  ("LDAO", "LDA"),
-  ("Monoolein", "MPG"),
-  ("Tris", "TAM"),
-  ("HEPES", "EPE"),
-  ("MES", "MES"),
-  ("Cacodylate", "CAD"),
-  ("PEG", "1PE"),
-  ("POPG (lipid)", "LHG"),
-  ("PE (lipid)", "PEF"),
-  ("PC (lipid)", "PLC"),
-  ("PS (lipid)", "PSF"),
-  ("PI(3,4)P2 (lipid)", "52N"),
-  ("Cholesterol hemisuccinate", "Y01"),
-  ("Cholesterol", "CLR"),
+#Hierarchical menu for commonly inserted CCP4 monomers
+COMMON_MONOMER_MENU = [
+  ("Buffers", [
+    ("Bis-Tris (BTB)", "BTB"),
+    ("Bicine (BCN)", "BCN"),
+    ("HEPES (EPE)", "EPE"),
+    ("MES (MES)", "MES"),
+    ("TAPS (T3A)", "T3A"),
+    ("Tris (TRS)", "TRS"),
+    ("Triethanolamine (TAM)", "TAM"),
+    ("Cacodylate (CAC)", "CAC"),
+  ]),
+  ("Ions / metals", [
+    ("Cations", [
+      ("Magnesium (MG)", "MG"),
+      ("Calcium (CA)", "CA"),
+      ("Sodium (NA)", "NA"),
+      ("Potassium (K)", "K"),
+    ]),
+    ("Transition / heavy metals", [
+      ("Zinc (ZN)", "ZN"),
+      ("Manganese (MN)", "MN"),
+      ("Iron (FE)", "FE"),
+      ("Cobalt (CO)", "CO"),
+      ("Copper (CU)", "CU"),
+      ("Nickel (NI)", "NI"),
+      ("Cadmium (CD)", "CD"),
+      ("Mercury(II) ion (HG)", "HG"),
+      ("Gold ion (AU)", "AU"),
+      ("Platinum(II) ion (PT)", "PT"),
+    ]),
+    ("Halides", [
+      ("Chloride (CL)", "CL"),
+      ("Bromide (BR)", "BR"),
+      ("Iodide (IOD)", "IOD"),
+    ]),
+    ("Oxyanions", [
+      ("Phosphate (PO4)", "PO4"),
+      ("Sulfate (SO4)", "SO4"),
+      ("Molybdate (MOO)", "MOO"),
+      ("Tungstate (WO4)", "WO4"),
+      ("Vanadate (VO4)", "VO4"),
+      ("Selenate (SE4)", "SE4"),
+      ("Arsenate (ART)", "ART"),
+    ]),
+    ("Heavy atoms", [
+      ("Mercury(II) ion (HG)", "HG"),
+      ("Lead(II) ion (PB)", "PB"),
+      ("Gold ion (AU)", "AU"),
+      ("Platinum(II) ion (PT)", "PT"),
+      ("Uranyl(VI) ion (IUM)", "IUM"),
+      ("Uranium (U1)", "U1"),
+      ("Osmium ion (OS)", "OS"),
+      ("Iridium ion (IR)", "IR"),
+      ("Gadolinium ion (GD3)", "GD3"),
+      ("Europium(III) ion (EU3)", "EU3"),
+      ("Terbium(III) ion (TB)", "TB"),
+      ("Holmium(III) ion (HO3)", "HO3"),
+      ("Lanthanum(III) ion (LA)", "LA"),
+      ("Lutetium(III) ion (LU)", "LU"),
+      ("Samarium(III) ion (SM)", "SM"),
+      ("Ytterbium(III) ion (YB)", "YB"),
+      ("Xenon (XE)", "XE"),
+      ("Krypton (KR)", "KR"),
+    ]),
+    ("Metal clusters", [
+      ("Fe-S cluster / cubane (SF4)", "SF4"),
+      ("Fe-S cluster (FS1)", "FS1"),
+      ("Fe-S cluster (35L)", "35L"),
+      ("FeMo cofactor-like cluster (ICS)", "ICS"),
+      ("Ni-Fe cluster (82N)", "82N"),
+      ("Tetranuclear copper-sulfide cluster (CUZ)", "CUZ"),
+    ]),
+  ]),
+  ("Solvents / additives", [
+    ("Acetate (ACT)", "ACT"),
+    ("DMSO (DMS)", "DMS"),
+    ("Ethanol (EOH)", "EOH"),
+    ("Ethylene glycol (EDO)", "EDO"),
+    ("Glycerol (GOL)", "GOL"),
+    ("Isopropanol (IPA)", "IPA"),
+    ("MPD (MPD)", "MPD"),
+    ("PEG (PEG)", "PEG"),
+    ("1-Butanol (1BO)", "1BO"),
+    ("1,4-Butanediol (BU1)", "BU1"),
+    ("Propylene glycol / R-1,2-propanediol (PGR)", "PGR"),
+    ("Propylene glycol / S-1,2-propanediol (PGO)", "PGO"),
+    ("Tetraethylene glycol (PG4)", "PG4"),
+    ("TMAO / trimethylamine oxide (TMO)", "TMO"),
+    ("Chelators", [
+      ("EDTA (EDT)", "EDT"),
+      ("Nitrilotriacetic acid (NTA)", "NTA"),
+    ]),
+    ("Reducing agents", [
+      ("Beta-mercaptoethanol (BME)", "BME"),
+      ("DTT / 2,3-dihydroxy-1,4-dithiobutane (DTT)", "DTT"),
+      ("TCEP / tris(2-carboxyethyl)phosphine (TCE)", "TCE"),
+    ]),
+    ("Organic acids", [
+      ("Citric acid (CIT)", "CIT"),
+      ("Citrate anion (FLC)", "FLC"),
+      ("Isocitric acid (ICT)", "ICT"),
+      ("Malate (MLT)", "MLT"),
+      ("Oxaloacetate (OAA)", "OAA"),
+      ("Oxalate (OXL)", "OXL"),
+    ]),
+  ]),
+  ("Detergents / lipids", [
+    ("Detergents", [
+      ("DM (decyl maltoside) (DMU)", "DMU"),
+      ("DDM (dodecyl maltoside) (LMT)", "LMT"),
+      ("LDAO (LDA)", "LDA"),
+      ("BOG / beta-octylglucoside (BOG)", "BOG"),
+      ("BNG / beta-nonylglucoside (BNG)", "BNG"),
+      ("BGL / beta-2-octylglucoside (BGL)", "BGL"),
+      ("Octyl beta-D-galactopyranoside (HSH)", "HSH"),
+      ("CHAPSO (1N7)", "1N7"),
+      ("C8E4 (C8E)", "C8E"),
+      ("C10E6 (C10)", "C10"),
+      ("Alpha-DDM / dodecyl-alpha-maltoside (LMU)", "LMU"),
+      ("Seleno-DDM / dodecyl-beta-selenomaltoside (LSM)", "LSM"),
+      ("Undecyl maltoside (UMQ)", "UMQ"),
+      ("OGNG (37X)", "37X"),
+      ("LMNG (LMN)", "LMN"),
+      ("Digitonin (AJP)", "AJP"),
+    ]),
+    ("Sterols", [
+      ("Cholesterol (CLR)", "CLR"),
+      ("Cholesteryl hemisuccinate (Y01)", "Y01"),
+    ]),
+    ("Lipids", [
+      ("Diundecyl phosphatidylcholine (PLC)", "PLC"),
+      ("Dioleoyl phosphatidylcholine (PCW)", "PCW"),
+      ("Dipalmitoyl phosphatidylethanolamine (PEF)", "PEF"),
+      ("Dicaproyl phosphatidylserine (PSF)", "PSF"),
+      ("Dipalmitoyl phosphatidylglycerol (LHG)", "LHG"),
+      ("Dipalmitoyl phosphatidic acid (PX6)", "PX6"),
+      ("PIPs / inositides", [
+        ("Phosphatidylinositol (T7X)", "T7X"),
+        ("Dihexadecanoyl PI(4,5)P2 (PIK)", "PIK"),
+        ("Dioctanoyl PI(3,4)P2 (52N)", "52N"),
+        ("Dioctanoyl PI(3,4,5)P3 (IP9)", "IP9"),
+        ("Dihexadecanoyl PI(3,4,5)P3 (PIZ)", "PIZ"),
+      ]),
+    ]),
+  ]),
+  ("Ligands", [
+    ("Nucleotides", [
+      ("Adenosine triphosphate (ATP)", "ATP"),
+      ("Adenosine diphosphate (ADP)", "ADP"),
+      ("Adenosine monophosphate (AMP)", "AMP"),
+      ("Guanosine triphosphate (GTP)", "GTP"),
+      ("Guanosine diphosphate (GDP)", "GDP"),
+      ("Guanosine monophosphate (5GP)", "5GP"),
+      ("Cytidine triphosphate (CTP)", "CTP"),
+      ("Cytidine diphosphate (CDP)", "CDP"),
+      ("Cytidine monophosphate (C5P)", "C5P"),
+      ("Uridine triphosphate (UTP)", "UTP"),
+      ("Uridine diphosphate (UDP)", "UDP"),
+      ("Uridine monophosphate (U)", "U"),
+    ]),
+    ("Bases / nucleosides", [
+      ("Adenine (ADE)", "ADE"),
+      ("Guanosine (GMP)", "GMP"),
+      ("Uridine (URI)", "URI"),
+      ("Cytosine (CYT)", "CYT"),
+      ("Uracil (URA)", "URA"),
+    ]),
+    ("Cofactors", [
+      ("Nicotinamide adenine dinucleotide (NAD)", "NAD"),
+      ("Nicotinamide adenine dinucleotide phosphate (NAP)", "NAP"),
+      ("Nicotinic acid adenine dinucleotide phosphate (DN4)", "DN4"),
+      ("Cyclic ADP-ribose (CXR)", "CXR"),
+      ("Acidic NAD+ form (NAJ)", "NAJ"),
+      ("Reduced nicotinamide adenine dinucleotide (NAI)", "NAI"),
+      ("Reduced nicotinamide adenine dinucleotide phosphate (NDP)", "NDP"),
+      ("Flavin adenine dinucleotide (FAD)", "FAD"),
+      ("Flavin mononucleotide (FMN)", "FMN"),
+      ("Coenzyme A (COA)", "COA"),
+      ("S-adenosylmethionine (SAM)", "SAM"),
+      ("S-adenosylhomocysteine (SAH)", "SAH"),
+      ("ADP-ribose (APR)", "APR"),
+      ("Adenosine 5'-pentaphosphate (5FA)", "5FA"),
+      ("Diadenosine triphosphate (BA3)", "BA3"),
+      ("Diadenosine tetraphosphate (B4P)", "B4P"),
+      ("Diadenosine pentaphosphate (AP5)", "AP5"),
+      ("Diguanosine triphosphate (GP3)", "GP3"),
+      ("Diguanosine pentaphosphate (GP5)", "GP5"),
+      ("ppGpp / guanosine 5',3'-tetraphosphate (G4P)", "G4P"),
+    ]),
+    ("Non-hydrolysable nucleotide analogs", [
+      ("AMP-PNP / AMPPNP (ANP)", "ANP"),
+      ("AMP-PCP (ACP)", "ACP"),
+      ("AMP-CPP (APC)", "APC"),
+      ("GMP-PNP / GppNHp (GNP)", "GNP"),
+      ("GMP-PCP (GCP)", "GCP"),
+      ("GTPgammaS (GSP)", "GSP"),
+    ]),
+    ("Vitamin / coenzyme cofactors", [
+      ("Pyridoxal 5'-phosphate (PLP)", "PLP"),
+      ("Thiamine diphosphate (TPP)", "TPP"),
+      ("Biotin (BTN)", "BTN"),
+      ("Tetrahydrofolate (THG)", "THG"),
+      ("5,10-Methenyltetrahydrofolate (GUE)", "GUE"),
+    ]),
+    ("Hemes / porphyrins", [
+      ("Heme B (HEM)", "HEM"),
+      ("Heme C (HEC)", "HEC"),
+      ("Heme A (HEA)", "HEA"),
+      ("Heme O (HEO)", "HEO"),
+      ("Heme D (DHE)", "DHE"),
+      ("Heme-AS (HAS)", "HAS"),
+      ("Heme D hydroxychlorin spirolactone (HDD)", "HDD"),
+      ("Ferrous tetravinylporphine complex (HEV)", "HEV"),
+    ]),
+    ("Tetrapyrroles / chlorophylls", [
+      ("Protoporphyrin IX (PP9)", "PP9"),
+      ("Biliverdin (EL5)", "EL5"),
+      ("Phycocyanobilin (CYC)", "CYC"),
+      ("Chlorophyll A (CLA)", "CLA"),
+      ("Chlorophyll B (CHL)", "CHL"),
+      ("Chlorophyll D (CL7)", "CL7"),
+      ("Chlorophyll F (F6C)", "F6C"),
+      ("Bacteriochlorophyll A (BCL)", "BCL"),
+      ("Bacteriochlorophyll B (BCB)", "BCB"),
+      ("Pheophytin A (PHO)", "PHO"),
+    ]),
+    ("Immunosuppressants / macrocycles", [
+      ("Rapamycin (RAP)", "RAP"),
+      ("Ascomycin analog (FK5)", "FK5"),
+    ]),
+    ("Retinoids", [
+      ("Retinal (RET)", "RET"),
+      ("Retinol (RTL)", "RTL"),
+      ("All-trans retinoic acid (REA)", "REA"),
+      ("9-cis-retinoic acid (9CR)", "9CR"),
+    ]),
+    ("Protease inhibitors", [
+      ("Benzamidine (BEN)", "BEN"),
+      ("E-64 (E64)", "E64"),
+      ("AEBSF (AES)", "AES"),
+      ("PMSF (PMF)", "PMF"),
+      ("TLCK (TCK)", "TCK"),
+    ]),
+    ("Polyamines", [
+      ("Spermidine (SPD)", "SPD"),
+      ("Spermine (SPM)", "SPM"),
+      ("Putrescine (PUT)", "PUT"),
+      ("Cadaverine (N2P)", "N2P"),
+    ]),
+    ("Free amino acids", [
+      ("Alanine (ALA)", "ALA"),
+      ("Arginine (ARG)", "ARG"),
+      ("Asparagine (ASN)", "ASN"),
+      ("Aspartic acid (ASP)", "ASP"),
+      ("Cysteine (CYS)", "CYS"),
+      ("Glutamine (GLN)", "GLN"),
+      ("Glutamic acid (GLU)", "GLU"),
+      ("Glycine (GLY)", "GLY"),
+      ("Histidine (HIS)", "HIS"),
+      ("Isoleucine (ILE)", "ILE"),
+      ("Leucine (LEU)", "LEU"),
+      ("Lysine (LYS)", "LYS"),
+      ("Methionine (MET)", "MET"),
+      ("Phenylalanine (PHE)", "PHE"),
+      ("Proline (PRO)", "PRO"),
+      ("Serine (SER)", "SER"),
+      ("Threonine (THR)", "THR"),
+      ("Tryptophan (TRP)", "TRP"),
+      ("Tyrosine (TYR)", "TYR"),
+      ("Valine (VAL)", "VAL"),
+    ]),
+    ("Phosphosugars / inositol phosphates", [
+      ("Glucose-1-phosphate (G1P)", "G1P"),
+      ("Glucose-6-phosphate (G6P)", "G6P"),
+      ("Glucosamine-6-phosphate (GLP)", "GLP"),
+      ("N-acetylglucosamine-6-phosphate (4QY)", "4QY"),
+      ("Mannose-1-phosphate (M1P)", "M1P"),
+      ("Mannose-6-phosphate (M6P)", "M6P"),
+      ("Fructose-6-phosphate (F6P)", "F6P"),
+      ("Fructose-1,6-bisphosphate (FBP)", "FBP"),
+      ("Ribose-5-phosphate (R5P)", "R5P"),
+      ("Inositol-1-phosphate (IPD)", "IPD"),
+      ("Inositol-4-phosphate (I4D)", "I4D"),
+      ("Inositol-1,4-bisphosphate (2IP)", "2IP"),
+      ("Inositol-4,5-bisphosphate (IP2)", "IP2"),
+      ("Inositol-1,4,5-trisphosphate (I3P)", "I3P"),
+      ("Inositol-2,4,5-trisphosphate (I2P)", "I2P"),
+      ("Inositol tetrakisphosphate (4IP)", "4IP"),
+      ("Inositol pentakisphosphate (I5P)", "I5P"),
+      ("Inositol hexakisphosphate / phytate (IHP)", "IHP"),
+    ]),
+    ("Free sugars", [
+      ("Alpha-D-glucose (GLC)", "GLC"),
+      ("Beta-D-glucose (BGC)", "BGC"),
+      ("Beta-D-galactose (GAL)", "GAL"),
+      ("Alpha-D-galactose (GLA)", "GLA"),
+      ("Mannose (MAN)", "MAN"),
+      ("Fucose (FUC)", "FUC"),
+      ("Fructose (FRU)", "FRU"),
+      ("Xylose (XYS)", "XYS"),
+      ("Alpha-D-ribofuranose (RIB)", "RIB"),
+      ("Alpha-L-arabinose (ARA)", "ARA"),
+    ]),
+  ]),
 ]
+
+
+def _replace_active_residue_with_monomer(required_resname, required_label, target_resname, modification_label):
+  residue = active_residue()
+  if not residue:
+    info_dialog(f"{modification_label} requires an active residue.")
+    return 0
+
+  mol_id, ch_id, resno, ins_code = residue[:4]
+  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
+  if current_resname != required_resname:
+    info_dialog(f"{modification_label} requires the active residue to be {required_label}.")
+    return 0
+
+  # Coot's built-in "Replace residue" GUI path uses mutate_by_overlap(),
+  # which supports nonstandard peptide-like residue monomers such as P1L/LLP.
+  if ins_code:
+    info_dialog(f"{modification_label} is not currently supported for residues with insertion codes.")
+    return 0
+
+  status = coot.mutate_by_overlap(mol_id, ch_id, resno, target_resname)
+  if status != 1:
+    info_dialog(f"Failed to apply {modification_label} to the active {required_label} residue.")
+    return 0
+  return 1
+
+
+def apply_palmitoylation_cys():
+  return _replace_active_residue_with_monomer("CYS", "Cys", "P1L", "Palmitoylation")
+
+
+def apply_plp_linkage_lys():
+  return _replace_active_residue_with_monomer("LYS", "Lys", "LLP", "PLP linkage")
+
+
+def apply_monomethyl_lys():
+  return _replace_active_residue_with_monomer("LYS", "Lys", "MLZ", "Monomethyl-Lys")
+
+
+def apply_dimethyl_lys():
+  return _replace_active_residue_with_monomer("LYS", "Lys", "MLY", "Dimethyl-Lys")
+
+
+def apply_trimethyl_lys():
+  return _replace_active_residue_with_monomer("LYS", "Lys", "M3L", "Trimethyl-Lys")
+
+
+def apply_acetyl_lys():
+  return _replace_active_residue_with_monomer("LYS", "Lys", "ALY", "Acetyl-Lys")
+
+
+def apply_carboxy_lys():
+  return _replace_active_residue_with_monomer("LYS", "Lys", "KCX", "Carboxy-Lys")
+
+
+def apply_retinal_linkage_lys():
+  residue = active_residue()
+  if not residue:
+    info_dialog("Retinal linkage requires an active residue.")
+    return 0
+
+  mol_id, ch_id, resno, ins_code = residue[:4]
+  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
+  if current_resname != "LYS":
+    info_dialog("Retinal linkage requires the active residue to be Lys.")
+    return 0
+
+  info_dialog("Retinal linkage is defined in CCP4/PDB as the LYS-RET link, not as a single replacement monomer. It needs a link-based workflow, so it is not available through this one-click replace menu yet.")
+  return 0
+
+
+def apply_phosphoserine():
+  return _replace_active_residue_with_monomer("SER", "Ser", "SEP", "Phosphoserine")
+
+
+def apply_phosphothreonine():
+  return _replace_active_residue_with_monomer("THR", "Thr", "TPO", "Phosphothreonine")
+
+
+def apply_phosphotyrosine():
+  return _replace_active_residue_with_monomer("TYR", "Tyr", "PTR", "Phosphotyrosine")
+
+
+def apply_selenomethionine():
+  return _replace_active_residue_with_monomer("MET", "Met", "MSE", "Selenomethionine")
+
+
+def apply_methionine_sulfoxide():
+  return _replace_active_residue_with_monomer("MET", "Met", "SME", "Methionine sulfoxide")
+
+
+def apply_hydroxyproline():
+  return _replace_active_residue_with_monomer("PRO", "Pro", "HYP", "Hydroxyproline")
+
+
+def apply_citrulline():
+  return _replace_active_residue_with_monomer("ARG", "Arg", "CIR", "Citrullination")
+
+
+def apply_methyl_arginine():
+  return _replace_active_residue_with_monomer("ARG", "Arg", "AGM", "Methyl-Arg")
+
+
+def apply_s_hydroxycysteine():
+  return _replace_active_residue_with_monomer("CYS", "Cys", "CSO", "S-hydroxycysteine")
+
+
+def add_covalent_modification_menu_entries(menu):
+  if menu is None:
+    return None
+
+  add_simple_coot_menu_menuitem(menu, "Palmitoylation (Cys)", lambda func: apply_palmitoylation_cys())
+  add_simple_coot_menu_menuitem(menu, "PLP linkage (Lys)", lambda func: apply_plp_linkage_lys())
+  add_simple_coot_menu_menuitem(menu, "Monomethyl-Lys (Lys)", lambda func: apply_monomethyl_lys())
+  add_simple_coot_menu_menuitem(menu, "Dimethyl-Lys (Lys)", lambda func: apply_dimethyl_lys())
+  add_simple_coot_menu_menuitem(menu, "Trimethyl-Lys (Lys)", lambda func: apply_trimethyl_lys())
+  add_simple_coot_menu_menuitem(menu, "Acetyl-Lys (Lys)", lambda func: apply_acetyl_lys())
+  add_simple_coot_menu_menuitem(menu, "Carboxy-Lys (Lys)", lambda func: apply_carboxy_lys())
+  add_simple_coot_menu_menuitem(menu, "Retinal linkage (Lys)", lambda func: apply_retinal_linkage_lys())
+  add_simple_coot_menu_menuitem(menu, "Phosphoserine (Ser)", lambda func: apply_phosphoserine())
+  add_simple_coot_menu_menuitem(menu, "Phosphothreonine (Thr)", lambda func: apply_phosphothreonine())
+  add_simple_coot_menu_menuitem(menu, "Phosphotyrosine (Tyr)", lambda func: apply_phosphotyrosine())
+  add_simple_coot_menu_menuitem(menu, "Selenomethionine (Met)", lambda func: apply_selenomethionine())
+  add_simple_coot_menu_menuitem(menu, "Methionine sulfoxide (Met)", lambda func: apply_methionine_sulfoxide())
+  add_simple_coot_menu_menuitem(menu, "Hydroxyproline (Pro)", lambda func: apply_hydroxyproline())
+  add_simple_coot_menu_menuitem(menu, "Citrullination (Arg)", lambda func: apply_citrulline())
+  add_simple_coot_menu_menuitem(menu, "Methyl-Arg (Arg)", lambda func: apply_methyl_arginine())
+  add_simple_coot_menu_menuitem(menu, "S-hydroxycysteine (Cys)", lambda func: apply_s_hydroxycysteine())
+
+
+def add_common_monomer_menu_entries(menu, entries):
+  if menu is None:
+    return None
+  for label, value in entries:
+    if isinstance(value, list):
+      submenu = Gio.Menu.new()
+      menu.append_submenu(label, submenu)
+      add_common_monomer_menu_entries(submenu, value)
+    else:
+      add_simple_coot_menu_menuitem(
+        menu,
+        label,
+        lambda func, monomer_code=value: get_monomer_no_H(monomer_code),
+      )
 
 #Colors subset of protein residues red, provided by user as string of single-letter ids.
 def color_protein_residue_subset():
@@ -5760,6 +6186,7 @@ if GUI_PYTHON_AVAILABLE:
   submenu_settings = Gio.Menu.new()
   submenu_build = Gio.Menu.new()
   submenu_common_monomers = Gio.Menu.new()
+  submenu_covalent_modifications = Gio.Menu.new()
   submenu_mutate = Gio.Menu.new()
   submenu_modify = Gio.Menu.new()
   submenu_maps = Gio.Menu.new()
@@ -5775,7 +6202,7 @@ if GUI_PYTHON_AVAILABLE:
 else:
   menu = None
   submenu_display = submenu_colour = submenu_fit = submenu_renumber = submenu_settings = None
-  submenu_build = submenu_mutate = submenu_modify = None
+  submenu_build = submenu_common_monomers = submenu_covalent_modifications = submenu_mutate = submenu_modify = None
   submenu_maps = None
 
 #**** Populate submenus ****
@@ -5943,12 +6370,10 @@ add_simple_coot_menu_menuitem(submenu_build,
 "Get fractional coordinates of active atom",lambda func: get_fract_coords()) 
 
 submenu_build.append_submenu("Common monomers", submenu_common_monomers)
-for monomer_label, monomer_code in COMMON_MONOMERS:
-  add_simple_coot_menu_menuitem(
-    submenu_common_monomers,
-    monomer_label,
-    lambda func, monomer_code=monomer_code: get_monomer_no_H(monomer_code),
-  )
+add_common_monomer_menu_entries(submenu_common_monomers, COMMON_MONOMER_MENU)
+
+submenu_build.append_submenu("Covalent modifications", submenu_covalent_modifications)
+add_covalent_modification_menu_entries(submenu_covalent_modifications)
 
 add_simple_coot_menu_menuitem(submenu_build, "Make alpha helix of length n", lambda func: place_new_helix()) 
 
