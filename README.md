@@ -2,7 +2,7 @@
 
 `coot1_trimmings.py` is a Coot startup script for Coot 1.1.x, ported from `coot-trimmings` for Coot 0.9.x with the assistence of the Codex LLM. It adds custom keybindings, map-display presets, model-editing shortcuts, and a small set of startup preferences.
 
-Custom items that rely on Gtk menus and dialogs are not working yet - stay tuned!
+Custom items that rely on Gtk menus and dialogs are not working yet - stay tuned! **EDIT:** Just added them - docs to come!
 
 A quick demo of some of the keyboard actions is here:
 
