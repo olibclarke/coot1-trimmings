@@ -592,6 +592,16 @@ def _click_spec_ins_code(click_spec):
   return ""
 
 
+def _click_spec_atom_name(click_spec):
+  if not isinstance(click_spec, list):
+    return ""
+  if len(click_spec) >= 7:
+    return click_spec[5]
+  if len(click_spec) == 6:
+    return click_spec[4]
+  return ""
+
+
 def _click_spec_alt_conf(click_spec):
   if not isinstance(click_spec, list):
     return ""
@@ -5812,6 +5822,220 @@ COMMON_MONOMER_MENU = [
   ]),
 ]
 
+COMMON_MONOMER_POINTER_TYPES = {
+  "MG": "Mg",
+  "CA": "Ca",
+  "NA": "Na",
+  "K": "K",
+  "CL": "Cl",
+  "BR": "Br",
+  "IOD": "I",
+  "ZN": "Zn",
+  "MN": "Mn",
+  "FE": "Fe",
+  "CO": "Co",
+  "CU": "Cu",
+  "NI": "Ni",
+  "CD": "Cd",
+  "HG": "Hg",
+  "PB": "Pb",
+  "AU": "Au",
+  "PT": "Pt",
+  "OS": "Os",
+  "IR": "Ir",
+  "GD3": "Gd",
+  "EU3": "Eu",
+  "TB": "Tb",
+  "HO3": "Ho",
+  "LA": "La",
+  "LU": "Lu",
+  "SM": "Sm",
+  "YB": "Yb",
+  "XE": "Xe",
+  "KR": "Kr",
+  "U1": "U",
+  "PO4": "PO4",
+  "SO4": "SO4",
+}
+
+
+def place_common_monomer(monomer_code):
+  pointer_type = COMMON_MONOMER_POINTER_TYPES.get(monomer_code)
+  if pointer_type:
+    place_typed_atom_at_pointer(pointer_type)
+  else:
+    get_monomer_no_H(monomer_code)
+
+
+COORDINATION_LINK_MENU = [
+  ("O donors", [
+    ("Mg-O coordination", {"metal_codes": ("MG",), "metal_label": "Mg", "donor_elements": ("O",), "donor_label": "oxygen donor", "distance": 2.10, "range_text": "expected range ~2.0-2.2 A"}),
+    ("Na-O coordination", {"metal_codes": ("NA",), "metal_label": "Na", "donor_elements": ("O",), "donor_label": "oxygen donor", "distance": 2.41, "range_text": "expected range ~2.3-2.6 A"}),
+    ("K-O coordination", {"metal_codes": ("K",), "metal_label": "K", "donor_elements": ("O",), "donor_label": "oxygen donor", "distance": 2.80, "range_text": "expected range ~2.7-3.2 A"}),
+    ("Ca-O coordination", {"metal_codes": ("CA",), "metal_label": "Ca", "donor_elements": ("O",), "donor_label": "oxygen donor", "distance": 2.40, "range_text": "expected range ~2.3-2.6 A"}),
+    ("Zn-O coordination", {"metal_codes": ("ZN",), "metal_label": "Zn", "donor_elements": ("O",), "donor_label": "oxygen donor", "distance": 2.00, "range_text": "expected range ~1.9-2.2 A"}),
+    ("Fe-O coordination", {"metal_codes": ("FE",), "metal_label": "Fe", "donor_elements": ("O",), "donor_label": "oxygen donor", "distance": 2.05, "range_text": "expected range ~2.0-2.2 A"}),
+  ]),
+  ("N donors", [
+    ("Zn-N coordination", {"metal_codes": ("ZN",), "metal_label": "Zn", "donor_elements": ("N",), "donor_label": "nitrogen donor", "distance": 2.058, "range_text": "expected range ~1.9-2.2 A"}),
+    ("Fe-N coordination", {"metal_codes": ("FE",), "metal_label": "Fe", "donor_elements": ("N",), "donor_label": "nitrogen donor", "distance": 2.058, "range_text": "expected range ~2.0-2.24 A"}),
+  ]),
+  ("S donors", [
+    ("Zn-S coordination", {"metal_codes": ("ZN",), "metal_label": "Zn", "donor_elements": ("S",), "donor_label": "sulfur donor", "distance": 2.340, "range_text": "expected range ~2.2-2.4 A"}),
+    ("Fe-S coordination", {"metal_codes": ("FE",), "metal_label": "Fe", "donor_elements": ("S",), "donor_label": "sulfur donor", "distance": 2.260, "range_text": "expected range ~2.27-2.36 A"}),
+  ]),
+]
+
+
+def _atom_name_element(atom_name):
+  atom_name = str(atom_name).strip().upper()
+  if not atom_name:
+    return ""
+  if atom_name[0].isdigit():
+    atom_name = atom_name[1:]
+  if atom_name.startswith("CL"):
+    return "CL"
+  if atom_name.startswith("BR"):
+    return "BR"
+  return atom_name[0]
+
+
+def _click_spec_to_link_spec(click_spec):
+  return [
+    _click_spec_chain_id(click_spec),
+    _click_spec_res_no(click_spec),
+    _click_spec_ins_code(click_spec),
+    _click_spec_atom_name(click_spec),
+    _click_spec_alt_conf(click_spec),
+  ]
+
+
+def _click_spec_residue_name(click_spec):
+  imol = _click_spec_imol(click_spec)
+  ch_id = _click_spec_chain_id(click_spec)
+  resno = _click_spec_res_no(click_spec)
+  ins_code = _click_spec_ins_code(click_spec)
+  if imol == -1 or ch_id is False or resno is False:
+    return ""
+  try:
+    return residue_name(imol, ch_id, resno, ins_code)
+  except Exception:
+    return ""
+
+
+def _click_spec_summary(click_spec):
+  resname = _click_spec_residue_name(click_spec) or "?"
+  ch_id = _click_spec_chain_id(click_spec)
+  resno = _click_spec_res_no(click_spec)
+  atom_name = _click_spec_atom_name(click_spec).strip() or "?"
+  return f"{resname} {ch_id}{resno} {atom_name}"
+
+
+def _click_spec_matches_metal(click_spec, metal_codes):
+  return _click_spec_residue_name(click_spec) in metal_codes
+
+
+def _click_spec_matches_donor(click_spec, donor_elements):
+  return _atom_name_element(_click_spec_atom_name(click_spec)) in donor_elements
+
+
+def _coordination_pair_from_clicks(click_1, click_2, metal_codes, donor_elements):
+  first_is_metal = _click_spec_matches_metal(click_1, metal_codes)
+  second_is_metal = _click_spec_matches_metal(click_2, metal_codes)
+  first_is_donor = _click_spec_matches_donor(click_1, donor_elements)
+  second_is_donor = _click_spec_matches_donor(click_2, donor_elements)
+
+  if first_is_metal and second_is_donor:
+    return click_1, click_2
+  if second_is_metal and first_is_donor:
+    return click_2, click_1
+  return None, None
+
+
+def _start_coordination_link_clicks(label, metal_codes, metal_label, donor_elements, donor_label, distance):
+  add_status_bar_text(f"{label}: click the metal atom and donor atom")
+
+  def make_link_from_clicks(*args):
+    click_1 = args[0]
+    click_2 = args[1]
+    imol_1 = _click_spec_imol(click_1)
+    imol_2 = _click_spec_imol(click_2)
+    if imol_1 == -1 or imol_2 == -1 or imol_1 != imol_2:
+      info_dialog(f"{label} requires two atoms in the same model molecule.")
+      return 0
+
+    metal_click, donor_click = _coordination_pair_from_clicks(click_1, click_2, metal_codes, donor_elements)
+    if metal_click is None:
+      metal_code_text = "/".join(metal_codes)
+      donor_text = "/".join(donor_elements)
+      info_dialog(
+        f"{label} requires one {metal_label} atom ({metal_code_text}) and one {donor_label} atom ({donor_text}).\n\n"
+        f"You clicked:\n{_click_spec_summary(click_1)}\n{_click_spec_summary(click_2)}"
+      )
+      return 0
+
+    imol = _click_spec_imol(metal_click)
+    metal_spec = _click_spec_to_link_spec(metal_click)
+    donor_spec = _click_spec_to_link_spec(donor_click)
+    coot.make_link_py(imol, metal_spec, donor_spec, "dummy", distance)
+    add_status_bar_text(f"{label}: added link ({distance:.3f} A)")
+    return 1
+
+  coot.user_defined_click_py(2, make_link_from_clicks)
+  return 1
+
+
+def _make_coordination_link(label, metal_codes, metal_label, donor_elements, donor_label, distance, range_text=""):
+  def submit_distance(value):
+    try:
+      chosen_distance = float(str(value).strip())
+    except Exception:
+      info_dialog(f"{label} requires a numeric distance.")
+      return 0
+    if chosen_distance <= 0:
+      info_dialog(f"{label} requires a positive distance.")
+      return 0
+    return _start_coordination_link_clicks(
+      label,
+      metal_codes,
+      metal_label,
+      donor_elements,
+      donor_label,
+      chosen_distance,
+    )
+
+  generic_single_entry(
+    f"{label}: target distance (A){' - ' + range_text if range_text else ''}",
+    f"{distance:.3f}",
+    "Click two atoms",
+    submit_distance,
+  )
+  return 1
+
+
+def add_coordination_link_menu_entries(menu, entries):
+  if menu is None:
+    return None
+  for label, value in entries:
+    if isinstance(value, list):
+      submenu = Gio.Menu.new()
+      menu.append_submenu(label, submenu)
+      add_coordination_link_menu_entries(submenu, value)
+    else:
+      add_simple_coot_menu_menuitem(
+        menu,
+        label,
+        lambda func, params=value, item_label=label: _make_coordination_link(
+          item_label,
+          params["metal_codes"],
+          params["metal_label"],
+          params["donor_elements"],
+          params["donor_label"],
+          params["distance"],
+          params.get("range_text", ""),
+        ),
+      )
+
 
 def _replace_active_residue_with_monomer(required_resname, required_label, target_resname, modification_label):
   residue = active_residue()
@@ -5838,12 +6062,165 @@ def _replace_active_residue_with_monomer(required_resname, required_label, targe
   return 1
 
 
+def _coot_py_residue_spec_to_tuple(res_spec_py):
+  if isinstance(res_spec_py, (list, tuple)):
+    if len(res_spec_py) >= 4 and isinstance(res_spec_py[0], bool):
+      return (res_spec_py[1], res_spec_py[2], res_spec_py[3])
+    if len(res_spec_py) >= 3:
+      return (res_spec_py[0], res_spec_py[1], res_spec_py[2])
+  return None
+
+
+def _regularize_linked_residues(imol, base_spec, new_res_spec_py):
+  new_spec = _coot_py_residue_spec_to_tuple(new_res_spec_py)
+  if not new_spec:
+    return 0
+
+  base_chain_id, base_resno, _base_ins_code = base_spec
+  new_chain_id, new_resno, _new_ins_code = new_spec
+  if base_chain_id != new_chain_id:
+    return 0
+
+  status = regularize_zone(imol, base_chain_id, min(base_resno, new_resno), max(base_resno, new_resno), "")
+  if status == 1:
+    accept_regularizement()
+  return status
+
+
+def _add_linked_modification(required_resname, required_label, new_residue_comp_id, link_type, modification_label):
+  residue = active_residue()
+  if not residue:
+    info_dialog(f"{modification_label} requires an active residue.")
+    return 0
+
+  mol_id, ch_id, resno, ins_code = residue[:4]
+  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
+  if current_resname != required_resname:
+    info_dialog(f"{modification_label} requires the active residue to be {required_label}.")
+    return 0
+
+  new_res_spec = coot.add_linked_residue_py(mol_id, ch_id, resno, ins_code, new_residue_comp_id, link_type, 2)
+  if not new_res_spec:
+    info_dialog(f"Failed to apply {modification_label} to the active {required_label} residue.")
+    return 0
+
+  _regularize_linked_residues(mol_id, (ch_id, resno, ins_code), new_res_spec)
+  return 1
+
+
+def _atom_xyz_map(imol, chain_id, resno, ins_code):
+  atom_info = residue_info_py(imol, chain_id, resno, ins_code)
+  if not isinstance(atom_info, list):
+    return {}
+
+  coords = {}
+  for atom in atom_info:
+    try:
+      atom_name = atom[0][0]
+      xyz = atom[2]
+      coords[atom_name] = xyz
+    except Exception:
+      pass
+  return coords
+
+
+def _first_residue_spec(imol):
+  for chain_id in chain_ids(imol):
+    resno = seqnum_from_serial_number(imol, chain_id, 0)
+    if resno != -10000:
+      return (chain_id, resno, "")
+  return None
+
+
+def _find_unused_resno_near(imol, chain_id, start_resno):
+  resno = start_resno
+  while resno < start_resno + 1000:
+    try:
+      if not residue_name(imol, chain_id, resno, ""):
+        return resno
+    except Exception:
+      return resno
+    resno += 1
+  return None
+
+
+def _merge_ligand_and_make_named_link(required_resname, required_label, ligand_comp_id, link_name,
+                                      ligand_atom_name, residue_atom_name, bond_length, modification_label):
+  residue = active_residue()
+  if not residue:
+    info_dialog(f"{modification_label} requires an active residue.")
+    return 0
+
+  mol_id, ch_id, resno, ins_code = residue[:4]
+  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
+  if current_resname != required_resname:
+    info_dialog(f"{modification_label} requires the active residue to be {required_label}.")
+    return 0
+
+  residue_centre = residue_centre_py(mol_id, ch_id, resno, ins_code)
+  if not isinstance(residue_centre, (list, tuple)) or len(residue_centre) != 3:
+    info_dialog(f"Failed to locate the active {required_label} residue for {modification_label}.")
+    return 0
+
+  ligand_imol = coot.get_monomer(ligand_comp_id)
+  if not valid_model_molecule_qm(ligand_imol):
+    info_dialog(f"Failed to import {ligand_comp_id} for {modification_label}.")
+    return 0
+
+  try:
+    ligand_spec = _first_residue_spec(ligand_imol)
+    if not ligand_spec:
+      info_dialog(f"Failed to prepare {ligand_comp_id} for {modification_label}.")
+      return 0
+
+    ligand_chain_id, ligand_resno, ligand_ins_code = ligand_spec
+    ligand_coords = _atom_xyz_map(ligand_imol, ligand_chain_id, ligand_resno, ligand_ins_code)
+    if not ligand_coords:
+      info_dialog(f"Failed to read {ligand_comp_id} coordinates for {modification_label}.")
+      return 0
+
+    xs = [xyz[0] for xyz in ligand_coords.values()]
+    ys = [xyz[1] for xyz in ligand_coords.values()]
+    zs = [xyz[2] for xyz in ligand_coords.values()]
+    ligand_centre = [sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)]
+    coot.translate_molecule_by(ligand_imol,
+                               residue_centre[0] - ligand_centre[0],
+                               residue_centre[1] - ligand_centre[1],
+                               residue_centre[2] - ligand_centre[2])
+
+    ligand_resno_new = _find_unused_resno_near(mol_id, ch_id, resno + 1)
+    if ligand_resno_new is None:
+      info_dialog(f"Failed to find a residue number for {ligand_comp_id} in chain {ch_id}.")
+      return 0
+
+    set_merge_molecules_ligand_spec([ch_id, ligand_resno_new, ""])
+    merge_result = merge_molecules([ligand_imol], mol_id)
+    if not isinstance(merge_result, (list, tuple)) or not merge_result or merge_result[0] != 1:
+      info_dialog(f"Failed to merge {ligand_comp_id} for {modification_label}.")
+      return 0
+
+    residue_spec = [ch_id, resno, ins_code, residue_atom_name, ""]
+    ligand_spec = [ch_id, ligand_resno_new, "", ligand_atom_name, ""]
+    coot.make_link_py(mol_id, residue_spec, ligand_spec, link_name, bond_length)
+    _regularize_linked_residues(mol_id, (ch_id, resno, ins_code), [ch_id, ligand_resno_new, ""])
+    return 1
+  finally:
+    if valid_model_molecule_qm(ligand_imol):
+      coot.close_molecule(ligand_imol)
+
+
 def apply_palmitoylation_cys():
   return _replace_active_residue_with_monomer("CYS", "Cys", "P1L", "Palmitoylation")
 
 
 def apply_plp_linkage_lys():
-  return _replace_active_residue_with_monomer("LYS", "Lys", "LLP", "PLP linkage")
+  return _merge_ligand_and_make_named_link("LYS", "Lys", "PLP", "LYS-PLP",
+                                           " C4A", " NZ ", 1.270, "PLP linkage")
+
+
+def apply_bme_adduct_cys():
+  return _merge_ligand_and_make_named_link("CYS", "Cys", "BME", "CYS-BME",
+                                           " S2 ", " SG ", 2.023, "BME adduct")
 
 
 def apply_monomethyl_lys():
@@ -5867,19 +6244,8 @@ def apply_carboxy_lys():
 
 
 def apply_retinal_linkage_lys():
-  residue = active_residue()
-  if not residue:
-    info_dialog("Retinal linkage requires an active residue.")
-    return 0
-
-  mol_id, ch_id, resno, ins_code = residue[:4]
-  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
-  if current_resname != "LYS":
-    info_dialog("Retinal linkage requires the active residue to be Lys.")
-    return 0
-
-  info_dialog("Retinal linkage is defined in CCP4/PDB as the LYS-RET link, not as a single replacement monomer. It needs a link-based workflow, so it is not available through this one-click replace menu yet.")
-  return 0
+  return _merge_ligand_and_make_named_link("LYS", "Lys", "RET", "LYS-RET",
+                                           " C15", " NZ ", 1.267, "Retinal linkage")
 
 
 def apply_phosphoserine():
@@ -5923,6 +6289,7 @@ def add_covalent_modification_menu_entries(menu):
     return None
 
   add_simple_coot_menu_menuitem(menu, "Palmitoylation (Cys)", lambda func: apply_palmitoylation_cys())
+  add_simple_coot_menu_menuitem(menu, "BME adduct (Cys)", lambda func: apply_bme_adduct_cys())
   add_simple_coot_menu_menuitem(menu, "PLP linkage (Lys)", lambda func: apply_plp_linkage_lys())
   add_simple_coot_menu_menuitem(menu, "Monomethyl-Lys (Lys)", lambda func: apply_monomethyl_lys())
   add_simple_coot_menu_menuitem(menu, "Dimethyl-Lys (Lys)", lambda func: apply_dimethyl_lys())
@@ -5953,7 +6320,7 @@ def add_common_monomer_menu_entries(menu, entries):
       add_simple_coot_menu_menuitem(
         menu,
         label,
-        lambda func, monomer_code=value: get_monomer_no_H(monomer_code),
+        lambda func, monomer_code=value: place_common_monomer(monomer_code),
       )
 
 #Colors subset of protein residues red, provided by user as string of single-letter ids.
@@ -6186,6 +6553,7 @@ if GUI_PYTHON_AVAILABLE:
   submenu_settings = Gio.Menu.new()
   submenu_build = Gio.Menu.new()
   submenu_common_monomers = Gio.Menu.new()
+  submenu_coordination_links = Gio.Menu.new()
   submenu_covalent_modifications = Gio.Menu.new()
   submenu_mutate = Gio.Menu.new()
   submenu_modify = Gio.Menu.new()
@@ -6202,7 +6570,7 @@ if GUI_PYTHON_AVAILABLE:
 else:
   menu = None
   submenu_display = submenu_colour = submenu_fit = submenu_renumber = submenu_settings = None
-  submenu_build = submenu_common_monomers = submenu_covalent_modifications = submenu_mutate = submenu_modify = None
+  submenu_build = submenu_common_monomers = submenu_coordination_links = submenu_covalent_modifications = submenu_mutate = submenu_modify = None
   submenu_maps = None
 
 #**** Populate submenus ****
@@ -6371,6 +6739,9 @@ add_simple_coot_menu_menuitem(submenu_build,
 
 submenu_build.append_submenu("Common monomers", submenu_common_monomers)
 add_common_monomer_menu_entries(submenu_common_monomers, COMMON_MONOMER_MENU)
+
+submenu_build.append_submenu("Coordination links", submenu_coordination_links)
+add_coordination_link_menu_entries(submenu_coordination_links, COORDINATION_LINK_MENU)
 
 submenu_build.append_submenu("Covalent modifications", submenu_covalent_modifications)
 add_covalent_modification_menu_entries(submenu_covalent_modifications)
