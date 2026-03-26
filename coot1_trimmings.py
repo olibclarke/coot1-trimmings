@@ -7,10 +7,15 @@ import struct
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 
 import gi
 import coot
+import coot_utils
+import gap
+from gap import fit_gap
+from mutate import three_letter_code2single_letter
 
 if not hasattr(gi, "require_version"):
   def _require_version(_namespace, _version):
@@ -19,7 +24,275 @@ if not hasattr(gi, "require_version"):
 
 from coot import *
 from coot_utils import *
+
+if not hasattr(coot_utils, "regularize_zone"):
+  coot_utils.regularize_zone = coot.regularize_zone
+
+def _gap_residue_info_compat(imol, chain_id, resno, ins_code):
+  return coot.residue_info_py(imol, chain_id, resno, ins_code) or []
+
+gap.residue_info = _gap_residue_info_compat
+if not hasattr(gap, "sys"):
+  gap.sys = sys
+
+def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
+  imol_map = coot.imol_refinement_map()
+  if imol_map == -1:
+    coot.info_dialog("Need to set a map to fit a loop")
+    return None
+
+  backup_mode = coot.backup_state(imol)
+  coot.make_backup(imol)
+  coot.turn_off_backup(imol)
+
+  rama_status = coot.refine_ramachandran_angles_state()
+  coot.set_refine_ramachandran_angles(use_rama_restraints)
+  temp_imols = set()
+
+  try:
+    if stop_resno < start_resno:
+      res_limits = [stop_resno - 1, start_resno + 1]
+    else:
+      res_limits = [start_resno - 1, stop_resno + 1]
+
+    if all([coot_utils.residue_exists_qm(imol, chain_id, resno, "") for resno in res_limits]):
+      imol_backwards = coot.copy_molecule(imol)
+      if valid_model_molecule_qm(imol_backwards):
+        temp_imols.add(imol_backwards)
+      loop_len = abs(start_resno - stop_resno) + 1
+      imol_both = coot.copy_molecule(imol) if loop_len >= 6 else None
+      if imol_both is not None and valid_model_molecule_qm(imol_both):
+        temp_imols.add(imol_both)
+
+      atom_selection = "//" + chain_id + "/" + str(min(start_resno, stop_resno) - 1) + \
+                       "-" + str(max(start_resno, stop_resno) + 1)
+      imol_fragment_backup = coot.new_molecule_by_atom_selection(imol, atom_selection)
+      if valid_model_molecule_qm(imol_fragment_backup):
+        temp_imols.add(imol_fragment_backup)
+        coot.set_mol_displayed(imol_fragment_backup, 0)
+
+      gap.fit_gap_generic(imol, chain_id, start_resno, stop_resno, sequence)
+      gap.fit_gap_generic(imol_backwards, chain_id, stop_resno, start_resno, sequence)
+
+      result_a = gap.low_density_average(imol_map, imol, chain_id, start_resno, stop_resno)
+      result_b = gap.low_density_average(imol_map, imol_backwards, chain_id, start_resno, stop_resno)
+      loop_list = [[imol, result_a], [imol_backwards, result_b]]
+
+      if loop_len >= 6:
+        start_resno1 = min([start_resno, stop_resno])
+        stop_resno2 = max([start_resno, stop_resno])
+        half_loop_len = loop_len // 2
+        stop_resno1 = start_resno1 + half_loop_len - 1
+        start_resno2 = stop_resno1 + 1
+        sequence1 = sequence[0:half_loop_len]
+        sequence2 = sequence[half_loop_len:len(sequence)]
+        gap.fit_gap_generic(imol_both, chain_id, start_resno1, stop_resno1, sequence1)
+        gap.fit_gap_generic(imol_both, chain_id, stop_resno2, start_resno2, sequence2)
+        immediate_refinement_mode = coot.refinement_immediate_replacement_state()
+        coot.set_refinement_immediate_replacement(1)
+        coot.refine_zone(imol_both, chain_id, stop_resno1 - loop_len//3, start_resno2 + loop_len//3, "")
+        coot.accept_regularizement()
+        coot.set_refinement_immediate_replacement(immediate_refinement_mode)
+        result_c = gap.low_density_average(imol_map, imol_both, chain_id, start_resno, stop_resno)
+        loop_list.append([imol_both, result_c])
+
+      i = 0
+      while i < (len(loop_list) - 1):
+        j = i + 1
+        while j < len(loop_list):
+          max_score = max(loop_list[i][1], loop_list[j][1])
+          if max_score != 0 and (min(loop_list[i][1], loop_list[j][1]) / max_score > 0.90):
+            temp_imols.discard(loop_list[j][0])
+            coot.close_molecule(loop_list[j][0])
+            loop_list.pop(j)
+          j += 1
+        i += 1
+
+      if result_a > result_b:
+        temp_imols.discard(imol_backwards)
+        coot.close_molecule(imol_backwards)
+      else:
+        coot.replace_fragment(imol, imol_backwards, atom_selection)
+        temp_imols.discard(imol_backwards)
+        coot.close_molecule(imol_backwards)
+    else:
+      gap.fit_gap_generic(imol, chain_id, start_resno, stop_resno, sequence)
+  finally:
+    for temp_imol in list(temp_imols):
+      if valid_model_molecule_qm(temp_imol):
+        coot.close_molecule(temp_imol)
+    coot.set_refine_ramachandran_angles(rama_status)
+    if backup_mode == 1:
+      coot.turn_on_backup(imol)
+
+gap.fit_gap = fit_gap
+
+
+def _residue_spec_to_cid_compat(residue_spec):
+  if not isinstance(residue_spec, (list, tuple)) or len(residue_spec) < 3:
+    return None
+  chain_id = residue_spec[0]
+  res_no = residue_spec[1]
+  ins_code = residue_spec[2] or ""
+  if ins_code:
+    return "//{chain_id}/{res_no}.{ins_code}".format(
+      chain_id=chain_id,
+      res_no=res_no,
+      ins_code=ins_code,
+    )
+  return "//{chain_id}/{res_no}".format(chain_id=chain_id, res_no=res_no)
+
+
+USER_DEFINED_COLOUR_TABLE_SIZE = 60
+USER_DEFINED_COLOUR_TABLE_BASE = 60
+USER_DEFINED_COLOUR_TABLE_READY = False
+
+
+def _make_default_user_defined_colours():
+  base_colours = [[0.72, 0.72, 0.72] for _ in range(USER_DEFINED_COLOUR_TABLE_SIZE)]
+  explicit_colours = {
+    0:  [0.72, 0.72, 0.72],
+    1:  [0.92, 0.92, 0.92],
+    2:  [0.18, 0.38, 0.95],
+    3:  [0.20, 0.62, 0.98],
+    4:  [0.10, 0.22, 0.98],
+    5:  [0.42, 0.78, 1.00],
+    10: [0.00, 0.76, 0.68],
+    15: [0.10, 0.78, 0.18],
+    22: [0.98, 0.88, 0.18],
+    27: [0.98, 0.60, 0.12],
+    28: [1.00, 0.48, 0.02],
+    30: [1.00, 0.28, 0.08],
+    31: [0.92, 0.12, 0.12],
+    34: [0.90, 0.20, 0.85],
+    39: [0.55, 0.28, 0.90],
+  }
+  for colour_index, colour in explicit_colours.items():
+    if 0 <= colour_index < USER_DEFINED_COLOUR_TABLE_SIZE:
+      base_colours[colour_index] = colour
+
+  colours = []
+  for i in range(USER_DEFINED_COLOUR_TABLE_SIZE):
+    colours.append((USER_DEFINED_COLOUR_TABLE_BASE + i, base_colours[i]))
+  return colours
+
+
+def _legacy_user_colour_index_to_coot_index(colour_index):
+  if not isinstance(colour_index, int):
+    return colour_index
+  if colour_index < 0:
+    return USER_DEFINED_COLOUR_TABLE_BASE
+  if colour_index >= USER_DEFINED_COLOUR_TABLE_SIZE:
+    return colour_index
+  return USER_DEFINED_COLOUR_TABLE_BASE + colour_index
+
+
+def ensure_user_defined_colour_table():
+  global USER_DEFINED_COLOUR_TABLE_READY
+  if USER_DEFINED_COLOUR_TABLE_READY:
+    return
+  if "make_alphafold_colours" in globals():
+    colours = make_alphafold_colours()
+  else:
+    colours = _make_default_user_defined_colours()
+  coot.set_user_defined_colours_py(colours)
+  USER_DEFINED_COLOUR_TABLE_READY = True
+
+
+if "set_user_defined_atom_colour_by_residue_py" not in globals():
+  def set_user_defined_atom_colour_by_residue_py(mol_id, residue_specs_colour_index_tuple_list_py):
+    ensure_user_defined_colour_table()
+    selection_colour_list = []
+    for item in residue_specs_colour_index_tuple_list_py or []:
+      if not isinstance(item, (list, tuple)) or len(item) < 2:
+        continue
+      residue_spec = item[0]
+      colour_index = item[1]
+      cid = _residue_spec_to_cid_compat(residue_spec)
+      if cid is None:
+        continue
+      selection_colour_list.append((cid, _legacy_user_colour_index_to_coot_index(colour_index)))
+    return coot.set_user_defined_atom_colour_by_selection_py(mol_id, selection_colour_list)
+
+
+if "clear_user_defined_atom_colours" not in globals():
+  clear_user_defined_atom_colours = coot.clear_user_defined_atom_colours
+
+
+if "graphics_to_user_defined_atom_colours_representation" not in globals():
+  graphics_to_user_defined_atom_colours_representation = (
+    coot.graphics_to_user_defined_atom_colours_representation
+  )
+
+
+if "graphics_to_user_defined_atom_colours_all_atoms_representation" not in globals():
+  graphics_to_user_defined_atom_colours_all_atoms_representation = (
+    coot.graphics_to_user_defined_atom_colours_all_atoms_representation
+  )
+
+
+_coot_graphics_to_bonds_representation = graphics_to_bonds_representation
+_coot_graphics_to_rainbow_representation = graphics_to_rainbow_representation
+_coot_graphics_to_b_factor_representation = graphics_to_b_factor_representation
+_coot_graphics_to_ca_plus_ligands_representation = graphics_to_ca_plus_ligands_representation
+_coot_graphics_to_ca_plus_ligands_and_sidechains_representation = (
+  graphics_to_ca_plus_ligands_and_sidechains_representation
+)
+_coot_graphics_to_ca_plus_ligands_sec_struct_representation = (
+  graphics_to_ca_plus_ligands_sec_struct_representation
+)
+
+
+def _clear_user_defined_colours_for_standard_representation(mol_id):
+  if mol_id is None or mol_id < 0:
+    return
+  clear_user_defined_atom_colours(mol_id)
+
+
+def graphics_to_bonds_representation(mol_id):
+  _clear_user_defined_colours_for_standard_representation(mol_id)
+  return _coot_graphics_to_bonds_representation(mol_id)
+
+
+def graphics_to_rainbow_representation(mol_id):
+  _clear_user_defined_colours_for_standard_representation(mol_id)
+  return _coot_graphics_to_rainbow_representation(mol_id)
+
+
+def graphics_to_b_factor_representation(mol_id):
+  _clear_user_defined_colours_for_standard_representation(mol_id)
+  return _coot_graphics_to_b_factor_representation(mol_id)
+
+
+def graphics_to_ca_plus_ligands_representation(mol_id):
+  _clear_user_defined_colours_for_standard_representation(mol_id)
+  return _coot_graphics_to_ca_plus_ligands_representation(mol_id)
+
+
+def graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id):
+  _clear_user_defined_colours_for_standard_representation(mol_id)
+  return _coot_graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
+
+
+def graphics_to_ca_plus_ligands_sec_struct_representation(mol_id):
+  _clear_user_defined_colours_for_standard_representation(mol_id)
+  return _coot_graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
+
+
+coot.graphics_to_bonds_representation = graphics_to_bonds_representation
+coot.graphics_to_rainbow_representation = graphics_to_rainbow_representation
+coot.graphics_to_b_factor_representation = graphics_to_b_factor_representation
+coot.graphics_to_ca_plus_ligands_representation = graphics_to_ca_plus_ligands_representation
+coot.graphics_to_ca_plus_ligands_and_sidechains_representation = (
+  graphics_to_ca_plus_ligands_and_sidechains_representation
+)
+coot.graphics_to_ca_plus_ligands_sec_struct_representation = (
+  graphics_to_ca_plus_ligands_sec_struct_representation
+)
+
+
 REGISTERED_KEYBINDING_CALLBACKS = []
+CUSTOM_COLOUR_OVERLAY_MOLECULES = {}
 MAP_SURFACE_DISPLAY_STATE = {}
 MAP_SURFACE_OPACITY_STATE = {}
 MAP_GLOBAL_VIEW_SETTINGS = {}
@@ -112,6 +385,16 @@ def _gui_unavailable_message(feature_name):
     feature_name
     + " is unavailable because the embedded Python environment cannot import the Gtk bindings needed by this helper."
   )
+
+
+def _coot11_user_colour_warning():
+  info_dialog(
+    "Custom per-residue colouring is currently disabled in this Coot 1.1 build.\n\n"
+    "The available Python user-defined colouring API stores persistent colour selections on the molecule "
+    "and contaminates ordinary display modes such as Colour by Atom.\n\n"
+    "This needs a separate overlay/additional-representation implementation rather than direct colouring of the base molecule."
+  )
+  return None
 
 
 def _register_key_binding_if(condition, name, key, thunk):
@@ -246,19 +529,35 @@ def _smart_copy_atom_selection(chain_id, resno, ins_code):
   return "//{chain_id}/{resno}".format(chain_id=chain_id, resno=resno)
 
 
+def _find_model_molecule_for_click_spec(chain_id, resno, ins_code):
+  if not chain_id or resno is False:
+    return -1
+  for imol in model_molecule_list():
+    if residue_exists_qm(imol, chain_id, resno, ins_code):
+      return imol
+  return -1
+
+
 def _click_spec_imol(click_spec):
+  valid_model_mols = model_molecule_list()
   if not isinstance(click_spec, list):
     residue = active_residue()
-    return residue[0] if residue else -1
+    return residue[0] if residue and residue[0] in valid_model_mols else -1
   if len(click_spec) >= 7:
-    if isinstance(click_spec[0], int) and click_spec[0] in molecule_number_list():
+    if isinstance(click_spec[0], int) and click_spec[0] in valid_model_mols:
       return click_spec[0]
-    if isinstance(click_spec[1], int) and click_spec[1] in molecule_number_list():
+    if isinstance(click_spec[1], int) and click_spec[1] in valid_model_mols:
       return click_spec[1]
-  if len(click_spec) == 6 and isinstance(click_spec[0], int):
+  if len(click_spec) == 6 and isinstance(click_spec[0], int) and click_spec[0] in valid_model_mols:
     return click_spec[0]
+  chain_id = _click_spec_chain_id(click_spec)
+  resno = _click_spec_res_no(click_spec)
+  ins_code = _click_spec_ins_code(click_spec)
+  imol = _find_model_molecule_for_click_spec(chain_id, resno, ins_code)
+  if imol in valid_model_mols:
+    return imol
   residue = active_residue()
-  if residue and residue[0] in molecule_number_list():
+  if residue and residue[0] in valid_model_mols:
     return residue[0]
   return -1
 
@@ -345,14 +644,16 @@ if GUI_PYTHON_AVAILABLE:
   generic_multiple_entries_with_check_button = (
     coot_gui.generic_multiple_entries_with_check_button
   )
-  generic_single_entry = coot_gui.generic_single_entry
   add_simple_action_to_menu = coot_gui.add_simple_action_to_menu
   add_module_cryo_em_gui = coot_gui.add_module_cryo_em_gui
   add_module_refine = coot_gui.add_module_refine
+  Gtk = coot_gui.Gtk
 
   _menu_action_counter = 0
 
   def add_simple_coot_menu_menuitem(menu, menu_item_label, activate_function):
+    if menu is None:
+      return None
     global _menu_action_counter
     action_name = "coot_trimmings_action_{0}".format(_menu_action_counter)
     _menu_action_counter += 1
@@ -361,22 +662,55 @@ if GUI_PYTHON_AVAILABLE:
       return activate_function(None)
 
     add_simple_action_to_menu(menu, menu_item_label, action_name, on_activate)
+
+  def generic_single_entry(function_label, entry_1_default_text, go_button_label, handle_go_function):
+    window = Gtk.Window()
+    window.set_title("Coot")
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    label = Gtk.Label(label=function_label)
+    entry = Gtk.Entry()
+    cancel_button = Gtk.Button(label="Cancel")
+    go_button = Gtk.Button(label=go_button_label)
+
+    label.set_margin_start(12)
+    label.set_margin_end(12)
+    label.set_margin_top(12)
+    label.set_margin_bottom(4)
+    entry.set_margin_start(12)
+    entry.set_margin_end(12)
+    entry.set_margin_bottom(8)
+    hbox_buttons.set_margin_start(12)
+    hbox_buttons.set_margin_end(12)
+    hbox_buttons.set_margin_bottom(12)
+
+    if isinstance(entry_1_default_text, str):
+      entry.set_text(entry_1_default_text)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def submit(*_args):
+      handle_go_function(entry.get_text())
+      window.destroy()
+      return False
+
+    cancel_button.connect("clicked", close_window)
+    go_button.connect("clicked", submit)
+    entry.connect("activate", submit)
+
+    vbox.append(label)
+    vbox.append(entry)
+    hbox_buttons.append(cancel_button)
+    hbox_buttons.append(go_button)
+    vbox.append(hbox_buttons)
+    window.set_child(vbox)
+    window.present()
+    entry.grab_focus()
+
 else:
-  def add_key_binding(name, key, thunk):
-    ctrl_key = 0
-    key_value = key
-    if isinstance(key, str) and key.startswith("Control_"):
-      ctrl_key = 1
-      key_value = key[len("Control_"):]
-    def wrapped_thunk():
-      try:
-        return thunk()
-      except Exception:
-        print("coot_trimmings keybinding failure:", name, "key=", key_value)
-        traceback.print_exc()
-        return None
-    REGISTERED_KEYBINDING_CALLBACKS.append(wrapped_thunk)
-    coot.add_key_binding_gtk4_py(key_value, ctrl_key, wrapped_thunk, name)
 
   def coot_toolbar_button(*_args, **_kwargs):
     return None
@@ -397,6 +731,7 @@ else:
   ):
     info_dialog(_gui_unavailable_message(function_label))
 
+
   def add_simple_coot_menu_menuitem(_menu, _menu_item_label, _activate_function):
     return None
 
@@ -405,6 +740,25 @@ else:
 
   def add_module_refine():
     return None
+
+
+def add_key_binding(name, key, thunk):
+  ctrl_key = 0
+  key_value = key
+  if isinstance(key, str) and key.startswith("Control_"):
+    ctrl_key = 1
+    key_value = key[len("Control_"):]
+
+  def wrapped_thunk():
+    try:
+      return thunk()
+    except Exception:
+      print("coot_trimmings keybinding failure:", name, "key=", key_value)
+      traceback.print_exc()
+      return None
+
+  REGISTERED_KEYBINDING_CALLBACKS.append(wrapped_thunk)
+  coot.add_key_binding_gtk4_py(key_value, ctrl_key, wrapped_thunk, name)
 
 if not CARBOHYDRATE_GUI_AVAILABLE:
   def add_module_carbohydrate_gui():
@@ -1692,10 +2046,336 @@ def colour_active_segment():
       for res in range(res_start,res_end+1):
         blank_color_spec=[([ch_id_here,res,""],blank_colour)]
         blank_list=blank_list+blank_color_spec
-  clear_user_defined_atom_colours(mol_id)
-  set_user_defined_atom_colour_by_residue_py(mol_id,colour_list)
-  set_user_defined_atom_colour_by_residue_py(mol_id,blank_list)
-  graphics_to_user_defined_atom_colours_representation(mol_id)
+  _apply_user_defined_residue_colours(mol_id, blank_list, colour_list)
+
+
+def _all_residue_specs_for_colouring(mol_id):
+  residue_specs=[]
+  for residue_entry in all_residues_with_serial_numbers(mol_id) or []:
+    if not residue_entry or len(residue_entry) < 4:
+      continue
+    residue_spec=residue_entry[1:]
+    chain_id=residue_spec_to_chain_id(residue_spec)
+    resno=residue_spec_to_res_no(residue_spec)
+    ins_code=residue_spec_to_ins_code(residue_spec)
+    if chain_id is False or resno is False or ins_code is False:
+      continue
+    residue_specs.append([chain_id,resno,ins_code])
+  return residue_specs
+
+
+def _active_molecule_or_status():
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  return residue[0]
+
+
+def _active_polymer_molecule_for_colouring(action_name):
+  residue=_active_residue_or_status()
+  if not residue:
+    return None
+  if not _residue_is_polymer(residue[0], residue[1], residue[2], residue[3]):
+    info_dialog(action_name+" requires the active residue to be polymer.")
+    return None
+  return residue[0]
+
+
+def _clear_custom_colour_overlay(mol_id):
+  overlay_mol_id = CUSTOM_COLOUR_OVERLAY_MOLECULES.pop(mol_id, None)
+  if overlay_mol_id is None:
+    return
+  try:
+    close_molecule(overlay_mol_id)
+  except Exception:
+    pass
+
+
+def _make_custom_colour_overlay_copy(mol_id):
+  _clear_custom_colour_overlay(mol_id)
+  overlay_mol_id = copy_molecule(mol_id)
+  if overlay_mol_id == -1:
+    add_status_bar_text("Failed to create custom colour overlay molecule")
+    return None
+  set_mol_active(overlay_mol_id, 0)
+  set_molecule_name(
+    overlay_mol_id,
+    molecule_name(mol_id) + " [trimmings colours]",
+  )
+  CUSTOM_COLOUR_OVERLAY_MOLECULES[mol_id] = overlay_mol_id
+  return overlay_mol_id
+
+
+def _clear_custom_colour_additional_representations(mol_id):
+  handles = []
+  for handle in handles:
+    try:
+      delete_additional_representation(mol_id, handle)
+    except Exception:
+      pass
+
+
+def _show_custom_colour_additional_representation(mol_id):
+  overlay_mol_id = _make_custom_colour_overlay_copy(mol_id)
+  if overlay_mol_id is None:
+    return None
+  return overlay_mol_id
+
+
+def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  ensure_user_defined_colour_table()
+  overlay_mol_id = _show_custom_colour_additional_representation(mol_id)
+  if overlay_mol_id is None:
+    return None
+  clear_user_defined_atom_colours(overlay_mol_id)
+  if colour_list:
+    set_user_defined_atom_colour_by_residue_py(overlay_mol_id, colour_list)
+  graphics_to_user_defined_atom_colours_representation(overlay_mol_id)
+  clear_user_defined_atom_colours(overlay_mol_id)
+  if info_message:
+    info_dialog(info_message)
+
+
+def color_by_rama_native(mol_id):
+  rama_results=all_molecule_ramachandran_score(mol_id)
+  if not isinstance(rama_results, list) or len(rama_results) < 6:
+    info_dialog("Unable to obtain Ramachandran scores.")
+    return None
+  scored_residues=rama_results[5]
+  blank_colour=0
+  rama_allowed_colour=27
+  rama_outlier_colour=31
+  blank_res_list=[]
+  rama_colour_list=[]
+  for residue_spec in _all_residue_specs_for_colouring(mol_id):
+    blank_res_list.append((residue_spec, blank_colour))
+  for item in scored_residues:
+    if not isinstance(item, list) or len(item) < 3:
+      continue
+    residue_spec=item[1]
+    rama_score=item[2]
+    if not isinstance(residue_spec, list):
+      continue
+    if rama_score < 0.002:
+      rama_colour_list.append((residue_spec[1:], rama_outlier_colour))
+    elif rama_score < 0.02:
+      rama_colour_list.append((residue_spec[1:], rama_allowed_colour))
+  _apply_user_defined_residue_colours(
+    mol_id,
+    blank_res_list,
+    rama_colour_list,
+    "Ramachandran coloring:\n\nRed = outlier (<0.2%)\n\nOrange = allowed/disfavored (<2%)",
+  )
+
+
+def color_by_rama_native_for_active_residue():
+  mol_id=_active_polymer_molecule_for_colouring("Ramachandran coloring")
+  if mol_id is None:
+    return None
+  return color_by_rama_native(mol_id)
+
+
+def color_by_density_fit_native(mol_id):
+  map_id=imol_refinement_map()
+  if map_id==-1:
+    info_dialog("You need a refinement map for density-fit coloring.")
+    return None
+  residue_specs=all_residues_sans_water(mol_id)
+  if not residue_specs:
+    info_dialog("No residues found for density-fit coloring.")
+    return None
+  correlation_results=map_to_model_correlation_per_residue(mol_id, residue_specs, 0, map_id)
+  blank_colour=0
+  blank_res_list=[]
+  density_colour_list=[]
+  for residue_spec in _all_residue_specs_for_colouring(mol_id):
+    blank_res_list.append((residue_spec, blank_colour))
+  for item in correlation_results:
+    if not isinstance(item, list) or len(item) < 2:
+      continue
+    residue_spec=item[0]
+    score=item[1]
+    if not isinstance(residue_spec, list):
+      continue
+    if score < 0.0:
+      score=0.0
+    if score > 1.0:
+      score=1.0
+    colour_index=int((1.0-score)*31+2)
+    density_colour_list.append((residue_spec[1:], colour_index))
+  _apply_user_defined_residue_colours(
+    mol_id,
+    blank_res_list,
+    density_colour_list,
+    "Active molecule colored by model/map correlation, in spectral coloring (blue=CC 1.0, red=CC 0.0)",
+  )
+
+
+def color_by_density_fit_native_for_active_residue():
+  mol_id=_active_polymer_molecule_for_colouring("Density-fit coloring")
+  if mol_id is None:
+    return None
+  return color_by_density_fit_native(mol_id)
+
+
+def color_by_ncs_difference(mol_id):
+  if mol_id not in model_molecule_list():
+    info_dialog("You need an active model for NCS-difference coloring.")
+    return None
+  ncs_data=None
+  for chain_id in chain_ids(mol_id):
+    try:
+      diffs=ncs_chain_differences(mol_id, chain_id)
+    except Exception:
+      diffs=False
+    if diffs:
+      ncs_data=diffs
+      break
+  if not ncs_data:
+    info_dialog("No NCS-difference data were found for the active molecule.")
+    return None
+
+  blank_colour=0
+  blank_res_list=[]
+  ncs_scores={}
+
+  for residue_spec in _all_residue_specs_for_colouring(mol_id):
+    blank_res_list.append((residue_spec, blank_colour))
+
+  for i in range(0, len(ncs_data), 3):
+    try:
+      peer_chain_id=ncs_data[i]
+      current_target_chain_id=ncs_data[i+1]
+      residue_diffs=ncs_data[i+2]
+    except Exception:
+      continue
+    if not isinstance(residue_diffs, list):
+      continue
+    for residue_diff in residue_diffs:
+      if not isinstance(residue_diff, list) or len(residue_diff) < 3:
+        continue
+      peer_residue=residue_diff[0]
+      target_residue=residue_diff[1]
+      mean_diff=residue_diff[2]
+      try:
+        mean_diff=float(mean_diff)
+      except Exception:
+        continue
+      if isinstance(peer_residue, list) and len(peer_residue) >= 2:
+        peer_spec=(peer_chain_id, peer_residue[0], peer_residue[1])
+        ncs_scores[peer_spec]=max(ncs_scores.get(peer_spec, 0.0), mean_diff)
+      if isinstance(target_residue, list) and len(target_residue) >= 2:
+        target_spec=(current_target_chain_id, target_residue[0], target_residue[1])
+        ncs_scores[target_spec]=max(ncs_scores.get(target_spec, 0.0), mean_diff)
+
+  if not ncs_scores:
+    info_dialog("No NCS-difference values were available for coloring.")
+    return None
+
+  ncs_colour_list=[]
+  for residue_spec, mean_diff in ncs_scores.items():
+    normalized_score=mean_diff/2.0
+    if normalized_score < 0.0:
+      normalized_score=0.0
+    if normalized_score > 1.0:
+      normalized_score=1.0
+    colour_index=int(normalized_score*31+2)
+    ncs_colour_list.append(([residue_spec[0], residue_spec[1], residue_spec[2]], colour_index))
+
+  _apply_user_defined_residue_colours(
+    mol_id,
+    blank_res_list,
+    ncs_colour_list,
+    "Active molecule colored by NCS difference, in spectral coloring (blue=low difference, red=high difference)",
+  )
+
+
+def color_by_ncs_difference_for_active_residue():
+  mol_id=_active_polymer_molecule_for_colouring("NCS-difference coloring")
+  if mol_id is None:
+    return None
+  return color_by_ncs_difference(mol_id)
+
+
+def color_by_clash_score(mol_id):
+  if mol_id not in model_molecule_list():
+    info_dialog("You need an active model for clash coloring.")
+    return None
+  try:
+    overlap_data=molecule_atom_overlaps(mol_id, -1)
+  except TypeError:
+    try:
+      overlap_data=molecule_atom_overlaps(mol_id)
+    except Exception:
+      overlap_data=False
+  except Exception:
+    overlap_data=False
+  if not isinstance(overlap_data, list):
+    info_dialog("No clash data were available for the active molecule.")
+    return None
+
+  blank_colour=0
+  blank_res_list=[]
+  max_overlap_by_residue={}
+
+  for residue_spec in _all_residue_specs_for_colouring(mol_id):
+    blank_res_list.append((residue_spec, blank_colour))
+
+  def accumulate_overlap_from_atom_spec(atom_spec, overlap_value):
+    if not isinstance(atom_spec, list):
+      return
+    try:
+      residue_spec=atom_spec_to_residue_spec(atom_spec)
+    except Exception:
+      return
+    if not isinstance(residue_spec, list) or len(residue_spec) < 3:
+      return
+    residue_key=(residue_spec_to_chain_id(residue_spec),
+                 residue_spec_to_res_no(residue_spec),
+                 residue_spec_to_ins_code(residue_spec))
+    previous_max=max_overlap_by_residue.get(residue_key, 0.0)
+    if overlap_value > previous_max:
+      max_overlap_by_residue[residue_key]=overlap_value
+
+  for overlap_item in overlap_data:
+    if not isinstance(overlap_item, dict):
+      continue
+    try:
+      overlap_value=float(overlap_item.get('overlap-volume', 0.0))
+    except Exception:
+      continue
+    atom_spec_1=overlap_item.get('atom-1-spec')
+    atom_spec_2=overlap_item.get('atom-2-spec')
+    accumulate_overlap_from_atom_spec(atom_spec_1, overlap_value)
+    accumulate_overlap_from_atom_spec(atom_spec_2, overlap_value)
+
+  if not max_overlap_by_residue:
+    info_dialog("No clash data were available for the active molecule.")
+    return None
+
+  clash_colour_list=[]
+  for residue_spec, max_overlap in max_overlap_by_residue.items():
+    normalized_score=max_overlap/2.0
+    if normalized_score < 0.0:
+      normalized_score=0.0
+    if normalized_score > 1.0:
+      normalized_score=1.0
+    colour_index=int(normalized_score*31+2)
+    clash_colour_list.append(([residue_spec[0], residue_spec[1], residue_spec[2]], colour_index))
+
+  _apply_user_defined_residue_colours(
+    mol_id,
+    blank_res_list,
+    clash_colour_list,
+    "Active molecule colored by per-residue maximum clash overlap, in spectral coloring (blue=low clash, red=high clash)",
+  )
+
+
+def color_by_clash_score_for_active_molecule():
+  mol_id=_active_molecule_or_status()
+  if mol_id is None:
+    return None
+  return color_by_clash_score(mol_id)
 
 
 def color_emringer_outliers(mol_id,map_id):
@@ -1733,12 +2413,8 @@ def color_emringer_outliers(mol_id,map_id):
           emringer_outlier_color_spec=[([ch_id,resid,ins_id],emringer_outlier_color)]
           emringer_outlier_list=emringer_outlier_list+emringer_outlier_color_spec
       print(("outlier_list",emringer_outlier_list))
-      try:
-        set_user_defined_atom_colour_by_residue_py(mol_id,emringer_outlier_list)
-        graphics_to_user_defined_atom_colours_representation(mol_id)
-      except NameError:
-        info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-        pass
+      set_user_defined_atom_colour_by_residue_py(mol_id,emringer_outlier_list)
+      graphics_to_user_defined_atom_colours_representation(mol_id)
   else:
     info_dialog("Sorry, you need phenix.cablam_validate, sed and awk installed and accessible from the terminal for this to work!")
 
@@ -1803,13 +2479,9 @@ def color_by_cablam2(mol_id):
             cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec 
 #     os.remove(file_name)
     os.remove(file_name_output)
-    try:
-      set_user_defined_atom_colour_by_residue_py(mol_id,cablam_outlier_list)
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-      info_dialog("CaBLAM coloring scheme (predicted SS and outliers): \n  \n Teal = alpha \n \n Green = 3-10 \n \n Purple = beta \n \n Yellow = Ca geometry outlier \n \n Orange = CaBLAM disfavored (5% cutoff) \n \n Red = CaBLAM outlier (1% cutoff)")
-    except NameError:
-      info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-      pass
+    set_user_defined_atom_colour_by_residue_py(mol_id,cablam_outlier_list)
+    graphics_to_user_defined_atom_colours_representation(mol_id)
+    info_dialog("CaBLAM coloring scheme (predicted SS and outliers): \n  \n Teal = alpha \n \n Green = 3-10 \n \n Purple = beta \n \n Yellow = Ca geometry outlier \n \n Orange = CaBLAM disfavored (5% cutoff) \n \n Red = CaBLAM outlier (1% cutoff)")
   else:
     info_dialog("Sorry, you need phenix.cablam_validate, sed and awk installed and accessible from the terminal for this to work!")
 
@@ -1847,13 +2519,9 @@ def color_by_rama(mol_id):
         ramalyze_outlier_list=ramalyze_outlier_list+ramalyze_outlier_colour_spec
 #     os.remove(file_name)
     os.remove(file_name_output)
-    try:
-      set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-      set_user_defined_atom_colour_by_residue_py(mol_id,ramalyze_outlier_list)
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-    except NameError:
-      info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-      pass
+    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
+    set_user_defined_atom_colour_by_residue_py(mol_id,ramalyze_outlier_list)
+    graphics_to_user_defined_atom_colours_representation(mol_id)
   else:
     info_dialog("Sorry, you need phenix.ramalyze, sed and awk installed and accessible from the terminal for this to work!")
 
@@ -1888,12 +2556,8 @@ def color_by_cc(mol_id):
         print(("cc=",cc,"color=",cc_colour))
         cc_colour_spec=[([ch_id,resid,ins_id],cc_colour)]
         cc_list=cc_list+cc_colour_spec
-    try:
-      set_user_defined_atom_colour_by_residue_py(mol_id,cc_list)
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-    except NameError:
-      info_dialog("You need a newer Coot - custom coloring is only in r6188 and later, sorry.")
-      pass
+    set_user_defined_atom_colour_by_residue_py(mol_id,cc_list)
+    graphics_to_user_defined_atom_colours_representation(mol_id)
   else:
     info_dialog("Sorry, you need phenix.model_map_cc, sed and awk installed and accessible from the terminal for this to work! Also, needs to be P1 map right now, sorry.")
     
@@ -1933,40 +2597,33 @@ def toggle_mol_display():
     mol_disp_flag_cycle=0
 
 #Cycle representation mode forward/back
-cycle_rep_flag={0:0}
-def cycle_rep_up(mol_id,flag):
-  global cycle_rep_flag
-  cycle_rep_flag[mol_id]=flag
-  if cycle_rep_flag[mol_id]==0:
-    graphics_to_ca_plus_ligands_representation(mol_id)
-    cycle_rep_flag[mol_id]=1
-  elif cycle_rep_flag[mol_id]==1:
-    graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
-    cycle_rep_flag[mol_id]=2
-  elif cycle_rep_flag[mol_id]==2:
-    graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
-    cycle_rep_flag[mol_id]=3
-  elif cycle_rep_flag[mol_id]==3:
-    graphics_to_rainbow_representation(mol_id)
-    cycle_rep_flag[mol_id]=4
-  elif cycle_rep_flag[mol_id]==4:
-    graphics_to_bonds_representation(mol_id)
-    cycle_rep_flag[mol_id]=5
-  elif cycle_rep_flag[mol_id]==5:
-    graphics_to_b_factor_representation(mol_id)
-    cycle_rep_flag[mol_id]=6
-  elif cycle_rep_flag[mol_id]==6:
-    try:
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-      cycle_rep_flag[mol_id]=7
-    except NameError:
-      cycle_rep_flag[mol_id]=0
-  elif cycle_rep_flag[mol_id]==7:
-    try:
-      graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
-      cycle_rep_flag[mol_id]=0
-    except NameError:
-      cycle_rep_flag[mol_id]=0
+REPRESENTATION_SEQUENCE = [
+  graphics_to_ca_plus_ligands_representation,
+  graphics_to_ca_plus_ligands_and_sidechains_representation,
+  graphics_to_ca_plus_ligands_sec_struct_representation,
+  graphics_to_rainbow_representation,
+  graphics_to_bonds_representation,
+  graphics_to_b_factor_representation,
+]
+DEFAULT_REPRESENTATION_INDEX = 4
+cycle_rep_flag = {}
+
+def _cycle_rep_flag_or_default(mol_id):
+  flag = cycle_rep_flag.get(mol_id, DEFAULT_REPRESENTATION_INDEX)
+  if flag not in range(len(REPRESENTATION_SEQUENCE)):
+    flag = DEFAULT_REPRESENTATION_INDEX
+  cycle_rep_flag[mol_id] = flag
+  return flag
+
+def _apply_representation_index(mol_id, flag):
+  REPRESENTATION_SEQUENCE[flag](mol_id)
+  cycle_rep_flag[mol_id] = flag
+  return flag
+
+def cycle_rep_up(mol_id,flag=None):
+  current_flag = _cycle_rep_flag_or_default(mol_id) if flag is None else flag
+  next_flag = (current_flag + 1) % len(REPRESENTATION_SEQUENCE)
+  return _apply_representation_index(mol_id, next_flag)
 
 # def add_partial_water():
 #   place_typed_atom_at_pointer("Water")
@@ -1988,39 +2645,10 @@ def cycle_rep_up(mol_id,flag):
 #      residue_inf=residue_info(mol_id,ch_id,resn,"")      
 
     
-def cycle_rep_down(mol_id,flag):
-  global cycle_rep_flag
-  cycle_rep_flag[mol_id]=flag
-  if cycle_rep_flag[mol_id]==4:
-    graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
-    cycle_rep_flag[mol_id]=3
-  elif cycle_rep_flag[mol_id]==3:
-    graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
-    cycle_rep_flag[mol_id]=2
-  elif cycle_rep_flag[mol_id]==2:
-    graphics_to_ca_plus_ligands_representation(mol_id)
-    cycle_rep_flag[mol_id]=1
-  elif cycle_rep_flag[mol_id]==1:
-    try:
-      graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
-      cycle_rep_flag[mol_id]=0
-    except NameError:
-      cycle_rep_flag[mol_id]=7
-  elif cycle_rep_flag[mol_id]==0:
-    try:
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-      cycle_rep_flag[mol_id]=7
-    except NameError:
-      cycle_rep_flag[mol_id]=7
-  elif cycle_rep_flag[mol_id]==7:
-    graphics_to_b_factor_representation(mol_id)
-    cycle_rep_flag[mol_id]=6
-  elif cycle_rep_flag[mol_id]==6:
-    graphics_to_bonds_representation(mol_id)
-    cycle_rep_flag[mol_id]=5
-  elif cycle_rep_flag[mol_id]==5:
-    graphics_to_rainbow_representation(mol_id)
-    cycle_rep_flag[mol_id]=4
+def cycle_rep_down(mol_id,flag=None):
+  current_flag = _cycle_rep_flag_or_default(mol_id) if flag is None else flag
+  next_flag = (current_flag - 1) % len(REPRESENTATION_SEQUENCE)
+  return _apply_representation_index(mol_id, next_flag)
 
 
 def cycle_rep_up_current():
@@ -2028,7 +2656,7 @@ def cycle_rep_up_current():
   if not residue:
     return None
   mol_id = residue[0]
-  cycle_rep_up(mol_id, cycle_rep_flag.get(mol_id, 0))
+  cycle_rep_up(mol_id)
 
 
 def cycle_rep_down_current():
@@ -2036,7 +2664,7 @@ def cycle_rep_down_current():
   if not residue:
     return None
   mol_id = residue[0]
-  cycle_rep_down(mol_id, cycle_rep_flag.get(mol_id, 0))
+  cycle_rep_down(mol_id)
 
 
 #Refine triple (Paul)
@@ -2587,18 +3215,6 @@ def auto_refine():
    
 
 #**** "Custom menu item functions ****
-#Deletes active chain
-def delete_chain():
-  active_chain_id=active_residue()[1]
-  active_mol_id=active_residue()[0]
-  turn_off_backup(active_mol_id)
-  while (is_polymer(active_mol_id,active_chain_id)==1) or (
-  is_solvent_chain_p(active_mol_id,active_chain_id)!=-1):
-    first_res=first_residue(active_mol_id,active_chain_id)
-    last_res=last_residue(active_mol_id,active_chain_id)
-    delete_residue_range(active_mol_id,active_chain_id,first_res,last_res)
-  turn_on_backup(active_mol_id)
-
 #Fits all polymer chains to map
 def rigid_fit_all_chains():
   mol_id=active_residue()[0]
@@ -2761,17 +3377,60 @@ def clear_distances_and_labels():
   remove_all_atom_labels()
   clear_measure_distances()
   
-#Delete hydrogens from active molecule
-def delete_h_active():
-  mol_id=active_residue()[0]
-  delete_hydrogens(mol_id)
-  
+def _snap_click_to_nearby_segment_terminus(mol_id, ch_id, resno, max_distance=2):
+  if mol_id not in model_molecule_list() or not ch_id or resno is False:
+    return None
+  try:
+    first_in_seg = first_residue_in_seg(mol_id, ch_id, resno)
+    last_in_seg = last_residue_in_seg(mol_id, ch_id, resno)
+  except Exception:
+    return None
+
+  candidates = [
+    ("N", first_in_seg, abs(first_in_seg - resno)),
+    ("C", last_in_seg, abs(last_in_seg - resno)),
+  ]
+  candidates = [candidate for candidate in candidates if candidate[2] <= max_distance]
+  if not candidates:
+    return None
+  candidates.sort(key=lambda candidate: candidate[2])
+  terminus_kind, terminus_resno, _distance = candidates[0]
+  return (terminus_kind, terminus_resno)
+
+
 #click the start and end point, then fit the gap between them with polyala
 def fit_polyala_gui():
   def fit_polyala(res1,res2):
-    length=abs(res1[3]-res2[3])-1
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
+    resno_1=_click_spec_res_no(res1)
+    resno_2=_click_spec_res_no(res2)
+    if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2):
+      info_dialog("Start and end residues must be in the same molecule and chain!")
+      return None
+    terminus_1 = _snap_click_to_nearby_segment_terminus(mol_id_1, ch_id_1, resno_1)
+    terminus_2 = _snap_click_to_nearby_segment_terminus(mol_id_1, ch_id_1, resno_2)
+    if terminus_1 is None or terminus_2 is None:
+      info_dialog("Click two termini flanking the loop, or within two residues of them.")
+      return None
+
+    clicked_termini = sorted([terminus_1, terminus_2], key=lambda item: item[1])
+    lower_kind, lower_resno = clicked_termini[0]
+    upper_kind, upper_resno = clicked_termini[1]
+    if lower_kind != "C" or upper_kind != "N":
+      info_dialog("Clicks must identify the C-terminus and N-terminus flanking the loop.")
+      return None
+
+    gap_start=lower_resno + 1
+    gap_end=upper_resno - 1
+    length=gap_end-gap_start+1
+    if length <= 0:
+      info_dialog("The selected termini do not flank a missing loop.")
+      return None
     loop_seq=length*"A"
-    fit_gap(res1[1],res1[2],res1[3],res2[3],loop_seq,1)
+    fit_gap(mol_id_1,ch_id_1,gap_start,gap_end,loop_seq,1)
   user_defined_click(2,fit_polyala)
   
 # Try to rebuild with db_mainchain after fit_gap?
@@ -2786,15 +3445,22 @@ def fit_polyala_gui():
 #Rebuild backbone in selected zone
 def rebuild_backbone_wrapper():
   def rebuild_backbone(res1,res2):
-    if res1[1]==res2[1] and res1[2]==res2[2]: #if residues in same mol and chain
-      mol_id=res1[1]
-      ch_id=res1[2]
-      resid1=res1[3]
-      resid2=res2[3]
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
+    resid1=_click_spec_res_no(res1)
+    resid2=_click_spec_res_no(res2)
+    if mol_id_1==mol_id_2 and ch_id_1==ch_id_2: #if residues in same mol and chain
+      mol_id=mol_id_1
+      ch_id=ch_id_1
       if resid1!=resid2:
         if resid2<resid1:
           resid1, resid2 = resid2, resid1
         new_mol_id=db_mainchain(mol_id,ch_id,resid1,resid2,"forwards")
+        if new_mol_id == -1 or not valid_model_molecule_qm(new_mol_id):
+          info_dialog("Backbone rebuild failed for the selected range")
+          return None
         accept_regularizement()
         res1_rsr=first_residue(new_mol_id,ch_id)
         res2_rsr=last_residue(new_mol_id,ch_id)
@@ -2824,9 +3490,9 @@ def rebuild_backbone_wrapper():
 
 def rebuild_backbone_reverse_wrapper():
   def rebuild_backbone_reverse(res1):
-    mol_id=res1[1]
-    ch_id=res1[2]
-    resid1=res1[3]
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    resid1=_click_spec_res_no(res1)
     segments=segment_list(mol_id)
     for seg in segments:
       if (resid1>=seg[2]) and (resid1<=seg[3]) and (ch_id==seg[1]):
@@ -2837,6 +3503,9 @@ def rebuild_backbone_reverse_wrapper():
         if res_start!=res_end:
           reverse_direction_of_fragment(mol_id,ch_id,res_start)
           new_mol_id=db_mainchain(mol_id,ch_id,res_start,res_end,"forwards")
+          if new_mol_id == -1 or not valid_model_molecule_qm(new_mol_id):
+            info_dialog("Backbone rebuild failed for the selected segment")
+            return None
         accept_regularizement()
         res1_rsr=first_residue(new_mol_id,ch_id)
         res2_rsr=last_residue(new_mol_id,ch_id)
@@ -3018,12 +3687,12 @@ def stepped_sphere_refine(mol_id,ch_id):
 #Copy fragment (click start and end)
 def copy_frag_by_click():
   def copy_frag(res1,res2):
-    mol_id_1=res1[1]
-    mol_id_2=res2[1]
-    ch_id_1=res1[2]
-    ch_id_2=res2[2]
-    resno_1=res1[3]
-    resno_2=res2[3]
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
+    resno_1=_click_spec_res_no(res1)
+    resno_2=_click_spec_res_no(res2)
     if (mol_id_1==mol_id_2) and (ch_id_1==ch_id_2):
       if resno_1>resno_2:
         atom_sel="//%s/%s-%s" %(ch_id_1,resno_2,resno_1)
@@ -3041,12 +3710,12 @@ def copy_frag_by_click():
 #Cut fragment (click start and end)
 def cut_frag_by_click():
   def cut_frag(res1,res2):
-    mol_id_1=res1[1]
-    mol_id_2=res2[1]
-    ch_id_1=res1[2]
-    ch_id_2=res2[2]
-    resno_1=res1[3]
-    resno_2=res2[3]
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
+    resno_1=_click_spec_res_no(res1)
+    resno_2=_click_spec_res_no(res2)
     if (mol_id_1==mol_id_2) and (ch_id_1==ch_id_2):
       turn_off_backup(mol_id_1)
       if resno_1>resno_2:
@@ -3068,40 +3737,32 @@ def cut_frag_by_click():
 
 
 #Delete sidechain range (click start and end)
-def delete_sidechain_range_by_click_a():
-  def delete_sidechain_range_by_click_b(res1,res2):
-    if (res1[1]!=res2[1]) or (res1[2]!=res2[2]) or (res1[3]==res2[3]):
-      info_dialog("Start and end points must be in the same mol and chain!")
-    else: 
-      if (res1[3] > res2[3]):
-        res_start=res2[3]-1
-        res_end=res1[3]+1
-      else:
-        res_start=res1[3]-1
-        res_end=res2[3]+1
-      mol_id=res1[1]
-      ch_id=res1[2]
-      turn_off_backup(mol_id)
-      delete_sidechain_range(mol_id,ch_id,res_start,res_end)
-      turn_on_backup(mol_id)
-  user_defined_click(2,delete_sidechain_range_by_click_b)
-  
+def delete_sidechain_range(mol_id, ch_id, res_start, res_end):
+  for resno in range(res_start, res_end + 1):
+    coot.delete_residue_sidechain(mol_id, ch_id, resno, "", 0)
+
 #Mutate range to poly-unk
 def mutate_residue_range_by_click_a():
   def mutate_residue_range_by_click_b(res1,res2):
-    if (res1[1]!=res2[1]) or (res1[2]!=res2[2]) or (res1[3]==res2[3]):
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
+    resno_1=_click_spec_res_no(res1)
+    resno_2=_click_spec_res_no(res2)
+    if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2) or (resno_1==resno_2):
       info_dialog("Start and end points must be in the same mol and chain!")
     else:
-      if (res1[3] > res2[3]):
-        res_start=res2[3]
-        res_end=res1[3]
+      if (resno_1 > resno_2):
+        res_start=resno_2
+        res_end=resno_1
         n=res_end-res_start+1
       else:
-        res_start=res1[3]
-        res_end=res2[3]
+        res_start=resno_1
+        res_end=resno_2
         n=res_end-res_start+1
-      mol_id=res1[1]
-      ch_id=res1[2]
+      mol_id=mol_id_1
+      ch_id=ch_id_1
       target_seq=n*"A"
       turn_off_backup(mol_id)
       mutate_residue_range(mol_id,ch_id,res_start,res_end,target_seq)
@@ -3113,19 +3774,25 @@ def mutate_residue_range_by_click_a():
 #Mutate range to polyala
 def mutate_residue_range_by_click_ala_a():
   def mutate_residue_range_by_click_ala_b(res1,res2):
-    if (res1[1]!=res2[1]) or (res1[2]!=res2[2]) or (res1[3]==res2[3]):
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
+    resno_1=_click_spec_res_no(res1)
+    resno_2=_click_spec_res_no(res2)
+    if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2) or (resno_1==resno_2):
       info_dialog("Start and end points must be in the same mol and chain!")
     else:
-      if (res1[3] > res2[3]):
-        res_start=res2[3]
-        res_end=res1[3]
+      if (resno_1 > resno_2):
+        res_start=resno_2
+        res_end=resno_1
         n=res_end-res_start+1
       else:
-        res_start=res1[3]
-        res_end=res2[3]
+        res_start=resno_1
+        res_end=resno_2
         n=res_end-res_start+1
-      mol_id=res1[1]
-      ch_id=res1[2]
+      mol_id=mol_id_1
+      ch_id=ch_id_1
       target_seq=n*"A"
       turn_off_backup(mol_id)
       mutate_residue_range(mol_id,ch_id,res_start,res_end,target_seq)
@@ -3134,30 +3801,21 @@ def mutate_residue_range_by_click_ala_a():
       turn_on_backup(mol_id)
   user_defined_click(2,mutate_residue_range_by_click_ala_b)
   
-#Merge two fragments
-def merge_fragments():
-  def merge_2_fragments(res1,res2):
-    mol_daughter=[res2[1]]
-    mol_ref=res1[1]
-    merge_molecules(mol_daughter,mol_ref)
-    toggle_display_mol(mol_ref)
-    toggle_display_mol(mol_ref)
-  user_defined_click(2,merge_2_fragments)
-  
 #Force addition of residue - useful when
 #Coot says "No acceptable position found"
 # but density is clear.
 def force_add_terminal_residue():
   def force_addition(res1):
-    mol_id=res1[1]
-    ch_id=res1[2]
-    res_no=res1[3]
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    res_no=_click_spec_res_no(res1)
+    ins_code=_click_spec_ins_code(res1)
     res_type="auto"
     add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
     res_type,-57.82,-47)
-    if residue_exists_qm(mol_id,ch_id,res_no+1,res1[4]):
+    if residue_exists_qm(mol_id,ch_id,res_no+1,ins_code):
       set_b_factor_residue_range(mol_id,ch_id,res_no+1,res_no+1,default_new_atoms_b_factor())
-    elif residue_exists_qm(mol_id,ch_id,res_no-1,res1[4]):
+    elif residue_exists_qm(mol_id,ch_id,res_no-1,ins_code):
       set_b_factor_residue_range(mol_id,ch_id,res_no-1,res_no-1,default_new_atoms_b_factor())
     sort_residues(mol_id)
   user_defined_click(1,force_addition)
@@ -3670,15 +4328,22 @@ def lengthen_loop():
   resn=active_atom[2]
   first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
   renumber_residue_range(mol_id,ch_id,first_res,resn,-1)
+  sort_residues(mol_id)
   delete_all_extra_restraints(mol_id)
   set_show_extra_restraints(mol_id,0)
   set_show_extra_restraints(mol_id,1)
   r1=resn-1
   r2=resn
   set_refinement_immediate_replacement(1)
-  fit_gap(mol_id,ch_id,r1,r2,"A",1)
-  accept_regularizement()
-  set_refinement_immediate_replacement(0)
+  try:
+    status = add_residue_by_map_fit(mol_id,ch_id,r1,"auto",1)
+    if not status:
+      info_dialog("Failed to add a residue into the loop gap")
+      return None
+    refine_zone(mol_id,ch_id,r1,r2+1,"")
+    accept_regularizement()
+  finally:
+    set_refinement_immediate_replacement(0)
 
 #Get fractional coordinates of active atom. Useful when inspecting heavy atom sites.
 def get_fract_coords():
@@ -3750,13 +4415,8 @@ def color_rotamer_outliers_and_missing_atoms(mol_id):
         else:
           rotamer_outlier_spec=[([ch_id,resn,""],blank_colour)]
           rotamer_outlier_list=rotamer_outlier_list+rotamer_outlier_spec
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,rotamer_outlier_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,missing_atoms_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  colour_list = rotamer_outlier_list + missing_atoms_list
+  _apply_user_defined_residue_colours(mol_id, [], colour_list)
 
 
 def color_polars_and_hphobs(mol_id):
@@ -3803,16 +4463,8 @@ def color_polars_and_hphobs(mol_id):
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
         blank_res_list=blank_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,polar_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,hphob_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,gly_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,pro_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  colour_list = polar_res_list + hphob_res_list + gly_res_list + pro_res_list
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
   
 def color_by_charge(mol_id):
   pos_list=["ARG","LYS","HIS"]
@@ -3842,14 +4494,8 @@ def color_by_charge(mol_id):
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
         blank_res_list=blank_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,pos_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,neg_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  colour_list = pos_res_list + neg_res_list
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
 
 def uncolor_other_chains():
   mol_id=active_residue()[0]
@@ -3864,12 +4510,7 @@ def uncolor_other_chains():
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
         blank_res_list=blank_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, [])
 
 def color_active_chain():
   mol_id=active_residue()[0]
@@ -3892,13 +4533,7 @@ def color_active_chain():
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],chain_colour)]
         chain_res_list=chain_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,chain_res_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, chain_res_list)
 
 def color_active_chain_by_num(chain_colour):
   mol_id=active_residue()[0]
@@ -3920,13 +4555,7 @@ def color_active_chain_by_num(chain_colour):
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],chain_colour)]
         chain_res_list=chain_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,chain_res_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, chain_res_list)
     
 def color_protein_na(mol_id):
   blank_colour=0
@@ -3955,14 +4584,8 @@ def color_protein_na(mol_id):
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
         blank_res_list=blank_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,protein_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,na_res_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  colour_list = protein_res_list + na_res_list
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
 
 
 def color_waters(mol_id):
@@ -3984,13 +4607,7 @@ def color_waters(mol_id):
         ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
         residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
         blank_res_list=blank_res_list+residue_to_color
-  try:
-    set_user_defined_atom_colour_by_residue_py(mol_id,water_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
-  except NameError:
-    info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-    pass
+  _apply_user_defined_residue_colours(mol_id, blank_res_list, water_list)
 
   
 #Search PDB by active chain
@@ -4307,10 +4924,10 @@ def place_helix_with_restraints():
 #Fixed now, I think.
 def merge_chains():
   def merge_chains_by_click(res1,res2):
-    mol_id_1=res1[1]
-    mol_id_2=res2[1]
-    ch_id_1=res1[2]
-    ch_id_2=res2[2]
+    mol_id_1=_click_spec_imol(res1)
+    mol_id_2=_click_spec_imol(res2)
+    ch_id_1=_click_spec_chain_id(res1)
+    ch_id_2=_click_spec_chain_id(res2)
     first_res_sel1=first_residue(mol_id_1,ch_id_1)
     last_res_sel1=last_residue(mol_id_1,ch_id_1)
     first_res_sel2=first_residue(mol_id_2,ch_id_2)
@@ -4344,7 +4961,7 @@ def rigid_body_fit_segments():
       ch_id=seg[1]
       turn_off_backup(mol_id)
       set_refinement_immediate_replacement(1)
-      rigid_body_refine_zone(res_start,res_end,ch_id,mol_id)
+      rigid_body_refine_zone(mol_id,ch_id,res_start,res_end)
       accept_regularizement()
       set_refinement_immediate_replacement(0)
       turn_on_backup(mol_id)
@@ -4365,7 +4982,7 @@ def fit_this_segment():
         ch_id=seg[1]
         turn_off_backup(mol_id)
         set_refinement_immediate_replacement(1)
-        rigid_body_refine_zone(res_start,res_end,ch_id,mol_id)
+        rigid_body_refine_zone(mol_id,ch_id,res_start,res_end)
         accept_regularizement()
         set_refinement_immediate_replacement(0)
         turn_on_backup(mol_id)
@@ -4692,21 +5309,24 @@ def set_map_level_quickly():
 #Grow helix from selected terminus
 def grow_helix():
   def grow_helix_post_click(res1):
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    res_no_start=_click_spec_res_no(res1)
     def grow_helix_enter_resn(n):
-      mol_id=res1[1]
-      ch_id=res1[2]
-      res_no=res1[3]
+      mol_id_local=mol_id
+      ch_id_local=ch_id
+      res_no=res_no_start
       res_no_0=res_no
       for i in range(1,(int(n)+1)):
         res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
+        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
         res_type,-57.82,-47)
-        sort_residues(mol_id)
-        if (res_no==(first_residue_in_seg(mol_id,ch_id,res_no)+1)):
+        sort_residues(mol_id_local)
+        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
           res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id,ch_id,res_no)-1)):
+        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
           res_no=res_no+1
-      set_b_factor_residue_range(mol_id,ch_id,res_no_0,res_no,default_new_atoms_b_factor())
+      set_b_factor_residue_range(mol_id_local,ch_id_local,res_no_0,res_no,default_new_atoms_b_factor())
     generic_single_entry("How many residues for helix?",
     "10","Grow helix",grow_helix_enter_resn)
   user_defined_click(1,grow_helix_post_click)
@@ -4714,21 +5334,24 @@ def grow_helix():
 #Grow strand from selected terminus
 def grow_strand():
   def grow_strand_post_click(res1):
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    res_no_start=_click_spec_res_no(res1)
     def grow_strand_enter_resn(n):
-      mol_id=res1[1]
-      ch_id=res1[2]
-      res_no=res1[3]
+      mol_id_local=mol_id
+      ch_id_local=ch_id
+      res_no=res_no_start
       res_no_0=res_no
       for i in range(1,(int(n)+1)):
         res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
+        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
         res_type,-139,135)
-        sort_residues(mol_id)
-        if (res_no==(first_residue_in_seg(mol_id,ch_id,res_no)+1)):
+        sort_residues(mol_id_local)
+        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
           res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id,ch_id,res_no)-1)):
+        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
           res_no=res_no+1
-      set_b_factor_residue_range(mol_id,ch_id,res_no_0,res_no,default_new_atoms_b_factor())
+      set_b_factor_residue_range(mol_id_local,ch_id_local,res_no_0,res_no,default_new_atoms_b_factor())
     generic_single_entry("How many residues for strand?",
     "10","Grow strand",grow_strand_enter_resn)
   user_defined_click(1,grow_strand_post_click)
@@ -4736,18 +5359,21 @@ def grow_strand():
 #Grow para strand from selected terminus
 def grow_parallel_strand():
   def grow_parallel_strand_post_click(res1):
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    res_no_start=_click_spec_res_no(res1)
     def grow_parallel_strand_enter_resn(n):
-      mol_id=res1[1]
-      ch_id=res1[2]
-      res_no=res1[3]
+      mol_id_local=mol_id
+      ch_id_local=ch_id
+      res_no=res_no_start
       for i in range(1,(int(n)+1)):
         res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
+        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
         res_type,-119,113)
-        sort_residues(mol_id)
-        if (res_no==(first_residue_in_seg(mol_id,ch_id,res_no)+1)):
+        sort_residues(mol_id_local)
+        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
           res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id,ch_id,res_no)-1)):
+        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
           res_no=res_no+1
     generic_single_entry("How many residues for parallel strand?",
     "10","Grow parallel strand",grow_parallel_strand_enter_resn)
@@ -4756,18 +5382,21 @@ def grow_parallel_strand():
 #Grow 3-10 helix from selected terminus
 def grow_helix_3_10():
   def grow_helix_post_click(res1):
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    res_no_start=_click_spec_res_no(res1)
     def grow_helix_enter_resn(n):
-      mol_id=res1[1]
-      ch_id=res1[2]
-      res_no=res1[3]
+      mol_id_local=mol_id
+      ch_id_local=ch_id
+      res_no=res_no_start
       for i in range(1,(int(n)+1)):
         res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
+        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
         res_type,-49,-26)
-        sort_residues(mol_id)
-        if (res_no==(first_residue_in_seg(mol_id,ch_id,res_no)+1)):
+        sort_residues(mol_id_local)
+        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
           res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id,ch_id,res_no)-1)):
+        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
           res_no=res_no+1
     generic_single_entry("How many residues for helix?",
     "10","Grow 3-10 helix",grow_helix_enter_resn)
@@ -4859,17 +5488,6 @@ def renumber_c_term_segment():
   generic_single_entry("New residue number?",
   str(active_residue()[2]),"Renumber",renumber_c_term_segment_entry)
   
-#Sharpen or blur map. Slider jerky on large maps.
-def sharpen_by_entered_factor():
-  if (scroll_wheel_map()==-1):
-    info_dialog("You need a map!")
-  else:
-    def sharpen_by_entry(B):
-      B=float(B)
-      sharpen(scroll_wheel_map(),B)
-    generic_single_entry("New B-factor for map?",
-    "-100","Sharpen/Blur",sharpen_by_entry)
-    
 #Reload map with different hi-res limit
 def change_hires_limit():
   if (scroll_wheel_map()==-1):
@@ -4887,46 +5505,30 @@ def change_hires_limit():
     generic_single_entry("New high-res limit for map?",
     "5.0","Change high resolution limit for active map",change_hires_by_entry)
     
-def change_hires_limit_copy():
-  if (scroll_wheel_map()==-1):
-    info_dialog("You need a map!")
-  else:
-    def change_hires_by_entry(new_res):
-      mol=scroll_wheel_map()
-      new_res=float(new_res)
-      mtz_file=map_parameters(mol)[0]
-      F_col=map_parameters(mol)[1]
-      PHI_col=map_parameters(mol)[2]
-      make_and_draw_map_with_reso_with_refmac_params(mtz_file,F_col,PHI_col,"",0,0,0,"Fobs:None-specified",
-      "SigF:None-specified","RFree:None-specified",0,0,1,1000.0,new_res)
-    generic_single_entry("New high-res limit for map?",
-    "5.0","Make low pass filtered copy of active map",change_hires_by_entry)
-
 #Make a button list for inserting common monomers
-def pick_common_monomers():
-  get_ddm=["DDM", lambda func: get_monomer_no_H("LMT")]
-  get_dm=["DM", lambda func: get_monomer_no_H("DMU")]
-  get_bog=["OG", lambda func: get_monomer_no_H("HSH")]
-  get_ldao=["LDAO", lambda func: get_monomer_no_H("LDA")]
-  get_mpg=["Monoolein", lambda func: get_monomer_no_H("MPG")]
-  get_glycerol=["Glycerol", lambda func: get_monomer_no_H("GOL")]
-  get_eg=["Ethylene glycol", lambda func: get_monomer_no_H("EDO")]
-  get_acetate=["Acetate", lambda func: get_monomer_no_H("ACT")]
-  get_dmso=["DMSO", lambda func: get_monomer_no_H("DMS")]
-  get_tris=["Tris", lambda func: get_monomer_no_H("TAM")]
-  get_hepes=["HEPES", lambda func: get_monomer_no_H("EPE")]
-  get_mes=["MES", lambda func: get_monomer_no_H("MES")]
-  get_cac=["Cacodylate", lambda func: get_monomer_no_H("CAD")]
-  get_peg=["PEG", lambda func: get_monomer_no_H("1PE")]
-  get_popg=["POPG (lipid)", lambda func: get_monomer_no_H("LHG")]
-  get_pe=["PE (lipid)", lambda func: get_monomer_no_H("PEF")]
-  get_pc=["PC (lipid)", lambda func: get_monomer_no_H("PLC")]
-  get_ps=["PS (lipid)", lambda func: get_monomer_no_H("PSF")]
-  get_ps=["PI(3,4)P2 (lipid)", lambda func: get_monomer_no_H("52N")]
-  get_chs=["Cholesterol hemisuccinate", lambda func: get_monomer_no_H("Y01")]
-  get_chl=["Cholesterol", lambda func: get_monomer_no_H("CLR")]
-  button_list=[get_acetate,get_eg,get_glycerol,get_dmso,get_ddm,get_dm,get_bog,get_ldao,get_mpg,get_tris,get_hepes,get_mes,get_cac,get_peg,get_popg,get_pe,get_pc,get_ps,get_chs,get_chl]
-  generic_button_dialog("Common small molecules",button_list)
+COMMON_MONOMERS = [
+  ("Acetate", "ACT"),
+  ("Ethylene glycol", "EDO"),
+  ("Glycerol", "GOL"),
+  ("DMSO", "DMS"),
+  ("DDM", "LMT"),
+  ("DM", "DMU"),
+  ("OG", "HSH"),
+  ("LDAO", "LDA"),
+  ("Monoolein", "MPG"),
+  ("Tris", "TAM"),
+  ("HEPES", "EPE"),
+  ("MES", "MES"),
+  ("Cacodylate", "CAD"),
+  ("PEG", "1PE"),
+  ("POPG (lipid)", "LHG"),
+  ("PE (lipid)", "PEF"),
+  ("PC (lipid)", "PLC"),
+  ("PS (lipid)", "PSF"),
+  ("PI(3,4)P2 (lipid)", "52N"),
+  ("Cholesterol hemisuccinate", "Y01"),
+  ("Cholesterol", "CLR"),
+]
 
 #Colors subset of protein residues red, provided by user as string of single-letter ids.
 def color_protein_residue_subset():
@@ -4957,12 +5559,7 @@ def color_protein_residue_subset():
           ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
           residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
           residue_list=residue_list+residue_to_color
-    try:
-      set_user_defined_atom_colour_by_residue_py(mol_id,residue_list)
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-    except NameError:
-      info_dialog("You need a newer Coot - custom coloring is only in r6174 and later, sorry.")
-      pass
+    _apply_user_defined_residue_colours(mol_id, [], residue_list)
   generic_single_entry("Residues to color? Single letter code (e.g. DE or de will color Asp/Glu)","A","Color entered residue types!",color_from_string)
 
 #Mutate active chain to entered sequence
@@ -5010,28 +5607,6 @@ def mutate_by_resnum():
     turn_on_backup(mol_id)
   generic_single_entry("Enter raw amino acid sequence (must be complete!)",
   default_seq,"Mutate active chain to match sequence using PDB numbering", enter_seq)
-
-#Make an alkyl chain of entered length and autofit to map if available
-def make_alkyl_chain():
-  def make_alkyl_chain_length_n(n):
-    smiles_string=int(int(n)+1)*"c"
-    new_molecule_by_smiles_string("",smiles_string,force_libcheck=True)
-    delete_hydrogens(molecule_number_list()[-1])
-    mol_id=molecule_number_list()[-1]
-    ch_id="A"
-    res_no=1
-    ins_code=""
-    altloc=""
-    new_residue_name="CXC"
-    set_residue_name(mol_id,ch_id,res_no,ins_code,new_residue_name)
-    delete_atom(mol_id,ch_id,res_no,ins_code," C  ",altloc)
-    prodrg_ify(mol_id,ch_id,res_no,ins_code)
-    close_molecule(molecule_number_list()[-1])
-    close_molecule(molecule_number_list()[-1])
-    if imol_refinement_map()!=-1:
-      fit_chain_to_map_by_random_jiggle(mol_id,ch_id,1000,0.1)
-  generic_single_entry("How many carbons do you want in the chain?",
-    "10","Make alkyl chain",make_alkyl_chain_length_n)
 
 #Make new helix (don't fit)
 def place_new_helix():
@@ -5163,6 +5738,13 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
     "OK...",
     lambda text, stay_open_qm: make_restr(text, stay_open_qm))
 '''
+
+try:
+  exec(GTK_DIALOG_FUNCTION_ARCHIVE, globals(), globals())
+except Exception:
+  print("coot_trimmings dialog archive activation failed")
+  traceback.print_exc()
+
 #
 # The full custom menu block is preserved verbatim below. Remove the opening
 # and closing triple quotes around the archive to re-enable it.
@@ -5171,24 +5753,30 @@ GTK_UI_ARCHIVE = r'''
 
 if GUI_PYTHON_AVAILABLE:
   menu = attach_module_menu_button("Custom")
+  submenu_display = Gio.Menu.new()
+  submenu_colour = None
+  submenu_fit = Gio.Menu.new()
+  submenu_renumber = Gio.Menu.new()
+  submenu_settings = Gio.Menu.new()
+  submenu_build = Gio.Menu.new()
+  submenu_common_monomers = Gio.Menu.new()
+  submenu_mutate = Gio.Menu.new()
+  submenu_modify = Gio.Menu.new()
+  submenu_maps = Gio.Menu.new()
 
-  # Coot 1.1 builds can expose coot_gui without a directly importable Gio API.
-  # Flatten the menu into one module button for maximum startup compatibility.
-  submenu_display = menu
-  submenu_fit = menu
-  submenu_renumber = menu
-  submenu_settings = menu
-  submenu_build = menu
-  submenu_mutate = menu
-  submenu_copy = menu
-  submenu_delete = menu
-  submenu_merge = menu
-  submenu_maps = menu
+  menu.append_submenu("Display", submenu_display)
+  menu.append_submenu("Fit", submenu_fit)
+  menu.append_submenu("Renumber", submenu_renumber)
+  menu.append_submenu("Settings", submenu_settings)
+  menu.append_submenu("Build", submenu_build)
+  menu.append_submenu("Mutate", submenu_mutate)
+  menu.append_submenu("Modify", submenu_modify)
+  menu.append_submenu("Maps", submenu_maps)
 else:
   menu = None
-  submenu_display = submenu_fit = submenu_renumber = submenu_settings = None
-  submenu_build = submenu_mutate = submenu_copy = submenu_delete = None
-  submenu_merge = submenu_maps = None
+  submenu_display = submenu_colour = submenu_fit = submenu_renumber = submenu_settings = None
+  submenu_build = submenu_mutate = submenu_modify = None
+  submenu_maps = None
 
 #**** Populate submenus ****
 #"Display..."
@@ -5204,48 +5792,48 @@ lambda func: clear_distances_and_labels())
 add_simple_coot_menu_menuitem(submenu_display,
 "Switch all mols to CA representation",lambda func: all_mols_to_ca())
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color active mol by rotamer prob (outliers magenta) and missing atoms (blue)", lambda func: color_rotamer_outliers_and_missing_atoms(active_residue()[0]))
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color active mol by hydrophobics (orange), polars (blue), glys (magenta) and pros (green)", lambda func: color_polars_and_hphobs(active_residue()[0]))
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color active mol by charge (+ve blue, -ve red)", lambda func: color_by_charge(active_residue()[0]))
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Uncolor other chains in active mol", lambda func: uncolor_other_chains())
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color active chain", lambda func: color_active_chain())
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color active segment", lambda func: colour_active_segment())
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color by protein/nucleic acid", lambda func: color_protein_na(active_residue()[0]))
 
 
-add_simple_coot_menu_menuitem(submenu_display,
+add_simple_coot_menu_menuitem(submenu_colour,
 "Color waters", lambda func: color_waters(active_residue()[0]))
 
-add_simple_coot_menu_menuitem(submenu_display, "Colour entered subset of protein residues for active mol", lambda func: color_protein_residue_subset())
+add_simple_coot_menu_menuitem(submenu_colour, "Colour entered subset of protein residues for active mol", lambda func: color_protein_residue_subset())
 
-add_simple_coot_menu_menuitem(submenu_display,
-"Color active mol by CaBLAM outliers (blue) (needs phenix)", lambda func: color_by_cablam2(active_residue()[0]))
+add_simple_coot_menu_menuitem(submenu_colour,
+"Color active mol by Ramachandran outliers", lambda func: color_by_rama_native_for_active_residue())
 
-add_simple_coot_menu_menuitem(submenu_display,
-"Color active mol by EMringer outliers (red) (needs phenix)", lambda func: color_emringer_outliers(active_residue()[0],scroll_wheel_map()))
+add_simple_coot_menu_menuitem(submenu_colour,
+"Color active mol by density fit", lambda func: color_by_density_fit_native_for_active_residue())
 
-add_simple_coot_menu_menuitem(submenu_display,
-"Color active mol by ramachandran outliers (blue) (needs phenix)", lambda func: color_by_rama(active_residue()[0]))
+add_simple_coot_menu_menuitem(submenu_colour,
+"Color active mol by NCS difference", lambda func: color_by_ncs_difference_for_active_residue())
 
-add_simple_coot_menu_menuitem(submenu_display,
-"Color active mol by map/model-CC at 4 A (Slow, needs phenix, P1 only)", lambda func: color_by_cc(active_residue()[0]))
+add_simple_coot_menu_menuitem(submenu_colour,
+"Color active mol by clash score", lambda func: color_by_clash_score_for_active_molecule())
 
-add_simple_coot_menu_menuitem(submenu_display, "Highlight chain breaks in active mol", lambda func: highlight_chain_breaks())
+add_simple_coot_menu_menuitem(submenu_colour, "Highlight chain breaks in active mol", lambda func: highlight_chain_breaks())
 
-add_simple_coot_menu_menuitem(submenu_display, "Highlight chain breaks in all mols", lambda func: highlight_all_chain_breaks())
+add_simple_coot_menu_menuitem(submenu_colour, "Highlight chain breaks in all mols", lambda func: highlight_all_chain_breaks())
 
 add_simple_coot_menu_menuitem(submenu_display, "Open current view in UCSF Chimera. Experimental!", lambda func: open_in_chimera())
 
@@ -5282,9 +5870,6 @@ lambda func: jiggle_fit_all_chains())
 
 add_simple_coot_menu_menuitem(submenu_fit, 
 "Jiggle-fit current mol to map (Slow!)", lambda func: jiggle_fit_active_mol())
-
-add_simple_coot_menu_menuitem(submenu_fit, 
-"Fit polyala loop (click start and end)", lambda func: fit_polyala_gui())
 
 add_simple_coot_menu_menuitem(submenu_fit, "Fit all segments", lambda func: rigid_body_fit_segments())
 
@@ -5357,14 +5942,19 @@ add_simple_coot_menu_menuitem(submenu_build,
 add_simple_coot_menu_menuitem(submenu_build,
 "Get fractional coordinates of active atom",lambda func: get_fract_coords()) 
 
-add_simple_coot_menu_menuitem(submenu_build,
-"Common monomers",lambda func: pick_common_monomers())
-
-add_simple_coot_menu_menuitem(submenu_build, "Make alkyl chain of length n", lambda func: make_alkyl_chain())
+submenu_build.append_submenu("Common monomers", submenu_common_monomers)
+for monomer_label, monomer_code in COMMON_MONOMERS:
+  add_simple_coot_menu_menuitem(
+    submenu_common_monomers,
+    monomer_label,
+    lambda func, monomer_code=monomer_code: get_monomer_no_H(monomer_code),
+  )
 
 add_simple_coot_menu_menuitem(submenu_build, "Make alpha helix of length n", lambda func: place_new_helix()) 
 
 add_simple_coot_menu_menuitem(submenu_build, "Make 3-10 helix of length n", lambda func: place_new_3_10_helix())
+
+add_simple_coot_menu_menuitem(submenu_build, "Build polyala loop (click start,end)", lambda func: fit_polyala_gui())
 
 add_simple_coot_menu_menuitem(submenu_build, "Rebuild backbone (click start,end)", lambda func: rebuild_backbone_wrapper())
 
@@ -5389,58 +5979,45 @@ add_simple_coot_menu_menuitem(submenu_mutate, "Mutate all MSEs to Met", lambda f
 add_simple_coot_menu_menuitem(submenu_mutate,
 "Mutate active chain to template sequence (numbering must match sequence!)", lambda func: mutate_by_resnum())
 
-#"Copy..."
-add_simple_coot_menu_menuitem(submenu_copy, "Copy current chain", 
+#"Modify..."
+add_simple_coot_menu_menuitem(submenu_modify, "Copy current chain", 
 lambda func: copy_active_chain())
 
-add_simple_coot_menu_menuitem(submenu_copy, "Cut current chain", 
+add_simple_coot_menu_menuitem(submenu_modify, "Cut current chain", 
 lambda func: cut_active_chain())
 
-add_simple_coot_menu_menuitem(submenu_copy, "Copy active segment", lambda func: copy_active_segment())
+add_simple_coot_menu_menuitem(submenu_modify, "Copy active segment", lambda func: copy_active_segment())
 
-add_simple_coot_menu_menuitem(submenu_copy, "Cut active segment", lambda func: cut_active_segment())
+add_simple_coot_menu_menuitem(submenu_modify, "Cut active segment", lambda func: cut_active_segment())
 
-add_simple_coot_menu_menuitem(submenu_copy,
+add_simple_coot_menu_menuitem(submenu_modify,
 "Copy fragment (click start and end)", lambda func: copy_frag_by_click())
 
-add_simple_coot_menu_menuitem(submenu_copy,
+add_simple_coot_menu_menuitem(submenu_modify,
 "Cut fragment (click start and end)", lambda func: cut_frag_by_click())
 
-add_simple_coot_menu_menuitem(submenu_copy,
+add_simple_coot_menu_menuitem(submenu_modify,
 "Copy active chain to NCS equivs", lambda func: copy_ncs_chain_from_active())
 
 
-#"Delete..."
-add_simple_coot_menu_menuitem(submenu_delete,
-"Delete active chain", lambda func: delete_chain())
+add_simple_coot_menu_menuitem(submenu_modify, "Delete active segment", lambda func: delete_active_segment())
 
-add_simple_coot_menu_menuitem(submenu_delete, "Delete active segment", lambda func: delete_active_segment())
-
-
-add_simple_coot_menu_menuitem(submenu_delete, 
-"Delete hydrogens from molecule", lambda func: delete_h_active())
-
-add_simple_coot_menu_menuitem(submenu_delete,
-"Delete sidechains in range (click start and end)", lambda func: delete_sidechain_range_by_click_a())  
-
-#"Merge..."
-
-add_simple_coot_menu_menuitem(submenu_merge, 
-"Merge two mols (click two; 2nd into 1st)", lambda func: merge_fragments())
-
-add_simple_coot_menu_menuitem(submenu_merge, "Merge chains (click two; 2nd into 1st)", lambda func: merge_chains())
+add_simple_coot_menu_menuitem(submenu_modify, "Merge chains (click two; 2nd into 1st)", lambda func: merge_chains())
 
 
 #"Maps..."
-add_simple_coot_menu_menuitem(submenu_maps,
-"Sharpen (enter B-factor)",lambda func: sharpen_by_entered_factor())
-
-add_simple_coot_menu_menuitem(submenu_maps,
-"Change hi-res limit for map",lambda func: change_hires_limit_copy())
-
 add_simple_coot_menu_menuitem(submenu_maps,
 "Go to center of scrollable map",lambda func: goto_center_of_map())
 
 add_simple_coot_menu_menuitem(submenu_maps,
 "Set refinement map to scrollable map",lambda func: set_map_to_scrollable_map())
 '''
+
+if GUI_PYTHON_AVAILABLE:
+  if "Gio" not in globals() and hasattr(coot_gui, "Gio"):
+    Gio = coot_gui.Gio
+  try:
+    exec(GTK_UI_ARCHIVE, globals(), globals())
+  except Exception:
+    print("coot_trimmings GUI archive activation failed")
+    traceback.print_exc()
