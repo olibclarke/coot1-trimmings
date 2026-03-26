@@ -2,8 +2,6 @@
 
 `coot1_trimmings.py` is a Coot startup script for Coot 1.1.x, ported from `coot-trimmings` for Coot 0.9.x with the assistence of the Codex LLM. It adds custom keybindings, map-display presets, model-editing shortcuts, and a small set of startup preferences.
 
-Custom items that rely on Gtk menus and dialogs are not working yet - stay tuned! **EDIT:** Just added them - docs to come!
-
 A quick demo of some of the keyboard actions is here:
 
 https://www.dropbox.com/scl/fi/1wytsp29147x5yt83coz9/coot1_trimmings_demo.mov?rlkey=7gjcty91ucuphhcoml14863gy&dl=0
@@ -34,6 +32,152 @@ The script changes a few defaults at startup, including:
 - Left mouse button used for view rotation
 - Brighter symmetry molecule colours
 - Disabled dragged map and smooth recentering.
+
+## Custom menus
+
+Recent Coot 1 daily / `--HEAD` builds now handle the Python GUI code well enough for the script's custom menus to work again. The script adds a top-level `Custom` menu with the following submenus:
+
+- `Display`
+- `Fit`
+- `Renumber`
+- `Settings`
+- `Build`
+- `Mutate`
+- `Modify`
+- `Maps`
+
+These menu items mostly mirror long-standing trimmings workflows that used to live only in keybindings or in the Coot 0.9 script, but are now exposed through the Coot 1 GUI.
+
+## Build menu
+
+The `Build` menu contains the model-building tools from the script as well as several large curated submenus.
+
+### Build tools
+
+The direct build/edit entries currently include:
+
+- Forced addition of terminal residue
+- Grow helix / strand / parallel strand / 3-10 helix from a clicked terminus
+- Shorten loop by one residue
+- Lengthen loop by one residue
+- Build polyalanine loop from two clicked termini
+- Rebuild backbone over a clicked range
+- Rebuild and reverse backbone of a clicked segment
+- Place ideal helices of user-defined length
+- Read out fractional coordinates of the active atom
+
+### Common monomers
+
+`Build -> Common monomers` is now a large hierarchical library intended to make common crystallographic and cryo-EM ligands quick to find without typing codes by hand or searching the monomer library. Every entry is labelled as `Name (CODE)` to avoid ambiguity.
+
+Top-level categories currently include:
+
+- `Buffers`
+- `Ions / metals`
+- `Solvents / additives`
+- `Detergents / lipids`
+- `Ligands`
+
+Examples of what is included:
+
+- Common buffers and crystallization additives such as HEPES, Bis-Tris, glycerol, MPD, PEGs, propylene glycol and TMAO
+- Ions, heavy atoms and oxyanions such as Mg, Ca, Zn, sulfate, phosphate, tungstate and molybdate
+- Detergents and lipids such as DDM, DM, LDAO, OG/beta-OG, LMNG, cholesterol, CHS, phospholipids
+- Cofactors and ligands such as nucleotides, non-hydrolysable nucleotide analogues, hemes, chlorophylls, polyamines, free amino acids, free sugars and phosphosugars
+- Protease inhibitors
+
+### Coordination links
+
+`Build -> Coordination links` provides a simple two-click "make link" helper for common metal coordination geometries. Current presets include:
+
+- `Mg-O`
+- `Na-O`
+- `K-O`
+- `Ca-O`
+- `Zn-O`, `Zn-N`, `Zn-S`
+- `Fe-O`, `Fe-N`, `Fe-S`
+
+Each preset:
+
+- opens a small dialog with a default coordination distance
+- shows an expected range based on database values
+- requires two clicked atoms
+- checks that the clicks match the selected metal and donor atom types
+- then creates a link between them
+
+This is useful when modelling metal sites at low resolution.
+
+### Covalent modifications
+
+`Build -> Covalent modifications` provides one-click helpers for common residue modifications.
+
+Two kinds of modification are currently supported:
+
+- Residue replacements using Coot's built-in replace residue pipeline
+- Link-style additions where a ligand is imported, merged, linked to the active residue, and the local region regularized
+
+Examples include:
+
+- Palmitoylation (Cys)
+- BME adduct (Cys)
+- PLP linkage (Lys)
+- Retinal linkage (Lys)
+- Lysine methylation / acetylation / carboxylation
+- Arginine methylation and citrullination
+- Phosphoserine / phosphothreonine / phosphotyrosine
+
+If the active residue is not of the correct type, the helper stops and tells you what residue type is required.
+
+## Other menu subgroups
+
+### Display
+
+The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes.
+
+### Fit
+
+The `Fit` menu exposes the range- and segment-fitting helpers, including:
+
+- Fit current chain / all chains / all segments
+- Jiggle-fit variants
+- Stepped sphere refine
+- Cylinder refine
+- Add a user-defined distance restraint by clicking two atoms
+
+### Renumber
+
+The `Renumber` menu contains the active-chain and active-segment renumbering helpers, including renumbering from the N-terminus or C-terminus to the active residue.
+
+### Settings
+
+The `Settings` menu contains small utility toggles such as automatic B-factor colour scaling and setting the default B factor for newly created atoms to the mean B factor of the active model.
+
+### Mutate
+
+The `Mutate` menu exposes residue-range mutation tools and sequence-driven mutation:
+
+- Mutate a clicked residue range to `UNK`
+- Mutate a clicked residue range to `ALA`
+- Convert all Met residues to MSE, or the reverse
+- Mutate the active chain to a supplied template sequence
+
+### Modify
+
+The `Modify` menu groups copying, cutting and merging tools, including:
+
+- Copy/cut current chain
+- Copy/cut active segment
+- Copy/cut a clicked fragment
+- Copy active chain to NCS equivalents
+- Delete active segment
+- Merge chains from two clicked fragments
+
+### Maps
+
+The `Maps` menu currently contains small map-management helpers:
+
+- Go to the centre of the scrollable map
+- Set the refinement map to the current scrollable map
 
 ## Example use case/Tutorial
 1. Load up an EM-map and model (e.g. 8HEZ & EMD-34705)
@@ -205,4 +349,3 @@ The following is a (possibly incomplete) list of built-in Coot 1 shortcuts (excl
 - Many commands assume an active residue.
 - Refinement and fitting commands assume an active refinement map.
 - Map-navigation and map-display commands assume an active scrollable map.
-
