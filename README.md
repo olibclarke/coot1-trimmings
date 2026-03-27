@@ -132,7 +132,7 @@ If the active residue is not of the correct type, the helper stops and tells you
 
 ### Display
 
-The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes.
+The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes. Also added a "High contrast toggle" which makes the view higher contrast by changing to ambient lighting for the model.
 
 ### Fit
 
