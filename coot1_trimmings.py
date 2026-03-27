@@ -35,6 +35,81 @@ gap.residue_info = _gap_residue_info_compat
 if not hasattr(gap, "sys"):
   gap.sys = sys
 
+
+# ============================================================================
+# User-editable settings
+# ============================================================================
+#
+# This section is the main place to tweak script behaviour. If you want to
+# change startup defaults, map appearance, lighting behaviour, or a few other
+# everyday parameters, start here.
+#
+
+# Startup behaviour and display defaults.
+STARTUP_SYMMETRY_COLOUR = (255, 35, 0)
+STARTUP_USE_LEFT_MOUSE_FOR_ROTATION = 1
+STARTUP_SCROLL_BY_WHEEL_MOUSE = 0
+STARTUP_AUTO_FIT_BEST_ROTAMER_CLASH = 1
+STARTUP_REFINE_MAX_RESIDUES = 100
+STARTUP_ROTAMER_SEARCH_MODE = ROTAMERSEARCHLOWRES
+STARTUP_MAP_SAMPLING_RATE = 3.0
+STARTUP_ADD_TERMINAL_PHI_PSI_TRIALS = 1000
+STARTUP_REFINEMENT_WEIGHT = 20.0
+STARTUP_SMOOTH_SCROLL = 0
+STARTUP_ACTIVE_MAP_DRAG = 0
+STARTUP_SHOW_ENVIRONMENT_DISTANCES = 0
+STARTUP_SHOW_ENVIRONMENT_BUMPS = 0
+STARTUP_SHOW_ENVIRONMENT_H_BONDS = 1
+STARTUP_ENVIRONMENT_DISTANCE_LIMITS = (2.1, 3.2)
+STARTUP_MAP_RADIUS = 20
+STARTUP_MAP_RADIUS_EM = 20
+STARTUP_DEFAULT_BOND_THICKNESS = 3
+STARTUP_USE_VARIABLE_BOND_THICKNESS = 1
+STARTUP_VARIABLE_BOND_THICKNESS = 7
+STARTUP_DEFAULT_NEW_ATOM_B = 50.0
+STARTUP_ADD_TERMINAL_POST_REFINE = 1
+STARTUP_TERMINAL_RIGID_BODY_REFINE = 0
+STARTUP_MUTATE_AUTO_FIT_POST_REFINE = 1
+STARTUP_SYMMETRY_SIZE = 30
+STARTUP_NOMENCLATURE_ERRORS_MODE = "ignore"
+STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE = 0.15
+STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
+
+# User-facing helper defaults.
+DEFAULT_NEW_HELIX_CHAIN_ID = "A"
+HIGH_CONTRAST_BOND_THICKNESS = 2
+
+# Map restyling defaults for the EM helper.
+EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
+EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
+EM_TARGET_PIXEL_SIZE = 0.5
+
+# Model lighting presets used by the high-contrast toggle.
+MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
+MODEL_NORMAL_DIFFUSE = (0.75, 0.75, 0.75, 1.0)
+MODEL_NORMAL_SPECULAR = (0.20, 64.0)
+MODEL_AMBIENT_ONLY_AMBIENT = (1.0, 1.0, 1.0, 1.0)
+MODEL_AMBIENT_ONLY_DIFFUSE = (0.0, 0.0, 0.0, 1.0)
+MODEL_AMBIENT_ONLY_SPECULAR = (0.0, 64.0)
+
+
+# ============================================================================
+# Runtime state
+# ============================================================================
+
+REGISTERED_KEYBINDING_CALLBACKS = []
+MAP_SURFACE_DISPLAY_STATE = {}
+MAP_SURFACE_OPACITY_STATE = {}
+MAP_GLOBAL_VIEW_SETTINGS = {}
+MAP_LOCAL_APPEARANCE_STATE = {}
+SMART_COPY_TEMPLATE_IMOL = None
+SMART_COPY_SOURCE_CENTRE = None
+SMART_COPY_RESIDUE_NAME = None
+MODEL_AMBIENT_LIGHTING_ENABLED = False
+MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = None
+MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = None
+
+
 def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
   imol_map = coot.imol_refinement_map()
   if imol_map == -1:
@@ -142,6 +217,16 @@ def _residue_spec_to_cid_compat(residue_spec):
     )
   return "//{chain_id}/{res_no}".format(chain_id=chain_id, res_no=res_no)
 
+
+# ============================================================================
+# Legacy / disabled custom-colouring support
+# ============================================================================
+#
+# The Colour menu is currently disabled in Coot 1.1 because the user-defined
+# colouring APIs remain awkward and fragile. The code below is kept for
+# reference and for a few programmatic helpers, but it is intentionally kept
+# away from the main startup settings and general utility code.
+#
 
 USER_DEFINED_COLOUR_TABLE_SIZE = 60
 USER_DEFINED_COLOUR_TABLE_BASE = 60
@@ -289,58 +374,7 @@ coot.graphics_to_ca_plus_ligands_and_sidechains_representation = (
 coot.graphics_to_ca_plus_ligands_sec_struct_representation = (
   graphics_to_ca_plus_ligands_sec_struct_representation
 )
-
-
-REGISTERED_KEYBINDING_CALLBACKS = []
 CUSTOM_COLOUR_OVERLAY_MOLECULES = {}
-MAP_SURFACE_DISPLAY_STATE = {}
-MAP_SURFACE_OPACITY_STATE = {}
-MAP_GLOBAL_VIEW_SETTINGS = {}
-MAP_LOCAL_APPEARANCE_STATE = {}
-SMART_COPY_TEMPLATE_IMOL = None
-SMART_COPY_SOURCE_CENTRE = None
-SMART_COPY_RESIDUE_NAME = None
-MODEL_AMBIENT_LIGHTING_ENABLED = False
-EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
-EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
-EM_TARGET_PIXEL_SIZE = 0.5
-
-# User-adjustable startup settings.
-STARTUP_SYMMETRY_COLOUR = (255, 35, 0)
-STARTUP_USE_LEFT_MOUSE_FOR_ROTATION = 1
-STARTUP_SCROLL_BY_WHEEL_MOUSE = 0
-STARTUP_AUTO_FIT_BEST_ROTAMER_CLASH = 1
-STARTUP_REFINE_MAX_RESIDUES = 100
-STARTUP_ROTAMER_SEARCH_MODE = ROTAMERSEARCHLOWRES
-STARTUP_MAP_SAMPLING_RATE = 3.0
-STARTUP_ADD_TERMINAL_PHI_PSI_TRIALS = 1000
-STARTUP_REFINEMENT_WEIGHT = 20.0
-STARTUP_SMOOTH_SCROLL = 0
-STARTUP_ACTIVE_MAP_DRAG = 0
-STARTUP_SHOW_ENVIRONMENT_DISTANCES = 0
-STARTUP_SHOW_ENVIRONMENT_BUMPS = 0
-STARTUP_SHOW_ENVIRONMENT_H_BONDS = 1
-STARTUP_ENVIRONMENT_DISTANCE_LIMITS = (2.1, 3.2)
-STARTUP_MAP_RADIUS = 20
-STARTUP_MAP_RADIUS_EM = 20
-STARTUP_DEFAULT_BOND_THICKNESS = 3
-STARTUP_USE_VARIABLE_BOND_THICKNESS = 1
-STARTUP_VARIABLE_BOND_THICKNESS = 7
-STARTUP_DEFAULT_NEW_ATOM_B = 50.0
-STARTUP_ADD_TERMINAL_POST_REFINE = 1
-STARTUP_TERMINAL_RIGID_BODY_REFINE = 0
-STARTUP_MUTATE_AUTO_FIT_POST_REFINE = 1
-STARTUP_SYMMETRY_SIZE = 30
-STARTUP_NOMENCLATURE_ERRORS_MODE = "ignore"
-STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE = 0.15
-STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
-DEFAULT_NEW_HELIX_CHAIN_ID = "A"
-MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
-MODEL_NORMAL_DIFFUSE = (0.75, 0.75, 0.75, 1.0)
-MODEL_NORMAL_SPECULAR = (0.20, 64.0)
-MODEL_AMBIENT_ONLY_AMBIENT = (1.0, 1.0, 1.0, 1.0)
-MODEL_AMBIENT_ONLY_DIFFUSE = (0.0, 0.0, 0.0, 1.0)
-MODEL_AMBIENT_ONLY_SPECULAR = (0.0, 64.0)
 
 POLYMER_RESIDUE_NAMES = {
   # Standard RNA/DNA.
@@ -776,9 +810,14 @@ if not CARBOHYDRATE_GUI_AVAILABLE:
 
 _apply_startup_settings()
 
-# Gtk-dependent modules, menus, toolbar buttons, and dialog bindings are
-# archived near the end of this file for clean re-enabling once the embedded
-# Python Gtk layer is available again.
+# ============================================================================
+# Keybindings (user-editable)
+# ============================================================================
+#
+# This is the main place to tweak keyboard shortcuts. The bindings live here
+# rather than at the very top so they can refer directly to the helpers they
+# call.
+#
 
 #place helix with prosmart alpha helix restraints and depict in rainbow
 add_key_binding("Place helix here","h",
@@ -1015,24 +1054,43 @@ lambda: widen_clipping_symmetric())
 
   
 #****Misc. functions (for keybindings and scripting****
-# def toggle_all_models_ambient_lighting():
-#   global MODEL_AMBIENT_LIGHTING_ENABLED
-#   if MODEL_AMBIENT_LIGHTING_ENABLED:
-#     ambient = MODEL_NORMAL_AMBIENT
-#     diffuse = MODEL_NORMAL_DIFFUSE
-#     specular = MODEL_NORMAL_SPECULAR
-#     status_message = "Set all models to normal lighting"
-#   else:
-#     ambient = MODEL_AMBIENT_ONLY_AMBIENT
-#     diffuse = MODEL_AMBIENT_ONLY_DIFFUSE
-#     specular = MODEL_AMBIENT_ONLY_SPECULAR
-#     status_message = "Set all models to ambient lighting"
-#   for imol in model_molecule_number_list():
-#     set_model_material_ambient(imol, ambient[0], ambient[1], ambient[2], ambient[3])
-#     set_model_material_diffuse(imol, diffuse[0], diffuse[1], diffuse[2], diffuse[3])
-#     set_model_material_specular(imol, specular[0], specular[1])
-#   MODEL_AMBIENT_LIGHTING_ENABLED = not MODEL_AMBIENT_LIGHTING_ENABLED
-#   add_status_bar_text(status_message)
+def toggle_high_contrast_mode():
+  global MODEL_AMBIENT_LIGHTING_ENABLED
+  global MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE
+  global MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS
+  if MODEL_AMBIENT_LIGHTING_ENABLED:
+    ambient = MODEL_NORMAL_AMBIENT
+    diffuse = MODEL_NORMAL_DIFFUSE
+    specular = MODEL_NORMAL_SPECULAR
+    use_variable_bonds = STARTUP_USE_VARIABLE_BOND_THICKNESS
+    default_bond_thickness = MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS
+    if default_bond_thickness is None:
+      default_bond_thickness = (
+        STARTUP_VARIABLE_BOND_THICKNESS
+        if STARTUP_USE_VARIABLE_BOND_THICKNESS
+        else STARTUP_DEFAULT_BOND_THICKNESS
+      )
+    set_do_GL_lighting(1 if MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE else 0)
+    status_message = "Set all models to normal lighting"
+  else:
+    MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = do_GL_lighting_state()
+    MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = get_default_bond_thickness()
+    set_do_GL_lighting(1)
+    ambient = MODEL_AMBIENT_ONLY_AMBIENT
+    diffuse = MODEL_AMBIENT_ONLY_DIFFUSE
+    specular = MODEL_AMBIENT_ONLY_SPECULAR
+    use_variable_bonds = 0
+    default_bond_thickness = HIGH_CONTRAST_BOND_THICKNESS
+    status_message = "Set all models to high-contrast ambient lighting"
+  set_use_variable_bond_thickness(use_variable_bonds)
+  set_default_bond_thickness(default_bond_thickness)
+  for imol in model_molecule_list():
+    set_model_material_ambient(imol, ambient[0], ambient[1], ambient[2], ambient[3])
+    set_model_material_diffuse(imol, diffuse[0], diffuse[1], diffuse[2], diffuse[3])
+    set_model_material_specular(imol, specular[0], specular[1])
+    set_bond_thickness(imol, default_bond_thickness)
+  MODEL_AMBIENT_LIGHTING_ENABLED = not MODEL_AMBIENT_LIGHTING_ENABLED
+  add_status_bar_text(status_message)
 
 
 def jiggle_fit_active_non_polymer_residue():
@@ -1787,8 +1845,10 @@ def _restore_global_view_settings(map_id, fallback_radius):
   saved = MAP_GLOBAL_VIEW_SETTINGS.get(map_id)
   if not saved:
     set_map_radius(fallback_radius)
+    set_map_radius_em(fallback_radius)
     return
   set_map_radius(saved["map_radius"])
+  set_map_radius_em(saved["map_radius"])
   set_clipping_front(saved["clipping_front"])
   set_clipping_back(saved["clipping_back"])
 
@@ -1800,6 +1860,7 @@ def _set_global_view_extent(map_id):
   back = get_clipping_plane_back()
   scale = global_radius / current_radius
   set_map_radius(global_radius)
+  set_map_radius_em(global_radius)
   set_clipping_front(front * scale)
   set_clipping_back(back * scale)
 
@@ -2073,6 +2134,14 @@ def _all_residue_specs_for_colouring(mol_id):
     residue_specs.append([chain_id,resno,ins_code])
   return residue_specs
 
+
+# ============================================================================
+# Legacy / disabled custom-colouring helpers
+# ============================================================================
+#
+# These are kept for reference and for occasional programmatic use, but the
+# Colour submenu is intentionally disabled in the current Coot 1.1 workflow.
+#
 
 def _active_molecule_or_status():
   residue = _active_residue_or_status()
@@ -6583,6 +6652,9 @@ lambda func: set_show_symmetry_master(not get_show_symmetry()))
 
 add_simple_coot_menu_menuitem(submenu_display, "Clear labels and distances", 
 lambda func: clear_distances_and_labels())
+
+add_simple_coot_menu_menuitem(submenu_display, "Toggle high-contrast model lighting",
+lambda func: toggle_high_contrast_mode())
 
 add_simple_coot_menu_menuitem(submenu_display,
 "Switch all mols to CA representation",lambda func: all_mols_to_ca())
