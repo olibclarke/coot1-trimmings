@@ -1,20 +1,21 @@
-# Oli's Coot customizations.
-# Copy this file into Coot's startup script directory and restart Coot.
+"""Oli's Coot 1.x customizations.
+
+Copy this file into Coot's startup script directory and restart Coot.
+The main user-editable knobs live near the top of the file under
+"User-editable settings".
+"""
 
 import math
 import os
 import struct
-import shutil
 import subprocess
 import sys
-import time
 import traceback
 
 import gi
 import coot
 import coot_utils
 import gap
-from gap import fit_gap
 from mutate import three_letter_code2single_letter
 
 if not hasattr(gi, "require_version"):
@@ -25,10 +26,20 @@ if not hasattr(gi, "require_version"):
 from coot import *
 from coot_utils import *
 
+
+# ============================================================================
+# Coot 1.1 compatibility shims
+# ============================================================================
+#
+# Several bundled Python helpers in current Coot 1.x builds are almost usable
+# but miss one or two names at runtime. The small wrappers below keep those
+# helpers working without having to rewrite the whole upstream module.
+#
 if not hasattr(coot_utils, "regularize_zone"):
   coot_utils.regularize_zone = coot.regularize_zone
 
 def _gap_residue_info_compat(imol, chain_id, resno, ins_code):
+  """Match gap.py's older expectation that residue_info() returns a list."""
   return coot.residue_info_py(imol, chain_id, resno, ins_code) or []
 
 gap.residue_info = _gap_residue_info_compat
@@ -72,6 +83,7 @@ STARTUP_TERMINAL_RIGID_BODY_REFINE = 0
 STARTUP_MUTATE_AUTO_FIT_POST_REFINE = 1
 STARTUP_SYMMETRY_SIZE = 30
 STARTUP_NOMENCLATURE_ERRORS_MODE = "ignore"
+STARTUP_REORIENTING_NEXT_RESIDUE_MODE = 1
 STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE = 0.15
 STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
 
@@ -108,9 +120,18 @@ SMART_COPY_RESIDUE_NAME = None
 MODEL_AMBIENT_LIGHTING_ENABLED = False
 MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = None
 MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = None
+MODEL_HIGH_CONTRAST_MOLECULES = set()
+NAVIGATION_LAST_RESIDUE = None
 
 
 def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
+  """Coot 1.x-safe wrapper around the bundled gap fitter.
+
+  The stock Python helper in this build has a few runtime bugs and leaves
+  temporary molecules behind. This wrapper keeps the original "fit both
+  directions and keep the better answer" logic, while making cleanup and error
+  handling predictable.
+  """
   imol_map = coot.imol_refinement_map()
   if imol_map == -1:
     coot.info_dialog("Need to set a map to fit a loop")
@@ -204,6 +225,7 @@ gap.fit_gap = fit_gap
 
 
 def _residue_spec_to_cid_compat(residue_spec):
+  """Convert a simple residue spec into the CID style used by newer helpers."""
   if not isinstance(residue_spec, (list, tuple)) or len(residue_spec) < 3:
     return None
   chain_id = residue_spec[0]
@@ -374,7 +396,10 @@ coot.graphics_to_ca_plus_ligands_and_sidechains_representation = (
 coot.graphics_to_ca_plus_ligands_sec_struct_representation = (
   graphics_to_ca_plus_ligands_sec_struct_representation
 )
-CUSTOM_COLOUR_OVERLAY_MOLECULES = {}
+CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS = {}
+CUSTOM_COLOUR_ADDITIONAL_REPRESENTATION_TYPE = 1
+CUSTOM_COLOUR_USER_DEFINED_BONDS_BOX_TYPE = 12
+CUSTOM_COLOUR_ADDITIONAL_BOND_WIDTH = 0.14
 
 POLYMER_RESIDUE_NAMES = {
   # Standard RNA/DNA.
@@ -457,6 +482,7 @@ def _ensure_startup_state_file():
 
 
 def _apply_startup_settings():
+  """Apply the top-of-file defaults once during startup."""
   set_symmetry_colour(*STARTUP_SYMMETRY_COLOUR)
   set_use_primary_mouse_button_for_view_rotation(STARTUP_USE_LEFT_MOUSE_FOR_ROTATION)
   _ensure_startup_state_file()
@@ -478,6 +504,7 @@ def _apply_startup_settings():
   set_map_radius_em(STARTUP_MAP_RADIUS_EM)
   set_default_bond_thickness(STARTUP_DEFAULT_BOND_THICKNESS)
   try:
+    # Older Coot builds may not expose the variable-thickness API at all.
     set_use_variable_bond_thickness(STARTUP_USE_VARIABLE_BOND_THICKNESS)
     set_default_bond_thickness(STARTUP_VARIABLE_BOND_THICKNESS)
   except NameError:
@@ -488,6 +515,7 @@ def _apply_startup_settings():
   set_mutate_auto_fit_do_post_refine(STARTUP_MUTATE_AUTO_FIT_POST_REFINE)
   set_symmetry_size(STARTUP_SYMMETRY_SIZE)
   set_nomenclature_errors_on_read(STARTUP_NOMENCLATURE_ERRORS_MODE)
+  set_reorienting_next_residue_mode(STARTUP_REORIENTING_NEXT_RESIDUE_MODE)
   set_user_defined_rotation_centre_crosshairs_size_scale_factor(
     STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE
   )
@@ -497,6 +525,7 @@ def _apply_startup_settings():
 
 
 def _active_residue_or_status():
+  """Return the active residue, or show a short status message if none exists."""
   residue = active_residue()
   if residue:
     return residue
@@ -505,6 +534,7 @@ def _active_residue_or_status():
 
 
 def _scrollable_map_or_status():
+  """Return the current scroll-wheel map, or show a short status message."""
   map_id = scroll_wheel_map()
   if map_id != -1 and map_id in map_molecule_list():
     return map_id
@@ -518,6 +548,168 @@ def _residue_is_polymer(mol_id, chain_id, resno, ins_code):
   return residue_name(mol_id, chain_id, resno, ins_code) in POLYMER_RESIDUE_NAMES
 
 
+def _residue_serial_number(mol_id, chain_id, resno, ins_code):
+  """Return the exact serial number for a residue, including insertion code."""
+  for serial_number in range(chain_n_residues(chain_id, mol_id)):
+    if seqnum_from_serial_number(mol_id, chain_id, serial_number) != resno:
+      continue
+    if insertion_code_from_serial_number(mol_id, chain_id, serial_number) == (ins_code or ""):
+      return serial_number
+  return -1
+
+
+def _default_navigation_target_xyz(atom_xyz, residue_name_here):
+  """Choose a stable fallback atom when orientation cannot be computed."""
+  if not atom_xyz:
+    return None
+  if len(residue_name_here) == 1:
+    preferred_atoms = ["C1'", "P", "C4'", "C3'"]
+  else:
+    preferred_atoms = ["CA", "CB", "N"]
+  for preferred_atom in preferred_atoms:
+    if preferred_atom in atom_xyz:
+      return atom_xyz[preferred_atom]
+  return next(iter(atom_xyz.values()))
+
+
+def _first_polymer_residue_in_chain(mol_id, chain_id):
+  for serial_number in range(chain_n_residues(chain_id, mol_id)):
+    resno = seqnum_from_serial_number(mol_id, chain_id, serial_number)
+    ins_code = insertion_code_from_serial_number(mol_id, chain_id, serial_number)
+    if _residue_is_polymer(mol_id, chain_id, resno, ins_code):
+      return (chain_id, resno, ins_code)
+  return None
+
+
+def _nearest_polymer_residue_to_rotation_centre(mol_id, chain_id=None, max_distance=10.0):
+  """Find the nearest polymer residue centre near the current rotation centre."""
+  centre = _rotation_centre_xyz()
+  best_residue = None
+  best_distance_sq = max_distance * max_distance
+  chain_ids_to_search = [chain_id] if chain_id and chain_id in chain_ids(mol_id) else chain_ids(mol_id)
+  for current_chain_id in chain_ids_to_search:
+    for serial_number in range(chain_n_residues(current_chain_id, mol_id)):
+      resno = seqnum_from_serial_number(mol_id, current_chain_id, serial_number)
+      ins_code = insertion_code_from_serial_number(mol_id, current_chain_id, serial_number)
+      if not _residue_is_polymer(mol_id, current_chain_id, resno, ins_code):
+        continue
+      residue_centre = residue_centre_py(mol_id, current_chain_id, resno, ins_code)
+      if not isinstance(residue_centre, (list, tuple)) or len(residue_centre) != 3:
+        continue
+      distance_sq = _distance_sq(centre, residue_centre)
+      if distance_sq <= best_distance_sq:
+        best_distance_sq = distance_sq
+        best_residue = (current_chain_id, resno, ins_code)
+  return best_residue
+
+
+def _navigation_reference_residue():
+  """Resolve the residue that navigation should use as its starting point."""
+  residue = active_residue()
+  if residue and _residue_is_polymer(residue[0], residue[1], residue[2], residue[3]):
+    return {
+      "mol_id": residue[0],
+      "chain_id": residue[1],
+      "resno": residue[2],
+      "ins_code": residue[3],
+      "source": "active",
+    }
+
+  global NAVIGATION_LAST_RESIDUE
+  if NAVIGATION_LAST_RESIDUE:
+    mol_id = NAVIGATION_LAST_RESIDUE["mol_id"]
+    chain_id = NAVIGATION_LAST_RESIDUE["chain_id"]
+    resno = NAVIGATION_LAST_RESIDUE["resno"]
+    ins_code = NAVIGATION_LAST_RESIDUE["ins_code"]
+    serial_number = NAVIGATION_LAST_RESIDUE.get("serial_number")
+    if mol_id in model_molecule_list() and _residue_is_polymer(mol_id, chain_id, resno, ins_code):
+      if serial_number is not None:
+        if serial_number < 0 or serial_number >= chain_n_residues(chain_id, mol_id):
+          serial_number = None
+        elif seqnum_from_serial_number(mol_id, chain_id, serial_number) != resno:
+          serial_number = None
+        elif insertion_code_from_serial_number(mol_id, chain_id, serial_number) != (ins_code or ""):
+          serial_number = None
+      return {
+        "mol_id": mol_id,
+        "chain_id": chain_id,
+        "resno": resno,
+        "ins_code": ins_code,
+        "source": "stored",
+        "serial_number": serial_number,
+      }
+    NAVIGATION_LAST_RESIDUE = None
+
+  mol_id = go_to_atom_molecule_number()
+  model_molecules = model_molecule_list()
+  if mol_id not in model_molecules:
+    add_status_bar_text("No active polymer residue or model molecule")
+    return None
+
+  molecule_chain_ids = chain_ids(mol_id)
+  chain_id = go_to_atom_chain_id()
+  if chain_id not in molecule_chain_ids:
+    chain_id = None
+
+  nearby_residue = _nearest_polymer_residue_to_rotation_centre(mol_id, chain_id)
+  if nearby_residue:
+    return {
+      "mol_id": mol_id,
+      "chain_id": nearby_residue[0],
+      "resno": nearby_residue[1],
+      "ins_code": nearby_residue[2],
+      "source": "nearby",
+    }
+
+  if chain_id:
+    first_polymer = _first_polymer_residue_in_chain(mol_id, chain_id)
+    if first_polymer:
+      return {
+        "mol_id": mol_id,
+        "chain_id": first_polymer[0],
+        "resno": first_polymer[1],
+        "ins_code": first_polymer[2],
+        "source": "chain_start",
+      }
+
+  for fallback_chain_id in molecule_chain_ids:
+    first_polymer = _first_polymer_residue_in_chain(mol_id, fallback_chain_id)
+    if first_polymer:
+      return {
+        "mol_id": mol_id,
+        "chain_id": first_polymer[0],
+        "resno": first_polymer[1],
+        "ins_code": first_polymer[2],
+        "source": "chain_start",
+      }
+
+  add_status_bar_text("No polymer residues found in the current model")
+  return None
+
+
+def _go_to_navigation_residue(mol_id, chain_id, resno, ins_code, serial_number=None):
+  """Navigate quietly by orienting/centring without invoking Go To highlighting."""
+  global NAVIGATION_LAST_RESIDUE
+  residue_name_here = residue_name(mol_id, chain_id, resno, ins_code)
+  atom_xyz = _trimmed_atom_xyz_map(mol_id, chain_id, resno, ins_code)
+  if serial_number is None:
+    serial_number = _residue_serial_number(mol_id, chain_id, resno, ins_code)
+  if not _orient_navigation_view(mol_id, chain_id, resno, ins_code, atom_xyz, residue_name_here):
+    target_xyz = _default_navigation_target_xyz(atom_xyz, residue_name_here)
+    if target_xyz is None:
+      target_xyz = residue_centre_py(mol_id, chain_id, resno, ins_code)
+    if isinstance(target_xyz, (list, tuple)) and len(target_xyz) == 3:
+      set_rotation_centre(*target_xyz)
+  NAVIGATION_LAST_RESIDUE = {
+    "mol_id": mol_id,
+    "chain_id": chain_id,
+    "resno": resno,
+    "ins_code": ins_code,
+    "serial_number": serial_number,
+  }
+  return 1
+
+
 def _rotation_centre_xyz():
   return [rotation_centre_position(axis) for axis in (0, 1, 2)]
 
@@ -527,6 +719,298 @@ def _distance_sq(point_1, point_2):
   dy = point_1[1] - point_2[1]
   dz = point_1[2] - point_2[2]
   return dx*dx + dy*dy + dz*dz
+
+
+def _vector_subtract(point_1, point_2):
+  return [point_1[0] - point_2[0], point_1[1] - point_2[1], point_1[2] - point_2[2]]
+
+
+def _vector_dot(vector_1, vector_2):
+  return vector_1[0]*vector_2[0] + vector_1[1]*vector_2[1] + vector_1[2]*vector_2[2]
+
+
+def _vector_cross(vector_1, vector_2):
+  return [
+    vector_1[1]*vector_2[2] - vector_1[2]*vector_2[1],
+    vector_1[2]*vector_2[0] - vector_1[0]*vector_2[2],
+    vector_1[0]*vector_2[1] - vector_1[1]*vector_2[0],
+  ]
+
+
+def _vector_length(vector):
+  return math.sqrt(_vector_dot(vector, vector))
+
+
+def _normalize_vector(vector):
+  length = math.sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2])
+  if length < 1.0e-7:
+    return None
+  return [component / length for component in vector]
+
+
+def _scale_vector(vector, scale):
+  return [component * scale for component in vector]
+
+
+def _project_vector_perpendicular(vector, axis):
+  axis_unit = _normalize_vector(axis)
+  if axis_unit is None:
+    return None
+  projection_scale = _vector_dot(vector, axis_unit)
+  perpendicular = [
+    vector[0] - projection_scale * axis_unit[0],
+    vector[1] - projection_scale * axis_unit[1],
+    vector[2] - projection_scale * axis_unit[2],
+  ]
+  return _normalize_vector(perpendicular)
+
+
+def _trimmed_atom_xyz_map(mol_id, chain_id, resno, ins_code):
+  atom_info = residue_info_py(mol_id, chain_id, resno, ins_code)
+  if not isinstance(atom_info, list):
+    return {}
+  atom_xyz = {}
+  for atom in atom_info:
+    try:
+      atom_name = atom[0][0].strip()
+      xyz = atom[2]
+    except Exception:
+      continue
+    if atom_name and atom_name not in atom_xyz:
+      atom_xyz[atom_name] = xyz
+  return atom_xyz
+
+
+def _rotation_matrix_to_quaternion(rotation_matrix):
+  """Convert a 3x3 rotation matrix to Coot's view quaternion format."""
+  m11, m12, m13 = rotation_matrix[0]
+  m21, m22, m23 = rotation_matrix[1]
+  m31, m32, m33 = rotation_matrix[2]
+  trace = m11 + m22 + m33
+  if trace > 0.0:
+    scale = math.sqrt(trace + 1.0) * 2.0
+    qw = 0.25 * scale
+    qx = (m32 - m23) / scale
+    qy = (m13 - m31) / scale
+    qz = (m21 - m12) / scale
+  elif m11 > m22 and m11 > m33:
+    scale = math.sqrt(1.0 + m11 - m22 - m33) * 2.0
+    qw = (m32 - m23) / scale
+    qx = 0.25 * scale
+    qy = (m12 + m21) / scale
+    qz = (m13 + m31) / scale
+  elif m22 > m33:
+    scale = math.sqrt(1.0 + m22 - m11 - m33) * 2.0
+    qw = (m13 - m31) / scale
+    qx = (m12 + m21) / scale
+    qy = 0.25 * scale
+    qz = (m23 + m32) / scale
+  else:
+    scale = math.sqrt(1.0 + m33 - m11 - m22) * 2.0
+    qw = (m21 - m12) / scale
+    qx = (m13 + m31) / scale
+    qy = (m23 + m32) / scale
+    qz = 0.25 * scale
+  return [qx, qy, qz, qw]
+
+
+def _protein_navigation_orientation(atom_xyz):
+  if "CA" not in atom_xyz:
+    return None
+  anchor = atom_xyz["CA"]
+  if "CB" in atom_xyz and "N" in atom_xyz and "C" in atom_xyz:
+    neighbour_vectors = []
+    for atom_name in ("N", "C", "CB"):
+      vector = _normalize_vector(_vector_subtract(atom_xyz[atom_name], anchor))
+      if vector is not None:
+        neighbour_vectors.append(vector)
+    if len(neighbour_vectors) == 3:
+      implicit_h = _normalize_vector([
+        -(neighbour_vectors[0][0] + neighbour_vectors[1][0] + neighbour_vectors[2][0]),
+        -(neighbour_vectors[0][1] + neighbour_vectors[1][1] + neighbour_vectors[2][1]),
+        -(neighbour_vectors[0][2] + neighbour_vectors[1][2] + neighbour_vectors[2][2]),
+      ])
+      if implicit_h is not None:
+        forward = _scale_vector(implicit_h, -1.0)
+        up_guess = _project_vector_perpendicular(_vector_subtract(atom_xyz["CB"], anchor), forward)
+        if up_guess is not None:
+          return anchor, forward, up_guess
+  if "N" in atom_xyz and "C" in atom_xyz and "O" in atom_xyz:
+    neighbour_vectors = []
+    for atom_name in ("N", "C", "O"):
+      vector = _normalize_vector(_vector_subtract(atom_xyz[atom_name], anchor))
+      if vector is not None:
+        neighbour_vectors.append(vector)
+    if len(neighbour_vectors) >= 2:
+      pseudo_h = _normalize_vector([
+        -sum(vector[0] for vector in neighbour_vectors),
+        -sum(vector[1] for vector in neighbour_vectors),
+        -sum(vector[2] for vector in neighbour_vectors),
+      ])
+      if pseudo_h is not None:
+        forward = _scale_vector(pseudo_h, -1.0)
+        up_guess = _project_vector_perpendicular(_vector_subtract(atom_xyz["O"], anchor), forward)
+        if up_guess is not None:
+          return anchor, forward, up_guess
+  return None
+
+
+def _glycine_navigation_orientation(atom_xyz):
+  """Treat glycine like an alanine by constructing a consistent pseudo-CB direction."""
+  if not all(atom_name in atom_xyz for atom_name in ("N", "CA", "C")):
+    return None
+  anchor = atom_xyz["CA"]
+  n_vector = _normalize_vector(_vector_subtract(atom_xyz["N"], anchor))
+  c_vector = _normalize_vector(_vector_subtract(atom_xyz["C"], anchor))
+  if n_vector is None or c_vector is None:
+    return None
+
+  # Glycine has two alpha hydrogens. Construct the idealized tetrahedral pair
+  # from the observed N-CA and C-CA directions, then treat one as a pseudo-CB
+  # so glycine feels like the other amino acids during residue stepping.
+  hydrogen_midpoint = [
+    -(n_vector[0] + c_vector[0]) * 0.5,
+    -(n_vector[1] + c_vector[1]) * 0.5,
+    -(n_vector[2] + c_vector[2]) * 0.5,
+  ]
+  plane_normal = _normalize_vector(_vector_cross(n_vector, c_vector))
+  if plane_normal is None:
+    return None
+  if "O" in atom_xyz:
+    o_vector = _normalize_vector(_vector_subtract(atom_xyz["O"], anchor))
+    if o_vector is not None and _vector_dot(plane_normal, o_vector) > 0.0:
+      plane_normal = _scale_vector(plane_normal, -1.0)
+  perpendicular_scale_sq = max(0.0, 1.0 - _vector_dot(hydrogen_midpoint, hydrogen_midpoint))
+  perpendicular_scale = math.sqrt(perpendicular_scale_sq)
+  pseudo_cb = _normalize_vector([
+    hydrogen_midpoint[0] + perpendicular_scale * plane_normal[0],
+    hydrogen_midpoint[1] + perpendicular_scale * plane_normal[1],
+    hydrogen_midpoint[2] + perpendicular_scale * plane_normal[2],
+  ])
+  implicit_h = _normalize_vector([
+    hydrogen_midpoint[0] - perpendicular_scale * plane_normal[0],
+    hydrogen_midpoint[1] - perpendicular_scale * plane_normal[1],
+    hydrogen_midpoint[2] - perpendicular_scale * plane_normal[2],
+  ])
+  if pseudo_cb is None or implicit_h is None:
+    return None
+  forward = _scale_vector(implicit_h, -1.0)
+  up_guess = _project_vector_perpendicular(pseudo_cb, forward)
+  if up_guess is None:
+    return None
+  return anchor, forward, up_guess
+
+
+def _nucleotide_navigation_orientation(atom_xyz):
+  if "C1'" not in atom_xyz:
+    return None
+  anchor = atom_xyz["C1'"]
+  base_atom_name = None
+  for atom_name in ("N9", "N1", "C4", "C2"):
+    if atom_name in atom_xyz:
+      base_atom_name = atom_name
+      break
+  if not base_atom_name:
+    return None
+  neighbour_vectors = []
+  for atom_name in ("O4'", "C2'", base_atom_name):
+    if atom_name not in atom_xyz:
+      continue
+    vector = _normalize_vector(_vector_subtract(atom_xyz[atom_name], anchor))
+    if vector is not None:
+      neighbour_vectors.append(vector)
+  if len(neighbour_vectors) < 3:
+    return None
+  implicit_h = _normalize_vector([
+    -sum(vector[0] for vector in neighbour_vectors),
+    -sum(vector[1] for vector in neighbour_vectors),
+    -sum(vector[2] for vector in neighbour_vectors),
+  ])
+  if implicit_h is None:
+    return None
+  forward = _scale_vector(implicit_h, -1.0)
+  up_guess = _project_vector_perpendicular(_vector_subtract(atom_xyz[base_atom_name], anchor), forward)
+  if up_guess is None:
+    return None
+  return anchor, forward, up_guess
+
+
+def _nucleotide_base_plane_normal(atom_xyz):
+  """Return a base-plane normal for canonical nucleotides when enough ring atoms are present."""
+  base_plane_atom_sets = (
+    ("N9", "C4", "C8"),  # purines
+    ("N1", "C2", "C6"),  # pyrimidines
+    ("C4", "C5", "C6"),  # generic aromatic fallback
+  )
+  for atom_names in base_plane_atom_sets:
+    if not all(atom_name in atom_xyz for atom_name in atom_names):
+      continue
+    point_1 = atom_xyz[atom_names[0]]
+    point_2 = atom_xyz[atom_names[1]]
+    point_3 = atom_xyz[atom_names[2]]
+    vector_1 = _normalize_vector(_vector_subtract(point_2, point_1))
+    vector_2 = _normalize_vector(_vector_subtract(point_3, point_1))
+    if vector_1 is None or vector_2 is None:
+      continue
+    plane_normal = _normalize_vector(_vector_cross(vector_1, vector_2))
+    if plane_normal is not None:
+      return plane_normal
+  return None
+
+
+def _orient_navigation_view(mol_id, chain_id, resno, ins_code, atom_xyz=None, residue_name_here=None):
+  """Orient the residue for a sidechain/base-forward inspection view."""
+  if atom_xyz is None:
+    atom_xyz = _trimmed_atom_xyz_map(mol_id, chain_id, resno, ins_code)
+  if not atom_xyz:
+    return None
+  if residue_name_here is None:
+    residue_name_here = residue_name(mol_id, chain_id, resno, ins_code)
+  if len(residue_name_here) == 1:
+    orientation = _nucleotide_navigation_orientation(atom_xyz)
+  elif residue_name_here == "GLY":
+    orientation = _glycine_navigation_orientation(atom_xyz)
+  else:
+    orientation = _protein_navigation_orientation(atom_xyz)
+  if not orientation:
+    return None
+
+  anchor, forward, up_guess = orientation
+  right = _normalize_vector(_vector_cross(forward, up_guess))
+  if right is None:
+    return None
+  up = _normalize_vector(_vector_cross(right, forward))
+  if up is None:
+    return None
+
+  # For nucleotides, keep the vertical orientation but yaw so the aromatic base
+  # sits more nearly in the screen plane rather than being obliquely foreshortened.
+  if len(residue_name_here) == 1:
+    base_plane_normal = _nucleotide_base_plane_normal(atom_xyz)
+    if base_plane_normal is not None:
+      desired_forward = _project_vector_perpendicular(base_plane_normal, up)
+      if desired_forward is not None:
+        if _vector_dot(desired_forward, forward) < 0.0:
+          desired_forward = _scale_vector(desired_forward, -1.0)
+        adjusted_right = _normalize_vector(_vector_cross(desired_forward, up))
+        if adjusted_right is not None:
+          adjusted_up = _normalize_vector(_vector_cross(adjusted_right, desired_forward))
+          if adjusted_up is not None:
+            forward = desired_forward
+            right = adjusted_right
+            up = adjusted_up
+
+  rotation_matrix = [
+    [right[0], right[1], right[2]],
+    [up[0], up[1], up[2]],
+    [-forward[0], -forward[1], -forward[2]],
+  ]
+  # Use the normal recenter path here so the local map recentres correctly.
+  # The distracting green indicator turned out to come from the Go To sync,
+  # which this custom navigation path no longer uses.
+  set_rotation_centre(*anchor)
+  set_view_quaternion(*_rotation_matrix_to_quaternion(rotation_matrix))
+  return 1
 
 
 def _capture_view_state():
@@ -541,6 +1025,182 @@ def _restore_view_state(view_state):
   set_rotation_centre(*view_state["rotation_centre"])
   set_view_quaternion(*view_state["quaternion"])
   set_zoom(view_state["zoom"])
+
+
+def _status_message(message):
+  add_status_bar_text(message)
+
+
+def _rotation_matrix_about_axis(axis, theta):
+  normalized_axis = _normalize_vector(axis)
+  if not normalized_axis:
+    return None
+  ux = normalized_axis[0]
+  uy = normalized_axis[1]
+  uz = normalized_axis[2]
+  cos_theta = math.cos(theta)
+  sin_theta = math.sin(theta)
+  one_minus_cos = 1.0 - cos_theta
+  return [
+    cos_theta + ux * ux * one_minus_cos,
+    ux * uy * one_minus_cos - uz * sin_theta,
+    ux * uz * one_minus_cos + uy * sin_theta,
+    uy * ux * one_minus_cos + uz * sin_theta,
+    cos_theta + uy * uy * one_minus_cos,
+    uy * uz * one_minus_cos - ux * sin_theta,
+    uz * ux * one_minus_cos - uy * sin_theta,
+    uz * uy * one_minus_cos + ux * sin_theta,
+    cos_theta + uz * uz * one_minus_cos,
+  ]
+
+
+def _zeroify_rotation_matrix(matrix):
+  if not matrix:
+    return None
+  zeroified = []
+  for value in matrix:
+    if abs(value) < 0.0000001:
+      zeroified.append(0.0)
+    elif abs(value - 1.0) < 0.0000001:
+      zeroified.append(1.0)
+    elif abs(value + 1.0) < 0.0000001:
+      zeroified.append(-1.0)
+    elif abs(value - 0.5) < 0.0000001:
+      zeroified.append(0.5)
+    elif abs(value + 0.5) < 0.0000001:
+      zeroified.append(-0.5)
+    else:
+      zeroified.append(value)
+  return zeroified
+
+
+def _rotation_c2_xy(theta):
+  return [
+    math.cos(2.0 * theta), math.sin(2.0 * theta), 0.0,
+    math.sin(2.0 * theta), -math.cos(2.0 * theta), 0.0,
+    0.0, 0.0, -1.0,
+  ]
+
+
+def _icosahedral_phi():
+  return 0.5 * (1.0 + math.sqrt(5.0))
+
+
+def _icosahedral_axes_c2():
+  phi = _icosahedral_phi()
+  axes = []
+  for sign_1 in [1.0, -1.0]:
+    for sign_2 in [1.0, -1.0]:
+      axes.append([0.0, sign_1, sign_2 * phi])
+      axes.append([sign_1, sign_2 * phi, 0.0])
+      axes.append([sign_2 * phi, 0.0, sign_1])
+  return axes
+
+
+def _icosahedral_axes_c3():
+  axes = []
+  for x in [1.0, -1.0]:
+    for y in [1.0, -1.0]:
+      for z in [1.0, -1.0]:
+        axes.append([x, y, z])
+  return axes
+
+
+def _icosahedral_axes_c5():
+  phi = _icosahedral_phi()
+  axes = []
+  for sign_1 in [1.0, -1.0]:
+    for sign_2 in [1.0, -1.0]:
+      axes.append([0.0, sign_1 / phi, sign_2 * phi])
+      axes.append([sign_1 / phi, sign_2 * phi, 0.0])
+      axes.append([sign_2 * phi, 0.0, sign_1 / phi])
+  return axes
+
+
+def _unique_rotation_matrices(matrices):
+  unique = []
+  seen = {}
+  for matrix in matrices:
+    zeroified = _zeroify_rotation_matrix(matrix)
+    key = tuple([round(value, 6) for value in zeroified])
+    if key not in seen:
+      seen[key] = True
+      unique.append(zeroified)
+  return unique
+
+
+def _generate_point_group_rotation_matrices(point_group_symbol):
+  symbol = point_group_symbol.strip().upper()
+  if not symbol:
+    return None
+
+  if symbol.startswith("C") and len(symbol) > 1 and symbol[1:].isdigit():
+    order = int(symbol[1:])
+    if order < 2:
+      return None
+    matrices = []
+    for index in range(1, order):
+      matrices.append(_rotation_matrix_about_axis([0.0, 0.0, 1.0], (2.0 * math.pi * index) / float(order)))
+    return _unique_rotation_matrices(matrices)
+
+  if symbol.startswith("D") and len(symbol) > 1 and symbol[1:].isdigit():
+    order = int(symbol[1:])
+    if order < 2:
+      return None
+    matrices = []
+    for index in range(1, order):
+      matrices.append(_rotation_matrix_about_axis([0.0, 0.0, 1.0], (2.0 * math.pi * index) / float(order)))
+    for index in range(order):
+      matrices.append(_rotation_c2_xy((math.pi * index) / float(order)))
+    return _unique_rotation_matrices(matrices)
+
+  if symbol == "T":
+    axes = [
+      [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+      [1.0, 1.0, 1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0],
+    ]
+    matrices = []
+    for axis in axes[:3]:
+      matrices.append(_rotation_matrix_about_axis(axis, math.pi))
+    for axis in axes[3:]:
+      matrices.append(_rotation_matrix_about_axis(axis, 2.0 * math.pi / 3.0))
+      matrices.append(_rotation_matrix_about_axis(axis, 4.0 * math.pi / 3.0))
+    return _unique_rotation_matrices(matrices)
+
+  if symbol == "O":
+    axes_c4 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    axes_c3 = [[1.0, 1.0, 1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0]]
+    axes_c2 = [
+      [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 0.0, 1.0],
+      [1.0, 0.0, -1.0], [0.0, 1.0, 1.0], [0.0, 1.0, -1.0],
+    ]
+    matrices = []
+    for axis in axes_c4:
+      matrices.append(_rotation_matrix_about_axis(axis, math.pi / 2.0))
+      matrices.append(_rotation_matrix_about_axis(axis, math.pi))
+      matrices.append(_rotation_matrix_about_axis(axis, 3.0 * math.pi / 2.0))
+    for axis in axes_c3:
+      matrices.append(_rotation_matrix_about_axis(axis, 2.0 * math.pi / 3.0))
+      matrices.append(_rotation_matrix_about_axis(axis, 4.0 * math.pi / 3.0))
+    for axis in axes_c2:
+      matrices.append(_rotation_matrix_about_axis(axis, math.pi))
+    return _unique_rotation_matrices(matrices)
+
+  if symbol == "I":
+    matrices = []
+    for axis in _icosahedral_axes_c2():
+      matrices.append(_rotation_matrix_about_axis(axis, math.pi))
+    for axis in _icosahedral_axes_c3():
+      matrices.append(_rotation_matrix_about_axis(axis, 2.0 * math.pi / 3.0))
+      matrices.append(_rotation_matrix_about_axis(axis, 4.0 * math.pi / 3.0))
+    for axis in _icosahedral_axes_c5():
+      matrices.append(_rotation_matrix_about_axis(axis, 2.0 * math.pi / 5.0))
+      matrices.append(_rotation_matrix_about_axis(axis, 4.0 * math.pi / 5.0))
+      matrices.append(_rotation_matrix_about_axis(axis, 6.0 * math.pi / 5.0))
+      matrices.append(_rotation_matrix_about_axis(axis, 8.0 * math.pi / 5.0))
+    return _unique_rotation_matrices(matrices)
+
+  return None
 
 
 def _close_smart_copy_template():
@@ -564,6 +1224,7 @@ def _smart_copy_atom_selection(chain_id, resno, ins_code):
 
 
 def _find_model_molecule_for_click_spec(chain_id, resno, ins_code):
+  """Find the clicked model by residue identity when the click payload lacks a usable imol."""
   if not chain_id or resno is False:
     return -1
   for imol in model_molecule_list():
@@ -572,18 +1233,34 @@ def _find_model_molecule_for_click_spec(chain_id, resno, ins_code):
   return -1
 
 
+def _click_spec_field(click_spec, long_index, short_index, default=None):
+  """Read a field from either of the common Coot 1.x click-spec layouts."""
+  if not isinstance(click_spec, list):
+    return default
+  if len(click_spec) >= 7:
+    return click_spec[long_index]
+  if len(click_spec) == 6:
+    return click_spec[short_index]
+  return default
+
+
 def _click_spec_imol(click_spec):
+  """Return a best-effort model molecule id from a Coot click spec.
+
+  Coot 1.x click payloads often contain correct chain/residue information but
+  unreliable molecule ids. Prefer a valid model id when present, otherwise fall
+  back to a residue lookup and finally the active residue.
+  """
   valid_model_mols = model_molecule_list()
   if not isinstance(click_spec, list):
     residue = active_residue()
     return residue[0] if residue and residue[0] in valid_model_mols else -1
-  if len(click_spec) >= 7:
-    if isinstance(click_spec[0], int) and click_spec[0] in valid_model_mols:
-      return click_spec[0]
-    if isinstance(click_spec[1], int) and click_spec[1] in valid_model_mols:
-      return click_spec[1]
-  if len(click_spec) == 6 and isinstance(click_spec[0], int) and click_spec[0] in valid_model_mols:
-    return click_spec[0]
+  first_imol = _click_spec_field(click_spec, 0, 0, -1)
+  second_imol = _click_spec_field(click_spec, 1, 0, -1)
+  if isinstance(first_imol, int) and first_imol in valid_model_mols:
+    return first_imol
+  if len(click_spec) >= 7 and isinstance(second_imol, int) and second_imol in valid_model_mols:
+    return second_imol
   chain_id = _click_spec_chain_id(click_spec)
   resno = _click_spec_res_no(click_spec)
   ins_code = _click_spec_ins_code(click_spec)
@@ -597,53 +1274,23 @@ def _click_spec_imol(click_spec):
 
 
 def _click_spec_chain_id(click_spec):
-  if not isinstance(click_spec, list):
-    return False
-  if len(click_spec) >= 7:
-    return click_spec[2]
-  if len(click_spec) == 6:
-    return click_spec[1]
-  return False
+  return _click_spec_field(click_spec, 2, 1, False)
 
 
 def _click_spec_res_no(click_spec):
-  if not isinstance(click_spec, list):
-    return False
-  if len(click_spec) >= 7:
-    return click_spec[3]
-  if len(click_spec) == 6:
-    return click_spec[2]
-  return False
+  return _click_spec_field(click_spec, 3, 2, False)
 
 
 def _click_spec_ins_code(click_spec):
-  if not isinstance(click_spec, list):
-    return ""
-  if len(click_spec) >= 7:
-    return click_spec[4]
-  if len(click_spec) == 6:
-    return click_spec[3]
-  return ""
+  return _click_spec_field(click_spec, 4, 3, "")
 
 
 def _click_spec_atom_name(click_spec):
-  if not isinstance(click_spec, list):
-    return ""
-  if len(click_spec) >= 7:
-    return click_spec[5]
-  if len(click_spec) == 6:
-    return click_spec[4]
-  return ""
+  return _click_spec_field(click_spec, 5, 4, "")
 
 
 def _click_spec_alt_conf(click_spec):
-  if not isinstance(click_spec, list):
-    return ""
-  if len(click_spec) >= 7:
-    return click_spec[6]
-  if len(click_spec) == 6:
-    return click_spec[5]
-  return ""
+  return _click_spec_field(click_spec, 6, 5, "")
 
 
 def ncs_master_chain_id(imol):
@@ -708,6 +1355,7 @@ if GUI_PYTHON_AVAILABLE:
     add_simple_action_to_menu(menu, menu_item_label, action_name, on_activate)
 
   def generic_single_entry(function_label, entry_1_default_text, go_button_label, handle_go_function):
+    """Small GTK4-safe fallback for the common one-text-entry prompt."""
     window = Gtk.Window()
     window.set_title("Coot")
 
@@ -754,6 +1402,62 @@ if GUI_PYTHON_AVAILABLE:
     window.present()
     entry.grab_focus()
 
+  def interesting_things_gui(dialog_name, thing_list):
+    """Show a simple GTK4 list of jump targets as labeled buttons."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+    window.set_default_size(520, 420)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    label = Gtk.Label(label=dialog_name)
+    scrolled = Gtk.ScrolledWindow()
+    inside_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    close_button = Gtk.Button(label="Close")
+
+    label.set_margin_start(12)
+    label.set_margin_end(12)
+    label.set_margin_top(12)
+    label.set_margin_bottom(4)
+    scrolled.set_margin_start(12)
+    scrolled.set_margin_end(12)
+    scrolled.set_margin_bottom(8)
+    close_button.set_margin_start(12)
+    close_button.set_margin_end(12)
+    close_button.set_margin_bottom(12)
+
+    # GTK4 will otherwise let the scrolled window collapse to the height of
+    # roughly one row, leaving most of the dialog as unused blank space.
+    scrolled.set_hexpand(True)
+    scrolled.set_vexpand(True)
+    inside_vbox.set_valign(Gtk.Align.START)
+    scrolled.set_child(inside_vbox)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def jump_to_entry(x, y, z):
+      set_rotation_centre(x, y, z)
+      return False
+
+    for entry in thing_list:
+      if len(entry) < 4:
+        continue
+      button = Gtk.Button(label=str(entry[0]))
+      button.connect(
+        "clicked",
+        lambda _button, x=entry[1], y=entry[2], z=entry[3]: jump_to_entry(x, y, z),
+      )
+      inside_vbox.append(button)
+
+    close_button.connect("clicked", close_window)
+
+    vbox.append(label)
+    vbox.append(scrolled)
+    vbox.append(close_button)
+    window.set_child(vbox)
+    window.present()
+
 else:
 
   def coot_toolbar_button(*_args, **_kwargs):
@@ -774,6 +1478,13 @@ else:
     function_label, _entry_1_default_text, _go_button_label, _handle_go_function
   ):
     info_dialog(_gui_unavailable_message(function_label))
+
+  def interesting_things_gui(dialog_name, thing_list):
+    labels = [str(entry[0]) for entry in thing_list if len(entry) >= 4]
+    message = dialog_name
+    if labels:
+      message += "\n\n" + "\n".join(labels)
+    info_dialog(message)
 
 
   def add_simple_coot_menu_menuitem(_menu, _menu_item_label, _activate_function):
@@ -1055,10 +1766,18 @@ lambda: widen_clipping_symmetric())
   
 #****Misc. functions (for keybindings and scripting****
 def toggle_high_contrast_mode():
+  """Toggle a simple ambient-only lighting preset for all visible models."""
   global MODEL_AMBIENT_LIGHTING_ENABLED
   global MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE
   global MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS
-  if MODEL_AMBIENT_LIGHTING_ENABLED:
+  global MODEL_HIGH_CONTRAST_MOLECULES
+  current_model_molecules = set(model_molecule_list())
+  needs_reapply = (
+    MODEL_AMBIENT_LIGHTING_ENABLED
+    and bool(current_model_molecules)
+    and not current_model_molecules.issubset(MODEL_HIGH_CONTRAST_MOLECULES)
+  )
+  if MODEL_AMBIENT_LIGHTING_ENABLED and not needs_reapply:
     ambient = MODEL_NORMAL_AMBIENT
     diffuse = MODEL_NORMAL_DIFFUSE
     specular = MODEL_NORMAL_SPECULAR
@@ -1072,24 +1791,35 @@ def toggle_high_contrast_mode():
       )
     set_do_GL_lighting(1 if MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE else 0)
     status_message = "Set all models to normal lighting"
+    MODEL_HIGH_CONTRAST_MOLECULES = set()
   else:
-    MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = do_GL_lighting_state()
-    MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = get_default_bond_thickness()
+    if not MODEL_AMBIENT_LIGHTING_ENABLED:
+      MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = do_GL_lighting_state()
+      MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = get_default_bond_thickness()
     set_do_GL_lighting(1)
     ambient = MODEL_AMBIENT_ONLY_AMBIENT
     diffuse = MODEL_AMBIENT_ONLY_DIFFUSE
     specular = MODEL_AMBIENT_ONLY_SPECULAR
     use_variable_bonds = 0
     default_bond_thickness = HIGH_CONTRAST_BOND_THICKNESS
-    status_message = "Set all models to high-contrast ambient lighting"
+    status_message = (
+      "Reapplied high-contrast ambient lighting to current models"
+      if needs_reapply
+      else "Set all models to high-contrast ambient lighting"
+    )
   set_use_variable_bond_thickness(use_variable_bonds)
   set_default_bond_thickness(default_bond_thickness)
-  for imol in model_molecule_list():
+  for imol in current_model_molecules:
     set_model_material_ambient(imol, ambient[0], ambient[1], ambient[2], ambient[3])
     set_model_material_diffuse(imol, diffuse[0], diffuse[1], diffuse[2], diffuse[3])
     set_model_material_specular(imol, specular[0], specular[1])
     set_bond_thickness(imol, default_bond_thickness)
-  MODEL_AMBIENT_LIGHTING_ENABLED = not MODEL_AMBIENT_LIGHTING_ENABLED
+  if needs_reapply:
+    MODEL_HIGH_CONTRAST_MOLECULES = set(current_model_molecules)
+  else:
+    MODEL_AMBIENT_LIGHTING_ENABLED = not MODEL_AMBIENT_LIGHTING_ENABLED
+    if MODEL_AMBIENT_LIGHTING_ENABLED:
+      MODEL_HIGH_CONTRAST_MOLECULES = set(current_model_molecules)
   add_status_bar_text(status_message)
 
 
@@ -1417,6 +2147,33 @@ def generate_smart_local_extra_restraints():
   return _generate_smart_local_extra_restraints_for_mol(residue[0], show_start_message=True)
 
 
+def generate_smart_local_extra_restraints_with_cutoff(distance_cutoff):
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  try:
+    parsed_cutoff = float(distance_cutoff)
+  except ValueError:
+    info_dialog("Minimum interatomic distance must be a number")
+    return None
+  if parsed_cutoff <= 0.0:
+    info_dialog("Minimum interatomic distance must be greater than 0")
+    return None
+  return _generate_smart_local_extra_restraints_for_mol(
+    residue[0], distance_cutoff=parsed_cutoff, show_start_message=True
+  )
+
+
+def prompt_generate_smart_local_extra_restraints():
+  """Prompt for the local distance cutoff before building smart restraints."""
+  generic_single_entry(
+    "Minimum interatomic distance for smart restraints (A)",
+    "3.7",
+    "Generate smart self restraints",
+    generate_smart_local_extra_restraints_with_cutoff,
+  )
+
+
 def flip_active_peptide():
   if coot_fitting and hasattr(coot_fitting, "pepflip_active_residue"):
     return coot_fitting.pepflip_active_residue()
@@ -1492,17 +2249,21 @@ def widen_clipping_symmetric():
   increase_clipping_back()
 
 
+def _set_map_radius_both(radius):
+  """Keep the standard and EM map-radius settings in sync."""
+  set_map_radius(radius)
+  set_map_radius_em(radius)
+
+
 def increase_map_radius():
   current_radius = get_map_radius()
-  set_map_radius(current_radius + 2.0)
-  set_map_radius_em(current_radius + 2.0)
+  _set_map_radius_both(current_radius + 2.0)
 
 
 def decrease_map_radius():
   current_radius = get_map_radius()
   new_radius = max(2.0, current_radius - 2.0)
-  set_map_radius(new_radius)
-  set_map_radius_em(new_radius)
+  _set_map_radius_both(new_radius)
 
 
 def active_map_surface_displayed():
@@ -1515,33 +2276,39 @@ def active_map_surface_displayed():
   )
 
 
-def increase_active_map_surface_opacity():
+def _active_surface_map_or_status():
+  """Return the active map if it is currently shown as a solid surface."""
   if not active_map_surface_displayed():
     add_status_bar_text("Active map is not in solid-surface mode")
     return None
-  map_id = scroll_wheel_map()
+  return scroll_wheel_map()
+
+
+def _adjust_active_map_surface_opacity(delta):
+  """Adjust the opacity of the active solid-surface map."""
+  map_id = _active_surface_map_or_status()
+  if map_id is None:
+    return None
   current_opacity = MAP_SURFACE_OPACITY_STATE.get(
     map_id, get_solid_density_surface_opacity(map_id)
   )
-  new_opacity = min(1.0, current_opacity + 0.05)
+  new_opacity = min(1.0, max(0.0, current_opacity + delta))
   MAP_SURFACE_OPACITY_STATE[map_id] = new_opacity
   set_solid_density_surface_opacity(map_id, new_opacity)
+
+
+def increase_active_map_surface_opacity():
+  """Increase active-map solid-surface opacity in 0.05 steps."""
+  return _adjust_active_map_surface_opacity(0.05)
 
 
 def decrease_active_map_surface_opacity():
-  if not active_map_surface_displayed():
-    add_status_bar_text("Active map is not in solid-surface mode")
-    return None
-  map_id = scroll_wheel_map()
-  current_opacity = MAP_SURFACE_OPACITY_STATE.get(
-    map_id, get_solid_density_surface_opacity(map_id)
-  )
-  new_opacity = max(0.0, current_opacity - 0.05)
-  MAP_SURFACE_OPACITY_STATE[map_id] = new_opacity
-  set_solid_density_surface_opacity(map_id, new_opacity)
+  """Decrease active-map solid-surface opacity in 0.05 steps."""
+  return _adjust_active_map_surface_opacity(-0.05)
 
 
 def display_only_active_map():
+  """Show only the active map, cycling if one map is already displayed alone."""
   map_ids = map_molecule_list()
   if not map_ids:
     add_status_bar_text("No maps loaded")
@@ -1610,25 +2377,24 @@ def display_only_active():
     set_mol_displayed(displayed_mol,0)
     set_mol_displayed(next_mol,1)
     
+def _step_map_sigma(mol_id, delta):
+  """Adjust contour sigma in coarse 0.5 steps within the usual trimmings range."""
+  current_level = get_contour_level_in_sigma(mol_id)
+  if 0.5 <= current_level <= 10.0:
+    new_level = current_level + delta
+  elif current_level < 0.5:
+    new_level = 0.5
+  else:
+    new_level = 10.0
+  set_contour_level_in_sigma(mol_id, new_level)
+
+
 def step_map_coarse_up(mol_id):
-  current_level=get_contour_level_in_sigma(mol_id)
-  if (current_level >= 0.5) and (current_level <= 10.0):
-    new_level=current_level+0.5
-  elif (current_level<0.5):
-    new_level=0.5
-  elif (current_level>10.0):
-    new_level=10.0
-  set_contour_level_in_sigma(mol_id,new_level)
+  _step_map_sigma(mol_id, 0.5)
+
 
 def step_map_coarse_down(mol_id):
-  current_level=get_contour_level_in_sigma(mol_id)
-  if (current_level >= 0.5) and (current_level <= 10.0):
-    new_level=current_level-0.5
-  elif (current_level<0.5):
-    new_level=0.5
-  elif (current_level>10.0):
-    new_level=10.0
-  set_contour_level_in_sigma(mol_id,new_level)
+  _step_map_sigma(mol_id, -0.5)
 
 
 def set_current_map_sigma(level):
@@ -1844,11 +2610,9 @@ def _save_global_view_settings(map_id):
 def _restore_global_view_settings(map_id, fallback_radius):
   saved = MAP_GLOBAL_VIEW_SETTINGS.get(map_id)
   if not saved:
-    set_map_radius(fallback_radius)
-    set_map_radius_em(fallback_radius)
+    _set_map_radius_both(fallback_radius)
     return
-  set_map_radius(saved["map_radius"])
-  set_map_radius_em(saved["map_radius"])
+  _set_map_radius_both(saved["map_radius"])
   set_clipping_front(saved["clipping_front"])
   set_clipping_back(saved["clipping_back"])
 
@@ -1859,8 +2623,7 @@ def _set_global_view_extent(map_id):
   front = get_clipping_plane_front()
   back = get_clipping_plane_back()
   scale = global_radius / current_radius
-  set_map_radius(global_radius)
-  set_map_radius_em(global_radius)
+  _set_map_radius_both(global_radius)
   set_clipping_front(front * scale)
   set_clipping_back(back * scale)
 
@@ -1904,40 +2667,70 @@ def toggle_global_map_view():
   
 #Go to next residue in current polymer chain.
 def next_res():
-  residue = _active_residue_or_status()
-  if not residue:
+  reference_residue = _navigation_reference_residue()
+  if not reference_residue:
     return None
-  mol_id=residue[0]
-  ch_id=residue[1]
-  resn=residue[2]
-  atom_name=residue[4]
-  sn=get_sn_from_resno(mol_id,ch_id,resn)
-  next_sn=sn+1
-  next_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),next_sn)
-  set_go_to_atom_molecule(mol_id)
-  if (next_res!=-10000 and is_protein_chain_p(mol_id,ch_id)==1):
-    set_go_to_atom_chain_residue_atom_name(ch_id,next_res,atom_name)
-  elif (next_res!=-10000 and is_nucleotide_chain_p(mol_id,ch_id)==1):
-    set_go_to_atom_chain_residue_atom_name(ch_id,next_res,atom_name)
+  if reference_residue["source"] == "chain_start":
+    return _go_to_navigation_residue(
+      reference_residue["mol_id"],
+      reference_residue["chain_id"],
+      reference_residue["resno"],
+      reference_residue["ins_code"],
+    )
+  mol_id = reference_residue["mol_id"]
+  ch_id = reference_residue["chain_id"]
+  serial_number = reference_residue.get("serial_number")
+  if serial_number is None:
+    serial_number = _residue_serial_number(
+      mol_id,
+      ch_id,
+      reference_residue["resno"],
+      reference_residue["ins_code"],
+    )
+  if serial_number < 0:
+    add_status_bar_text("Could not resolve the current residue in its chain")
+    return None
+  n_residues = chain_n_residues(ch_id, mol_id)
+  for next_serial in range(serial_number + 1, n_residues):
+    next_resno = seqnum_from_serial_number(mol_id, ch_id, next_serial)
+    next_ins_code = insertion_code_from_serial_number(mol_id, ch_id, next_serial)
+    if _residue_is_polymer(mol_id, ch_id, next_resno, next_ins_code):
+      return _go_to_navigation_residue(mol_id, ch_id, next_resno, next_ins_code, next_serial)
+  add_status_bar_text("Already at the C-terminus of the current polymer chain")
+  return None
 
 #Go to previous residue in current polymer chain.
 def prev_res():
-  residue = _active_residue_or_status()
-  if not residue:
+  reference_residue = _navigation_reference_residue()
+  if not reference_residue:
     return None
-  mol_id=residue[0]
-  ch_id=residue[1]
-  resn=residue[2]
-  atom_name=residue[4]
-  sn=get_sn_from_resno(mol_id,ch_id,resn)
-  if (sn>=1):
-    sn=sn-1
-  prev_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),sn)
-  set_go_to_atom_molecule(mol_id)
-  if (prev_res!=-10000 and is_protein_chain_p(mol_id,ch_id)==1):
-    set_go_to_atom_chain_residue_atom_name(ch_id,prev_res,atom_name)
-  elif (prev_res!=-10000 and is_nucleotide_chain_p(mol_id,ch_id)==1):
-    set_go_to_atom_chain_residue_atom_name(ch_id,prev_res,atom_name)
+  if reference_residue["source"] == "chain_start":
+    return _go_to_navigation_residue(
+      reference_residue["mol_id"],
+      reference_residue["chain_id"],
+      reference_residue["resno"],
+      reference_residue["ins_code"],
+    )
+  mol_id = reference_residue["mol_id"]
+  ch_id = reference_residue["chain_id"]
+  serial_number = reference_residue.get("serial_number")
+  if serial_number is None:
+    serial_number = _residue_serial_number(
+      mol_id,
+      ch_id,
+      reference_residue["resno"],
+      reference_residue["ins_code"],
+    )
+  if serial_number < 0:
+    add_status_bar_text("Could not resolve the current residue in its chain")
+    return None
+  for previous_serial in range(serial_number - 1, -1, -1):
+    previous_resno = seqnum_from_serial_number(mol_id, ch_id, previous_serial)
+    previous_ins_code = insertion_code_from_serial_number(mol_id, ch_id, previous_serial)
+    if _residue_is_polymer(mol_id, ch_id, previous_resno, previous_ins_code):
+      return _go_to_navigation_residue(mol_id, ch_id, previous_resno, previous_ins_code, previous_serial)
+  add_status_bar_text("Already at the N-terminus of the current polymer chain")
+  return None
   
 def sequence_context():
   mol_id=active_residue()[0]
@@ -1997,100 +2790,6 @@ def toggle_map_display():
         set_map_displayed(map_id,1) 
     map_disp_flag_cycle=0
 
-#Open displayed models and maps in Chimera, set map levels and view
-def open_in_chimera():
-  if find_exe("chimera"): #If chimera exists do stuff, else raise an error
-    import subprocess
-    pwd=os.getcwd() #Dir from which coot was launched
-    cofr=rotation_centre() #3-membered list [x,y,z]
-    make_directory_maybe("coot-chimera") #Put coot droppings here
-    coot_chimera_path=pwd+"/coot-chimera/"
-    check_path=coot_chimera_path+"chimera_launcher.cmd" #Chimera run script that will be written later
-    check_path2=coot_chimera_path+"matrix.txt" #Orientation matrix for chimera input
-    view_number=add_view_here("tmp")
-#     initial_zoom=zoom_factor() #Coot's zoom factor. 100 is the initial state, zooming out gets larger, in gets smaller.
-#     reset_view()
-    zoom=zoom_factor()
-#     go_to_view_number(view_number,1)
-#     scale_factor=initial_zoom/base_zoom
-#     chimera_scale=base_zoom/initial_zoom
-    chimera_scale=100.0/zoom #Approx - breaks down when initial views upon loading mol in Coot or Chimera are different
-    coot_slab_thickness=(0.071*zoom)+2.8612 #Empirically estimated
-    chimera_clip_val=coot_slab_thickness/2.0 #Dist from cofr to clip plane (symmetric)
-    map_radius=get_map_radius() #We'll use this to export a map_radius sized fragment
-    if os.path.isfile(check_path): #if chimera script exists, delete it.
-      os.remove(check_path)
-    if os.path.isfile(check_path2): #same for matrix.txt
-      os.remove(check_path2)
-    map_list=map_molecule_list()
-    mol_list=model_molecule_list()
-    disp_mol_list=[]
-    disp_map_list=[]
-    for mol_id in model_molecule_list():
-      if mol_is_displayed(mol_id):
-        disp_mol_list.append(mol_id) 
-    for map_id in map_molecule_list():
-      if map_is_displayed(mol_id):
-        disp_map_list.append(map_id)   
-    print(("disp model list",disp_mol_list))
-    print(("disp map list",disp_map_list))
-    set_graphics_window_size(1000,1000)
-    matrix_list=view_matrix() #9-membered list of rotation matrix elements.
-    with open(check_path2,"a") as matrix_file: #Write orientation matrix (specify first pdb as model, then use matrixcopy to apply to all others). Translation vector in last column is 0,0,0 because we will take care of that separately.
-      matrix_file.write("Model {model_id}.0\n".format(model_id=disp_mol_list[0]))
-      matrix_file.write("\t {a} {b} {c} 0.0\n".format(a=matrix_list[0],b=matrix_list[1],c=matrix_list[2]))
-      matrix_file.write("\t {a} {b} {c} 0.0\n".format(a=matrix_list[3],b=matrix_list[4],c=matrix_list[5]))
-      matrix_file.write("\t {a} {b} {c} 0.0\n".format(a=matrix_list[6],b=matrix_list[7],c=matrix_list[8]))
-    with open(check_path,"a") as cmd_file: #Start writing stuff to chimera launch script.
-      for mol_id in model_molecule_list():
-        if mol_is_displayed(mol_id):
-          file_name=coot_chimera_path+"mol_{mol_id}.pdb".format(mol_id=mol_id)
-          write_pdb_file(mol_id,file_name)
-          path_to_file=file_name
-          model_id=mol_id
-          cmd_file.write("open #{model_id} {mol}\n".format(model_id=model_id,mol=path_to_file)) 
-          cmd_file.write("color gold #{model_id}; color byhet #{model_id};  sel #{model_id}; namesel tmp; ~ribbon tmp; ~disp tmp; sel tmp&@CA&protein; repr stick sel; disp sel; sel tmp&~protein; repr stick sel; disp sel;  setattr m stickScale 1.0 tmp;  sel side chain/base.without CA/C1'&tmp; repr stick sel; disp sel; setattr b radius 0.1 sel; color byhet tmp; sel @CA|@CB; namesel tmp2; sel tmp&tmp2; repr stick sel; setattr b radius 0.1 sel; sel @CD,N&:pro&tmp; disp sel; repr stick sel; setattr b radius 0.1 sel; ~sel; disp ~protein\n".format(model_id=model_id)) 
-          cmd_file.write("matrixset matrix.txt\n")
-          cmd_file.write("matrixcopy #{mol_id0} #{mol_id}\n".format(mol_id0=disp_mol_list[0],mol_id=model_id))         
-      map_id0=mol_id
-      for map_id in map_molecule_list():
-        if map_is_displayed(map_id):
-          map_level=get_contour_level_absolute(map_id)
-          if map_is_difference_map(map_id):
-            model_id=map_id0+map_id #make sure that the assigned model number of each map is unique and does not overlap with those of pdbs.
-            if map_id==0:
-              model_id=model_id+1
-            file_name=coot_chimera_path+"diff_map_{model_id}.mrc".format(model_id=model_id)
-            path_to_file=file_name
-            export_map_fragment(map_id,cofr[0],cofr[1],cofr[2],map_radius,file_name)
-            cmd_file.write("open #{model_id} {diff_map} \n".format(model_id=model_id,diff_map=path_to_file))
-            cmd_file.write("volume #{model_id} capfaces false style mesh meshlighting false squaremesh false color \"#08882eefa222\" step 1 ;  sop cap off ;  set depthCue ;  set dcStart 0.2 ;  set dcEnd 1 ;  background solid white ; set showcofr ;  cofr view ;  clip on; volume #{model_id} level -{map_level} color #da1200000000 level {map_level} color #0000bda00000 \n".format(model_id=model_id,map_level=map_level))
-            cmd_file.write("matrixset matrix.txt\n")
-            cmd_file.write("matrixcopy #{mol_id0} #{model_id}\n".format(mol_id0=disp_mol_list[0],model_id=model_id))
-          else:
-            model_id=map_id0+map_id
-            if map_id==0:
-              model_id=model_id+1
-            file_name=coot_chimera_path+"map_{model_id}.mrc".format(model_id=model_id)
-            export_map_fragment(map_id,cofr[0],cofr[1],cofr[2],map_radius,file_name)
-            path_to_file=file_name
-            cmd_file.write("open #{model_id} {map} \n".format(model_id=model_id,map=path_to_file))
-            cmd_file.write("volume #{model_id} capfaces false style mesh meshlighting false squaremesh false color \"#08882eefa222\" step 1 ;  sop cap off ;  set depthCue ;  set dcStart 0.2 ;  set dcEnd 1 ;  background solid white ; set showcofr ;  cofr view ;  clip on; volume #{model_id} level {map_level} \n".format(model_id=model_id,map_level=map_level))
-            cmd_file.write("matrixset matrix.txt\n")
-            cmd_file.write("matrixcopy #{mol_id0} #{model_id}\n".format(mol_id0=disp_mol_list[0],model_id=model_id))
-      cmd_file.write("~sel; set projection orthographic; clip off; cofr {x},{y},{z} coordinatesystem #{mol_id0}; ac mc; center sel; cofr view; cofr fixed; clip hither {clipval} fromCenter true; clip yon -{clipval} fromCenter true; cofr view; clip on; ~set showcofr; del sel; scale {chimera_scale}; windowsize 1000 1000; scene ca_and_sidechains save; disp; scene all_atoms save; scene ca_and_sidechains reset; windowsize 1000 1000".format(x=cofr[0],y=cofr[1],z=cofr[2],mol_id0=disp_mol_list[0],chimera_scale=chimera_scale,clipval=chimera_clip_val))
-      #line above applies translation and scale obtained from coot rotation center and zoom_factor
-    chimera_exe=find_exe("chimera")
-    info_dialog("Opening in Chimera...\nOrientation should be right but you will probably need to \nadjust the scale and clipping to get the same view as in Coot. \n If you can't see anything, try zooming out.")
-    subprocess.Popen(["chimera",check_path])
-  else: 
-    info_dialog("Sorry, you need UCSF Chimera installed and accessible from the terminal for this to work!")
-#This works okay, though adjustment of zoom and clipping still not ideal.
-#would it be possible to add a subprocess.communicate() to use Coot as a controller for Chimera?
-#Hmmm
-#Doesn't work when attempting to open second set of maps loaded, when first set is undisplayed... Fixed! (I think)
-
-
 #Colour active segment
 def colour_active_segment():
   mol_id=active_residue()[0]
@@ -2136,11 +2835,14 @@ def _all_residue_specs_for_colouring(mol_id):
 
 
 # ============================================================================
-# Legacy / disabled custom-colouring helpers
+# Experimental custom-colouring helpers
 # ============================================================================
 #
-# These are kept for reference and for occasional programmatic use, but the
-# Colour submenu is intentionally disabled in the current Coot 1.1 workflow.
+# The old base-molecule user-defined colouring path leaks into ordinary display
+# modes in this Coot 1.1 build. The only same-molecule route that looks
+# plausible is to create additional representations using the dedicated
+# user-defined bond-colour mode, then immediately clear the molecule's stored
+# colour rules. Ramachandran colouring is the current test case for that path.
 #
 
 def _active_molecule_or_status():
@@ -2148,6 +2850,23 @@ def _active_molecule_or_status():
   if not residue:
     return None
   return residue[0]
+
+
+def yellowify_carbons_in_active_molecule():
+  """Use Coot's live bond-colour rotation path to yellowify active-molecule carbons."""
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  previous_c_only_flag = get_colour_map_rotation_on_read_pdb_c_only_flag()
+  try:
+    set_colour_map_rotation_on_read_pdb_c_only_flag(1)
+    # In Coot's bond-colour rotation code, 21 degrees is treated as the
+    # default/yellow reference rotation for standard carbon colouring.
+    set_bond_colour_rotation_for_molecule(mol_id, 21.0)
+  finally:
+    set_colour_map_rotation_on_read_pdb_c_only_flag(previous_c_only_flag)
+  add_status_bar_text("Yellowified carbons in the active molecule")
+  return 1
 
 
 def _active_polymer_molecule_for_colouring(action_name):
@@ -2160,57 +2879,114 @@ def _active_polymer_molecule_for_colouring(action_name):
   return residue[0]
 
 
-def _clear_custom_colour_overlay(mol_id):
-  overlay_mol_id = CUSTOM_COLOUR_OVERLAY_MOLECULES.pop(mol_id, None)
-  if overlay_mol_id is None:
-    return
-  try:
-    close_molecule(overlay_mol_id)
-  except Exception:
-    pass
-
-
-def _make_custom_colour_overlay_copy(mol_id):
-  _clear_custom_colour_overlay(mol_id)
-  overlay_mol_id = copy_molecule(mol_id)
-  if overlay_mol_id == -1:
-    add_status_bar_text("Failed to create custom colour overlay molecule")
-    return None
-  set_mol_active(overlay_mol_id, 0)
-  set_molecule_name(
-    overlay_mol_id,
-    molecule_name(mol_id) + " [trimmings colours]",
-  )
-  CUSTOM_COLOUR_OVERLAY_MOLECULES[mol_id] = overlay_mol_id
-  return overlay_mol_id
-
-
 def _clear_custom_colour_additional_representations(mol_id):
-  handles = []
+  handles = CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS.pop(mol_id, [])
   for handle in handles:
     try:
       delete_additional_representation(mol_id, handle)
     except Exception:
       pass
+  try:
+    clear_user_defined_atom_colours(mol_id)
+  except Exception:
+    pass
 
 
-def _show_custom_colour_additional_representation(mol_id):
-  overlay_mol_id = _make_custom_colour_overlay_copy(mol_id)
-  if overlay_mol_id is None:
+def _set_user_defined_atom_colour_by_residue_atoms_py(mol_id, residue_specs_colour_index_tuple_list_py):
+  """Apply residue colours atom-by-atom, avoiding the fragile selection-CID parser."""
+  ensure_user_defined_colour_table()
+  atom_colour_list = []
+  for item in residue_specs_colour_index_tuple_list_py or []:
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+      continue
+    residue_spec = item[0]
+    colour_index = item[1]
+    if not isinstance(residue_spec, (list, tuple)) or len(residue_spec) < 3:
+      continue
+    chain_id = residue_spec[0]
+    res_no = residue_spec[1]
+    ins_code = residue_spec[2] or ""
+    atom_info = residue_info_py(mol_id, chain_id, res_no, ins_code)
+    if not isinstance(atom_info, list):
+      continue
+    for atom in atom_info:
+      try:
+        atom_name = atom[0][0]
+        alt_conf = atom[0][1]
+      except Exception:
+        continue
+      atom_spec = [mol_id, chain_id, res_no, ins_code, atom_name, alt_conf]
+      atom_colour_list.append(
+        (atom_spec, _legacy_user_colour_index_to_coot_index(colour_index))
+      )
+  return coot.set_user_defined_atom_colour_py(mol_id, atom_colour_list)
+
+
+def _make_custom_colour_additional_representation(mol_id, residue_spec):
+  if not isinstance(residue_spec, (list, tuple)) or len(residue_spec) < 3:
     return None
-  return overlay_mol_id
+  chain_id = residue_spec[0]
+  res_no = residue_spec[1]
+  ins_code = residue_spec[2] or ""
+  draw_hydrogens_flag = 0
+  if "draw_hydrogens_state" in globals():
+    try:
+      draw_hydrogens_flag = draw_hydrogens_state(mol_id)
+    except Exception:
+      draw_hydrogens_flag = 0
+  handle = additional_representation_by_attributes(
+    mol_id,
+    chain_id,
+    res_no,
+    res_no,
+    ins_code,
+    CUSTOM_COLOUR_ADDITIONAL_REPRESENTATION_TYPE,
+    CUSTOM_COLOUR_USER_DEFINED_BONDS_BOX_TYPE,
+    CUSTOM_COLOUR_ADDITIONAL_BOND_WIDTH,
+    draw_hydrogens_flag,
+  )
+  if handle == -1:
+    return None
+  return handle
+
+
+def clear_custom_colour_representations_for_active_molecule():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  _clear_custom_colour_additional_representations(mol_id)
+  add_status_bar_text("Cleared custom colour representations")
 
 
 def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  del blank_res_list
   ensure_user_defined_colour_table()
-  overlay_mol_id = _show_custom_colour_additional_representation(mol_id)
-  if overlay_mol_id is None:
+  _clear_custom_colour_additional_representations(mol_id)
+  if not colour_list:
+    if info_message:
+      info_dialog(info_message)
     return None
-  clear_user_defined_atom_colours(overlay_mol_id)
-  if colour_list:
-    set_user_defined_atom_colour_by_residue_py(overlay_mol_id, colour_list)
-  graphics_to_user_defined_atom_colours_representation(overlay_mol_id)
-  clear_user_defined_atom_colours(overlay_mol_id)
+  clear_user_defined_atom_colours(mol_id)
+  colour_count = _set_user_defined_atom_colour_by_residue_atoms_py(mol_id, colour_list)
+  if not colour_count:
+    _clear_custom_colour_additional_representations(mol_id)
+    info_dialog("Failed to set user-defined atom colours for the requested residues.")
+    return None
+  handles = []
+  seen_residue_specs = set()
+  for residue_spec, _colour_index in colour_list:
+    residue_key = tuple(residue_spec[:3])
+    if residue_key in seen_residue_specs:
+      continue
+    seen_residue_specs.add(residue_key)
+    handle = _make_custom_colour_additional_representation(mol_id, residue_spec)
+    if handle is not None:
+      handles.append(handle)
+  CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS[mol_id] = handles
+  clear_user_defined_atom_colours(mol_id)
+  if not handles:
+    info_dialog("Failed to create a custom-colour additional representation.")
+    return None
   if info_message:
     info_dialog(info_message)
 
@@ -3521,94 +4297,6 @@ def fit_polyala_gui():
 #     db_mainchain?
 #   user_defined_click(2,fit_polyala)
 
-#Rebuild backbone in selected zone
-def rebuild_backbone_wrapper():
-  def rebuild_backbone(res1,res2):
-    mol_id_1=_click_spec_imol(res1)
-    mol_id_2=_click_spec_imol(res2)
-    ch_id_1=_click_spec_chain_id(res1)
-    ch_id_2=_click_spec_chain_id(res2)
-    resid1=_click_spec_res_no(res1)
-    resid2=_click_spec_res_no(res2)
-    if mol_id_1==mol_id_2 and ch_id_1==ch_id_2: #if residues in same mol and chain
-      mol_id=mol_id_1
-      ch_id=ch_id_1
-      if resid1!=resid2:
-        if resid2<resid1:
-          resid1, resid2 = resid2, resid1
-        new_mol_id=db_mainchain(mol_id,ch_id,resid1,resid2,"forwards")
-        if new_mol_id == -1 or not valid_model_molecule_qm(new_mol_id):
-          info_dialog("Backbone rebuild failed for the selected range")
-          return None
-        accept_regularizement()
-        res1_rsr=first_residue(new_mol_id,ch_id)
-        res2_rsr=last_residue(new_mol_id,ch_id)
-        #need to mutate each residue to appropriate sidechain and kill sidechain
-        #get target seq with aa_code=three_letter_code2single_letter(residue_name(mol_id,ch_id,resnum,ins_code))
-        #mutate_residue_range
-        #delete_sidechain_range
-        target_seq=""
-        for res in range(res1_rsr,res2_rsr+1):
-          aa_code=three_letter_code2single_letter(residue_name(new_mol_id,ch_id,res,""))
-          target_seq=target_seq+aa_code
-        print(("target seq:",target_seq))
-        mutate_residue_range(new_mol_id,ch_id,res1_rsr,res2_rsr,target_seq)
-        delete_sidechain_range(new_mol_id,ch_id,res1_rsr,res2_rsr)
-        for res in range(res1_rsr,res2_rsr+1):
-          if residue_name(new_mol_id,ch_id,res,"")=="PRO":
-            target_seq="P"
-            mutate_residue_range(new_mol_id,ch_id,res,res,target_seq)
-        #cut out orginal region and merge in new fragment?
-        refine_zone(new_mol_id,ch_id,res1_rsr,res2_rsr,"")
-        accept_regularizement()
-      else:
-        info_dialog("Sorry, you need at least 2 residues in a zone!")
-    else:
-      info_dialog("Sorry, residues must be in same mol and chain!")
-  user_defined_click(2,rebuild_backbone)
-
-def rebuild_backbone_reverse_wrapper():
-  def rebuild_backbone_reverse(res1):
-    mol_id=_click_spec_imol(res1)
-    ch_id=_click_spec_chain_id(res1)
-    resid1=_click_spec_res_no(res1)
-    segments=segment_list(mol_id)
-    for seg in segments:
-      if (resid1>=seg[2]) and (resid1<=seg[3]) and (ch_id==seg[1]):
-        res_start=seg[2]
-        res_end=seg[3]
-        ch_id=seg[1]
-        turn_off_backup(mol_id)
-        if res_start!=res_end:
-          reverse_direction_of_fragment(mol_id,ch_id,res_start)
-          new_mol_id=db_mainchain(mol_id,ch_id,res_start,res_end,"forwards")
-          if new_mol_id == -1 or not valid_model_molecule_qm(new_mol_id):
-            info_dialog("Backbone rebuild failed for the selected segment")
-            return None
-        accept_regularizement()
-        res1_rsr=first_residue(new_mol_id,ch_id)
-        res2_rsr=last_residue(new_mol_id,ch_id)
-        #need to mutate each residue to appropriate sidechain and kill sidechain
-        #get target seq with aa_code=three_letter_code2single_letter(residue_name(mol_id,ch_id,resnum,ins_code))
-        #mutate_residue_range
-        #delete_sidechain_range
-        target_seq=""
-        for res in range(res1_rsr,res2_rsr+1):
-          aa_code=three_letter_code2single_letter(residue_name(new_mol_id,ch_id,res,""))
-          target_seq=target_seq+aa_code
-        print(("target seq:",target_seq))
-        mutate_residue_range(new_mol_id,ch_id,res1_rsr,res2_rsr,target_seq)
-        delete_sidechain_range(new_mol_id,ch_id,res1_rsr,res2_rsr)
-        for res in range(res1_rsr,res2_rsr+1):
-          if residue_name(new_mol_id,ch_id,res,"")=="PRO":
-            target_seq="P"
-            mutate_residue_range(new_mol_id,ch_id,res,res,target_seq)
-        #cut out orginal region and merge in new fragment?
-        delete_residue_range(mol_id,ch_id,res_start,res_end)
-        merge_molecules([new_mol_id],mol_id)
-        turn_off_backup(mol_id)
-  user_defined_click(1,rebuild_backbone_reverse)
-
 #Real space refine for keyboard shortcut
 def refine_click():
   def refine_click_a(res1,res2):
@@ -3666,103 +4354,6 @@ def refine_residues_range(mol_id,ch_id,resno_1,resno_2,ins_code_1):
 
   
   
-#refine range, plus everything in contact with it
-def refine_residues_sphere_click():
-  def refine_residues_sphere_click_a(res1,res2):
-    mol_id_1=_click_spec_imol(res1)
-    mol_id_2=_click_spec_imol(res2)
-    ch_id_1=_click_spec_chain_id(res1)
-    ch_id_2=_click_spec_chain_id(res2)
-    resno_1=_click_spec_res_no(res1)
-    resno_2=_click_spec_res_no(res2)
-    ins_code_1=_click_spec_ins_code(res1)
-    ins_code_2=_click_spec_ins_code(res2)
-    if (mol_id_1==mol_id_2) and (ch_id_1==ch_id_2) and (imol_refinement_map()!=-1):
-      if resno_1>=resno_2:
-        resno_1,resno_2=resno_2,resno_1 #Swap res numbers if wrong way round
-      res_list=[]
-      nearby_residues=[]
-      for resn in range(resno_1,resno_2+1):
-        res_triple=[ch_id_1,resn,ins_code_1] #Does not account for varying ins code. Should be able to fix using residues_matching_criteria(), e.g.:
-        #residues_matching_criteria(0, lambda chain_id,resno,ins_code,serial: True), except substitute a test func for true
-        #that evaluates to true if resno, mol id and ch_id match, and returns ins_code (third item in output triple)
-        res_list.append(res_triple) #append rather than adding, bc making list of lists
-      for resn in range(resno_1+1,resno_2-1):
-        res_triple=[ch_id_1,resn,ins_code_1] #Does not account for varying ins code. Should be able to fix using residues_matching_criteria(), e.g.:
-        new_nearby_residues=residues_near_residue(mol_id_1,res_triple,5)
-        nearby_residues.extend(new_nearby_residues)
-      if len(res_list)<=2:
-        for resn in range(resno_1,resno_2+1):
-          res_triple=[ch_id_1,resn,ins_code_1] #Does not account for varying ins code. Should be able to fix using residues_matching_criteria(), e.g.:
-          new_nearby_residues=residues_near_residue(mol_id_1,res_triple,5)
-          nearby_residues.extend(new_nearby_residues)
-      res_list=res_list+nearby_residues
-      print(res_list)
-      res_list=[list(x) for x in set(tuple(x) for x in res_list)] #Uniquifies list of lists
-      print(("hopefully unique:",res_list))
-      refine_residues(mol_id_1,res_list)
-      print(res_list)
-    else:
-      info_dialog("Sorry, start and end residues must be in same mol and chain! And you need to have a refinement map.")
-  user_defined_click(2,refine_residues_sphere_click_a)
-
-#Python version of sphere refine from here:
-#https://www.mail-archive.com/coot@jiscmail.ac.uk/msg01463.html
-def sphere_refine_active(radius):
-    active_atom = active_residue()
-    if (not active_atom):
-        add_status_bar_text("No active residue")
-    else:
-        imol      = active_atom[0]
-        chain_id  = active_atom[1]
-        res_no    = active_atom[2]
-        ins_code  = active_atom[3]
-        atom_name = active_atom[4]
-        alt_conf  = active_atom[5]
-        centred_residue = active_atom[1:4]
-        other_residues = residues_near_residue(imol, centred_residue, radius)
-        all_residues = [centred_residue]
-        if isinstance(other_residues, list):
-            all_residues += other_residues
-        print("imol: %s residues: %s" %(imol, all_residues))
-        refine_residues(imol, all_residues)
-
-def stepped_sphere_refine(mol_id,ch_id):
-  turn_off_backup(mol_id)
-  set_refinement_immediate_replacement(1)
-  valid_resnames=['A','C','T','G','U','ALA','UNK','ARG','ASN','ASP','CYS','GLU','GLN','GLY','HIS','ILE','LEU','LYS','MET','MSE','PHE','PRO','SER','THR','TRP','TYR','VAL']
-  if is_polymer(mol_id,ch_id): 
-    first_res=first_residue(mol_id,ch_id)
-    last_res=last_residue(mol_id,ch_id)
-    if is_protein_chain_p(mol_id,ch_id):
-      for res in range(first_res,last_res+1):
-        res_exist_flag=does_residue_exist_p(mol_id,ch_id,res,"")
-        resname=residue_name(mol_id,ch_id,res,"")
-        if (res_exist_flag==1) and (resname in valid_resnames):
-          set_go_to_atom_chain_residue_atom_name(ch_id,res," CA ")
-          sphere_refine_active(7)
-          accept_regularizement()
-    elif is_nucleotide_chain_p(mol_id,ch_id):
-      for res in range(first_res,last_res+1):
-        res_exist_flag=does_residue_exist_p(mol_id,ch_id,res,"")
-        resname=residue_name(mol_id,ch_id,res,"")
-        if (res_exist_flag==1) and (resname in valid_resnames):
-          set_go_to_atom_chain_residue_atom_name(ch_id,res," P ")
-          sphere_refine_active(7)
-          accept_regularizement()
-  set_refinement_immediate_replacement(0)
-  turn_on_backup(mol_id)
-  info_dialog("Refinement finished - all done!")
-
-  
-#Stepped v of cylinder refine:
-#get mol from active residue
-#for ch_id in mol:
-#cylinder_refine four res segments, with two res overlap
-#ignore breaks?
-#what about waters?
-
-
 #Copy fragment (click start and end)
 def copy_frag_by_click():
   def copy_frag(res1,res2):
@@ -4953,47 +5544,6 @@ def highlight_all_chain_breaks():
       pass
     turn_on_backup(mol_id)
 
-def local_hbonds_and_baddies():
-  mol_id=active_residue()[0]
-  probe_local_sphere(mol_id,5)
-  undisplay_list=["wide contact","close contact"]
-  display_list=["bad overlap","H-bonds","small overlap"]
-  for obj_name in undisplay_list:
-    obj_number=generic_object_with_name(obj_name)
-    generic_object_clear(obj_number)
-  for obj_name in display_list:
-    obj_number=generic_object_with_name(obj_name)
-    set_display_generic_object(obj_number,1)
-    try:
-      attach_generic_object_to_molecule(obj_number, mol_id)
-    except NameError:
-      info_dialog("attach_generic_object_to_molecule is only present in Coot r6057 and later, sorry.")
-      pass
-      
-def global_hbonds_and_baddies():
-  mol_id=active_residue()[0]
-  probe(mol_id)
-  close_molecule(model_molecule_list()[-1])
-  undisplay_list=["wide contact","close contact","H-bonds","small overlap"]
-  display_list=["bad overlap"]
-  for obj_name in undisplay_list:
-    obj_number=generic_object_with_name(obj_name)
-    generic_object_clear(obj_number)
-  for obj_name in display_list:
-    obj_number=generic_object_with_name(obj_name)
-    set_display_generic_object(obj_number,1)
-    try:
-      attach_generic_object_to_molecule(obj_number, mol_id)
-    except NameError:
-      info_dialog("attach_generic_object_to_molecule is only present in Coot r6057 and later, sorry.")
-      pass
-      
-def clear_dots():
-  undisplay_list=["wide contact","close contact", "small overlap","bad overlap","H-bonds","H-bond","big-overlap","close-contact","small-overlap","wide-contact","clashes"]
-  for obj_name in undisplay_list:
-    obj_number=generic_object_with_name(obj_name)
-    generic_object_clear(obj_number)
-
 #Place helix and add helix restraints
 def place_helix_with_restraints():
   place_helix_here()
@@ -5144,42 +5694,6 @@ def add_term_shortcut_force_strand():
     sort_residues(mol_id)
     set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg+1,atom_name)
 
-#Add h-bond restraints to active mol with Prosmart
-def run_prosmart_self():
-  """
-  target is my molecule, ref is the homologous (high-res) model
-
-  extra arg: include_side_chains=False
-  """
-  imol_target=active_residue()[0]
-  dir_stub = "coot-ccp4"
-  prosmart_dir="ProSMART_Output"
-  make_directory_maybe(dir_stub)
-  make_directory_maybe(prosmart_dir)
-  target_pdb_file_name = os.path.join(dir_stub,
-                                      molecule_name_stub(imol_target, 0).replace(" ", "_") + \
-                                      "-prosmart.pdb")
-  prosmart_out = os.path.join("ProSMART_Output",
-                              molecule_name_stub(imol_target, 0).replace(" ", "_") + \
-                              "-prosmart.txt")
-
-  write_pdb_file(imol_target, target_pdb_file_name)
-  prosmart_exe = find_exe("prosmart")
-  if prosmart_exe:
-    l = ["-p1", target_pdb_file_name,
-         "-h","-self_restrain","-bond_max","4.0","-bond_override", "2","-o",prosmart_dir]
-    popen_command(prosmart_exe,
-                  l,
-                  [],
-                  os.path.join(dir_stub, "prosmart.log"),
-                  False)
-    if (not os.path.isfile(prosmart_out)):
-      print("file not found", prosmart_out)
-    else:
-      print("Reading ProSMART restraints from", prosmart_out)
-      add_refmac_extra_restraints(imol_target, prosmart_out)
-      delete_extra_restraints_worse_than(imol_target,4)
-      
 #Fix all atoms in active residue
 def fix_active_residue():
   ar=active_residue() #ar[0] is mol_id, 1 is ch_id, 2 is resnum, 3 is ins code, 4 is atom name (CA) and 5 is alt conf 
@@ -5230,93 +5744,163 @@ def return_seq_as_string(mol_id,ch_id):
     seq=seq+aa_code
   return seq
 
-stereo_gif_counter=1
-def make_rot_gif():
-  if find_exe("convert"):
-    global stereo_gif_counter
-    import subprocess
-    pwd=os.getcwd()
-    set_rotation_center_size(0)
-    set_draw_axes(0)
-    rotate_y_scene(1,-2)
-    screendump_image("{pwd}/pair1_tmp.ppm".format(pwd=pwd))
-    rotate_y_scene(1,1)
-    screendump_image("{pwd}/pair2_tmp.ppm".format(pwd=pwd))
-    rotate_y_scene(1,1)
-    screendump_image("{pwd}/pair3_tmp.ppm".format(pwd=pwd))
-    rotate_y_scene(1,1)
-    screendump_image("{pwd}/pair4_tmp.ppm".format(pwd=pwd))
-    rotate_y_scene(1,1)
-    screendump_image("{pwd}/pair5_tmp.ppm".format(pwd=pwd))
-    rotate_y_scene(1,-2)
-    p=subprocess.Popen("convert -scale 500 -normalize -fuzz 5% -delay 8 -loop 0 -layers Optimize {pwd}/pair1_tmp.ppm {pwd}/pair2_tmp.ppm {pwd}/pair3_tmp.ppm {pwd}/pair4_tmp.ppm {pwd}/pair5_tmp.ppm {pwd}/pair4_tmp.ppm {pwd}/pair3_tmp.ppm {pwd}/pair2_tmp.ppm {pwd}/stereo_density_{stereo_gif_counter}.gif".format(pwd=pwd,stereo_gif_counter=stereo_gif_counter),shell=True) 
-    p.communicate()
-    stereo_gif_counter=stereo_gif_counter+1
-    os.remove("{pwd}/pair1_tmp.ppm".format(pwd=pwd))
-    os.remove("{pwd}/pair2_tmp.ppm".format(pwd=pwd))
-    os.remove("{pwd}/pair3_tmp.ppm".format(pwd=pwd))
-    os.remove("{pwd}/pair4_tmp.ppm".format(pwd=pwd))
-    os.remove("{pwd}/pair5_tmp.ppm".format(pwd=pwd))
-    set_rotation_center_size(0.1)
-    set_draw_axes(1)
-  else:
-    info_dialog("You need Imagemagick to use this!")
-    
-    
-def find_sequence_in_current_chain(subseq):
-  subseq=subseq.upper()
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  seq=return_seq_as_string(mol_id,ch_id)
+def _compile_sequence_pattern(subseq):
+  """Compile simple sequence search syntax such as X and (A/S)."""
+  pattern=[]
   index=0
+  while index < len(subseq):
+    character=subseq[index]
+    if character=="(":
+      close_index=subseq.find(")", index+1)
+      if close_index==-1:
+        raise ValueError("Unmatched '(' in sequence pattern")
+      option_text=subseq[index+1:close_index]
+      if not option_text:
+        raise ValueError("Empty bracketed option in sequence pattern")
+      options=[piece.strip().upper() for piece in option_text.split("/") if piece.strip()]
+      if not options:
+        raise ValueError("Empty bracketed option in sequence pattern")
+      allowed=set()
+      for option in options:
+        if len(option)!=1:
+          raise ValueError("Bracketed options must be single-letter residues")
+        allowed.add(option)
+      pattern.append(("set", allowed))
+      index=close_index+1
+      continue
+    if character=="X":
+      pattern.append(("any", None))
+    else:
+      pattern.append(("set", set([character])))
+    index=index+1
+  if not pattern:
+    raise ValueError("Empty sequence pattern")
+  return pattern
+
+
+def _sequence_pattern_matches_at(seq, start_index, compiled_pattern):
+  if start_index+len(compiled_pattern) > len(seq):
+    return False
+  for offset in range(len(compiled_pattern)):
+    mode, allowed=compiled_pattern[offset]
+    seq_char=seq[start_index+offset]
+    if mode=="any":
+      continue
+    if seq_char not in allowed:
+      return False
+  return True
+
+
+def _sequence_match_context_label(ch_id, seq, sn_start, pattern_length, mol_id):
+  sn_end=sn_start+pattern_length-1
+  resno_start=seqnum_from_serial_number(mol_id,ch_id,sn_start)
+  resno_end=seqnum_from_serial_number(mol_id,ch_id,sn_end)
+  left_context_start=max(0, sn_start-3)
+  right_context_end=min(len(seq), sn_start+pattern_length+3)
+  left_context=seq[left_context_start:sn_start]
+  match_context=seq[sn_start:sn_start+pattern_length]
+  right_context=seq[sn_start+pattern_length:right_context_end]
+  if left_context_start>0:
+    left_context="..."+left_context
+  if right_context_end<len(seq):
+    right_context=right_context+"..."
+  return "%s%d-%d: %s*%s*%s" %(ch_id,resno_start,resno_end,left_context,match_context,right_context)
+
+
+def _sequence_match_list_entry(mol_id, ch_id, seq, sn_start, pattern_length):
+  """Build a chooser entry for a sequence hit using the residue centre."""
+  resno=seqnum_from_serial_number(mol_id,ch_id,sn_start)
+  ins_code=insertion_code_from_serial_number(mol_id,ch_id,sn_start)
+  residue_centre=residue_centre_py(mol_id,ch_id,resno,ins_code)
+  if not (isinstance(residue_centre, (list, tuple)) and len(residue_centre)==3):
+    return None
+  return [
+    _sequence_match_context_label(ch_id,seq,sn_start,pattern_length,mol_id),
+    residue_centre[0],
+    residue_centre[1],
+    residue_centre[2],
+  ]
+
+
+def _sequence_match_jump_target(mol_id, ch_id, serial_number):
+  """Return the residue-centred jump target for a sequence match."""
+  resno=seqnum_from_serial_number(mol_id,ch_id,serial_number)
+  ins_code=insertion_code_from_serial_number(mol_id,ch_id,serial_number)
+  alt_confs=residue_alt_confs(mol_id,ch_id,resno,ins_code)
+  # Try the blank alt-conf first: in Coot 1 a residue can report sidechain
+  # alternate conformers while the backbone CA/P atom itself is unalted.
+  alt_conf_candidates=[""]
+  for alt_conf in alt_confs:
+    if alt_conf not in alt_conf_candidates:
+      alt_conf_candidates.append(alt_conf)
+  for atom_name in ["CA", "P"]:
+    for alt_conf in alt_conf_candidates:
+      try:
+        atom_spec=atom_specs(mol_id,ch_id,resno,ins_code,atom_name,alt_conf)
+        return {
+          "resno": resno,
+          "atom_name": atom_name,
+          "x": atom_spec[-3],
+          "y": atom_spec[-2],
+          "z": atom_spec[-1],
+        }
+      except TypeError:
+        pass
+  residue_centre = residue_centre_py(mol_id, ch_id, resno, ins_code)
+  if isinstance(residue_centre, (list, tuple)) and len(residue_centre) == 3:
+    return {
+      "resno": resno,
+      "atom_name": " CA ",
+      "x": residue_centre[0],
+      "y": residue_centre[1],
+      "z": residue_centre[2],
+    }
+  return None
+
+
+def find_sequence_in_current_chain(subseq):
+  subseq=subseq.upper().strip()
+  residue=_active_residue_or_status()
+  if not residue:
+    return None
+  mol_id=residue[0]
+  ch_id=residue[1]
+  seq=return_seq_as_string(mol_id,ch_id)
+  try:
+    compiled_pattern=_compile_sequence_pattern(subseq)
+  except ValueError as error:
+    info_dialog(str(error))
+    return None
   sn_list=[]
   interesting_list=[]
-  while index < len(seq):
-    try:
-      index=seq.index(subseq,index)
-    except ValueError:
-      break
-    sn_list.append(index)
-    if index==-1:
-      break
-    index=index+len(subseq)
+  pattern_length=len(compiled_pattern)
+  index=0
+  while index <= len(seq)-pattern_length:
+    if _sequence_pattern_matches_at(seq, index, compiled_pattern):
+      sn_list.append(index)
+      index=index+pattern_length
+    else:
+      index=index+1
   if len(sn_list)==1:
     sn_start=sn_list[0]
-    resno=seqnum_from_serial_number(mol_id,ch_id,sn_start)
-    ins_code=insertion_code_from_serial_number(mol_id,ch_id,sn_start)
-    alt_conf=residue_alt_confs(mol_id,ch_id,resno,ins_code)[0]
-    print(("sn_start",sn_start))
-    try:
-      x=atom_specs(mol_id,ch_id,resno,ins_code,"CA",alt_conf)[-3]
-      y=atom_specs(mol_id,ch_id,resno,ins_code,"CA",alt_conf)[-2]
-      z=atom_specs(mol_id,ch_id,resno,ins_code,"CA",alt_conf)[-1]
-    except TypeError:
-      x=atom_specs(mol_id,ch_id,resno,ins_code,"P",alt_conf)[-3]
-      y=atom_specs(mol_id,ch_id,resno,ins_code,"P",alt_conf)[-2]
-      z=atom_specs(mol_id,ch_id,resno,ins_code,"P",alt_conf)[-1]
-    set_rotation_centre(x,y,z)
+    target=_sequence_match_jump_target(mol_id, ch_id, sn_start)
+    if not target:
+      info_dialog("Found the sequence match, but could not locate a CA/P atom to center on.")
+      return None
+    set_rotation_centre(target["x"],target["y"],target["z"])
+    set_go_to_atom_molecule(mol_id)
+    set_go_to_atom_chain_residue_atom_name(ch_id,target["resno"],target["atom_name"])
   elif len(sn_list)==0:
     info_dialog("Sequence not found!")
   elif len(sn_list)>1:
-    count=0
     for sn in sn_list:
-      count=count+1
-      resno=seqnum_from_serial_number(mol_id,ch_id,sn)
-      ins_code=insertion_code_from_serial_number(mol_id,ch_id,sn)
-      alt_conf=residue_alt_confs(mol_id,ch_id,resno,ins_code)[0]
-      print(("sn_start",sn))
-      try:
-        x=atom_specs(mol_id,ch_id,resno,ins_code,"CA",alt_conf)[-3]
-        y=atom_specs(mol_id,ch_id,resno,ins_code,"CA",alt_conf)[-2]
-        z=atom_specs(mol_id,ch_id,resno,ins_code,"CA",alt_conf)[-1]
-      except TypeError:
-        x=atom_specs(mol_id,ch_id,resno,ins_code,"P",alt_conf)[-3]
-        y=atom_specs(mol_id,ch_id,resno,ins_code,"P",alt_conf)[-2]
-        z=atom_specs(mol_id,ch_id,resno,ins_code,"P",alt_conf)[-1]
-      list_entry=[str(resno),x,y,z]
+      list_entry=_sequence_match_list_entry(mol_id,ch_id,seq,sn,pattern_length)
+      if not list_entry:
+        continue
       interesting_list.append(list_entry)
-      print(("interesting list",interesting_list))
-    print(("interesting list",interesting_list))
+    if not interesting_list:
+      info_dialog("Found matching sequence positions, but could not locate jump atoms for them.")
+      return None
     interesting_things_gui("Matches to entered sequence",interesting_list)
 
 #Test post manipulation background func
@@ -5339,8 +5923,20 @@ def find_sequence_in_current_chain(subseq):
 #     print "BL DEBUG:: moved something in mol ", imol
 #     return 1
 
-#****Disabled Gtk-dependent UI archive****
-# Re-enable these once embedded Python can import Gtk/coot_gui cleanly again.
+# ---------------------------------------------------------------------------
+# Legacy Gtk archive
+# ---------------------------------------------------------------------------
+# The primary Coot 1.x startup/menu path lives above. The large blocks below
+# preserve older Gtk-heavy helpers so we can either revive them selectively or
+# refer back to the original implementations when porting features.
+#
+# There are two archives here:
+#   * GTK_DIALOG_FUNCTION_ARCHIVE: historical dialog-backed helpers. We still
+#     exec() these after the GTK4-safe fallback dialogs are defined so older
+#     tool functions remain available when they are still useful.
+#   * GTK_UI_ARCHIVE: the old bulk menu-construction block. It is preserved
+#     verbatim and still exec()'d on Gtk-capable builds, but it is no longer
+#     the main place to edit the Coot 1 menu layout.
 #
 # Archived startup wiring that is currently non-functional in this build:
 #
@@ -5367,8 +5963,8 @@ def find_sequence_in_current_chain(subseq):
 # coot_toolbar_button("Sequence context", "sequence_context()", icon_name="")
 # coot_toolbar_button("Accept RSR", "accept_regularizement()", icon_name="")
 #
-# Disabled Gtk/dialog helper functions are preserved verbatim here so they can
-# be restored cleanly once embedded Python can import Gtk/coot_gui again.
+# Keep the original dialog-backed helper implementations verbatim so that
+# future ports can compare behavior against the old Gtk path line-for-line.
 GTK_DIALOG_FUNCTION_ARCHIVE = r'''
 def set_map_level_quickly():
   if scroll_wheel_map()!=-1 and map_is_displayed(scroll_wheel_map())!=0:
@@ -5587,252 +6183,180 @@ def change_hires_limit():
 #Hierarchical menu for commonly inserted CCP4 monomers
 COMMON_MONOMER_MENU = [
   ("Buffers", [
-    ("Bis-Tris (BTB)", "BTB"),
     ("Bicine (BCN)", "BCN"),
+    ("Bis-Tris (BTB)", "BTB"),
+    ("Cacodylate (CAC)", "CAC"),
     ("HEPES (EPE)", "EPE"),
     ("MES (MES)", "MES"),
     ("TAPS (T3A)", "T3A"),
-    ("Tris (TRS)", "TRS"),
     ("Triethanolamine (TAM)", "TAM"),
-    ("Cacodylate (CAC)", "CAC"),
-  ]),
-  ("Ions / metals", [
-    ("Cations", [
-      ("Magnesium (MG)", "MG"),
-      ("Calcium (CA)", "CA"),
-      ("Sodium (NA)", "NA"),
-      ("Potassium (K)", "K"),
-    ]),
-    ("Transition / heavy metals", [
-      ("Zinc (ZN)", "ZN"),
-      ("Manganese (MN)", "MN"),
-      ("Iron (FE)", "FE"),
-      ("Cobalt (CO)", "CO"),
-      ("Copper (CU)", "CU"),
-      ("Nickel (NI)", "NI"),
-      ("Cadmium (CD)", "CD"),
-      ("Mercury(II) ion (HG)", "HG"),
-      ("Gold ion (AU)", "AU"),
-      ("Platinum(II) ion (PT)", "PT"),
-    ]),
-    ("Halides", [
-      ("Chloride (CL)", "CL"),
-      ("Bromide (BR)", "BR"),
-      ("Iodide (IOD)", "IOD"),
-    ]),
-    ("Oxyanions", [
-      ("Phosphate (PO4)", "PO4"),
-      ("Sulfate (SO4)", "SO4"),
-      ("Molybdate (MOO)", "MOO"),
-      ("Tungstate (WO4)", "WO4"),
-      ("Vanadate (VO4)", "VO4"),
-      ("Selenate (SE4)", "SE4"),
-      ("Arsenate (ART)", "ART"),
-    ]),
-    ("Heavy atoms", [
-      ("Mercury(II) ion (HG)", "HG"),
-      ("Lead(II) ion (PB)", "PB"),
-      ("Gold ion (AU)", "AU"),
-      ("Platinum(II) ion (PT)", "PT"),
-      ("Uranyl(VI) ion (IUM)", "IUM"),
-      ("Uranium (U1)", "U1"),
-      ("Osmium ion (OS)", "OS"),
-      ("Iridium ion (IR)", "IR"),
-      ("Gadolinium ion (GD3)", "GD3"),
-      ("Europium(III) ion (EU3)", "EU3"),
-      ("Terbium(III) ion (TB)", "TB"),
-      ("Holmium(III) ion (HO3)", "HO3"),
-      ("Lanthanum(III) ion (LA)", "LA"),
-      ("Lutetium(III) ion (LU)", "LU"),
-      ("Samarium(III) ion (SM)", "SM"),
-      ("Ytterbium(III) ion (YB)", "YB"),
-      ("Xenon (XE)", "XE"),
-      ("Krypton (KR)", "KR"),
-    ]),
-    ("Metal clusters", [
-      ("Fe-S cluster / cubane (SF4)", "SF4"),
-      ("Fe-S cluster (FS1)", "FS1"),
-      ("Fe-S cluster (35L)", "35L"),
-      ("FeMo cofactor-like cluster (ICS)", "ICS"),
-      ("Ni-Fe cluster (82N)", "82N"),
-      ("Tetranuclear copper-sulfide cluster (CUZ)", "CUZ"),
-    ]),
-  ]),
-  ("Solvents / additives", [
-    ("Acetate (ACT)", "ACT"),
-    ("DMSO (DMS)", "DMS"),
-    ("Ethanol (EOH)", "EOH"),
-    ("Ethylene glycol (EDO)", "EDO"),
-    ("Glycerol (GOL)", "GOL"),
-    ("Isopropanol (IPA)", "IPA"),
-    ("MPD (MPD)", "MPD"),
-    ("PEG (PEG)", "PEG"),
-    ("1-Butanol (1BO)", "1BO"),
-    ("1,4-Butanediol (BU1)", "BU1"),
-    ("Propylene glycol / R-1,2-propanediol (PGR)", "PGR"),
-    ("Propylene glycol / S-1,2-propanediol (PGO)", "PGO"),
-    ("Tetraethylene glycol (PG4)", "PG4"),
-    ("TMAO / trimethylamine oxide (TMO)", "TMO"),
-    ("Chelators", [
-      ("EDTA (EDT)", "EDT"),
-      ("Nitrilotriacetic acid (NTA)", "NTA"),
-    ]),
-    ("Reducing agents", [
-      ("Beta-mercaptoethanol (BME)", "BME"),
-      ("DTT / 2,3-dihydroxy-1,4-dithiobutane (DTT)", "DTT"),
-      ("TCEP / tris(2-carboxyethyl)phosphine (TCE)", "TCE"),
-    ]),
-    ("Organic acids", [
-      ("Citric acid (CIT)", "CIT"),
-      ("Citrate anion (FLC)", "FLC"),
-      ("Isocitric acid (ICT)", "ICT"),
-      ("Malate (MLT)", "MLT"),
-      ("Oxaloacetate (OAA)", "OAA"),
-      ("Oxalate (OXL)", "OXL"),
-    ]),
+    ("Tris (TRS)", "TRS"),
   ]),
   ("Detergents / lipids", [
     ("Detergents", [
-      ("DM (decyl maltoside) (DMU)", "DMU"),
-      ("DDM (dodecyl maltoside) (LMT)", "LMT"),
-      ("LDAO (LDA)", "LDA"),
-      ("BOG / beta-octylglucoside (BOG)", "BOG"),
-      ("BNG / beta-nonylglucoside (BNG)", "BNG"),
-      ("BGL / beta-2-octylglucoside (BGL)", "BGL"),
-      ("Octyl beta-D-galactopyranoside (HSH)", "HSH"),
-      ("CHAPSO (1N7)", "1N7"),
-      ("C8E4 (C8E)", "C8E"),
-      ("C10E6 (C10)", "C10"),
       ("Alpha-DDM / dodecyl-alpha-maltoside (LMU)", "LMU"),
+      ("BGL / beta-2-octylglucoside (BGL)", "BGL"),
+      ("BNG / beta-nonylglucoside (BNG)", "BNG"),
+      ("BOG / beta-octylglucoside (BOG)", "BOG"),
+      ("C10E6 (C10)", "C10"),
+      ("C8E4 (C8E)", "C8E"),
+      ("CHAPS (CPS)", "CPS"),
+      ("CHAPSO (1N7)", "1N7"),
+      ("Cyclohexyl-hexyl-beta-D-maltoside (MA4)", "MA4"),
+      ("CYMAL-4 (CVM)", "CVM"),
+      ("CYMAL-5 (CM5)", "CM5"),
+      ("DDM (dodecyl maltoside) (LMT)", "LMT"),
+      ("Digitonin (AJP)", "AJP"),
+      ("DM (decyl maltoside) (DMU)", "DMU"),
+      ("LDAO (LDA)", "LDA"),
+      ("LMNG (LMN)", "LMN"),
+      ("Octyl beta-D-galactopyranoside (HSH)", "HSH"),
+      ("OGNG (37X)", "37X"),
       ("Seleno-DDM / dodecyl-beta-selenomaltoside (LSM)", "LSM"),
       ("Undecyl maltoside (UMQ)", "UMQ"),
-      ("OGNG (37X)", "37X"),
-      ("LMNG (LMN)", "LMN"),
-      ("Digitonin (AJP)", "AJP"),
+    ]),
+    ("Lipids", [
+      ("Bile salts", [
+        ("Cholic acid (CHD)", "CHD"),
+        ("Deoxycholic acid (DXC)", "DXC"),
+        ("Taurodeoxycholate (6SB)", "6SB"),
+      ]),
+      ("Dicaproyl phosphatidylserine (PSF)", "PSF"),
+      ("Dioleoyl phosphatidylcholine (PCW)", "PCW"),
+      ("Dipalmitoyl phosphatidic acid (PX6)", "PX6"),
+      ("Dipalmitoyl phosphatidylethanolamine (PEF)", "PEF"),
+      ("Dipalmitoyl phosphatidylglycerol (LHG)", "LHG"),
+      ("Diundecyl phosphatidylcholine (PLC)", "PLC"),
+      ("PIPs / inositides", [
+        ("Dihexadecanoyl PI(3,4,5)P3 (PIZ)", "PIZ"),
+        ("Dihexadecanoyl PI(4,5)P2 (PIK)", "PIK"),
+        ("Dioctanoyl PI(3,4)P2 (52N)", "52N"),
+        ("Dioctanoyl PI(3,4,5)P3 (IP9)", "IP9"),
+        ("Phosphatidylinositol (T7X)", "T7X"),
+      ]),
+      ("Sphingolipids", [
+        ("Sphingomyelin (FO4)", "FO4"),
+        ("Sphingosine (SPH)", "SPH"),
+        ("Sphingosine-1-phosphate (S1P)", "S1P"),
+        ("Sulfatide (SLF)", "SLF"),
+        ("Sulfogalactocerebroside (SFT)", "SFT"),
+      ]),
     ]),
     ("Sterols", [
       ("Cholesterol (CLR)", "CLR"),
       ("Cholesteryl hemisuccinate (Y01)", "Y01"),
     ]),
-    ("Lipids", [
-      ("Diundecyl phosphatidylcholine (PLC)", "PLC"),
-      ("Dioleoyl phosphatidylcholine (PCW)", "PCW"),
-      ("Dipalmitoyl phosphatidylethanolamine (PEF)", "PEF"),
-      ("Dicaproyl phosphatidylserine (PSF)", "PSF"),
-      ("Dipalmitoyl phosphatidylglycerol (LHG)", "LHG"),
-      ("Dipalmitoyl phosphatidic acid (PX6)", "PX6"),
-      ("PIPs / inositides", [
-        ("Phosphatidylinositol (T7X)", "T7X"),
-        ("Dihexadecanoyl PI(4,5)P2 (PIK)", "PIK"),
-        ("Dioctanoyl PI(3,4)P2 (52N)", "52N"),
-        ("Dioctanoyl PI(3,4,5)P3 (IP9)", "IP9"),
-        ("Dihexadecanoyl PI(3,4,5)P3 (PIZ)", "PIZ"),
-      ]),
+  ]),
+  ("Ions / metals", [
+    ("Cations", [
+      ("Ammonium (NH4)", "NH4"),
+      ("Barium (BA)", "BA"),
+      ("Calcium (CA)", "CA"),
+      ("Cesium (CS)", "CS"),
+      ("Lithium (LI)", "LI"),
+      ("Magnesium (MG)", "MG"),
+      ("Potassium (K)", "K"),
+      ("Rubidium (RB)", "RB"),
+      ("Sodium (NA)", "NA"),
+      ("Strontium (SR)", "SR"),
+    ]),
+    ("Halides", [
+      ("Bromide (BR)", "BR"),
+      ("Chloride (CL)", "CL"),
+      ("Fluoride (F)", "F"),
+      ("Iodide (IOD)", "IOD"),
+    ]),
+    ("Heavy atoms", [
+      ("Europium(III) ion (EU3)", "EU3"),
+      ("Gadolinium ion (GD3)", "GD3"),
+      ("Gold ion (AU)", "AU"),
+      ("Holmium(III) ion (HO3)", "HO3"),
+      ("Iridium ion (IR)", "IR"),
+      ("Krypton (KR)", "KR"),
+      ("Lanthanum(III) ion (LA)", "LA"),
+      ("Lead(II) ion (PB)", "PB"),
+      ("Lutetium(III) ion (LU)", "LU"),
+      ("Mercury(II) ion (HG)", "HG"),
+      ("Osmium ion (OS)", "OS"),
+      ("Platinum(II) ion (PT)", "PT"),
+      ("Samarium(III) ion (SM)", "SM"),
+      ("Terbium(III) ion (TB)", "TB"),
+      ("Uranium (U1)", "U1"),
+      ("Uranyl(VI) ion (IUM)", "IUM"),
+      ("Xenon (XE)", "XE"),
+      ("Ytterbium(III) ion (YB)", "YB"),
+    ]),
+    ("Metal clusters", [
+      ("Fe-S cluster (35L)", "35L"),
+      ("Fe-S cluster (FS1)", "FS1"),
+      ("Fe-S cluster / cubane (SF4)", "SF4"),
+      ("FeMo cofactor-like cluster (ICS)", "ICS"),
+      ("Ni-Fe cluster (82N)", "82N"),
+      ("Tetranuclear copper-sulfide cluster (CUZ)", "CUZ"),
+    ]),
+    ("Other anions", [
+      ("Azide (AZI)", "AZI"),
+      ("Biselenite (BSY)", "BSY"),
+      ("Carbonate (CO3)", "CO3"),
+      ("Nitrate (NO3)", "NO3"),
+      ("Perchlorate (LCP)", "LCP"),
+      ("Phosphite (PO3)", "PO3"),
+      ("Sulfite (SO3)", "SO3"),
+      ("Thiocyanate (SCN)", "SCN"),
+    ]),
+    ("Oxyanions", [
+      ("Arsenate (ART)", "ART"),
+      ("Molybdate (MOO)", "MOO"),
+      ("Phosphate (PO4)", "PO4"),
+      ("Selenate (SE4)", "SE4"),
+      ("Sulfate (SO4)", "SO4"),
+      ("Tungstate (WO4)", "WO4"),
+      ("Vanadate (VO4)", "VO4"),
+    ]),
+    ("Transition / heavy metals", [
+      ("Barium (BA)", "BA"),
+      ("Cadmium (CD)", "CD"),
+      ("Cobalt (CO)", "CO"),
+      ("Copper (CU)", "CU"),
+      ("Gold ion (AU)", "AU"),
+      ("Iron (FE)", "FE"),
+      ("Manganese (MN)", "MN"),
+      ("Mercury(II) ion (HG)", "HG"),
+      ("Nickel (NI)", "NI"),
+      ("Platinum(II) ion (PT)", "PT"),
+      ("Strontium (SR)", "SR"),
+      ("Zinc (ZN)", "ZN"),
     ]),
   ]),
   ("Ligands", [
-    ("Nucleotides", [
-      ("Adenosine triphosphate (ATP)", "ATP"),
-      ("Adenosine diphosphate (ADP)", "ADP"),
-      ("Adenosine monophosphate (AMP)", "AMP"),
-      ("Guanosine triphosphate (GTP)", "GTP"),
-      ("Guanosine diphosphate (GDP)", "GDP"),
-      ("Guanosine monophosphate (5GP)", "5GP"),
-      ("Cytidine triphosphate (CTP)", "CTP"),
-      ("Cytidine diphosphate (CDP)", "CDP"),
-      ("Cytidine monophosphate (C5P)", "C5P"),
-      ("Uridine triphosphate (UTP)", "UTP"),
-      ("Uridine diphosphate (UDP)", "UDP"),
-      ("Uridine monophosphate (U)", "U"),
-    ]),
     ("Bases / nucleosides", [
       ("Adenine (ADE)", "ADE"),
-      ("Guanosine (GMP)", "GMP"),
-      ("Uridine (URI)", "URI"),
       ("Cytosine (CYT)", "CYT"),
+      ("Guanosine (GMP)", "GMP"),
       ("Uracil (URA)", "URA"),
+      ("Uridine (URI)", "URI"),
     ]),
     ("Cofactors", [
+      ("Acidic NAD+ form (NAJ)", "NAJ"),
+      ("Adenosine 5'-pentaphosphate (5FA)", "5FA"),
+      ("ADP-ribose (APR)", "APR"),
+      ("Coenzyme A (COA)", "COA"),
+      ("Cyclic ADP-ribose (CXR)", "CXR"),
+      ("Diadenosine pentaphosphate (AP5)", "AP5"),
+      ("Diadenosine tetraphosphate (B4P)", "B4P"),
+      ("Diadenosine triphosphate (BA3)", "BA3"),
+      ("Diguanosine pentaphosphate (GP5)", "GP5"),
+      ("Diguanosine triphosphate (GP3)", "GP3"),
+      ("Flavin adenine dinucleotide (FAD)", "FAD"),
+      ("Flavin mononucleotide (FMN)", "FMN"),
       ("Nicotinamide adenine dinucleotide (NAD)", "NAD"),
       ("Nicotinamide adenine dinucleotide phosphate (NAP)", "NAP"),
       ("Nicotinic acid adenine dinucleotide phosphate (DN4)", "DN4"),
-      ("Cyclic ADP-ribose (CXR)", "CXR"),
-      ("Acidic NAD+ form (NAJ)", "NAJ"),
+      ("ppGpp / guanosine 5',3'-tetraphosphate (G4P)", "G4P"),
       ("Reduced nicotinamide adenine dinucleotide (NAI)", "NAI"),
       ("Reduced nicotinamide adenine dinucleotide phosphate (NDP)", "NDP"),
-      ("Flavin adenine dinucleotide (FAD)", "FAD"),
-      ("Flavin mononucleotide (FMN)", "FMN"),
-      ("Coenzyme A (COA)", "COA"),
-      ("S-adenosylmethionine (SAM)", "SAM"),
       ("S-adenosylhomocysteine (SAH)", "SAH"),
-      ("ADP-ribose (APR)", "APR"),
-      ("Adenosine 5'-pentaphosphate (5FA)", "5FA"),
-      ("Diadenosine triphosphate (BA3)", "BA3"),
-      ("Diadenosine tetraphosphate (B4P)", "B4P"),
-      ("Diadenosine pentaphosphate (AP5)", "AP5"),
-      ("Diguanosine triphosphate (GP3)", "GP3"),
-      ("Diguanosine pentaphosphate (GP5)", "GP5"),
-      ("ppGpp / guanosine 5',3'-tetraphosphate (G4P)", "G4P"),
-    ]),
-    ("Non-hydrolysable nucleotide analogs", [
-      ("AMP-PNP / AMPPNP (ANP)", "ANP"),
-      ("AMP-PCP (ACP)", "ACP"),
-      ("AMP-CPP (APC)", "APC"),
-      ("GMP-PNP / GppNHp (GNP)", "GNP"),
-      ("GMP-PCP (GCP)", "GCP"),
-      ("GTPgammaS (GSP)", "GSP"),
-    ]),
-    ("Vitamin / coenzyme cofactors", [
-      ("Pyridoxal 5'-phosphate (PLP)", "PLP"),
-      ("Thiamine diphosphate (TPP)", "TPP"),
-      ("Biotin (BTN)", "BTN"),
-      ("Tetrahydrofolate (THG)", "THG"),
-      ("5,10-Methenyltetrahydrofolate (GUE)", "GUE"),
-    ]),
-    ("Hemes / porphyrins", [
-      ("Heme B (HEM)", "HEM"),
-      ("Heme C (HEC)", "HEC"),
-      ("Heme A (HEA)", "HEA"),
-      ("Heme O (HEO)", "HEO"),
-      ("Heme D (DHE)", "DHE"),
-      ("Heme-AS (HAS)", "HAS"),
-      ("Heme D hydroxychlorin spirolactone (HDD)", "HDD"),
-      ("Ferrous tetravinylporphine complex (HEV)", "HEV"),
-    ]),
-    ("Tetrapyrroles / chlorophylls", [
-      ("Protoporphyrin IX (PP9)", "PP9"),
-      ("Biliverdin (EL5)", "EL5"),
-      ("Phycocyanobilin (CYC)", "CYC"),
-      ("Chlorophyll A (CLA)", "CLA"),
-      ("Chlorophyll B (CHL)", "CHL"),
-      ("Chlorophyll D (CL7)", "CL7"),
-      ("Chlorophyll F (F6C)", "F6C"),
-      ("Bacteriochlorophyll A (BCL)", "BCL"),
-      ("Bacteriochlorophyll B (BCB)", "BCB"),
-      ("Pheophytin A (PHO)", "PHO"),
-    ]),
-    ("Immunosuppressants / macrocycles", [
-      ("Rapamycin (RAP)", "RAP"),
-      ("Ascomycin analog (FK5)", "FK5"),
-    ]),
-    ("Retinoids", [
-      ("Retinal (RET)", "RET"),
-      ("Retinol (RTL)", "RTL"),
-      ("All-trans retinoic acid (REA)", "REA"),
-      ("9-cis-retinoic acid (9CR)", "9CR"),
-    ]),
-    ("Protease inhibitors", [
-      ("Benzamidine (BEN)", "BEN"),
-      ("E-64 (E64)", "E64"),
-      ("AEBSF (AES)", "AES"),
-      ("PMSF (PMF)", "PMF"),
-      ("TLCK (TCK)", "TCK"),
-    ]),
-    ("Polyamines", [
-      ("Spermidine (SPD)", "SPD"),
-      ("Spermine (SPM)", "SPM"),
-      ("Putrescine (PUT)", "PUT"),
-      ("Cadaverine (N2P)", "N2P"),
+      ("S-adenosylmethionine (SAM)", "SAM"),
     ]),
     ("Free amino acids", [
       ("Alanine (ALA)", "ALA"),
@@ -5840,8 +6364,8 @@ COMMON_MONOMER_MENU = [
       ("Asparagine (ASN)", "ASN"),
       ("Aspartic acid (ASP)", "ASP"),
       ("Cysteine (CYS)", "CYS"),
-      ("Glutamine (GLN)", "GLN"),
       ("Glutamic acid (GLU)", "GLU"),
+      ("Glutamine (GLN)", "GLN"),
       ("Glycine (GLY)", "GLY"),
       ("Histidine (HIS)", "HIS"),
       ("Isoleucine (ILE)", "ILE"),
@@ -5856,46 +6380,182 @@ COMMON_MONOMER_MENU = [
       ("Tyrosine (TYR)", "TYR"),
       ("Valine (VAL)", "VAL"),
     ]),
-    ("Phosphosugars / inositol phosphates", [
-      ("Glucose-1-phosphate (G1P)", "G1P"),
-      ("Glucose-6-phosphate (G6P)", "G6P"),
-      ("Glucosamine-6-phosphate (GLP)", "GLP"),
-      ("N-acetylglucosamine-6-phosphate (4QY)", "4QY"),
-      ("Mannose-1-phosphate (M1P)", "M1P"),
-      ("Mannose-6-phosphate (M6P)", "M6P"),
-      ("Fructose-6-phosphate (F6P)", "F6P"),
-      ("Fructose-1,6-bisphosphate (FBP)", "FBP"),
-      ("Ribose-5-phosphate (R5P)", "R5P"),
-      ("Inositol-1-phosphate (IPD)", "IPD"),
-      ("Inositol-4-phosphate (I4D)", "I4D"),
-      ("Inositol-1,4-bisphosphate (2IP)", "2IP"),
-      ("Inositol-4,5-bisphosphate (IP2)", "IP2"),
-      ("Inositol-1,4,5-trisphosphate (I3P)", "I3P"),
-      ("Inositol-2,4,5-trisphosphate (I2P)", "I2P"),
-      ("Inositol tetrakisphosphate (4IP)", "4IP"),
-      ("Inositol pentakisphosphate (I5P)", "I5P"),
-      ("Inositol hexakisphosphate / phytate (IHP)", "IHP"),
-    ]),
     ("Free sugars", [
-      ("Alpha-D-glucose (GLC)", "GLC"),
-      ("Beta-D-glucose (BGC)", "BGC"),
-      ("Beta-D-galactose (GAL)", "GAL"),
       ("Alpha-D-galactose (GLA)", "GLA"),
-      ("Mannose (MAN)", "MAN"),
-      ("Fucose (FUC)", "FUC"),
-      ("Fructose (FRU)", "FRU"),
-      ("Xylose (XYS)", "XYS"),
+      ("Alpha-D-glucose (GLC)", "GLC"),
       ("Alpha-D-ribofuranose (RIB)", "RIB"),
       ("Alpha-L-arabinose (ARA)", "ARA"),
+      ("Beta-D-galactose (GAL)", "GAL"),
+      ("Beta-D-glucose (BGC)", "BGC"),
+      ("Fructose (FRU)", "FRU"),
+      ("Fucose (FUC)", "FUC"),
+      ("Mannose (MAN)", "MAN"),
+      ("Xylose (XYS)", "XYS"),
     ]),
+    ("Hemes / porphyrins", [
+      ("Ferrous tetravinylporphine complex (HEV)", "HEV"),
+      ("Heme A (HEA)", "HEA"),
+      ("Heme B (HEM)", "HEM"),
+      ("Heme C (HEC)", "HEC"),
+      ("Heme D (DHE)", "DHE"),
+      ("Heme D hydroxychlorin spirolactone (HDD)", "HDD"),
+      ("Heme O (HEO)", "HEO"),
+      ("Heme-AS (HAS)", "HAS"),
+    ]),
+    ("Immunosuppressants / macrocycles", [
+      ("Ascomycin analog (FK5)", "FK5"),
+      ("Rapamycin (RAP)", "RAP"),
+    ]),
+    ("Non-hydrolysable nucleotide analogs", [
+      ("AMP-CPP (APC)", "APC"),
+      ("AMP-PCP (ACP)", "ACP"),
+      ("AMP-PNP / AMPPNP (ANP)", "ANP"),
+      ("GMP-PCP (GCP)", "GCP"),
+      ("GMP-PNP / GppNHp (GNP)", "GNP"),
+      ("GTPgammaS (GSP)", "GSP"),
+    ]),
+    ("Nucleotides", [
+      ("Adenosine diphosphate (ADP)", "ADP"),
+      ("Adenosine monophosphate (AMP)", "AMP"),
+      ("Adenosine triphosphate (ATP)", "ATP"),
+      ("Cytidine diphosphate (CDP)", "CDP"),
+      ("Cytidine monophosphate (C5P)", "C5P"),
+      ("Cytidine triphosphate (CTP)", "CTP"),
+      ("Guanosine diphosphate (GDP)", "GDP"),
+      ("Guanosine monophosphate (5GP)", "5GP"),
+      ("Guanosine triphosphate (GTP)", "GTP"),
+      ("Uridine diphosphate (UDP)", "UDP"),
+      ("Uridine monophosphate (U)", "U"),
+      ("Uridine triphosphate (UTP)", "UTP"),
+    ]),
+    ("Phosphosugars / inositol phosphates", [
+      ("Fructose-1,6-bisphosphate (FBP)", "FBP"),
+      ("Fructose-6-phosphate (F6P)", "F6P"),
+      ("Glucosamine-6-phosphate (GLP)", "GLP"),
+      ("Glucose-1-phosphate (G1P)", "G1P"),
+      ("Glucose-6-phosphate (G6P)", "G6P"),
+      ("Inositol hexakisphosphate / phytate (IHP)", "IHP"),
+      ("Inositol pentakisphosphate (I5P)", "I5P"),
+      ("Inositol tetrakisphosphate (4IP)", "4IP"),
+      ("Inositol-1,4,5-trisphosphate (I3P)", "I3P"),
+      ("Inositol-1,4-bisphosphate (2IP)", "2IP"),
+      ("Inositol-1-phosphate (IPD)", "IPD"),
+      ("Inositol-2,4,5-trisphosphate (I2P)", "I2P"),
+      ("Inositol-4,5-bisphosphate (IP2)", "IP2"),
+      ("Inositol-4-phosphate (I4D)", "I4D"),
+      ("Mannose-1-phosphate (M1P)", "M1P"),
+      ("Mannose-6-phosphate (M6P)", "M6P"),
+      ("N-acetylglucosamine-6-phosphate (4QY)", "4QY"),
+      ("Ribose-5-phosphate (R5P)", "R5P"),
+    ]),
+    ("Polyamines", [
+      ("Cadaverine (N2P)", "N2P"),
+      ("Putrescine (PUT)", "PUT"),
+      ("Spermidine (SPD)", "SPD"),
+      ("Spermine (SPM)", "SPM"),
+    ]),
+    ("Protease inhibitors", [
+      ("AEBSF (AES)", "AES"),
+      ("Benzamidine (BEN)", "BEN"),
+      ("E-64 (E64)", "E64"),
+      ("PMSF (PMF)", "PMF"),
+      ("TLCK (TCK)", "TCK"),
+    ]),
+    ("Retinoids", [
+      ("9-cis-retinoic acid (9CR)", "9CR"),
+      ("All-trans retinoic acid (REA)", "REA"),
+      ("Retinal (RET)", "RET"),
+      ("Retinol (RTL)", "RTL"),
+    ]),
+    ("Tetrapyrroles / chlorophylls", [
+      ("Bacteriochlorophyll A (BCL)", "BCL"),
+      ("Bacteriochlorophyll B (BCB)", "BCB"),
+      ("Biliverdin (EL5)", "EL5"),
+      ("Chlorophyll A (CLA)", "CLA"),
+      ("Chlorophyll B (CHL)", "CHL"),
+      ("Chlorophyll D (CL7)", "CL7"),
+      ("Chlorophyll F (F6C)", "F6C"),
+      ("Pheophytin A (PHO)", "PHO"),
+      ("Phycocyanobilin (CYC)", "CYC"),
+      ("Protoporphyrin IX (PP9)", "PP9"),
+    ]),
+    ("Vitamin / coenzyme cofactors", [
+      ("5,10-Methenyltetrahydrofolate (GUE)", "GUE"),
+      ("Biotin (BTN)", "BTN"),
+      ("Pyridoxal 5'-phosphate (PLP)", "PLP"),
+      ("Tetrahydrofolate (THG)", "THG"),
+      ("Thiamine diphosphate (TPP)", "TPP"),
+    ]),
+  ]),
+  ("Solvents / additives", [
+    ("1,4-Butanediol (BU1)", "BU1"),
+    ("1-Butanol (1BO)", "1BO"),
+    ("Acetate (ACT)", "ACT"),
+    ("Acetonitrile (CCN)", "CCN"),
+    ("Ammonium (NH4)", "NH4"),
+    ("Azide (AZI)", "AZI"),
+    ("Carbonate (CO3)", "CO3"),
+    ("Chelators", [
+      ("EDTA (EDT)", "EDT"),
+      ("Nitrilotriacetic acid (NTA)", "NTA"),
+    ]),
+    ("DMSO (DMS)", "DMS"),
+    ("Ethanol (EOH)", "EOH"),
+    ("Ethylene glycol (EDO)", "EDO"),
+    ("Formic acid (FMT)", "FMT"),
+    ("Glycerol (GOL)", "GOL"),
+    ("Isopropanol (IPA)", "IPA"),
+    ("Methanol (MOH)", "MOH"),
+    ("MPD (MPD)", "MPD"),
+    ("n-Propanol (POL)", "POL"),
+    ("Nitrate (NO3)", "NO3"),
+    ("Organic acids", [
+      ("Citrate anion (FLC)", "FLC"),
+      ("Citric acid (CIT)", "CIT"),
+      ("Isocitric acid (ICT)", "ICT"),
+      ("Malate (MLT)", "MLT"),
+      ("Malonate (MLI)", "MLI"),
+      ("Oxalate (OXL)", "OXL"),
+      ("Oxaloacetate (OAA)", "OAA"),
+    ]),
+    ("Organic cations", [
+      ("Tetrabutylammonium (TBA)", "TBA"),
+      ("Tetramethylammonium (TMA)", "TMA"),
+      ("Triethylammonium (TEA)", "TEA"),
+    ]),
+    ("PEG (PEG)", "PEG"),
+    ("Propylene glycol / R-1,2-propanediol (PGR)", "PGR"),
+    ("Propylene glycol / S-1,2-propanediol (PGO)", "PGO"),
+    ("Reducing agents", [
+      ("Beta-mercaptoethanol (BME)", "BME"),
+      ("DTT / 2,3-dihydroxy-1,4-dithiobutane (DTT)", "DTT"),
+      ("TCEP / tris(2-carboxyethyl)phosphine (TCE)", "TCE"),
+    ]),
+    ("Tartaric acid", [
+      ("D(-)-Tartaric acid (TAR)", "TAR"),
+      ("L(+)-Tartaric acid (TLA)", "TLA"),
+    ]),
+    ("Taurine (TAU)", "TAU"),
+    ("Tetraethylene glycol (PG4)", "PG4"),
+    ("Thiocyanate (SCN)", "SCN"),
+    ("TMAO / trimethylamine oxide (TMO)", "TMO"),
+    ("Urea (URE)", "URE"),
   ]),
 ]
 
+# Some "monomers" are really better handled as typed atoms or built-in simple
+# groups. Those are placed at the pointer instead of going through get_monomer().
 COMMON_MONOMER_POINTER_TYPES = {
+  "LI": "Li",
   "MG": "Mg",
   "CA": "Ca",
   "NA": "Na",
   "K": "K",
+  "RB": "Rb",
+  "CS": "Cs",
+  "SR": "Sr",
+  "BA": "Ba",
+  "F": "F",
   "CL": "Cl",
   "BR": "Br",
   "IOD": "I",
@@ -5929,6 +6589,7 @@ COMMON_MONOMER_POINTER_TYPES = {
 
 
 def place_common_monomer(monomer_code):
+  """Place a common monomer or simple ion at the pointer/current centre."""
   pointer_type = COMMON_MONOMER_POINTER_TYPES.get(monomer_code)
   if pointer_type:
     place_typed_atom_at_pointer(pointer_type)
@@ -6022,6 +6683,7 @@ def _coordination_pair_from_clicks(click_1, click_2, metal_codes, donor_elements
 
 
 def _start_coordination_link_clicks(label, metal_codes, metal_label, donor_elements, donor_label, distance):
+  """Start a two-click workflow for ad hoc coordination links."""
   add_status_bar_text(f"{label}: click the metal atom and donor atom")
 
   def make_link_from_clicks(*args):
@@ -6055,6 +6717,7 @@ def _start_coordination_link_clicks(label, metal_codes, metal_label, donor_eleme
 
 
 def _make_coordination_link(label, metal_codes, metal_label, donor_elements, donor_label, distance, range_text=""):
+  """Prompt for a target distance, then start the two-click link helper."""
   def submit_distance(value):
     try:
       chosen_distance = float(str(value).strip())
@@ -6083,6 +6746,7 @@ def _make_coordination_link(label, metal_codes, metal_label, donor_elements, don
 
 
 def add_coordination_link_menu_entries(menu, entries):
+  """Recursively populate the Coordination links submenu."""
   if menu is None:
     return None
   for label, value in entries:
@@ -6107,6 +6771,7 @@ def add_coordination_link_menu_entries(menu, entries):
 
 
 def _replace_active_residue_with_monomer(required_resname, required_label, target_resname, modification_label):
+  """Apply a replace-residue style covalent modification to the active residue."""
   residue = active_residue()
   if not residue:
     info_dialog(f"{modification_label} requires an active residue.")
@@ -6156,27 +6821,6 @@ def _regularize_linked_residues(imol, base_spec, new_res_spec_py):
   return status
 
 
-def _add_linked_modification(required_resname, required_label, new_residue_comp_id, link_type, modification_label):
-  residue = active_residue()
-  if not residue:
-    info_dialog(f"{modification_label} requires an active residue.")
-    return 0
-
-  mol_id, ch_id, resno, ins_code = residue[:4]
-  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
-  if current_resname != required_resname:
-    info_dialog(f"{modification_label} requires the active residue to be {required_label}.")
-    return 0
-
-  new_res_spec = coot.add_linked_residue_py(mol_id, ch_id, resno, ins_code, new_residue_comp_id, link_type, 2)
-  if not new_res_spec:
-    info_dialog(f"Failed to apply {modification_label} to the active {required_label} residue.")
-    return 0
-
-  _regularize_linked_residues(mol_id, (ch_id, resno, ins_code), new_res_spec)
-  return 1
-
-
 def _atom_xyz_map(imol, chain_id, resno, ins_code):
   atom_info = residue_info_py(imol, chain_id, resno, ins_code)
   if not isinstance(atom_info, list):
@@ -6215,6 +6859,11 @@ def _find_unused_resno_near(imol, chain_id, start_resno):
 
 def _merge_ligand_and_make_named_link(required_resname, required_label, ligand_comp_id, link_name,
                                       ligand_atom_name, residue_atom_name, bond_length, modification_label):
+  """Import a ligand monomer, merge it into the active model, then create a named link.
+
+  This is used for modifications that are represented by a separate linked
+  component rather than a single replacement residue.
+  """
   residue = active_residue()
   if not residue:
     info_dialog(f"{modification_label} requires an active residue.")
@@ -6278,106 +6927,186 @@ def _merge_ligand_and_make_named_link(required_resname, required_label, ligand_c
       coot.close_molecule(ligand_imol)
 
 
-def apply_palmitoylation_cys():
-  return _replace_active_residue_with_monomer("CYS", "Cys", "P1L", "Palmitoylation")
+COVALENT_MODIFICATION_MENU = [
+  ("Palmitoylation (Cys)", {
+    "mode": "replace",
+    "required_resname": "CYS",
+    "required_label": "Cys",
+    "target_resname": "P1L",
+    "modification_label": "Palmitoylation",
+  }),
+  ("BME adduct (Cys)", {
+    "mode": "merge_link",
+    "required_resname": "CYS",
+    "required_label": "Cys",
+    "ligand_comp_id": "BME",
+    "link_name": "CYS-BME",
+    "ligand_atom_name": " S2 ",
+    "residue_atom_name": " SG ",
+    "bond_length": 2.023,
+    "modification_label": "BME adduct",
+  }),
+  ("PLP linkage (Lys)", {
+    "mode": "merge_link",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "ligand_comp_id": "PLP",
+    "link_name": "LYS-PLP",
+    "ligand_atom_name": " C4A",
+    "residue_atom_name": " NZ ",
+    "bond_length": 1.270,
+    "modification_label": "PLP linkage",
+  }),
+  ("Monomethyl-Lys (Lys)", {
+    "mode": "replace",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "target_resname": "MLZ",
+    "modification_label": "Monomethyl-Lys",
+  }),
+  ("Dimethyl-Lys (Lys)", {
+    "mode": "replace",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "target_resname": "MLY",
+    "modification_label": "Dimethyl-Lys",
+  }),
+  ("Trimethyl-Lys (Lys)", {
+    "mode": "replace",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "target_resname": "M3L",
+    "modification_label": "Trimethyl-Lys",
+  }),
+  ("Acetyl-Lys (Lys)", {
+    "mode": "replace",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "target_resname": "ALY",
+    "modification_label": "Acetyl-Lys",
+  }),
+  ("Carboxy-Lys (Lys)", {
+    "mode": "replace",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "target_resname": "KCX",
+    "modification_label": "Carboxy-Lys",
+  }),
+  ("Retinal linkage (Lys)", {
+    "mode": "merge_link",
+    "required_resname": "LYS",
+    "required_label": "Lys",
+    "ligand_comp_id": "RET",
+    "link_name": "LYS-RET",
+    "ligand_atom_name": " C15",
+    "residue_atom_name": " NZ ",
+    "bond_length": 1.267,
+    "modification_label": "Retinal linkage",
+  }),
+  ("Phosphoserine (Ser)", {
+    "mode": "replace",
+    "required_resname": "SER",
+    "required_label": "Ser",
+    "target_resname": "SEP",
+    "modification_label": "Phosphoserine",
+  }),
+  ("Phosphothreonine (Thr)", {
+    "mode": "replace",
+    "required_resname": "THR",
+    "required_label": "Thr",
+    "target_resname": "TPO",
+    "modification_label": "Phosphothreonine",
+  }),
+  ("Phosphotyrosine (Tyr)", {
+    "mode": "replace",
+    "required_resname": "TYR",
+    "required_label": "Tyr",
+    "target_resname": "PTR",
+    "modification_label": "Phosphotyrosine",
+  }),
+  ("Selenomethionine (Met)", {
+    "mode": "replace",
+    "required_resname": "MET",
+    "required_label": "Met",
+    "target_resname": "MSE",
+    "modification_label": "Selenomethionine",
+  }),
+  ("Methionine sulfoxide (Met)", {
+    "mode": "replace",
+    "required_resname": "MET",
+    "required_label": "Met",
+    "target_resname": "SME",
+    "modification_label": "Methionine sulfoxide",
+  }),
+  ("Hydroxyproline (Pro)", {
+    "mode": "replace",
+    "required_resname": "PRO",
+    "required_label": "Pro",
+    "target_resname": "HYP",
+    "modification_label": "Hydroxyproline",
+  }),
+  ("Citrullination (Arg)", {
+    "mode": "replace",
+    "required_resname": "ARG",
+    "required_label": "Arg",
+    "target_resname": "CIR",
+    "modification_label": "Citrullination",
+  }),
+  ("Methyl-Arg (Arg)", {
+    "mode": "replace",
+    "required_resname": "ARG",
+    "required_label": "Arg",
+    "target_resname": "AGM",
+    "modification_label": "Methyl-Arg",
+  }),
+  ("S-hydroxycysteine (Cys)", {
+    "mode": "replace",
+    "required_resname": "CYS",
+    "required_label": "Cys",
+    "target_resname": "CSO",
+    "modification_label": "S-hydroxycysteine",
+  }),
+]
 
 
-def apply_plp_linkage_lys():
-  return _merge_ligand_and_make_named_link("LYS", "Lys", "PLP", "LYS-PLP",
-                                           " C4A", " NZ ", 1.270, "PLP linkage")
-
-
-def apply_bme_adduct_cys():
-  return _merge_ligand_and_make_named_link("CYS", "Cys", "BME", "CYS-BME",
-                                           " S2 ", " SG ", 2.023, "BME adduct")
-
-
-def apply_monomethyl_lys():
-  return _replace_active_residue_with_monomer("LYS", "Lys", "MLZ", "Monomethyl-Lys")
-
-
-def apply_dimethyl_lys():
-  return _replace_active_residue_with_monomer("LYS", "Lys", "MLY", "Dimethyl-Lys")
-
-
-def apply_trimethyl_lys():
-  return _replace_active_residue_with_monomer("LYS", "Lys", "M3L", "Trimethyl-Lys")
-
-
-def apply_acetyl_lys():
-  return _replace_active_residue_with_monomer("LYS", "Lys", "ALY", "Acetyl-Lys")
-
-
-def apply_carboxy_lys():
-  return _replace_active_residue_with_monomer("LYS", "Lys", "KCX", "Carboxy-Lys")
-
-
-def apply_retinal_linkage_lys():
-  return _merge_ligand_and_make_named_link("LYS", "Lys", "RET", "LYS-RET",
-                                           " C15", " NZ ", 1.267, "Retinal linkage")
-
-
-def apply_phosphoserine():
-  return _replace_active_residue_with_monomer("SER", "Ser", "SEP", "Phosphoserine")
-
-
-def apply_phosphothreonine():
-  return _replace_active_residue_with_monomer("THR", "Thr", "TPO", "Phosphothreonine")
-
-
-def apply_phosphotyrosine():
-  return _replace_active_residue_with_monomer("TYR", "Tyr", "PTR", "Phosphotyrosine")
-
-
-def apply_selenomethionine():
-  return _replace_active_residue_with_monomer("MET", "Met", "MSE", "Selenomethionine")
-
-
-def apply_methionine_sulfoxide():
-  return _replace_active_residue_with_monomer("MET", "Met", "SME", "Methionine sulfoxide")
-
-
-def apply_hydroxyproline():
-  return _replace_active_residue_with_monomer("PRO", "Pro", "HYP", "Hydroxyproline")
-
-
-def apply_citrulline():
-  return _replace_active_residue_with_monomer("ARG", "Arg", "CIR", "Citrullination")
-
-
-def apply_methyl_arginine():
-  return _replace_active_residue_with_monomer("ARG", "Arg", "AGM", "Methyl-Arg")
-
-
-def apply_s_hydroxycysteine():
-  return _replace_active_residue_with_monomer("CYS", "Cys", "CSO", "S-hydroxycysteine")
+def _apply_covalent_modification(spec):
+  """Dispatch a covalent-modification menu entry from a single data record."""
+  if spec["mode"] == "replace":
+    return _replace_active_residue_with_monomer(
+      spec["required_resname"],
+      spec["required_label"],
+      spec["target_resname"],
+      spec["modification_label"],
+    )
+  if spec["mode"] == "merge_link":
+    return _merge_ligand_and_make_named_link(
+      spec["required_resname"],
+      spec["required_label"],
+      spec["ligand_comp_id"],
+      spec["link_name"],
+      spec["ligand_atom_name"],
+      spec["residue_atom_name"],
+      spec["bond_length"],
+      spec["modification_label"],
+    )
+  raise ValueError("Unknown covalent modification mode: {0}".format(spec["mode"]))
 
 
 def add_covalent_modification_menu_entries(menu):
+  """Populate the Build -> Covalent modifications submenu."""
   if menu is None:
     return None
 
-  add_simple_coot_menu_menuitem(menu, "Palmitoylation (Cys)", lambda func: apply_palmitoylation_cys())
-  add_simple_coot_menu_menuitem(menu, "BME adduct (Cys)", lambda func: apply_bme_adduct_cys())
-  add_simple_coot_menu_menuitem(menu, "PLP linkage (Lys)", lambda func: apply_plp_linkage_lys())
-  add_simple_coot_menu_menuitem(menu, "Monomethyl-Lys (Lys)", lambda func: apply_monomethyl_lys())
-  add_simple_coot_menu_menuitem(menu, "Dimethyl-Lys (Lys)", lambda func: apply_dimethyl_lys())
-  add_simple_coot_menu_menuitem(menu, "Trimethyl-Lys (Lys)", lambda func: apply_trimethyl_lys())
-  add_simple_coot_menu_menuitem(menu, "Acetyl-Lys (Lys)", lambda func: apply_acetyl_lys())
-  add_simple_coot_menu_menuitem(menu, "Carboxy-Lys (Lys)", lambda func: apply_carboxy_lys())
-  add_simple_coot_menu_menuitem(menu, "Retinal linkage (Lys)", lambda func: apply_retinal_linkage_lys())
-  add_simple_coot_menu_menuitem(menu, "Phosphoserine (Ser)", lambda func: apply_phosphoserine())
-  add_simple_coot_menu_menuitem(menu, "Phosphothreonine (Thr)", lambda func: apply_phosphothreonine())
-  add_simple_coot_menu_menuitem(menu, "Phosphotyrosine (Tyr)", lambda func: apply_phosphotyrosine())
-  add_simple_coot_menu_menuitem(menu, "Selenomethionine (Met)", lambda func: apply_selenomethionine())
-  add_simple_coot_menu_menuitem(menu, "Methionine sulfoxide (Met)", lambda func: apply_methionine_sulfoxide())
-  add_simple_coot_menu_menuitem(menu, "Hydroxyproline (Pro)", lambda func: apply_hydroxyproline())
-  add_simple_coot_menu_menuitem(menu, "Citrullination (Arg)", lambda func: apply_citrulline())
-  add_simple_coot_menu_menuitem(menu, "Methyl-Arg (Arg)", lambda func: apply_methyl_arginine())
-  add_simple_coot_menu_menuitem(menu, "S-hydroxycysteine (Cys)", lambda func: apply_s_hydroxycysteine())
+  for label, spec in COVALENT_MODIFICATION_MENU:
+    add_simple_coot_menu_menuitem(
+      menu,
+      label,
+      lambda func, item_spec=spec: _apply_covalent_modification(item_spec),
+    )
 
 
 def add_common_monomer_menu_entries(menu, entries):
+  """Recursively populate the Common monomers submenu from nested menu data."""
   if menu is None:
     return None
   for label, value in entries:
@@ -6564,7 +7293,7 @@ def renumber_seg_by_active_res():
   str(active_residue()[2]),"Renumber",renum_seg)
 
 def find_sequence_with_entry():
-  generic_single_entry("Enter sequence fragment to find",
+  generic_single_entry("Enter sequence fragment to find\n(X=wildcard, (A/S)=either residue)",
   "MAAAA","Find sequence in active chain",find_sequence_in_current_chain)
 
 def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
@@ -6601,15 +7330,17 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
     lambda text, stay_open_qm: make_restr(text, stay_open_qm))
 '''
 
+# Re-enable the archived helper functions only after the live GTK4-safe
+# replacements above have been defined.
 try:
   exec(GTK_DIALOG_FUNCTION_ARCHIVE, globals(), globals())
 except Exception:
   print("coot_trimmings dialog archive activation failed")
   traceback.print_exc()
 
-#
-# The full custom menu block is preserved verbatim below. Remove the opening
-# and closing triple quotes around the archive to re-enable it.
+# Preserve the older menu-building block as a clearly separated archive. The
+# main Coot 1.x menu layout should be edited in the live menu code above; this
+# archive is primarily here so legacy items can be compared or revived safely.
 GTK_UI_ARCHIVE = r'''
 #****Make and arrange menus****
 
@@ -6655,6 +7386,9 @@ lambda func: clear_distances_and_labels())
 
 add_simple_coot_menu_menuitem(submenu_display, "Toggle high-contrast model lighting",
 lambda func: toggle_high_contrast_mode())
+
+add_simple_coot_menu_menuitem(submenu_display, "Yellow-ify carbons",
+lambda func: yellowify_carbons_in_active_molecule())
 
 add_simple_coot_menu_menuitem(submenu_display,
 "Switch all mols to CA representation",lambda func: all_mols_to_ca())
@@ -6702,26 +7436,13 @@ add_simple_coot_menu_menuitem(submenu_colour, "Highlight chain breaks in active 
 
 add_simple_coot_menu_menuitem(submenu_colour, "Highlight chain breaks in all mols", lambda func: highlight_all_chain_breaks())
 
-add_simple_coot_menu_menuitem(submenu_display, "Open current view in UCSF Chimera. Experimental!", lambda func: open_in_chimera())
-
-add_simple_coot_menu_menuitem(submenu_display, "Show local probe dots (H-bonds, VdW and baddies only)", lambda func: local_hbonds_and_baddies())
-
-add_simple_coot_menu_menuitem(submenu_display, "Show global probe dots (bad overlaps only)", lambda func: global_hbonds_and_baddies())
-
-add_simple_coot_menu_menuitem(submenu_display, "Clear probe dots", lambda func: clear_dots())
-
 add_simple_coot_menu_menuitem(submenu_display, "Find sequence in active chain", lambda func: find_sequence_with_entry())
-
-add_simple_coot_menu_menuitem(submenu_display, "Make stereo-wiggle GIF of current scenre (Needs ImageMagick!)", lambda func: make_rot_gif())
 
 
 
 #"Fit..."
 add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", 
 lambda func: rigid_fit_all_chains())
-
-add_simple_coot_menu_menuitem(submenu_fit, "Stepped sphere refine active chain",
-lambda func: stepped_sphere_refine(active_residue()[0],active_residue()[1]))
 
 add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", 
 lambda func: rigid_fit_active_chain())
@@ -6743,12 +7464,7 @@ add_simple_coot_menu_menuitem(submenu_fit, "Fit all segments", lambda func: rigi
 add_simple_coot_menu_menuitem(submenu_fit, "Fit this segment", lambda func: fit_this_segment())
 
 add_simple_coot_menu_menuitem(submenu_fit,
-"Prosmart self restrain active mol",lambda func: run_prosmart_self())
-
-add_simple_coot_menu_menuitem(submenu_fit,
-"Cylinder refine (click start and end of range)",lambda func: refine_residues_sphere_click())
-
-add_simple_coot_menu_menuitem(submenu_fit, "Add distance restraint (click two atoms)",lambda func:  user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0))
+"Smart self restrain active mol...",lambda func: prompt_generate_smart_local_extra_restraints())
 
 #"Renumber..."
 
@@ -6824,10 +7540,6 @@ add_simple_coot_menu_menuitem(submenu_build, "Make 3-10 helix of length n", lamb
 
 add_simple_coot_menu_menuitem(submenu_build, "Build polyala loop (click start,end)", lambda func: fit_polyala_gui())
 
-add_simple_coot_menu_menuitem(submenu_build, "Rebuild backbone (click start,end)", lambda func: rebuild_backbone_wrapper())
-
-add_simple_coot_menu_menuitem(submenu_build, "Rebuild and reverse backbone of segment (click segment)", lambda func: rebuild_backbone_reverse_wrapper())
-
 
 
 
@@ -6859,6 +7571,12 @@ add_simple_coot_menu_menuitem(submenu_modify, "Copy active segment", lambda func
 add_simple_coot_menu_menuitem(submenu_modify, "Cut active segment", lambda func: cut_active_segment())
 
 add_simple_coot_menu_menuitem(submenu_modify,
+"Smart copy active non-polymer residue", lambda func: smart_copy_active_non_polymer_residue())
+
+add_simple_coot_menu_menuitem(submenu_modify,
+"Smart paste copied non-polymer residue", lambda func: smart_paste_copied_non_polymer_residue())
+
+add_simple_coot_menu_menuitem(submenu_modify,
 "Copy fragment (click start and end)", lambda func: copy_frag_by_click())
 
 add_simple_coot_menu_menuitem(submenu_modify,
@@ -6885,6 +7603,8 @@ if GUI_PYTHON_AVAILABLE:
   if "Gio" not in globals() and hasattr(coot_gui, "Gio"):
     Gio = coot_gui.Gio
   try:
+    # Some legacy menu items are still useful in Coot 1.x, so keep the old
+    # archive loadable instead of rewriting the whole block by hand.
     exec(GTK_UI_ARCHIVE, globals(), globals())
   except Exception:
     print("coot_trimmings GUI archive activation failed")
