@@ -42,6 +42,8 @@ from coot_utils import *
 #
 if not hasattr(coot_utils, "regularize_zone"):
   coot_utils.regularize_zone = coot.regularize_zone
+if not hasattr(coot_utils, "get_view_matrix_element"):
+  coot_utils.get_view_matrix_element = coot.get_view_matrix_element
 
 def _gap_residue_info_compat(imol, chain_id, resno, ins_code):
   """Match gap.py's older expectation that residue_info() returns a list."""
@@ -102,6 +104,10 @@ COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
 EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
 EM_TARGET_PIXEL_SIZE = 0.5
+MAP_BRIGHTEN_SCALE_FACTOR = 1.05
+MAP_DARKEN_SCALE_FACTOR = 1.0 / MAP_BRIGHTEN_SCALE_FACTOR
+MAP_BRIGHTNESS_MIN_COMPONENT = 0.05
+MAP_BRIGHTNESS_MAX_COMPONENT = 1.0
 
 # EM-ringer-like side-chain density helper defaults.
 EMRINGER_HELPER_STEP_DEGREES = 15.0
@@ -1507,15 +1513,22 @@ if GUI_PYTHON_AVAILABLE:
     window.present()
     entry.grab_focus()
 
-  def generic_confirm_dialog(function_label, message_text, confirm_button_label, handle_confirm_function):
-    """Small GTK4-safe confirmation dialog for potentially expensive actions."""
+  def generic_confirm_dialog(
+    function_label,
+    message_text,
+    cancel_button_label,
+    handle_cancel_function,
+    confirm_button_label,
+    handle_confirm_function,
+  ):
+    """Small GTK4-safe two-option dialog for potentially expensive actions."""
     window = Gtk.Window()
     window.set_title("Coot")
 
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     label = Gtk.Label(label=message_text)
-    cancel_button = Gtk.Button(label="Cancel")
+    cancel_button = Gtk.Button(label=cancel_button_label)
     confirm_button = Gtk.Button(label=confirm_button_label)
 
     label.set_margin_start(12)
@@ -1533,12 +1546,17 @@ if GUI_PYTHON_AVAILABLE:
       window.destroy()
       return False
 
+    def cancel(*_args):
+      handle_cancel_function()
+      window.destroy()
+      return False
+
     def submit(*_args):
       handle_confirm_function()
       window.destroy()
       return False
 
-    cancel_button.connect("clicked", close_window)
+    cancel_button.connect("clicked", cancel)
     confirm_button.connect("clicked", submit)
 
     vbox.append(label)
@@ -2122,7 +2140,12 @@ else:
     info_dialog(_gui_unavailable_message(function_label))
 
   def generic_confirm_dialog(
-    function_label, _message_text, _confirm_button_label, _handle_confirm_function
+    function_label,
+    _message_text,
+    _cancel_button_label,
+    _handle_cancel_function,
+    _confirm_button_label,
+    _handle_confirm_function,
   ):
     info_dialog(_gui_unavailable_message(function_label))
 
@@ -2234,6 +2257,12 @@ lambda: smart_paste_copied_non_polymer_residue())
 #Toggle global display of map
 add_key_binding("Toggle global view of map","G",
 lambda: toggle_global_map_view())
+
+#Darken/Brighten current scrollable map
+add_key_binding("Darken current map",",",
+lambda: darken_scrollable_map())
+add_key_binding("Brighten current map",".",
+lambda: brighten_scrollable_map())
 
 #Generate smart extra distance restraints on active model
 add_key_binding("Generate smart local extra restraints","g",
@@ -3883,6 +3912,53 @@ def step_current_map_coarse_down():
   step_map_coarse_down(map_id)
 
 
+def _map_brightness_scale_would_clip(map_id, scale_factor):
+  """Return True if a brighten/darken step would trigger Coot's colour clamp."""
+  try:
+    current_colour = map_colour_components_py(map_id)
+  except Exception:
+    return False
+  if not isinstance(current_colour, (list, tuple)):
+    return False
+  try:
+    for component in current_colour:
+      proposed = float(component) * float(scale_factor)
+      if proposed < MAP_BRIGHTNESS_MIN_COMPONENT or proposed > MAP_BRIGHTNESS_MAX_COMPONENT:
+        return True
+  except Exception:
+    return False
+  return False
+
+
+def _scale_scrollable_map_brightness(scale_factor, status_message, clipped_message):
+  """Brighten or darken only the current scrollable map."""
+  map_id = _scrollable_map_or_status()
+  if map_id is None:
+    return None
+  if _map_brightness_scale_would_clip(map_id, scale_factor):
+    add_status_bar_text(clipped_message)
+    return None
+  coot_utils.brighten_map(map_id, scale_factor)
+  add_status_bar_text(status_message)
+  return map_id
+
+
+def brighten_scrollable_map():
+  return _scale_scrollable_map_brightness(
+    MAP_BRIGHTEN_SCALE_FACTOR,
+    "Brightened current map",
+    "Skipped brightening current map to avoid hitting map-colour limits",
+  )
+
+
+def darken_scrollable_map():
+  return _scale_scrollable_map_brightness(
+    MAP_DARKEN_SCALE_FACTOR,
+    "Darkened current map",
+    "Skipped darkening current map to avoid hitting map-colour limits",
+  )
+
+
 def start_measure_distance():
   add_status_bar_text("Pick 2 atoms to measure distance")
   do_distance_define()
@@ -4061,16 +4137,22 @@ def resample_active_map_for_em_half_angstrom(force=False, allow_large_output=Fal
   ):
     generic_confirm_dialog(
       "Resample/restyle current map",
-      "This will create a large resampled map "
-      "({0} x {1} x {2}; max dimension {3} > {4}).\n\n"
-      "Are you sure you want to continue?".format(
+      "Resampling would generate a large map, which may take a while.\n\n"
+      "Estimated grid: {0} x {1} x {2} (max dimension {3} > {4}).\n\n"
+      "What do you want to do?".format(
         new_grid[0],
         new_grid[1],
         new_grid[2],
         max_grid_dimension,
         EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION,
       ),
-      "Continue",
+      "Just restyle - skip resampling",
+      lambda: _restyle_active_map_without_resampling(
+        map_id,
+        contour_level_sigma,
+        "Skipped resampling and just restyled current map",
+      ),
+      "Go ahead and resample, I'll make a cup of coffee...",
       lambda: resample_active_map_for_em_half_angstrom(force=force, allow_large_output=True),
     )
     return None
