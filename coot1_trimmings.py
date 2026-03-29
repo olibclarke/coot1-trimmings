@@ -2242,8 +2242,8 @@ lambda: start_measure_distance())
 add_key_binding("Go to nearest density peak","b",
 lambda: go_to_nearest_density_peak())
 
-#Resample active EM map to 0.5 A/pixel and restyle
-add_key_binding("Resample active EM map to 0.5 A/pixel","C",
+#Resample active map to 0.5 A/pixel and restyle
+add_key_binding("Resample active map to 0.5 A/pixel","C",
 lambda: resample_active_map_for_em_half_angstrom())
 
 #Smart-copy active ligand/ion/water
@@ -2263,6 +2263,8 @@ add_key_binding("Darken current map",",",
 lambda: darken_scrollable_map())
 add_key_binding("Brighten current map",".",
 lambda: brighten_scrollable_map())
+add_key_binding("Set map contour in sigma","L",
+lambda: set_map_level_quickly())
 
 #Generate smart extra distance restraints on active model
 add_key_binding("Generate smart local extra restraints","g",
@@ -2412,10 +2414,10 @@ lambda: set_current_map_sigma(8))
 add_key_binding("Map to 9 sigma","(",
 lambda: set_current_map_sigma(9))
 
-add_key_binding("Map plus 0.5 sigma","|",
+add_key_binding("Map plus 0.1 sigma","+",
 lambda: step_current_map_coarse_up())
 
-add_key_binding("Map minus 0.5 sigma","_",
+add_key_binding("Map minus 0.1 sigma","_",
 lambda: step_current_map_coarse_down())
 
 add_key_binding("Increase map radius","'",
@@ -3872,23 +3874,23 @@ def display_only_active():
     set_mol_displayed(next_mol,1)
     
 def _step_map_sigma(mol_id, delta):
-  """Adjust contour sigma in coarse 0.5 steps within the usual trimmings range."""
+  """Adjust contour sigma in coarse 0.1 steps within the usual trimmings range."""
   current_level = get_contour_level_in_sigma(mol_id)
-  if 0.5 <= current_level <= 10.0:
+  if 0.1 <= current_level <= 10.0:
     new_level = current_level + delta
-  elif current_level < 0.5:
-    new_level = 0.5
+  elif current_level < 0.1:
+    new_level = 0.1
   else:
     new_level = 10.0
   set_contour_level_in_sigma(mol_id, new_level)
 
 
 def step_map_coarse_up(mol_id):
-  _step_map_sigma(mol_id, 0.5)
+  _step_map_sigma(mol_id, 0.1)
 
 
 def step_map_coarse_down(mol_id):
-  _step_map_sigma(mol_id, -0.5)
+  _step_map_sigma(mol_id, -0.1)
 
 
 def set_current_map_sigma(level):
@@ -4324,35 +4326,37 @@ def prev_res():
   return None
   
 def sequence_context():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  resnum=active_residue()[2]
-  ins_code=active_residue()[3]
-  resname=residue_name(mol_id,ch_id,resnum,ins_code)
-  def get_aa_code(resnum):
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    ins_code=active_residue()[3]
-    if residue_name(mol_id,ch_id,resnum,ins_code):
-      aa_code=three_letter_code2single_letter(residue_name(mol_id,ch_id,resnum,ins_code))
-      if (len(residue_name(mol_id,ch_id,resnum,ins_code))==1):
-        aa_code=residue_name(mol_id,ch_id,resnum,ins_code)
-      if (residue_name(mol_id,ch_id,resnum,ins_code)!="ALA") and (aa_code=="A") and (len(residue_name(mol_id,ch_id,resnum,ins_code))!=1):
-        aa_code="X"
-    else:
-      aa_code="-"
+  residue = _active_residue_or_status()
+  if residue is None:
+    return None
+
+  mol_id = residue[0]
+  ch_id = residue[1]
+  resnum = residue[2]
+  ins_code = residue[3]
+  resname = residue_name(mol_id, ch_id, resnum, ins_code)
+
+  def get_aa_code(context_resnum):
+    context_resname = residue_name(mol_id, ch_id, context_resnum, ins_code)
+    if not context_resname:
+      return "-"
+    if len(context_resname) == 1:
+      return context_resname
+    aa_code = three_letter_code2single_letter(context_resname)
+    if context_resname != "ALA" and aa_code == "A":
+      return "X"
     return aa_code
-  current_res=get_aa_code(resnum)
-  minus_context=""
+
+  current_res = get_aa_code(resnum)
+  minus_context = ""
   for i in range(1,10):
-    aa_code=str(get_aa_code(resnum-i))
-    minus_context=aa_code + minus_context
-  plus_context=""
+    minus_context = str(get_aa_code(resnum - i)) + minus_context
+  plus_context = ""
   for i in range(1,10):
-    aa_code=str(get_aa_code(resnum+i))
-    plus_context=plus_context + aa_code
+    plus_context = plus_context + str(get_aa_code(resnum + i))
   final_string="Residue:  " + resname + "  " + str(resnum) +"  Sequence context: ..." + minus_context + "[" + current_res + "]" + plus_context + "..."
   info_dialog(final_string)
+  return 1
   
 #Toggle display of active map
 map_disp_flag={0:0}
@@ -9632,6 +9636,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Find sequence in active chain",
     lambda func: find_sequence_with_entry(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Sequence context",
+    lambda func: sequence_context(),
   )
   add_simple_coot_menu_menuitem(
     submenu_display,
