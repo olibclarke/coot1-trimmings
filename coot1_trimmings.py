@@ -6,11 +6,16 @@ The main user-editable knobs live near the top of the file under
 """
 
 import math
+import hashlib
+import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import traceback
+import warnings
+from functools import lru_cache
 
 import gi
 import coot
@@ -90,6 +95,8 @@ STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
 # User-facing helper defaults.
 DEFAULT_NEW_HELIX_CHAIN_ID = "A"
 HIGH_CONTRAST_BOND_THICKNESS = 2
+COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
+COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 
 # Map restyling defaults for the EM helper.
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
@@ -122,6 +129,8 @@ MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = None
 MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = None
 MODEL_HIGH_CONTRAST_MOLECULES = set()
 NAVIGATION_LAST_RESIDUE = None
+COMMON_MONOMER_FAVORITES_MENU = None
+COMMON_MONOMER_LAST_BROWSED_DIRECTORY = None
 
 
 def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
@@ -1402,6 +1411,312 @@ if GUI_PYTHON_AVAILABLE:
     window.present()
     entry.grab_focus()
 
+  def generic_double_entry(
+    function_label,
+    entry_1_label,
+    entry_1_default_text,
+    entry_2_label,
+    entry_2_default_text,
+    go_button_label,
+    handle_go_function,
+  ):
+    """GTK4-safe two-entry prompt used for small add/edit helpers."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    title_label = Gtk.Label(label=function_label)
+    label_1 = Gtk.Label(label=entry_1_label)
+    entry_1 = Gtk.Entry()
+    label_2 = Gtk.Label(label=entry_2_label)
+    entry_2 = Gtk.Entry()
+    cancel_button = Gtk.Button(label="Cancel")
+    go_button = Gtk.Button(label=go_button_label)
+
+    title_label.set_margin_start(12)
+    title_label.set_margin_end(12)
+    title_label.set_margin_top(12)
+    title_label.set_margin_bottom(4)
+    label_1.set_margin_start(12)
+    label_1.set_margin_end(12)
+    entry_1.set_margin_start(12)
+    entry_1.set_margin_end(12)
+    label_2.set_margin_start(12)
+    label_2.set_margin_end(12)
+    label_2.set_margin_top(6)
+    entry_2.set_margin_start(12)
+    entry_2.set_margin_end(12)
+    entry_2.set_margin_bottom(8)
+    hbox_buttons.set_margin_start(12)
+    hbox_buttons.set_margin_end(12)
+    hbox_buttons.set_margin_bottom(12)
+
+    if isinstance(entry_1_default_text, str):
+      entry_1.set_text(entry_1_default_text)
+    if isinstance(entry_2_default_text, str):
+      entry_2.set_text(entry_2_default_text)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def submit(*_args):
+      status = handle_go_function(entry_1.get_text(), entry_2.get_text())
+      if status not in (0, False):
+        window.destroy()
+      return False
+
+    cancel_button.connect("clicked", close_window)
+    go_button.connect("clicked", submit)
+    entry_1.connect("activate", lambda *_args: entry_2.grab_focus())
+    entry_2.connect("activate", submit)
+
+    vbox.append(title_label)
+    vbox.append(label_1)
+    vbox.append(entry_1)
+    vbox.append(label_2)
+    vbox.append(entry_2)
+    hbox_buttons.append(cancel_button)
+    hbox_buttons.append(go_button)
+    vbox.append(hbox_buttons)
+    window.set_child(vbox)
+    window.present()
+    entry_1.grab_focus()
+
+  def _populate_entry_from_file_chooser(parent_window, target_entry, chooser_title):
+    """Open a GTK file chooser and copy the selected path into an entry."""
+    def _gtk_gio_module():
+      gio_module = globals().get("Gio")
+      if gio_module is not None:
+        return gio_module
+      coot_gui_module = globals().get("coot_gui")
+      if coot_gui_module is not None and hasattr(coot_gui_module, "Gio"):
+        gio_module = coot_gui_module.Gio
+        globals()["Gio"] = gio_module
+        return gio_module
+      try:
+        from gi.repository import Gio as gio_module
+      except Exception:
+        return None
+      globals()["Gio"] = gio_module
+      return gio_module
+
+    def _remember_browsed_directory_from_path(path):
+      global COMMON_MONOMER_LAST_BROWSED_DIRECTORY
+      if not isinstance(path, str):
+        return None
+      normalised_path = os.path.abspath(os.path.expanduser(path))
+      directory = normalised_path if os.path.isdir(normalised_path) else os.path.dirname(normalised_path)
+      if directory and os.path.isdir(directory):
+        COMMON_MONOMER_LAST_BROWSED_DIRECTORY = directory
+      return None
+
+    def _apply_file_chooser_initial_folder(chooser, gio_module=None):
+      initial_directory = COMMON_MONOMER_LAST_BROWSED_DIRECTORY
+      if not initial_directory or not os.path.isdir(initial_directory):
+        return None
+      if gio_module is None:
+        gio_module = _gtk_gio_module()
+      if gio_module is None or not hasattr(gio_module, "File"):
+        return None
+      initial_folder = gio_module.File.new_for_path(initial_directory)
+      if hasattr(chooser, "set_initial_folder"):
+        try:
+          chooser.set_initial_folder(initial_folder)
+          return None
+        except Exception:
+          pass
+      if hasattr(chooser, "set_current_folder"):
+        try:
+          with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            chooser.set_current_folder(initial_folder)
+        except Exception:
+          return None
+      return None
+
+    cif_filter = Gtk.FileFilter()
+    cif_filter.set_name("CIF dictionaries")
+    for pattern in ("*.cif", "*.mmcif", "*.dic"):
+      cif_filter.add_pattern(pattern)
+
+    all_filter = Gtk.FileFilter()
+    all_filter.set_name("All files")
+    all_filter.add_pattern("*")
+
+    if hasattr(Gtk, "FileDialog"):
+      gio_module = _gtk_gio_module()
+
+      chooser = Gtk.FileDialog()
+      chooser.set_title(chooser_title)
+      _apply_file_chooser_initial_folder(chooser, gio_module)
+
+      if gio_module is not None and hasattr(gio_module, "ListStore"):
+        filters = gio_module.ListStore.new(Gtk.FileFilter)
+        filters.append(cif_filter)
+        filters.append(all_filter)
+        chooser.set_filters(filters)
+        chooser.set_default_filter(cif_filter)
+
+      def on_open_finished(dialog, result):
+        try:
+          chosen_file = dialog.open_finish(result)
+        except Exception:
+          return None
+        if chosen_file is not None and chosen_file.get_path():
+          chosen_path = chosen_file.get_path()
+          target_entry.set_text(chosen_path)
+          _remember_browsed_directory_from_path(chosen_path)
+        return None
+
+      chooser.open(parent_window, None, on_open_finished)
+      return None
+
+    if hasattr(Gtk, "FileChooserNative"):
+      # Coot's embedded GTK can lack Gtk.FileDialog even though the old
+      # chooser still works. Keep the fallback, but suppress the Python-side
+      # deprecation warnings so the console does not fill up on each browse.
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        chooser = Gtk.FileChooserNative.new(
+          chooser_title,
+          parent_window,
+          Gtk.FileChooserAction.OPEN,
+          "Open",
+          "Cancel",
+        )
+        chooser.add_filter(cif_filter)
+        chooser.add_filter(all_filter)
+      _apply_file_chooser_initial_folder(chooser)
+
+      def on_response(dialog, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT:
+          chosen_file = dialog.get_file()
+          if chosen_file is not None and chosen_file.get_path():
+            chosen_path = chosen_file.get_path()
+            target_entry.set_text(chosen_path)
+            _remember_browsed_directory_from_path(chosen_path)
+        dialog.destroy()
+
+      chooser.connect("response", on_response)
+      chooser.show()
+      return None
+
+    if hasattr(Gtk, "FileChooserDialog"):
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        chooser = Gtk.FileChooserDialog(
+          title=chooser_title,
+          transient_for=parent_window,
+          action=Gtk.FileChooserAction.OPEN,
+        )
+        chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        chooser.add_button("Open", Gtk.ResponseType.ACCEPT)
+        chooser.add_filter(cif_filter)
+        chooser.add_filter(all_filter)
+      _apply_file_chooser_initial_folder(chooser)
+
+      def on_response(dialog, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT:
+          chosen_file = dialog.get_file()
+          if chosen_file is not None and chosen_file.get_path():
+            chosen_path = chosen_file.get_path()
+            target_entry.set_text(chosen_path)
+            _remember_browsed_directory_from_path(chosen_path)
+        dialog.destroy()
+
+      chooser.connect("response", on_response)
+      chooser.present()
+      return None
+
+    info_dialog("Browse is unavailable in this Gtk build; please paste the CIF path manually.")
+    return None
+
+  def generic_double_entry_with_file_browse(
+    function_label,
+    entry_1_label,
+    entry_1_default_text,
+    entry_2_label,
+    entry_2_default_text,
+    entry_2_browse_title,
+    go_button_label,
+    handle_go_function,
+  ):
+    """GTK4-safe two-entry prompt with a Browse button for the second field."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    entry_2_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    title_label = Gtk.Label(label=function_label)
+    label_1 = Gtk.Label(label=entry_1_label)
+    entry_1 = Gtk.Entry()
+    label_2 = Gtk.Label(label=entry_2_label)
+    entry_2 = Gtk.Entry()
+    browse_button = Gtk.Button(label="Browse...")
+    cancel_button = Gtk.Button(label="Cancel")
+    go_button = Gtk.Button(label=go_button_label)
+
+    title_label.set_margin_start(12)
+    title_label.set_margin_end(12)
+    title_label.set_margin_top(12)
+    title_label.set_margin_bottom(4)
+    label_1.set_margin_start(12)
+    label_1.set_margin_end(12)
+    entry_1.set_margin_start(12)
+    entry_1.set_margin_end(12)
+    label_2.set_margin_start(12)
+    label_2.set_margin_end(12)
+    label_2.set_margin_top(6)
+    entry_2_row.set_margin_start(12)
+    entry_2_row.set_margin_end(12)
+    entry_2_row.set_margin_bottom(8)
+    entry_2.set_hexpand(True)
+    hbox_buttons.set_margin_start(12)
+    hbox_buttons.set_margin_end(12)
+    hbox_buttons.set_margin_bottom(12)
+
+    if isinstance(entry_1_default_text, str):
+      entry_1.set_text(entry_1_default_text)
+    if isinstance(entry_2_default_text, str):
+      entry_2.set_text(entry_2_default_text)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def submit(*_args):
+      status = handle_go_function(entry_1.get_text(), entry_2.get_text())
+      if status not in (0, False):
+        window.destroy()
+      return False
+
+    cancel_button.connect("clicked", close_window)
+    browse_button.connect(
+      "clicked",
+      lambda *_args: _populate_entry_from_file_chooser(window, entry_2, entry_2_browse_title),
+    )
+    go_button.connect("clicked", submit)
+    entry_1.connect("activate", lambda *_args: entry_2.grab_focus())
+    entry_2.connect("activate", submit)
+
+    entry_2_row.append(entry_2)
+    entry_2_row.append(browse_button)
+
+    vbox.append(title_label)
+    vbox.append(label_1)
+    vbox.append(entry_1)
+    vbox.append(label_2)
+    vbox.append(entry_2_row)
+    hbox_buttons.append(cancel_button)
+    hbox_buttons.append(go_button)
+    vbox.append(hbox_buttons)
+    window.set_child(vbox)
+    window.present()
+    entry_1.grab_focus()
+
   def interesting_things_gui(dialog_name, thing_list):
     """Show a simple GTK4 list of jump targets as labeled buttons."""
     window = Gtk.Window()
@@ -1458,6 +1773,58 @@ if GUI_PYTHON_AVAILABLE:
     window.set_child(vbox)
     window.present()
 
+  def action_button_dialog(dialog_name, button_list, close_on_click=True):
+    """GTK4-safe scrolling list of action buttons."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+    window.set_default_size(520, 420)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    label = Gtk.Label(label=dialog_name)
+    scrolled = Gtk.ScrolledWindow()
+    inside_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    close_button = Gtk.Button(label="Close")
+
+    label.set_margin_start(12)
+    label.set_margin_end(12)
+    label.set_margin_top(12)
+    label.set_margin_bottom(4)
+    scrolled.set_margin_start(12)
+    scrolled.set_margin_end(12)
+    scrolled.set_margin_bottom(8)
+    close_button.set_margin_start(12)
+    close_button.set_margin_end(12)
+    close_button.set_margin_bottom(12)
+
+    scrolled.set_hexpand(True)
+    scrolled.set_vexpand(True)
+    inside_vbox.set_valign(Gtk.Align.START)
+    scrolled.set_child(inside_vbox)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    for button_label, callback in button_list:
+      button = Gtk.Button(label=str(button_label))
+
+      def on_click(_button, action=callback):
+        action()
+        if close_on_click:
+          window.destroy()
+        return False
+
+      button.connect("clicked", on_click)
+      inside_vbox.append(button)
+
+    close_button.connect("clicked", close_window)
+
+    vbox.append(label)
+    vbox.append(scrolled)
+    vbox.append(close_button)
+    window.set_child(vbox)
+    window.present()
+
 else:
 
   def coot_toolbar_button(*_args, **_kwargs):
@@ -1479,8 +1846,38 @@ else:
   ):
     info_dialog(_gui_unavailable_message(function_label))
 
+  def generic_double_entry(
+    function_label,
+    _entry_1_label,
+    _entry_1_default_text,
+    _entry_2_label,
+    _entry_2_default_text,
+    _go_button_label,
+    _handle_go_function,
+  ):
+    info_dialog(_gui_unavailable_message(function_label))
+
+  def generic_double_entry_with_file_browse(
+    function_label,
+    _entry_1_label,
+    _entry_1_default_text,
+    _entry_2_label,
+    _entry_2_default_text,
+    _entry_2_browse_title,
+    _go_button_label,
+    _handle_go_function,
+  ):
+    info_dialog(_gui_unavailable_message(function_label))
+
   def interesting_things_gui(dialog_name, thing_list):
     labels = [str(entry[0]) for entry in thing_list if len(entry) >= 4]
+    message = dialog_name
+    if labels:
+      message += "\n\n" + "\n".join(labels)
+    info_dialog(message)
+
+  def action_button_dialog(dialog_name, button_list, _close_on_click=True):
+    labels = [str(label) for label, _callback in button_list]
     message = dialog_name
     if labels:
       message += "\n\n" + "\n".join(labels)
@@ -5963,9 +6360,10 @@ def find_sequence_in_current_chain(subseq):
 # coot_toolbar_button("Sequence context", "sequence_context()", icon_name="")
 # coot_toolbar_button("Accept RSR", "accept_regularizement()", icon_name="")
 #
-# Keep the original dialog-backed helper implementations verbatim so that
-# future ports can compare behavior against the old Gtk path line-for-line.
-GTK_DIALOG_FUNCTION_ARCHIVE = r'''
+# Historical dialog-backed helper implementations promoted back into normal
+# Python. These used to live inside GTK_DIALOG_FUNCTION_ARCHIVE and were
+# executed at startup via exec(...); keeping them as direct code preserves
+# behavior while removing that startup-time string execution path.
 def set_map_level_quickly():
   if scroll_wheel_map()!=-1 and map_is_displayed(scroll_wheel_map())!=0:
     current_map_level=get_contour_level_in_sigma(scroll_wheel_map())
@@ -6546,55 +6944,724 @@ COMMON_MONOMER_MENU = [
 # Some "monomers" are really better handled as typed atoms or built-in simple
 # groups. Those are placed at the pointer instead of going through get_monomer().
 COMMON_MONOMER_POINTER_TYPES = {
-  "LI": "Li",
-  "MG": "Mg",
-  "CA": "Ca",
-  "NA": "Na",
+  # Single-atom monomers are passed through using their CCP4 component code.
+  "LI": "LI",
+  "MG": "MG",
+  "CA": "CA",
+  "NA": "NA",
   "K": "K",
-  "RB": "Rb",
-  "CS": "Cs",
-  "SR": "Sr",
-  "BA": "Ba",
+  "RB": "RB",
+  "CS": "CS",
+  "SR": "SR",
+  "BA": "BA",
   "F": "F",
-  "CL": "Cl",
-  "BR": "Br",
-  "IOD": "I",
-  "ZN": "Zn",
-  "MN": "Mn",
-  "FE": "Fe",
-  "CO": "Co",
-  "CU": "Cu",
-  "NI": "Ni",
-  "CD": "Cd",
-  "HG": "Hg",
-  "PB": "Pb",
-  "AU": "Au",
-  "PT": "Pt",
-  "OS": "Os",
-  "IR": "Ir",
-  "GD3": "Gd",
-  "EU3": "Eu",
-  "TB": "Tb",
-  "HO3": "Ho",
-  "LA": "La",
-  "LU": "Lu",
-  "SM": "Sm",
-  "YB": "Yb",
-  "XE": "Xe",
-  "KR": "Kr",
-  "U1": "U",
+  "CL": "CL",
+  "BR": "BR",
+  "IOD": "IOD",
+  "ZN": "ZN",
+  "MN": "MN",
+  "FE": "FE",
+  "CO": "CO",
+  "CU": "CU",
+  "NI": "NI",
+  "CD": "CD",
+  "HG": "HG",
+  "PB": "PB",
+  "AU": "AU",
+  "PT": "PT",
+  "OS": "OS",
+  "IR": "IR",
+  "GD3": "GD3",
+  "EU3": "EU3",
+  "TB": "TB",
+  "HO3": "HO3",
+  "LA": "LA",
+  "LU": "LU",
+  "SM": "SM",
+  "YB": "YB",
+  "XE": "XE",
+  "KR": "KR",
+  "U1": "U1",
   "PO4": "PO4",
   "SO4": "SO4",
 }
 
 
+@lru_cache(maxsize=1)
+def _coot_trimmings_dir():
+  return os.path.dirname(_coot_trimmings_file_path())
+
+
+def _coot_trimmings_file_path():
+  candidates = []
+
+  runtime_file = globals().get("__file__", "")
+  module_file = getattr(sys.modules.get(__name__), "__file__", "")
+
+  for candidate in (
+    runtime_file,
+    module_file,
+    os.path.expanduser("~/.config/Coot/coot_trimmings.py"),
+    os.path.expanduser("~/Library/Application Support/Coot/coot_trimmings.py"),
+    os.path.join(os.getcwd(), "coot_trimmings.py"),
+  ):
+    if isinstance(candidate, str) and candidate:
+      normalized = os.path.abspath(candidate)
+      if normalized not in candidates:
+        candidates.append(normalized)
+
+  for candidate in candidates:
+    if os.path.isfile(candidate):
+      return candidate
+
+  if candidates:
+    return candidates[0]
+  return os.path.abspath("coot_trimmings.py")
+
+
+def _common_monomer_favorites_path():
+  return os.path.join(_coot_trimmings_dir(), COMMON_MONOMER_FAVORITES_FILENAME)
+
+
+@lru_cache(maxsize=1)
+def _ccp4_monomer_library_roots():
+  roots = []
+  for candidate in (
+    os.environ.get("CLIBD_MON"),
+    os.path.join(os.environ.get("CCP4", ""), "lib", "data", "monomers") if os.environ.get("CCP4") else "",
+    "/Applications/CCP4/ccp4-9/lib/data/monomers",
+  ):
+    if candidate and os.path.isdir(candidate) and candidate not in roots:
+      roots.append(candidate)
+  return roots
+
+
+@lru_cache(maxsize=None)
+def _find_ccp4_monomer_file(monomer_code):
+  normalized_code = str(monomer_code).strip().upper()
+  if not normalized_code:
+    return None
+  for root in _ccp4_monomer_library_roots():
+    candidate = os.path.join(root, normalized_code[0].lower(), normalized_code + ".cif")
+    if os.path.isfile(candidate):
+      return candidate
+  return None
+
+
+def _is_pointer_type_common_monomer(monomer_code):
+  return bool(_pointer_type_for_monomer_code(monomer_code))
+
+
+def _single_atom_pointer_type_from_cif(monomer_code):
+  normalized_code = str(monomer_code).strip().upper()
+  monomer_file = _find_ccp4_monomer_file(monomer_code)
+  if not monomer_file:
+    return None
+
+  try:
+    with open(monomer_file, "r", encoding="utf-8") as handle:
+      lines = handle.readlines()
+  except Exception:
+    return None
+
+  in_atom_loop = False
+  atom_headers = []
+  atom_rows = []
+
+  for raw_line in lines:
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+      continue
+    if line == "loop_":
+      in_atom_loop = False
+      atom_headers = []
+      continue
+    if line.startswith("_chem_comp_atom."):
+      in_atom_loop = True
+      atom_headers.append(line)
+      continue
+    if in_atom_loop and atom_headers and line.startswith("_"):
+      in_atom_loop = False
+      atom_headers = []
+      continue
+    if in_atom_loop and atom_headers:
+      atom_rows.append(line.split())
+      if len(atom_rows) > 1:
+        return None
+
+  if len(atom_rows) != 1 or not atom_headers:
+    return None
+
+  try:
+    type_symbol_index = atom_headers.index("_chem_comp_atom.type_symbol")
+  except ValueError:
+    return None
+
+  atom_row = atom_rows[0]
+  if type_symbol_index >= len(atom_row):
+    return None
+
+  type_symbol = atom_row[type_symbol_index].strip().upper()
+  if not type_symbol:
+    return None
+  return normalized_code
+
+
+def _pointer_type_for_monomer_code(monomer_code):
+  normalized_code = str(monomer_code).strip().upper()
+  if not normalized_code:
+    return None
+  explicit_pointer_type = COMMON_MONOMER_POINTER_TYPES.get(normalized_code)
+  if explicit_pointer_type:
+    return explicit_pointer_type
+  return _single_atom_pointer_type_from_cif(normalized_code)
+
+
+def _common_monomer_code_is_supported(monomer_code):
+  normalized_code = str(monomer_code).strip().upper()
+  if not normalized_code:
+    return False
+  if _pointer_type_for_monomer_code(normalized_code):
+    return True
+  return bool(_find_ccp4_monomer_file(normalized_code))
+
+
+def _sanitize_common_monomer_favorite_name(name):
+  allowed_punctuation = set(" -+/'.(),[]&:")
+  cleaned = "".join(
+    character
+    for character in str(name)
+    if character.isalnum() or character in allowed_punctuation
+  )
+  return " ".join(cleaned.split()).strip()
+
+
+def _sanitize_common_monomer_code(code):
+  return "".join(character for character in str(code).upper() if character.isalnum())
+
+
+def _normalize_common_monomer_favorite_code(name, code):
+  favorite_name = _sanitize_common_monomer_favorite_name(name)
+  monomer_code = _sanitize_common_monomer_code(code)
+  if not favorite_name or not monomer_code:
+    return None
+  return {"kind": "code", "name": favorite_name, "code": monomer_code}
+
+
+def _normalize_common_monomer_cif_path(cif_path):
+  normalized_path = os.path.abspath(os.path.expanduser(str(cif_path).strip()))
+  if not normalized_path or not os.path.isfile(normalized_path):
+    return None
+  return normalized_path
+
+
+@lru_cache(maxsize=None)
+def _extract_cif_component_id(cif_path):
+  try:
+    with open(cif_path, "r", encoding="utf-8") as handle:
+      for raw_line in handle:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+          continue
+        if line.startswith("_chem_comp.id"):
+          parts = line.split(maxsplit=1)
+          if len(parts) == 2:
+            comp_id = _sanitize_common_monomer_code(parts[1].strip().strip("'\""))
+            if comp_id:
+              return comp_id
+        if line.startswith("data_comp_") and line != "data_comp_list":
+          comp_id = _sanitize_common_monomer_code(line[len("data_comp_"):])
+          if comp_id:
+            return comp_id
+  except Exception:
+    return None
+  return None
+
+
+def _pointer_type_for_cif_path(cif_path, comp_id=None):
+  normalized_path = _normalize_common_monomer_cif_path(cif_path)
+  normalized_code = _sanitize_common_monomer_code(comp_id or "")
+  if not normalized_path:
+    return None
+
+  try:
+    with open(normalized_path, "r", encoding="utf-8") as handle:
+      lines = handle.readlines()
+  except Exception:
+    return None
+
+  in_atom_loop = False
+  atom_headers = []
+  atom_rows = []
+
+  for raw_line in lines:
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+      continue
+    if line == "loop_":
+      in_atom_loop = False
+      atom_headers = []
+      continue
+    if line.startswith("_chem_comp_atom."):
+      in_atom_loop = True
+      atom_headers.append(line)
+      continue
+    if in_atom_loop and atom_headers and line.startswith("_"):
+      in_atom_loop = False
+      atom_headers = []
+      continue
+    if in_atom_loop and atom_headers:
+      atom_rows.append(line.split())
+      if len(atom_rows) > 1:
+        return None
+
+  if len(atom_rows) != 1 or not atom_headers:
+    return None
+
+  try:
+    type_symbol_index = atom_headers.index("_chem_comp_atom.type_symbol")
+  except ValueError:
+    return None
+
+  atom_row = atom_rows[0]
+  if type_symbol_index >= len(atom_row):
+    return None
+
+  type_symbol = atom_row[type_symbol_index].strip().upper()
+  if not type_symbol:
+    return None
+  return normalized_code or _extract_cif_component_id(normalized_path)
+
+
+def _normalize_common_monomer_favorite_cif(name, cif_path, comp_id=None):
+  favorite_name = _sanitize_common_monomer_favorite_name(name)
+  normalized_path = _normalize_common_monomer_cif_path(cif_path)
+  if not favorite_name or not normalized_path:
+    return None
+  normalized_comp_id = _sanitize_common_monomer_code(comp_id or "")
+  if not normalized_comp_id:
+    normalized_comp_id = _extract_cif_component_id(normalized_path)
+  if not normalized_comp_id:
+    return None
+  return {
+    "kind": "cif",
+    "name": favorite_name,
+    "cif_path": normalized_path,
+    "comp_id": normalized_comp_id,
+  }
+
+
+def _validate_custom_cif_dictionary(cif_path, comp_id):
+  """Check that a CIF dictionary can be read and can build its component."""
+  normalized_path = _normalize_common_monomer_cif_path(cif_path)
+  normalized_code = _sanitize_common_monomer_code(comp_id)
+  if not normalized_path or not normalized_code:
+    return None
+
+  try:
+    read_cif_dictionary(normalized_path)
+  except Exception:
+    traceback.print_exc()
+    return None
+
+  temp_imol = coot.get_monomer_from_dictionary(normalized_code, 1)
+  if not valid_model_molecule_qm(temp_imol):
+    return None
+
+  try:
+    return {
+      "cif_path": normalized_path,
+      "comp_id": normalized_code,
+      "pointer_type": _pointer_type_for_cif_path(normalized_path, normalized_code),
+    }
+  finally:
+    if valid_model_molecule_qm(temp_imol):
+      coot.close_molecule(temp_imol)
+
+
+def _managed_common_monomer_cif_path(source_cif_path, comp_id):
+  normalized_path = _normalize_common_monomer_cif_path(source_cif_path)
+  normalized_code = _sanitize_common_monomer_code(comp_id)
+  if not normalized_path or not normalized_code:
+    return None
+  with open(normalized_path, "rb") as handle:
+    digest = hashlib.sha1(handle.read()).hexdigest()[:12]
+  return os.path.join(
+    _coot_trimmings_dir(),
+    f"{COMMON_MONOMER_FAVORITE_CIF_PREFIX}{normalized_code}_{digest}.cif",
+  )
+
+
+def _materialize_common_monomer_favorite_cif(name, cif_path):
+  normalized = _normalize_common_monomer_favorite_cif(name, cif_path)
+  if not normalized:
+    return None
+  validation = _validate_custom_cif_dictionary(normalized["cif_path"], normalized["comp_id"])
+  if not validation:
+    return None
+  managed_cif_path = _managed_common_monomer_cif_path(normalized["cif_path"], normalized["comp_id"])
+  if not managed_cif_path:
+    return None
+  os.makedirs(os.path.dirname(managed_cif_path), exist_ok=True)
+  if os.path.abspath(normalized["cif_path"]) != os.path.abspath(managed_cif_path):
+    shutil.copyfile(normalized["cif_path"], managed_cif_path)
+  normalized["cif_path"] = managed_cif_path
+  return normalized
+
+
+def _favorite_entry_token(entry):
+  if entry.get("kind") == "cif":
+    return entry["comp_id"]
+  return entry["code"]
+
+
+def _favorite_menu_label(entry):
+  if entry.get("kind") == "cif":
+    return str(entry["name"]).strip()
+  return f"{str(entry['name']).strip()} ({_favorite_entry_token(entry)})"
+
+
+def _favorite_identity(entry):
+  if entry.get("kind") == "cif":
+    return ("cif", entry["cif_path"], entry["comp_id"])
+  return ("code", entry["code"])
+
+
+def _load_common_monomer_favorites():
+  favorites_path = _common_monomer_favorites_path()
+  if not os.path.isfile(favorites_path):
+    return []
+
+  try:
+    with open(favorites_path, "r", encoding="utf-8") as handle:
+      raw_favorites = json.load(handle)
+  except Exception:
+    print("coot_trimmings favorite-load failure:", favorites_path)
+    traceback.print_exc()
+    return []
+
+  favorites = []
+  seen_favorites = set()
+  if isinstance(raw_favorites, list):
+    for entry in raw_favorites:
+      if not isinstance(entry, dict):
+        continue
+      if entry.get("kind") == "cif" or "cif_path" in entry:
+        normalized = _normalize_common_monomer_favorite_cif(
+          entry.get("name", ""),
+          entry.get("cif_path", ""),
+          entry.get("comp_id", ""),
+        )
+      else:
+        normalized = _normalize_common_monomer_favorite_code(
+          entry.get("name", ""),
+          entry.get("code", ""),
+        )
+      if not normalized:
+        continue
+      favorite_identity = _favorite_identity(normalized)
+      if favorite_identity in seen_favorites:
+        continue
+      if normalized["kind"] == "code":
+        monomer_code = normalized["code"]
+        if monomer_code not in COMMON_MONOMER_POINTER_TYPES and not _find_ccp4_monomer_file(monomer_code):
+          continue
+      if normalized["kind"] == "cif" and not os.path.isfile(normalized["cif_path"]):
+        continue
+      seen_favorites.add(favorite_identity)
+      favorites.append(normalized)
+
+  favorites.sort(key=lambda entry: _favorite_menu_label(entry).lower())
+  return favorites
+
+
+def _save_common_monomer_favorites(favorites):
+  favorites_path = _common_monomer_favorites_path()
+  if not favorites:
+    if os.path.isfile(favorites_path):
+      os.remove(favorites_path)
+    return favorites_path
+  os.makedirs(os.path.dirname(favorites_path), exist_ok=True)
+  with open(favorites_path, "w", encoding="utf-8") as handle:
+    json.dump(favorites, handle, indent=2, sort_keys=True)
+  return favorites_path
+
+
+def _clear_gio_menu(menu):
+  if menu is None:
+    return None
+  if hasattr(menu, "remove_all"):
+    menu.remove_all()
+    return None
+  if hasattr(menu, "get_n_items") and hasattr(menu, "remove"):
+    while menu.get_n_items() > 0:
+      menu.remove(0)
+  return None
+
+
+def refresh_common_monomer_favorites_menu():
+  """Rebuild the Favorites submenu from the persistent JSON file."""
+  global COMMON_MONOMER_FAVORITES_MENU
+  menu = COMMON_MONOMER_FAVORITES_MENU
+  if menu is None:
+    return None
+
+  _clear_gio_menu(menu)
+  add_simple_coot_menu_menuitem(menu, "Add favorite from monomer code...", lambda func: prompt_add_common_monomer_code_favorite())
+  add_simple_coot_menu_menuitem(menu, "Add favorite from CIF...", lambda func: prompt_add_common_monomer_cif_favorite())
+  add_simple_coot_menu_menuitem(menu, "Remove favorite...", lambda func: prompt_remove_common_monomer_favorite())
+
+  for favorite in _load_common_monomer_favorites():
+    add_simple_coot_menu_menuitem(
+      menu,
+      _favorite_menu_label(favorite),
+      lambda func, favorite_entry=favorite: place_common_monomer_favorite(favorite_entry),
+    )
+  return None
+
+
+def _upsert_common_monomer_code_favorite(name, code):
+  normalized = _normalize_common_monomer_favorite_code(name, code)
+  if not normalized:
+    info_dialog(
+      "Favorites require both a display name and a monomer code.\n\n"
+      "Invalid characters are stripped automatically; if that leaves either field empty, the favorite is rejected."
+    )
+    return 0
+
+  monomer_code = normalized["code"]
+  if not _common_monomer_code_is_supported(monomer_code):
+    info_dialog(
+      f"{monomer_code} was not found in the CCP4 monomer library.\n\n"
+      "Favorites are validated case-insensitively against the installed CCP4 monomer files,\n"
+      "with typed-atom special cases handled for metal/ion monomers placed at the pointer."
+    )
+    return 0
+
+  favorites = _load_common_monomer_favorites()
+  favorite_identity = _favorite_identity(normalized)
+  if favorite_identity in [_favorite_identity(entry) for entry in favorites]:
+    favorites = [entry for entry in favorites if _favorite_identity(entry) != favorite_identity]
+    status_text = f"Updated favorite: {_favorite_menu_label(normalized)}"
+  else:
+    status_text = f"Added favorite: {_favorite_menu_label(normalized)}"
+
+  favorites.append(normalized)
+  favorites.sort(key=lambda entry: _favorite_menu_label(entry).lower())
+  try:
+    favorites_path = _save_common_monomer_favorites(favorites)
+  except Exception:
+    info_dialog("Failed to save Common monomer favorites.")
+    traceback.print_exc()
+    return 0
+  refresh_common_monomer_favorites_menu()
+  add_status_bar_text(f"{status_text} [{favorites_path}]")
+  return 1
+
+
+def _upsert_common_monomer_cif_favorite(name, cif_path):
+  normalized = _materialize_common_monomer_favorite_cif(name, cif_path)
+  if not normalized:
+    info_dialog(
+      "CIF favorites require both a display name and a valid CIF dictionary.\n\n"
+      "The file must exist, contain a readable component ID, and successfully build the monomer in Coot."
+    )
+    return 0
+
+  favorites = _load_common_monomer_favorites()
+  favorite_identity = _favorite_identity(normalized)
+  if favorite_identity in [_favorite_identity(entry) for entry in favorites]:
+    favorites = [entry for entry in favorites if _favorite_identity(entry) != favorite_identity]
+    status_text = f"Updated favorite: {_favorite_menu_label(normalized)}"
+  else:
+    status_text = f"Added favorite: {_favorite_menu_label(normalized)}"
+
+  favorites.append(normalized)
+  favorites.sort(key=lambda entry: _favorite_menu_label(entry).lower())
+  try:
+    favorites_path = _save_common_monomer_favorites(favorites)
+  except Exception:
+    info_dialog("Failed to save Common monomer favorites.")
+    traceback.print_exc()
+    return 0
+  refresh_common_monomer_favorites_menu()
+  add_status_bar_text(f"{status_text} [{favorites_path}]")
+  return 1
+
+
+def prompt_add_common_monomer_code_favorite():
+  """Prompt for a persistent code-backed Common-monomers favorite."""
+  generic_double_entry(
+    "Add Common Monomer Favorite",
+    "Favorite name",
+    "",
+    "Monomer code",
+    "",
+    "Add favorite",
+    _upsert_common_monomer_code_favorite,
+  )
+  return 1
+
+
+def prompt_add_common_monomer_cif_favorite():
+  """Prompt for a persistent custom-CIF Common-monomers favorite."""
+  generic_double_entry_with_file_browse(
+    "Add Common Monomer Favorite",
+    "Favorite name",
+    "",
+    "CIF file path",
+    "",
+    "Choose CIF dictionary",
+    "Add favorite",
+    _upsert_common_monomer_cif_favorite,
+  )
+  return 1
+
+
+def _remove_common_monomer_favorite(favorite_entry):
+  favorites = _load_common_monomer_favorites()
+  favorite_identity = _favorite_identity(favorite_entry)
+  new_favorites = [entry for entry in favorites if _favorite_identity(entry) != favorite_identity]
+  if len(new_favorites) == len(favorites):
+    info_dialog(f"{_favorite_menu_label(favorite_entry)} is not currently in Common monomer favorites.")
+    return 0
+  try:
+    _save_common_monomer_favorites(new_favorites)
+  except Exception:
+    info_dialog("Failed to save Common monomer favorites.")
+    traceback.print_exc()
+    return 0
+  if favorite_entry.get("kind") == "cif":
+    managed_cif_path = favorite_entry.get("cif_path", "")
+    if (
+      isinstance(managed_cif_path, str)
+      and managed_cif_path
+      and os.path.dirname(os.path.abspath(managed_cif_path)) == _coot_trimmings_dir()
+      and os.path.basename(managed_cif_path).startswith(COMMON_MONOMER_FAVORITE_CIF_PREFIX)
+      and not any(
+        entry.get("kind") == "cif" and entry.get("cif_path") == managed_cif_path
+        for entry in new_favorites
+      )
+    ):
+      try:
+        if os.path.isfile(managed_cif_path):
+          os.remove(managed_cif_path)
+      except Exception:
+        traceback.print_exc()
+  refresh_common_monomer_favorites_menu()
+  add_status_bar_text(f"Removed favorite: {_favorite_menu_label(favorite_entry)}")
+  return 1
+
+
+def prompt_remove_common_monomer_favorite():
+  """Show the current favorites as removable buttons."""
+  favorites = _load_common_monomer_favorites()
+  if not favorites:
+    info_dialog("No Common monomer favorites are currently saved.")
+    return 0
+
+  action_button_dialog(
+    "Remove Common Monomer Favorite",
+    [
+      (
+        _favorite_menu_label(entry),
+        lambda favorite_entry=entry: _remove_common_monomer_favorite(favorite_entry),
+      )
+      for entry in favorites
+    ],
+    close_on_click=True,
+  )
+  return 1
+
+
+def place_common_monomer_favorite(favorite_entry):
+  """Place either a library monomer favorite or a custom-CIF favorite."""
+  if favorite_entry.get("kind") == "cif":
+    return place_custom_cif_monomer(favorite_entry["cif_path"], favorite_entry["comp_id"])
+  return place_common_monomer(favorite_entry["code"])
+
+
+def _common_monomer_target_molecule():
+  residue = active_residue()
+  if residue:
+    return residue[0]
+  try:
+    mol_id = go_to_atom_molecule_number()
+    if valid_model_molecule_qm(mol_id):
+      return mol_id
+  except Exception:
+    pass
+  for mol_id in model_molecule_list():
+    if valid_model_molecule_qm(mol_id):
+      return mol_id
+  return None
+
+
+def place_custom_cif_monomer(cif_path, comp_id=None):
+  """Load a custom CIF-backed monomer favorite and place it in Coot."""
+  normalized_path = _normalize_common_monomer_cif_path(cif_path)
+  normalized_code = _sanitize_common_monomer_code(comp_id or _extract_cif_component_id(cif_path) or "")
+  if not normalized_path or not normalized_code:
+    info_dialog("This favorite references an invalid CIF file or component ID.")
+    return 0
+
+  pointer_type = _pointer_type_for_cif_path(normalized_path, normalized_code)
+  if pointer_type:
+    target_mol_id = _common_monomer_target_molecule()
+    if target_mol_id is None:
+      info_dialog(
+        f"{normalized_code} could not be added because there is no target model molecule.\n\n"
+        "Single-atom monomers such as metals and halides are inserted into an existing model.\n"
+        "Load a model first, or make sure a model molecule is active, then try again."
+      )
+      return 0
+    try:
+      set_pointer_atom_molecule(target_mol_id)
+    except Exception:
+      pass
+    try:
+      set_go_to_atom_molecule(target_mol_id)
+    except Exception:
+      pass
+    place_typed_atom_at_pointer(pointer_type)
+    return target_mol_id
+
+  read_cif_dictionary(normalized_path)
+  monomer_imol = coot.get_monomer_from_dictionary(normalized_code, 1)
+  if not valid_model_molecule_qm(monomer_imol):
+    monomer_imol = coot.get_monomer(normalized_code)
+  if not valid_model_molecule_qm(monomer_imol):
+    info_dialog(f"Failed to build {normalized_code} from {normalized_path}.")
+    return 0
+  delete_hydrogens(monomer_imol)
+  return monomer_imol
+
+
 def place_common_monomer(monomer_code):
   """Place a common monomer or simple ion at the pointer/current centre."""
-  pointer_type = COMMON_MONOMER_POINTER_TYPES.get(monomer_code)
+  pointer_type = _pointer_type_for_monomer_code(monomer_code)
   if pointer_type:
+    target_mol_id = _common_monomer_target_molecule()
+    if target_mol_id is None:
+      info_dialog(
+        f"{str(monomer_code).strip().upper()} could not be added because there is no target model molecule.\n\n"
+        "Single-atom monomers such as metals and halides are inserted into an existing model.\n"
+        "Load a model first, or make sure a model molecule is active, then try again."
+      )
+      return 0
+    try:
+      set_pointer_atom_molecule(target_mol_id)
+    except Exception:
+      pass
+    try:
+      set_go_to_atom_molecule(target_mol_id)
+    except Exception:
+      pass
     place_typed_atom_at_pointer(pointer_type)
+    return target_mol_id
   else:
     get_monomer_no_H(monomer_code)
+    return molecule_number_list()[-1]
 
 
 COORDINATION_LINK_MENU = [
@@ -7328,15 +8395,332 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
     ["Stay open?", lambda active_state: stay_open(active_state)],
     "OK...",
     lambda text, stay_open_qm: make_restr(text, stay_open_qm))
-'''
 
-# Re-enable the archived helper functions only after the live GTK4-safe
-# replacements above have been defined.
-try:
-  exec(GTK_DIALOG_FUNCTION_ARCHIVE, globals(), globals())
-except Exception:
-  print("coot_trimmings dialog archive activation failed")
-  traceback.print_exc()
+
+def _build_custom_display_menu(submenu_display):
+  """Populate the Display submenu in normal Python rather than exec'd text."""
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "All Molecules use \"C-alpha\" Symmetry",
+    lambda func: [valid_model_molecule_qm(imol) and symmetry_as_calphas(imol, 1) for imol in molecule_number_list()],
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Toggle Symmetry",
+    lambda func: set_show_symmetry_master(not get_show_symmetry()),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Clear labels and distances",
+    lambda func: clear_distances_and_labels(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Toggle high-contrast model lighting",
+    lambda func: toggle_high_contrast_mode(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Yellow-ify carbons",
+    lambda func: yellowify_carbons_in_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Switch all mols to CA representation",
+    lambda func: all_mols_to_ca(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Find sequence in active chain",
+    lambda func: find_sequence_with_entry(),
+  )
+
+
+def _build_custom_fit_menu(submenu_fit):
+  add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", lambda func: rigid_fit_all_chains())
+  add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", lambda func: rigid_fit_active_chain())
+  add_simple_coot_menu_menuitem(
+    submenu_fit,
+    "Jiggle-fit current chain to map (Slow!)",
+    lambda func: jiggle_fit_active_chain(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_fit,
+    "Jiggle-fit current chain to B-smoothed map (Slow!)",
+    lambda func: jiggle_fit_active_chain_smooth(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_fit,
+    "Jiggle-fit all chains to map (very slow!)",
+    lambda func: jiggle_fit_all_chains(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_fit,
+    "Jiggle-fit current mol to map (Slow!)",
+    lambda func: jiggle_fit_active_mol(),
+  )
+  add_simple_coot_menu_menuitem(submenu_fit, "Fit all segments", lambda func: rigid_body_fit_segments())
+  add_simple_coot_menu_menuitem(submenu_fit, "Fit this segment", lambda func: fit_this_segment())
+  add_simple_coot_menu_menuitem(
+    submenu_fit,
+    "Smart self restrain active mol...",
+    lambda func: prompt_generate_smart_local_extra_restraints(),
+  )
+
+
+def _build_custom_renumber_menu(submenu_renumber):
+  add_simple_coot_menu_menuitem(
+    submenu_renumber,
+    "Renumber active chain by first res",
+    lambda func: renumber_by_first_res(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_renumber,
+    "Renumber active chain by last res",
+    lambda func: renumber_by_last_res(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_renumber,
+    "Renumber active chain by current res",
+    lambda func: renumber_by_active_res(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_renumber,
+    "Renumber from N-term to active residue",
+    lambda func: renumber_n_term_segment(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_renumber,
+    "Renumber from active residue to C-term",
+    lambda func: renumber_c_term_segment(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_renumber,
+    "Renumber segment by active res",
+    lambda func: renumber_seg_by_active_res(),
+  )
+
+
+def _build_custom_settings_menu(submenu_settings):
+  add_simple_coot_menu_menuitem(
+    submenu_settings,
+    "Auto-scale B-factor coloring for active mol",
+    lambda func: autoscale_b_factor(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_settings,
+    "Set Bfac for new atoms to mean B for active mol",
+    lambda func: set_new_atom_b_fac_to_mean(),
+  )
+
+
+def _build_custom_build_menu(
+  submenu_build,
+  submenu_common_monomers,
+  submenu_common_monomer_favorites,
+  submenu_coordination_links,
+  submenu_covalent_modifications,
+):
+  global COMMON_MONOMER_FAVORITES_MENU
+
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Forced addition of terminal residue (click terminus)",
+    lambda func: force_add_terminal_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Grow helix (click terminus)",
+    lambda func: grow_helix(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Grow strand (click terminus)",
+    lambda func: grow_strand(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Grow parallel strand (click terminus)",
+    lambda func: grow_parallel_strand(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Grow 3-10 helix (click terminus)",
+    lambda func: grow_helix_3_10(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Shorten loop by one residue",
+    lambda func: shorten_loop(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Lengthen loop by one residue",
+    lambda func: lengthen_loop(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Get fractional coordinates of active atom",
+    lambda func: get_fract_coords(),
+  )
+
+  submenu_build.append_submenu("Common monomers", submenu_common_monomers)
+  submenu_common_monomers.append_submenu("Favorites", submenu_common_monomer_favorites)
+  COMMON_MONOMER_FAVORITES_MENU = submenu_common_monomer_favorites
+  refresh_common_monomer_favorites_menu()
+  add_common_monomer_menu_entries(submenu_common_monomers, COMMON_MONOMER_MENU)
+
+  submenu_build.append_submenu("Coordination links", submenu_coordination_links)
+  add_coordination_link_menu_entries(submenu_coordination_links, COORDINATION_LINK_MENU)
+
+  submenu_build.append_submenu("Covalent modifications", submenu_covalent_modifications)
+  add_covalent_modification_menu_entries(submenu_covalent_modifications)
+
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Make alpha helix of length n",
+    lambda func: place_new_helix(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Make 3-10 helix of length n",
+    lambda func: place_new_3_10_helix(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_build,
+    "Build polyala loop (click start,end)",
+    lambda func: fit_polyala_gui(),
+  )
+
+
+def _build_custom_mutate_menu(submenu_mutate):
+  add_simple_coot_menu_menuitem(
+    submenu_mutate,
+    "Mutate range to UNK (click start and end)",
+    lambda func: mutate_residue_range_by_click_a(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_mutate,
+    "Mutate range to ALA (click start and end)",
+    lambda func: mutate_residue_range_by_click_ala_a(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_mutate,
+    "Mutate all Mets to MSE",
+    lambda func: mutate_all_mets_to_mse(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_mutate,
+    "Mutate all MSEs to Met",
+    lambda func: mutate_all_mse_to_met(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_mutate,
+    "Mutate active chain to template sequence (numbering must match sequence!)",
+    lambda func: mutate_by_resnum(),
+  )
+
+
+def _build_custom_modify_menu(submenu_modify):
+  add_simple_coot_menu_menuitem(submenu_modify, "Copy current chain", lambda func: copy_active_chain())
+  add_simple_coot_menu_menuitem(submenu_modify, "Cut current chain", lambda func: cut_active_chain())
+  add_simple_coot_menu_menuitem(submenu_modify, "Copy active segment", lambda func: copy_active_segment())
+  add_simple_coot_menu_menuitem(submenu_modify, "Cut active segment", lambda func: cut_active_segment())
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Smart copy active non-polymer residue",
+    lambda func: smart_copy_active_non_polymer_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Smart paste copied non-polymer residue",
+    lambda func: smart_paste_copied_non_polymer_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Copy fragment (click start and end)",
+    lambda func: copy_frag_by_click(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Cut fragment (click start and end)",
+    lambda func: cut_frag_by_click(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Copy active chain to NCS equivs",
+    lambda func: copy_ncs_chain_from_active(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Delete active segment",
+    lambda func: delete_active_segment(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Merge chains (click two; 2nd into 1st)",
+    lambda func: merge_chains(),
+  )
+
+
+def _build_custom_maps_menu(submenu_maps):
+  add_simple_coot_menu_menuitem(
+    submenu_maps,
+    "Go to center of scrollable map",
+    lambda func: goto_center_of_map(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_maps,
+    "Set refinement map to scrollable map",
+    lambda func: set_map_to_scrollable_map(),
+  )
+
+
+def build_custom_menu():
+  """Create the top-level Custom menu with direct Python submenu builders."""
+  if not GUI_PYTHON_AVAILABLE:
+    return None
+  if "Gio" not in globals() and hasattr(coot_gui, "Gio"):
+    globals()["Gio"] = coot_gui.Gio
+
+  menu = attach_module_menu_button("Custom")
+  submenu_display = Gio.Menu.new()
+  submenu_fit = Gio.Menu.new()
+  submenu_renumber = Gio.Menu.new()
+  submenu_settings = Gio.Menu.new()
+  submenu_build = Gio.Menu.new()
+  submenu_common_monomers = Gio.Menu.new()
+  submenu_common_monomer_favorites = Gio.Menu.new()
+  submenu_coordination_links = Gio.Menu.new()
+  submenu_covalent_modifications = Gio.Menu.new()
+  submenu_mutate = Gio.Menu.new()
+  submenu_modify = Gio.Menu.new()
+  submenu_maps = Gio.Menu.new()
+
+  menu.append_submenu("Display", submenu_display)
+  menu.append_submenu("Fit", submenu_fit)
+  menu.append_submenu("Renumber", submenu_renumber)
+  menu.append_submenu("Settings", submenu_settings)
+  menu.append_submenu("Build", submenu_build)
+  menu.append_submenu("Mutate", submenu_mutate)
+  menu.append_submenu("Modify", submenu_modify)
+  menu.append_submenu("Maps", submenu_maps)
+
+  _build_custom_display_menu(submenu_display)
+  _build_custom_fit_menu(submenu_fit)
+  _build_custom_renumber_menu(submenu_renumber)
+  _build_custom_settings_menu(submenu_settings)
+  _build_custom_build_menu(
+    submenu_build,
+    submenu_common_monomers,
+    submenu_common_monomer_favorites,
+    submenu_coordination_links,
+    submenu_covalent_modifications,
+  )
+  _build_custom_mutate_menu(submenu_mutate)
+  _build_custom_modify_menu(submenu_modify)
+  _build_custom_maps_menu(submenu_maps)
+  return menu
 
 # Preserve the older menu-building block as a clearly separated archive. The
 # main Coot 1.x menu layout should be edited in the live menu code above; this
@@ -7353,6 +8737,7 @@ if GUI_PYTHON_AVAILABLE:
   submenu_settings = Gio.Menu.new()
   submenu_build = Gio.Menu.new()
   submenu_common_monomers = Gio.Menu.new()
+  submenu_common_monomer_favorites = Gio.Menu.new()
   submenu_coordination_links = Gio.Menu.new()
   submenu_covalent_modifications = Gio.Menu.new()
   submenu_mutate = Gio.Menu.new()
@@ -7370,7 +8755,7 @@ if GUI_PYTHON_AVAILABLE:
 else:
   menu = None
   submenu_display = submenu_colour = submenu_fit = submenu_renumber = submenu_settings = None
-  submenu_build = submenu_common_monomers = submenu_coordination_links = submenu_covalent_modifications = submenu_mutate = submenu_modify = None
+  submenu_build = submenu_common_monomers = submenu_common_monomer_favorites = submenu_coordination_links = submenu_covalent_modifications = submenu_mutate = submenu_modify = None
   submenu_maps = None
 
 #**** Populate submenus ****
@@ -7526,6 +8911,9 @@ add_simple_coot_menu_menuitem(submenu_build,
 "Get fractional coordinates of active atom",lambda func: get_fract_coords()) 
 
 submenu_build.append_submenu("Common monomers", submenu_common_monomers)
+submenu_common_monomers.append_submenu("Favorites", submenu_common_monomer_favorites)
+COMMON_MONOMER_FAVORITES_MENU = submenu_common_monomer_favorites
+refresh_common_monomer_favorites_menu()
 add_common_monomer_menu_entries(submenu_common_monomers, COMMON_MONOMER_MENU)
 
 submenu_build.append_submenu("Coordination links", submenu_coordination_links)
@@ -7600,12 +8988,8 @@ add_simple_coot_menu_menuitem(submenu_maps,
 '''
 
 if GUI_PYTHON_AVAILABLE:
-  if "Gio" not in globals() and hasattr(coot_gui, "Gio"):
-    Gio = coot_gui.Gio
   try:
-    # Some legacy menu items are still useful in Coot 1.x, so keep the old
-    # archive loadable instead of rewriting the whole block by hand.
-    exec(GTK_UI_ARCHIVE, globals(), globals())
+    build_custom_menu()
   except Exception:
-    print("coot_trimmings GUI archive activation failed")
+    print("coot_trimmings direct menu build failed")
     traceback.print_exc()
