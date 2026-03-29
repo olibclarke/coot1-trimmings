@@ -225,6 +225,8 @@ These are the main custom bindings currently defined by the script.
 | `O`     | Go to the equivalent residue on the NCS master chain         |
 | `D`     | Toggle environment distances / H-bond display                |
 | `Z`     | Clear distances and labels                                   |
+| `,`     | Brighten scrollable map                                      |
+| `.`     | Darken scrollable map                                        |
 
 ### Map controls
 
