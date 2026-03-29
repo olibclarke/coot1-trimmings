@@ -104,6 +104,8 @@ COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
 EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
 EM_TARGET_PIXEL_SIZE = 0.5
+EM_MASKED_MAP_RADIUS = 1.7
+EM_MASKED_MAP_COLOUR = (1.0, 0.0, 1.0)
 MAP_BRIGHTEN_SCALE_FACTOR = 1.05
 MAP_DARKEN_SCALE_FACTOR = 1.0 / MAP_BRIGHTEN_SCALE_FACTOR
 MAP_BRIGHTNESS_MIN_COMPONENT = 0.05
@@ -650,6 +652,20 @@ def _scrollable_map_or_status():
   if map_id != -1 and map_id in map_molecule_list():
     return map_id
   add_status_bar_text("No active map")
+  return None
+
+
+def _active_model_molecule_for_map_tools(action_name):
+  """Resolve the current model molecule for map/model wrapper helpers."""
+  residue = active_residue()
+  if residue and residue[0] in model_molecule_list():
+    return residue[0]
+
+  mol_id = go_to_atom_molecule_number()
+  if mol_id in model_molecule_list():
+    return mol_id
+
+  add_status_bar_text(f"No active model for {action_name}")
   return None
 
 
@@ -4178,6 +4194,60 @@ def resample_active_map_for_em_half_angstrom(force=False, allow_large_output=Fal
   close_molecule(map_id)
   add_status_bar_text("Created EM-style 0.5 A/pixel map")
   return new_map_id
+
+
+def make_masked_map_em():
+  """Mask the active map by the active molecule and display the result in magenta."""
+  map_id = _scrollable_map_or_status()
+  if map_id is None:
+    return None
+
+  mol_id = _active_model_molecule_for_map_tools("masked map")
+  if mol_id is None:
+    return None
+
+  current_contour_absolute = abs(get_contour_level_absolute(map_id))
+
+  previous_mask_radius = None
+  try:
+    previous_mask_radius = map_mask_atom_radius()
+  except Exception:
+    previous_mask_radius = None
+
+  try:
+    set_map_mask_atom_radius(EM_MASKED_MAP_RADIUS)
+    new_map_id = mask_map_by_molecule(map_id, mol_id, 0)
+  finally:
+    if previous_mask_radius is not None:
+      set_map_mask_atom_radius(previous_mask_radius)
+
+  if new_map_id == -1 or new_map_id not in map_molecule_list():
+    info_dialog("Failed to create masked map.")
+    return None
+
+  set_map_is_difference_map(new_map_id, 0)
+  set_map_colour(
+    new_map_id,
+    EM_MASKED_MAP_COLOUR[0],
+    EM_MASKED_MAP_COLOUR[1],
+    EM_MASKED_MAP_COLOUR[2],
+  )
+  if current_contour_absolute > 0.0:
+    set_contour_level_absolute(new_map_id, current_contour_absolute)
+  set_map_displayed(new_map_id, 1)
+  add_status_bar_text(
+    "Created masked map #{0} from map #{1} around molecule #{2}".format(
+      new_map_id,
+      map_id,
+      mol_id,
+    )
+  )
+  return new_map_id
+
+
+def make_pseudo_diff_map_em():
+  """Backward-compatible wrapper for the older pseudo-diff menu action name."""
+  return make_masked_map_em()
 
 
 def _map_global_extent_radius(map_id):
@@ -9886,6 +9956,11 @@ def _build_custom_maps_menu(submenu_maps):
     submenu_maps,
     "Set refinement map to scrollable map",
     lambda func: set_map_to_scrollable_map(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_maps,
+    "Make masked map (EM)",
+    lambda func: make_masked_map_em(),
   )
 
 
