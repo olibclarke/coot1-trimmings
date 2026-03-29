@@ -103,6 +103,19 @@ EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
 EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
 EM_TARGET_PIXEL_SIZE = 0.5
 
+# EM-ringer-like side-chain density helper defaults.
+EMRINGER_HELPER_STEP_DEGREES = 15.0
+EMRINGER_HELPER_MIN_PEAK_TO_CONTOUR_RATIO = 1.0
+EMRINGER_HELPER_MIN_ABSOLUTE_DENSITY = 0.35
+EMRINGER_HELPER_OCCUPIED_DISTANCE = 1.2
+EMRINGER_HELPER_CA_CB_BOND_LENGTH = 1.53
+EMRINGER_HELPER_CB_CG_BOND_LENGTH = 1.52
+EMRINGER_HELPER_FINE_STEP_DEGREES = 5.0
+EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION = 0.75
+EMRINGER_HELPER_WEAK_LIGAND_OUTSIDE_FRACTION = 0.30
+EMRINGER_HELPER_MIN_LIGAND_HEAVY_ATOMS = 2
+EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER = 0.30
+
 # Model lighting presets used by the high-contrast toggle.
 MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
 MODEL_NORMAL_DIFFUSE = (0.75, 0.75, 0.75, 1.0)
@@ -131,6 +144,7 @@ MODEL_HIGH_CONTRAST_MOLECULES = set()
 NAVIGATION_LAST_RESIDUE = None
 COMMON_MONOMER_FAVORITES_MENU = None
 COMMON_MONOMER_LAST_BROWSED_DIRECTORY = None
+EMRINGER_HELPER_BACKBONE_ATOM_NAMES = {"N", "CA", "C", "O", "OXT", "CB"}
 
 
 def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
@@ -426,6 +440,87 @@ POLYMER_RESIDUE_NAMES = {
   "P1L", "SEP", "TPO", "PTR", "CSO", "CME", "MLY", "MLZ",
   "HYP", "KCX", "ALY", "MLY", "FME", "PYL", "SEC"
 }
+
+# Residue-specific atom names that genuinely occupy the chi1/gamma position.
+# These are used to decide whether a strong virtual-CG peak is already
+# accounted for by placed atoms, without letting distal atoms mask real chi1
+# problems.
+EMRINGER_HELPER_CHI1_BLOCKER_ATOM_NAMES = {
+  "ALA": set(),
+  "ARG": {"CG"},
+  "ASN": {"CG"},
+  "ASP": {"CG"},
+  "CME": {"SG"},
+  "CSO": {"SG"},
+  "CYS": {"SG"},
+  "FME": {"CG"},
+  "GLN": {"CG"},
+  "GLU": {"CG"},
+  "HIS": {"CG"},
+  "HYP": {"CG"},
+  "ILE": {"CG1", "CG2"},
+  "KCX": {"CG"},
+  "LEU": {"CG"},
+  "LYS": {"CG"},
+  "M3L": {"CG"},
+  "MET": {"CG"},
+  "MSE": {"CG"},
+  "MLY": {"CG"},
+  "MLZ": {"CG"},
+  "P1L": {"SG"},
+  "PHE": {"CG"},
+  "PRO": {"CG"},
+  "PTR": {"CG"},
+  "SEC": {"SE"},
+  "SEP": {"OG"},
+  "SER": {"OG"},
+  "THR": {"OG1", "CG2"},
+  "TPO": {"OG1", "CG2"},
+  "TRP": {"CG"},
+  "TYR": {"CG"},
+  "VAL": {"CG1", "CG2"},
+}
+
+# Extra torsion stages for longer flexible sidechains. Each entry defines a
+# later sidechain sweep around a downstream bond plus the atom(s) that should
+# already occupy that stage if the model is built correctly.
+EMRINGER_HELPER_LATE_STAGE_DEFINITIONS = {
+  "ARG": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG", "blockers": {"CD"}, "bond_length": 1.52},
+    {"label": "chi3", "reference": "CB", "axis_start": "CG", "axis_end": "CD", "blockers": {"NE"}, "bond_length": 1.46},
+    {"label": "chi4", "reference": "CG", "axis_start": "CD", "axis_end": "NE", "blockers": {"CZ"}, "bond_length": 1.33},
+  ],
+  "GLN": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG", "blockers": {"CD"}, "bond_length": 1.52},
+  ],
+  "GLU": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG", "blockers": {"CD"}, "bond_length": 1.52},
+  ],
+  "ILE": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG1", "blockers": {"CD1"}, "bond_length": 1.52},
+  ],
+  "LEU": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG", "blockers": {"CD1", "CD2"}, "bond_length": 1.52},
+  ],
+  "LYS": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG", "blockers": {"CD"}, "bond_length": 1.52},
+    {"label": "chi3", "reference": "CB", "axis_start": "CG", "axis_end": "CD", "blockers": {"CE"}, "bond_length": 1.52},
+    {"label": "chi4", "reference": "CG", "axis_start": "CD", "axis_end": "CE", "blockers": {"NZ"}, "bond_length": 1.48},
+  ],
+  "MET": [
+    {"label": "chi2", "reference": "CA", "axis_start": "CB", "axis_end": "CG", "blockers": {"SD"}, "bond_length": 1.81},
+    {"label": "chi3", "reference": "CB", "axis_start": "CG", "axis_end": "SD", "blockers": {"CE"}, "bond_length": 1.79},
+  ],
+}
+
+WATER_RESIDUE_NAMES = {"HOH", "WAT", "DOD", "OH2", "H2O"}
+ODD_RESIDUE_CATEGORY_ORDER = (
+  "Possible Misfits",
+  "Weak Sidechains",
+  "Weak Backbone",
+  "Weak Waters",
+  "Weak Ligands",
+)
 
 
 def _optional_import(module_name):
@@ -1751,8 +1846,8 @@ if GUI_PYTHON_AVAILABLE:
       window.destroy()
       return False
 
-    def jump_to_entry(x, y, z):
-      set_rotation_centre(x, y, z)
+    def jump_to_entry(entry):
+      _activate_interesting_entry(entry)
       return False
 
     for entry in thing_list:
@@ -1761,7 +1856,7 @@ if GUI_PYTHON_AVAILABLE:
       button = Gtk.Button(label=str(entry[0]))
       button.connect(
         "clicked",
-        lambda _button, x=entry[1], y=entry[2], z=entry[3]: jump_to_entry(x, y, z),
+        lambda _button, current_entry=entry: jump_to_entry(current_entry),
       )
       inside_vbox.append(button)
 
@@ -1772,6 +1867,144 @@ if GUI_PYTHON_AVAILABLE:
     vbox.append(close_button)
     window.set_child(vbox)
     window.present()
+
+  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists):
+    """Show grouped clickable jump targets in a single scrollable dialog."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+    window.set_default_size(560, 520)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    navigation_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    label = Gtk.Label(label=dialog_name)
+    scrolled = Gtk.ScrolledWindow()
+    inside_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    prev_button = Gtk.Button(label="<--Prev")
+    next_button = Gtk.Button(label="Next-->")
+    close_button = Gtk.Button(label="Close")
+
+    label.set_margin_start(12)
+    label.set_margin_end(12)
+    label.set_margin_top(12)
+    label.set_margin_bottom(4)
+    label.set_wrap(True)
+    label.set_xalign(0.0)
+    scrolled.set_margin_start(12)
+    scrolled.set_margin_end(12)
+    scrolled.set_margin_bottom(8)
+    navigation_row.set_halign(Gtk.Align.CENTER)
+    navigation_row.set_margin_start(12)
+    navigation_row.set_margin_end(12)
+    navigation_row.set_margin_bottom(4)
+    close_button.set_margin_start(12)
+    close_button.set_margin_end(12)
+    close_button.set_margin_bottom(12)
+    close_button.set_halign(Gtk.Align.CENTER)
+
+    scrolled.set_hexpand(True)
+    scrolled.set_vexpand(True)
+    inside_vbox.set_valign(Gtk.Align.START)
+    scrolled.set_child(inside_vbox)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def jump_to_entry(entry, category_name=None):
+      _activate_interesting_entry(entry, category_name)
+      return False
+
+    # Keep a flat ordered list for Prev/Next while still rendering grouped rows.
+    flat_entry_specs = []
+    current_index = {"value": 0}
+
+    def activate_entry(entry_index):
+      if not flat_entry_specs:
+        return False
+      entry_index = entry_index % len(flat_entry_specs)
+      current_index["value"] = entry_index
+      category_name, entry, button = flat_entry_specs[entry_index]
+      jump_to_entry(entry, category_name)
+      try:
+        button.grab_focus()
+      except Exception:
+        pass
+      return False
+
+    shown_any_category = False
+    for category_name, thing_list in categorized_thing_lists:
+      if not thing_list:
+        continue
+      shown_any_category = True
+
+      header = Gtk.Label(label=f"{category_name} ({len(thing_list)})")
+      header.set_xalign(0.0)
+      header.set_margin_top(6)
+      header.set_margin_bottom(2)
+      inside_vbox.append(header)
+
+      for entry in thing_list:
+        if len(entry) < 4:
+          continue
+        button = Gtk.Button(label=str(entry[0]))
+        entry_index = len(flat_entry_specs)
+        flat_entry_specs.append((category_name, entry, button))
+        button.connect(
+          "clicked",
+          lambda _button, idx=entry_index: activate_entry(idx),
+        )
+        inside_vbox.append(button)
+
+      separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+      separator.set_margin_top(4)
+      separator.set_margin_bottom(2)
+      inside_vbox.append(separator)
+
+    if not shown_any_category:
+      empty_label = Gtk.Label(label="No results")
+      empty_label.set_xalign(0.0)
+      inside_vbox.append(empty_label)
+
+    prev_button.connect("clicked", lambda *_args: activate_entry(current_index["value"] - 1))
+    next_button.connect("clicked", lambda *_args: activate_entry(current_index["value"] + 1))
+    close_button.connect("clicked", close_window)
+    prev_button.set_sensitive(bool(flat_entry_specs))
+    next_button.set_sensitive(bool(flat_entry_specs))
+
+    vbox.append(label)
+    vbox.append(scrolled)
+    navigation_row.append(prev_button)
+    navigation_row.append(next_button)
+    vbox.append(navigation_row)
+    vbox.append(close_button)
+    window.set_child(vbox)
+    window.present()
+
+  def _interesting_entry_status_text(entry, category_name=None):
+    entry_label = str(entry[0]) if entry else ""
+    if entry_label and category_name:
+      return f"{entry_label} - {_odd_residue_status_suffix(category_name)}"
+    return entry_label
+
+  def _activate_interesting_entry(entry, category_name=None):
+    """Jump to a chooser entry, using smart residue navigation when available."""
+    status_message = _interesting_entry_status_text(entry, category_name)
+    if len(entry) >= 5 and isinstance(entry[4], dict):
+      navigation = entry[4]
+      if navigation.get("type") == "polymer_residue":
+        if status_message:
+          add_status_bar_text(status_message)
+        return _go_to_navigation_residue(
+          navigation["mol_id"],
+          navigation["chain_id"],
+          navigation["resno"],
+          navigation.get("ins_code", ""),
+          navigation.get("serial_number"),
+        )
+    if status_message:
+      add_status_bar_text(status_message)
+    set_rotation_centre(entry[1], entry[2], entry[3])
+    return False
 
   def action_button_dialog(dialog_name, button_list, close_on_click=True):
     """GTK4-safe scrolling list of action buttons."""
@@ -2354,6 +2587,794 @@ def go_to_nearest_density_peak():
 
   set_rotation_centre(peak_point[0], peak_point[1], peak_point[2])
   return peak_point
+
+
+def _active_analysis_map_or_status():
+  """Return the currently active map for density-analysis helpers."""
+  map_id = scroll_wheel_map()
+  if map_id != -1 and map_id in map_molecule_list():
+    return map_id
+  map_id = imol_refinement_map()
+  if map_id != -1 and map_id in map_molecule_list():
+    return map_id
+  add_status_bar_text("No active map")
+  return None
+
+
+def _active_polymer_molecule_or_status():
+  """Resolve the current model molecule for polymer-scoped validation helpers."""
+  reference = _navigation_reference_residue()
+  if reference is None:
+    return None
+  return reference["mol_id"]
+
+
+def _residue_atom_records_and_xyz(imol, chain_id, resno, ins_code):
+  """Parse a residue once into both atom records and an atom-name lookup map."""
+  atom_info = residue_info_py(imol, chain_id, resno, ins_code)
+  if not isinstance(atom_info, list):
+    return [], {}
+
+  atom_records = []
+  atom_xyz = {}
+  for atom in atom_info:
+    try:
+      atom_name = atom[0][0].strip()
+      element = atom[1][2].strip().upper()
+      xyz = list(atom[2])
+    except Exception:
+      continue
+    if atom_name and len(xyz) == 3:
+      atom_records.append({
+        "name": atom_name,
+        "element": element,
+        "xyz": xyz,
+      })
+      atom_xyz.setdefault(atom_name, xyz)
+  return atom_records, atom_xyz
+
+
+def _residue_atom_records(imol, chain_id, resno, ins_code):
+  """Return parsed atom records with names, coordinates, and elements."""
+  atom_records, _atom_xyz = _residue_atom_records_and_xyz(imol, chain_id, resno, ins_code)
+  return atom_records
+
+
+def _pseudo_cb_direction_from_backbone(atom_xyz):
+  """Construct an alanine-like pseudo-CB direction from backbone geometry."""
+  if not all(atom_name in atom_xyz for atom_name in ("N", "CA", "C")):
+    return None
+  anchor = atom_xyz["CA"]
+  n_vector = _normalize_vector(_vector_subtract(atom_xyz["N"], anchor))
+  c_vector = _normalize_vector(_vector_subtract(atom_xyz["C"], anchor))
+  if n_vector is None or c_vector is None:
+    return None
+
+  hydrogen_midpoint = [
+    -(n_vector[0] + c_vector[0]) * 0.5,
+    -(n_vector[1] + c_vector[1]) * 0.5,
+    -(n_vector[2] + c_vector[2]) * 0.5,
+  ]
+  plane_normal = _normalize_vector(_vector_cross(n_vector, c_vector))
+  if plane_normal is None:
+    return None
+  if "O" in atom_xyz:
+    o_vector = _normalize_vector(_vector_subtract(atom_xyz["O"], anchor))
+    if o_vector is not None and _vector_dot(plane_normal, o_vector) > 0.0:
+      plane_normal = _scale_vector(plane_normal, -1.0)
+
+  perpendicular_scale_sq = max(0.0, 1.0 - _vector_dot(hydrogen_midpoint, hydrogen_midpoint))
+  perpendicular_scale = math.sqrt(perpendicular_scale_sq)
+  return _normalize_vector([
+    hydrogen_midpoint[0] + perpendicular_scale * plane_normal[0],
+    hydrogen_midpoint[1] + perpendicular_scale * plane_normal[1],
+    hydrogen_midpoint[2] + perpendicular_scale * plane_normal[2],
+  ])
+
+
+def _emringer_ring_frame(atom_xyz):
+  """Build the CA-CB frame used to sweep a virtual CG around chi1."""
+  if not all(atom_name in atom_xyz for atom_name in ("N", "CA", "C")):
+    return None
+
+  ca_xyz = atom_xyz["CA"]
+  if "CB" in atom_xyz:
+    cb_xyz = atom_xyz["CB"]
+    axis_unit = _normalize_vector(_vector_subtract(cb_xyz, ca_xyz))
+  else:
+    pseudo_cb_direction = _pseudo_cb_direction_from_backbone(atom_xyz)
+    if pseudo_cb_direction is None:
+      return None
+    axis_unit = pseudo_cb_direction
+    cb_xyz = [
+      ca_xyz[0] + EMRINGER_HELPER_CA_CB_BOND_LENGTH * axis_unit[0],
+      ca_xyz[1] + EMRINGER_HELPER_CA_CB_BOND_LENGTH * axis_unit[1],
+      ca_xyz[2] + EMRINGER_HELPER_CA_CB_BOND_LENGTH * axis_unit[2],
+    ]
+
+  if axis_unit is None:
+    return None
+
+  ring_u = _project_vector_perpendicular(_vector_subtract(atom_xyz["N"], ca_xyz), axis_unit)
+  if ring_u is None:
+    ring_u = _project_vector_perpendicular(_vector_subtract(atom_xyz["C"], ca_xyz), axis_unit)
+  if ring_u is None:
+    return None
+  ring_v = _normalize_vector(_vector_cross(axis_unit, ring_u))
+  if ring_v is None:
+    return None
+
+  return {
+    "ca_xyz": ca_xyz,
+    "cb_xyz": cb_xyz,
+    "anchor_xyz": cb_xyz,
+    "axis_unit": axis_unit,
+    "ring_u": ring_u,
+    "ring_v": ring_v,
+  }
+
+
+def _emringer_torsion_ring_frame(atom_xyz, reference_atom_name, axis_start_atom_name, axis_end_atom_name):
+  """Build a generic torsion frame for sweeping a downstream sidechain atom."""
+  if not all(atom_name in atom_xyz for atom_name in (reference_atom_name, axis_start_atom_name, axis_end_atom_name)):
+    return None
+
+  axis_start_xyz = atom_xyz[axis_start_atom_name]
+  axis_end_xyz = atom_xyz[axis_end_atom_name]
+  axis_unit = _normalize_vector(_vector_subtract(axis_end_xyz, axis_start_xyz))
+  if axis_unit is None:
+    return None
+
+  ring_u = _project_vector_perpendicular(
+    _vector_subtract(atom_xyz[reference_atom_name], axis_start_xyz),
+    axis_unit,
+  )
+  if ring_u is None:
+    return None
+  ring_v = _normalize_vector(_vector_cross(axis_unit, ring_u))
+  if ring_v is None:
+    return None
+
+  return {
+    "anchor_xyz": axis_end_xyz,
+    "axis_unit": axis_unit,
+    "ring_u": ring_u,
+    "ring_v": ring_v,
+  }
+
+
+def _virtual_torsion_point(ring_frame, bond_length, angle_degrees):
+  anchor_xyz = ring_frame["anchor_xyz"]
+  axis_unit = ring_frame["axis_unit"]
+  ring_u = ring_frame["ring_u"]
+  ring_v = ring_frame["ring_v"]
+  axial_offset = bond_length / 3.0
+  radial_offset = bond_length * math.sqrt(8.0 / 9.0)
+  angle_radians = math.radians(angle_degrees)
+  ring_direction = [
+    math.cos(angle_radians) * ring_u[0] + math.sin(angle_radians) * ring_v[0],
+    math.cos(angle_radians) * ring_u[1] + math.sin(angle_radians) * ring_v[1],
+    math.cos(angle_radians) * ring_u[2] + math.sin(angle_radians) * ring_v[2],
+  ]
+  return [
+    anchor_xyz[0] + axial_offset * axis_unit[0] + radial_offset * ring_direction[0],
+    anchor_xyz[1] + axial_offset * axis_unit[1] + radial_offset * ring_direction[1],
+    anchor_xyz[2] + axial_offset * axis_unit[2] + radial_offset * ring_direction[2],
+  ]
+
+
+def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
+                                       step_degrees=EMRINGER_HELPER_STEP_DEGREES,
+                                       fine_step_degrees=EMRINGER_HELPER_FINE_STEP_DEGREES):
+  """Find the strongest density peak along a virtual sidechain torsion sweep."""
+  if step_degrees <= 0.0:
+    step_degrees = EMRINGER_HELPER_STEP_DEGREES
+
+  best_density = None
+  best_angle = None
+  best_point = None
+  n_steps = max(1, int(round(360.0 / step_degrees)))
+  for step_index in range(n_steps):
+    angle_degrees = (360.0 * step_index) / n_steps
+    sample_point = _virtual_torsion_point(ring_frame, bond_length, angle_degrees)
+    density_value = density_at_point(map_id, sample_point[0], sample_point[1], sample_point[2])
+    if best_density is None or density_value > best_density:
+      best_density = density_value
+      best_angle = angle_degrees
+      best_point = sample_point
+
+  if best_density is None:
+    return None
+
+  if fine_step_degrees > 0.0 and fine_step_degrees < step_degrees and best_angle is not None:
+    search_start = best_angle - step_degrees
+    search_stop = best_angle + step_degrees
+    n_fine_steps = max(1, int(round((search_stop - search_start) / fine_step_degrees)))
+    for step_index in range(n_fine_steps + 1):
+      angle_degrees = search_start + step_index * fine_step_degrees
+      sample_point = _virtual_torsion_point(ring_frame, bond_length, angle_degrees)
+      density_value = density_at_point(map_id, sample_point[0], sample_point[1], sample_point[2])
+      if density_value > best_density:
+        best_density = density_value
+        best_angle = angle_degrees
+        best_point = sample_point
+
+  return {
+    "density": best_density,
+    "angle_degrees": best_angle % 360.0 if best_angle is not None else None,
+    "point": best_point,
+  }
+
+
+def _sample_virtual_cg_density_peak(map_id, ring_frame, step_degrees=EMRINGER_HELPER_STEP_DEGREES):
+  """Find the strongest density peak along the virtual-CG chi1 sweep."""
+  return _sample_virtual_stage_density_peak(
+    map_id,
+    ring_frame,
+    EMRINGER_HELPER_CB_CG_BOND_LENGTH,
+    step_degrees=step_degrees,
+  )
+
+
+def _emringer_late_stage_definitions(residue_name_here):
+  """Return later-torsion sweeps for longer, flexible sidechains."""
+  return EMRINGER_HELPER_LATE_STAGE_DEFINITIONS.get(residue_name_here, [])
+
+
+def _emringer_chi1_blocker_atom_names(residue_name_here):
+  """Return the atom names that genuinely occupy the chi1/gamma position.
+
+  The first-pass helper used every heavy atom beyond CB as an occupancy check,
+  which was too blunt: a distal atom could hide a real gamma-position outlier.
+  For the chi1 sweep we only want atoms that belong at the gamma stage for the
+  residue, plus a conservative fallback for unfamiliar components.
+  """
+  return EMRINGER_HELPER_CHI1_BLOCKER_ATOM_NAMES.get(residue_name_here)
+
+
+def _emringer_chi1_blocker_atoms(atom_records, residue_name_here):
+  blocker_atom_names = _emringer_chi1_blocker_atom_names(residue_name_here)
+  blocker_atoms = []
+  for atom in atom_records:
+    if atom["element"] in ("H", "D"):
+      continue
+    atom_name = atom["name"]
+    if blocker_atom_names is None:
+      if atom_name in EMRINGER_HELPER_BACKBONE_ATOM_NAMES:
+        continue
+    else:
+      if atom_name not in blocker_atom_names:
+        continue
+    blocker_atoms.append(atom)
+  return blocker_atoms
+
+
+def _emringer_blocker_atoms(atom_records, blocker_atom_names):
+  blocker_atoms = []
+  for atom in atom_records:
+    if atom["element"] in ("H", "D"):
+      continue
+    if atom["name"] in blocker_atom_names:
+      blocker_atoms.append(atom)
+  return blocker_atoms
+
+
+def _nucleotide_base_atoms(atom_records, glycosidic_atom_name=None):
+  """Return heavy atoms that belong to the base rather than the sugar/phosphate."""
+  base_atoms = []
+  for atom in atom_records:
+    atom_name = atom["name"]
+    if atom["element"] in ("H", "D"):
+      continue
+    if "'" in atom_name or atom_name.startswith("OP") or atom_name in {"P", "O1P", "O2P", "O3P"}:
+      continue
+    if glycosidic_atom_name and atom_name == glycosidic_atom_name:
+      continue
+    base_atoms.append(atom)
+  return base_atoms
+
+
+def _nucleotide_stage_specs(atom_xyz, atom_records):
+  """Build a glycosidic torsion sweep for nucleic acid bases."""
+  if "C1'" not in atom_xyz:
+    return []
+
+  reference_atom_name = next((name for name in ("O4'", "C2'", "C3'") if name in atom_xyz), None)
+  if reference_atom_name is None:
+    return []
+
+  if "N9" in atom_xyz:
+    glycosidic_atom_name = "N9"
+    blocker_atom_names = {"C4", "C8"}
+  elif "N1" in atom_xyz:
+    glycosidic_atom_name = "N1"
+    blocker_atom_names = {"C2", "C6"}
+  else:
+    return []
+
+  ring_frame = _emringer_torsion_ring_frame(atom_xyz, reference_atom_name, "C1'", glycosidic_atom_name)
+  if ring_frame is None:
+    return []
+
+  blocker_atoms = _emringer_blocker_atoms(atom_records, blocker_atom_names)
+  if not blocker_atoms:
+    blocker_atoms = _nucleotide_base_atoms(atom_records, glycosidic_atom_name)
+  if not blocker_atoms:
+    return []
+
+  return [{
+    "label": "chi",
+    "ring_frame": ring_frame,
+    "bond_length": 1.38,
+    "blocker_atoms": blocker_atoms,
+  }]
+
+
+def _emringer_stage_specs(atom_xyz, atom_records, residue_name_here):
+  """Build the torsion stages that should be tested for a residue."""
+  if "C1'" in atom_xyz:
+    return _nucleotide_stage_specs(atom_xyz, atom_records)
+
+  stage_specs = []
+
+  chi1_ring_frame = _emringer_ring_frame(atom_xyz)
+  if chi1_ring_frame is not None:
+    stage_specs.append({
+      "label": "chi1",
+      "ring_frame": chi1_ring_frame,
+      "bond_length": EMRINGER_HELPER_CB_CG_BOND_LENGTH,
+      "blocker_atoms": _emringer_chi1_blocker_atoms(atom_records, residue_name_here),
+    })
+
+  for stage_definition in _emringer_late_stage_definitions(residue_name_here):
+    ring_frame = _emringer_torsion_ring_frame(
+      atom_xyz,
+      stage_definition["reference"],
+      stage_definition["axis_start"],
+      stage_definition["axis_end"],
+    )
+    if ring_frame is None:
+      continue
+    stage_specs.append({
+      "label": stage_definition["label"],
+      "ring_frame": ring_frame,
+      "bond_length": stage_definition["bond_length"],
+      "blocker_atoms": _emringer_blocker_atoms(atom_records, stage_definition["blockers"]),
+    })
+
+  return stage_specs
+
+
+def _nearest_stage_blocker(stage_spec, peak_point):
+  """Return the nearest blocker atom to a stage peak, if any."""
+  nearest_distance_sq = None
+  nearest_blocker_name = None
+  for atom in stage_spec["blocker_atoms"]:
+    distance_sq = _distance_sq(atom["xyz"], peak_point)
+    if nearest_distance_sq is None or distance_sq < nearest_distance_sq:
+      nearest_distance_sq = distance_sq
+      nearest_blocker_name = atom["name"]
+  return nearest_blocker_name, nearest_distance_sq
+
+
+def _mean_density_at_atoms(map_id, atom_records):
+  """Average map density at the current placed stage atoms, if any exist."""
+  if not atom_records:
+    return None
+
+  density_values = []
+  for atom in atom_records:
+    xyz = atom["xyz"]
+    density_values.append(density_at_point(map_id, xyz[0], xyz[1], xyz[2]))
+  if not density_values:
+    return None
+  return sum(density_values) / float(len(density_values))
+
+
+def _backbone_support_positions(atom_xyz):
+  """Return the local backbone/sugar positions used to prefilter weak residues."""
+  if "C1'" in atom_xyz or "P" in atom_xyz:
+    atom_names = ("P", "O5'", "C5'", "C4'", "C3'", "O3'", "C1'")
+  else:
+    atom_names = ("N", "CA", "C", "O")
+  return [atom_xyz[atom_name] for atom_name in atom_names if atom_name in atom_xyz]
+
+
+def _backbone_density_support(map_id, atom_xyz, density_threshold):
+  """Return the fraction of backbone support points that are above threshold."""
+  backbone_positions = _backbone_support_positions(atom_xyz)
+  if not backbone_positions:
+    return 0.0, 0, 0
+
+  supported_points = 0
+  for position in backbone_positions:
+    if density_at_point(map_id, position[0], position[1], position[2]) >= density_threshold:
+      supported_points += 1
+  total_points = len(backbone_positions)
+  return (float(supported_points) / total_points), supported_points, total_points
+
+
+def _residue_display_point(atom_records, atom_xyz):
+  """Choose a useful jump target for non-polymer residues and summaries."""
+  if atom_records:
+    xs = [atom["xyz"][0] for atom in atom_records]
+    ys = [atom["xyz"][1] for atom in atom_records]
+    zs = [atom["xyz"][2] for atom in atom_records]
+    return [sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)]
+  if atom_xyz:
+    return next(iter(atom_xyz.values()))
+  return None
+
+
+def _evaluate_emringer_stage(map_id, stage_spec):
+  """Evaluate one torsion stage and return its peak/current-density summary."""
+  peak = _sample_virtual_stage_density_peak(map_id, stage_spec["ring_frame"], stage_spec["bond_length"])
+  if peak is None:
+    return None
+
+  current_stage_density = _mean_density_at_atoms(map_id, stage_spec["blocker_atoms"])
+  nearest_blocker_name, nearest_distance_sq = _nearest_stage_blocker(stage_spec, peak["point"])
+  density_gain = peak["density"] - current_stage_density if current_stage_density is not None else peak["density"]
+  return {
+    "label": stage_spec["label"],
+    "bond_length": stage_spec["bond_length"],
+    "ring_frame": stage_spec["ring_frame"],
+    "peak": peak,
+    "current_stage_density": current_stage_density,
+    "nearest_blocker_name": nearest_blocker_name,
+    "nearest_distance_sq": nearest_distance_sq,
+    "density_gain": density_gain,
+  }
+
+
+def _weak_stage_inset_peak_density(map_id, stage_result, inset_buffer=EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER):
+  """Sample a slightly inset torsion ring to avoid flagging borderline weak cases."""
+  inset_bond_length = stage_result["bond_length"] - inset_buffer
+  if inset_bond_length <= 0.0:
+    return stage_result["peak"]["density"]
+  inset_peak = _sample_virtual_stage_density_peak(
+    map_id,
+    stage_result["ring_frame"],
+    inset_bond_length,
+  )
+  if inset_peak is None:
+    return stage_result["peak"]["density"]
+  return max(stage_result["peak"]["density"], inset_peak["density"])
+
+
+def _format_residue_id(chain_id, resno, ins_code):
+  return f"{chain_id}{resno}{ins_code or ''}"
+
+
+def _display_residue_name(residue_name):
+  """Return a readable residue label for GUI lists."""
+  if not residue_name:
+    return ""
+  if residue_name in POLYMER_RESIDUE_NAMES and len(residue_name) == 3 and residue_name.isalpha():
+    return residue_name.capitalize()
+  return residue_name.upper()
+
+
+def _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name=None):
+  """Compact GUI label: chain:resno[icode] residue-type."""
+  residue_id = f"{chain_id}:{resno}{ins_code or ''}"
+  if residue_name:
+    return f"{residue_id} {_display_residue_name(residue_name)}"
+  return residue_id
+
+
+def _log_odd_residue_results(mol_id, map_id, peak_threshold, categorized_details):
+  """Print full odd-residue diagnostics to the log in dialog order."""
+  print(
+    "Odd residues for molecule #{0} at the current threshold of the scrollable map "
+    "(Map #{1}); threshold={2:.4f}".format(mol_id, map_id, peak_threshold)
+  )
+  for category_name, detail_lines in categorized_details:
+    print(f"{category_name} ({len(detail_lines)})")
+    for detail_line in detail_lines:
+      print(f"  {detail_line}")
+
+
+def _heavy_non_hydrogen_atoms(atom_records):
+  """Return non-hydrogen atoms for water/ligand density checks."""
+  return [atom for atom in atom_records if atom["element"] not in ("H", "D")]
+
+
+def _atom_density_values(map_id, atom_records):
+  """Sample map density at each listed atom position."""
+  density_values = []
+  for atom in atom_records:
+    x, y, z = atom["xyz"]
+    density_values.append(density_at_point(map_id, x, y, z))
+  return density_values
+
+
+def _append_odd_residue_entry(categorized_entries, category_name, sort_key, dialog_label, point, detail_label,
+                              navigation_metadata=None):
+  """Store one GUI/log entry tuple in the requested odd-residue category."""
+  gui_entry = [dialog_label, point[0], point[1], point[2]]
+  if navigation_metadata is not None:
+    gui_entry.append(navigation_metadata)
+  categorized_entries[category_name].append((sort_key, gui_entry, detail_label))
+
+
+def _sorted_odd_residue_outputs(categorized_entries):
+  """Sort each category once, then split into GUI entries and log-detail lines."""
+  gui_categories = []
+  detail_categories = []
+  for category_name in ODD_RESIDUE_CATEGORY_ORDER:
+    sorted_entries = sorted(categorized_entries[category_name], key=lambda item: item[0])
+    gui_categories.append((category_name, [entry for _sort_key, entry, _detail in sorted_entries]))
+    detail_categories.append((category_name, [detail for _sort_key, _entry, detail in sorted_entries]))
+  return gui_categories, detail_categories
+
+
+def _odd_residue_navigation_metadata(mol_id, chain_id, resno, ins_code, serial_number):
+  """Describe a polymer residue jump target for the smart navigation helper."""
+  return {
+    "type": "polymer_residue",
+    "mol_id": mol_id,
+    "chain_id": chain_id,
+    "resno": resno,
+    "ins_code": ins_code or "",
+    "serial_number": serial_number,
+  }
+
+
+def _odd_residue_status_suffix(category_name):
+  """Return a concise category label for status-bar navigation messages."""
+  status_suffixes = {
+    "Possible Misfits": "Possible Misfit?",
+    "Weak Sidechains": "Weak Sidechain",
+    "Weak Backbone": "Weak Backbone",
+    "Weak Waters": "Weak Water",
+    "Weak Ligands": "Weak Ligand",
+  }
+  return status_suffixes.get(category_name, category_name)
+
+
+def _missing_atom_residue_keys(mol_id):
+  """Return residue keys flagged by Coot as having missing atoms."""
+  try:
+    missing_specs = missing_atom_info(mol_id)
+  except Exception:
+    try:
+      missing_specs = missing_atom_info_py(mol_id)
+    except Exception:
+      return set()
+
+  residue_keys = set()
+  if not isinstance(missing_specs, (list, tuple)):
+    return residue_keys
+
+  for spec in missing_specs:
+    if not isinstance(spec, (list, tuple)) or len(spec) < 2:
+      continue
+    chain_id = spec[0]
+    resno = spec[1]
+    ins_code = spec[2] if len(spec) > 2 else ""
+    if isinstance(chain_id, str):
+      residue_keys.add((chain_id, resno, ins_code or ""))
+  return residue_keys
+
+
+def find_odd_residues():
+  """Find odd residues in the active molecule using density-based heuristics."""
+  map_id = _active_analysis_map_or_status()
+  if map_id is None:
+    return None
+
+  mol_id = _active_polymer_molecule_or_status()
+  if mol_id is None:
+    return None
+
+  contour_level = abs(get_contour_level_absolute(map_id))
+  if contour_level > 0.0:
+    peak_threshold = contour_level * EMRINGER_HELPER_MIN_PEAK_TO_CONTOUR_RATIO
+  else:
+    peak_threshold = EMRINGER_HELPER_MIN_ABSOLUTE_DENSITY
+  occupied_distance_sq = EMRINGER_HELPER_OCCUPIED_DISTANCE * EMRINGER_HELPER_OCCUPIED_DISTANCE
+
+  categorized_entries = {category_name: [] for category_name in ODD_RESIDUE_CATEGORY_ORDER}
+  missing_atom_residue_keys = _missing_atom_residue_keys(mol_id)
+
+  for chain_index, chain_id in enumerate(chain_ids(mol_id)):
+    for serial_number in range(chain_n_residues(chain_id, mol_id)):
+      residue_name_here = resname_from_serial_number(mol_id, chain_id, serial_number)
+      resno = seqnum_from_serial_number(mol_id, chain_id, serial_number)
+      ins_code = insertion_code_from_serial_number(mol_id, chain_id, serial_number)
+
+      atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code)
+      if not atom_xyz:
+        continue
+      residue_id = _format_residue_id(chain_id, resno, ins_code)
+      dialog_label = _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here)
+      if (chain_id, resno, ins_code or "") in missing_atom_residue_keys:
+        dialog_label = f"{dialog_label} (Missing atoms)"
+
+      if residue_name_here in WATER_RESIDUE_NAMES:
+        heavy_atoms = _heavy_non_hydrogen_atoms(atom_records)
+        if not heavy_atoms:
+          continue
+        atom_densities = _atom_density_values(map_id, heavy_atoms)
+        max_density = max(atom_densities)
+        if max_density < peak_threshold:
+          point = heavy_atoms[atom_densities.index(max_density)]["xyz"]
+          detail_label = (
+            f"{residue_id} {residue_name_here}: max atom density {max_density:.4f} "
+            f"below threshold {peak_threshold:.4f}"
+          )
+          _append_odd_residue_entry(
+            categorized_entries,
+            "Weak Waters",
+            (max_density, chain_index, serial_number),
+            dialog_label,
+            point,
+            detail_label,
+          )
+        continue
+
+      if residue_name_here not in POLYMER_RESIDUE_NAMES:
+        heavy_atoms = _heavy_non_hydrogen_atoms(atom_records)
+        if len(heavy_atoms) < EMRINGER_HELPER_MIN_LIGAND_HEAVY_ATOMS:
+          continue
+        atom_densities = _atom_density_values(map_id, heavy_atoms)
+        outside_count = sum(1 for density_value in atom_densities if density_value < peak_threshold)
+        outside_fraction = outside_count / float(len(heavy_atoms))
+        if outside_fraction > EMRINGER_HELPER_WEAK_LIGAND_OUTSIDE_FRACTION:
+          point = _residue_display_point(atom_records, atom_xyz)
+          mean_density = sum(atom_densities) / float(len(atom_densities))
+          detail_label = (
+            f"{residue_id} {residue_name_here}: {outside_count}/{len(heavy_atoms)} heavy atoms "
+            f"({outside_fraction:.0%}) outside contour; mean density {mean_density:.4f}"
+          )
+          _append_odd_residue_entry(
+            categorized_entries,
+            "Weak Ligands",
+            (-outside_fraction, mean_density, chain_index, serial_number),
+            dialog_label,
+            point,
+            detail_label,
+          )
+        continue
+
+      if residue_name_here == "GLY":
+        continue
+
+      navigation_metadata = _odd_residue_navigation_metadata(mol_id, chain_id, resno, ins_code, serial_number)
+      support_fraction, supported_points, total_points = _backbone_density_support(map_id, atom_xyz, peak_threshold)
+      if total_points == 0 or support_fraction < EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION:
+        point = _residue_display_point(atom_records, atom_xyz)
+        detail_label = (
+          f"{residue_id} {residue_name_here}: backbone support {supported_points}/{total_points} "
+          f"({support_fraction:.0%}) below threshold"
+        )
+        _append_odd_residue_entry(
+          categorized_entries,
+          "Weak Backbone",
+          (support_fraction, chain_index, serial_number),
+          dialog_label,
+          point,
+          detail_label,
+          navigation_metadata,
+        )
+        continue
+
+      stage_specs = _emringer_stage_specs(atom_xyz, atom_records, residue_name_here)
+      if not stage_specs:
+        continue
+
+      best_stage_result = None
+      strongest_current_density = None
+      strongest_buffered_peak_density = None
+      has_stage_atoms = False
+      for stage_index, stage_spec in enumerate(stage_specs):
+        stage_result = _evaluate_emringer_stage(map_id, stage_spec)
+        if stage_result is None:
+          continue
+        if best_stage_result is None or stage_result["peak"]["density"] > best_stage_result["peak"]["density"]:
+          best_stage_result = stage_result
+
+        current_stage_density = stage_result["current_stage_density"]
+        if current_stage_density is not None:
+          if strongest_current_density is None or current_stage_density > strongest_current_density:
+            strongest_current_density = current_stage_density
+        buffered_peak_density = _weak_stage_inset_peak_density(map_id, stage_result)
+        if strongest_buffered_peak_density is None or buffered_peak_density > strongest_buffered_peak_density:
+          strongest_buffered_peak_density = buffered_peak_density
+        if stage_result["nearest_distance_sq"] is not None:
+          has_stage_atoms = True
+
+        if stage_result["peak"]["density"] < peak_threshold:
+          continue
+        if current_stage_density is not None and stage_result["peak"]["density"] <= current_stage_density:
+          continue
+        if stage_result["nearest_distance_sq"] is not None and stage_result["nearest_distance_sq"] <= occupied_distance_sq:
+          continue
+
+        contour_ratio = stage_result["peak"]["density"] / peak_threshold if peak_threshold > 0.0 else 0.0
+        if stage_result["nearest_distance_sq"] is None:
+          placement_note = f"no {stage_result['label']}-stage atoms placed"
+        else:
+          placement_note = "{0} is {1:.1f} A away".format(
+            stage_result["nearest_blocker_name"] or f"nearest {stage_result['label']}-stage atom",
+            math.sqrt(stage_result["nearest_distance_sq"]),
+          )
+        if stage_result["current_stage_density"] is None:
+          density_note = "current stage unbuilt"
+        else:
+          density_note = "current stage density {0:.4f}, gain {1:.4f}".format(
+            current_stage_density,
+            stage_result["density_gain"],
+          )
+        detail_label = (
+          f"{residue_id} {residue_name_here}: peak {stage_result['peak']['density']:.4f} "
+          f"({contour_ratio:.1f}x threshold) at {stage_result['label']} {stage_result['peak']['angle_degrees']:.0f} deg; "
+          f"{density_note}; {placement_note}"
+        )
+        _append_odd_residue_entry(
+          categorized_entries,
+          "Possible Misfits",
+          (-stage_result["density_gain"], -stage_result["peak"]["density"], chain_index, serial_number, stage_index),
+          dialog_label,
+          stage_result["peak"]["point"],
+          detail_label,
+          navigation_metadata,
+        )
+
+      if best_stage_result is None or best_stage_result["peak"]["density"] >= peak_threshold:
+        continue
+
+      if not has_stage_atoms:
+        continue
+
+      if strongest_buffered_peak_density is not None and strongest_buffered_peak_density >= peak_threshold:
+        continue
+
+      if strongest_current_density is not None and strongest_current_density >= peak_threshold:
+        continue
+
+      point = best_stage_result["peak"]["point"] if best_stage_result["peak"]["point"] else _residue_display_point(atom_records, atom_xyz)
+      if strongest_current_density is None:
+        current_density_note = "no current stage atoms placed"
+      else:
+        current_density_note = "strongest current stage density {0:.4f}".format(strongest_current_density)
+      detail_label = (
+        f"{residue_id} {residue_name_here}: best {best_stage_result['label']} peak "
+        f"{best_stage_result['peak']['density']:.4f} below threshold {peak_threshold:.4f}; "
+        f"{current_density_note}; strongest inset-ring peak {0:.4f}".format(strongest_buffered_peak_density or 0.0)
+      )
+      _append_odd_residue_entry(
+        categorized_entries,
+        "Weak Sidechains",
+        (best_stage_result["peak"]["density"], -(strongest_current_density or 0.0), chain_index, serial_number),
+        dialog_label,
+        point,
+        detail_label,
+        navigation_metadata,
+      )
+
+  if not any(categorized_entries.values()):
+    info_dialog(
+      "No odd residues found in the current molecule\n"
+      f"at the current threshold ({peak_threshold:.4f})."
+    )
+    return 0
+
+  sorted_gui_categories, sorted_detail_categories = _sorted_odd_residue_outputs(categorized_entries)
+
+  categorized_interesting_things_gui(
+    "Odd residues in molecule #{0} at the current threshold of the "
+    "scrollable map (Map #{1}):".format(mol_id, map_id),
+    sorted_gui_categories,
+  )
+  _log_odd_residue_results(mol_id, map_id, peak_threshold, sorted_detail_categories)
+  return sum(len(entries) for entries in categorized_entries.values())
+
+
+def find_emringer_like_sidechain_density_outliers():
+  """Backward-compatible entry point for the older menu/helper name."""
+  return find_odd_residues()
 
 
 def _generate_smart_local_extra_restraints_for_mol(mol_id, show_start_message=True):
@@ -8433,6 +9454,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Find sequence in active chain",
     lambda func: find_sequence_with_entry(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Odd residues",
+    lambda func: find_odd_residues(),
   )
 
 
