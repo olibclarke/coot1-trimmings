@@ -137,7 +137,7 @@ The `Display` menu collects GUI-accessible versions of common viewing and analys
 #### Odd residues
 "Odd residues" scans the active model against the current scrollable map contour and groups suspicious features into _Possible Misfits_, _Weak Sidechains_, _Weak Backbone_, _Weak Waters_, and _Weak Ligands_. 
 
-Protein and nucleic-acid residues use torsion-based virtual-atom sampling (a la [EM-ringer](https://www.nature.com/articles/nmeth.3541)) to detect sidechain/base density peaks that suggest alternate conformations or misfit rotamers, while waters and ligands are flagged when too much of the placed model falls outside the current contour. 
+Protein and nucleic-acid residues use torsion-based virtual-atom sampling (a la [EM-Ringer](https://www.nature.com/articles/nmeth.3541)) to detect sidechain/base density peaks that suggest alternate conformations or misfit rotamers, while waters and ligands are flagged when too much of the placed model falls outside the current contour. 
 
 Results are shown as a clickable categorized list with Previous/Next navigation buttons; diagnostics are printed to the log.
 
