@@ -242,6 +242,7 @@ These are the main custom bindings currently defined by the script.
 | `&` | Set current map to 7 sigma |
 | `*` | Set current map to 8 sigma |
 | `(` | Set current map to 9 sigma |
+| `L` | Set current map to entered sigma |
 | `+` | Increase current map contour by 0.1 sigma |
 | `_` | Decrease current map contour by 0.1 sigma |
 | `'` | Increase map radius |
