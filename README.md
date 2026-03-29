@@ -206,6 +206,7 @@ These are the main custom bindings currently defined by the script.
 
 - Several bindings override native Coot 1 shortcuts (documented below).
 - Most commands act on the active residue, active model, or active scrollable map.
+- If you want a printable version, I've added a sheetsheet [here](Coot_Trimmings_Hotkey_Cheat_Sheet.pdf).
 
 ### Display and navigation
 
