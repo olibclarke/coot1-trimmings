@@ -115,6 +115,7 @@ EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION = 0.75
 EMRINGER_HELPER_WEAK_LIGAND_OUTSIDE_FRACTION = 0.30
 EMRINGER_HELPER_MIN_LIGAND_HEAVY_ATOMS = 2
 EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER = 0.30
+EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION = 1024
 
 # Model lighting presets used by the high-contrast toggle.
 MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
@@ -1506,6 +1507,47 @@ if GUI_PYTHON_AVAILABLE:
     window.present()
     entry.grab_focus()
 
+  def generic_confirm_dialog(function_label, message_text, confirm_button_label, handle_confirm_function):
+    """Small GTK4-safe confirmation dialog for potentially expensive actions."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    label = Gtk.Label(label=message_text)
+    cancel_button = Gtk.Button(label="Cancel")
+    confirm_button = Gtk.Button(label=confirm_button_label)
+
+    label.set_margin_start(12)
+    label.set_margin_end(12)
+    label.set_margin_top(12)
+    label.set_margin_bottom(8)
+    label.set_wrap(True)
+    label.set_xalign(0.0)
+    hbox_buttons.set_margin_start(12)
+    hbox_buttons.set_margin_end(12)
+    hbox_buttons.set_margin_bottom(12)
+    hbox_buttons.set_halign(Gtk.Align.CENTER)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def submit(*_args):
+      handle_confirm_function()
+      window.destroy()
+      return False
+
+    cancel_button.connect("clicked", close_window)
+    confirm_button.connect("clicked", submit)
+
+    vbox.append(label)
+    hbox_buttons.append(cancel_button)
+    hbox_buttons.append(confirm_button)
+    vbox.append(hbox_buttons)
+    window.set_child(vbox)
+    window.present()
+
   def generic_double_entry(
     function_label,
     entry_1_label,
@@ -2076,6 +2118,11 @@ else:
 
   def generic_single_entry(
     function_label, _entry_1_default_text, _go_button_label, _handle_go_function
+  ):
+    info_dialog(_gui_unavailable_message(function_label))
+
+  def generic_confirm_dialog(
+    function_label, _message_text, _confirm_button_label, _handle_confirm_function
   ):
     info_dialog(_gui_unavailable_message(function_label))
 
@@ -3913,6 +3960,29 @@ def _resample_factor_for_target_pixel_size(map_id, target_pixel_size):
   return None, None
 
 
+def _resample_plan_for_target_pixel_size(map_id, target_pixel_size):
+  """Estimate the output grid that resampling would create for a target pixel size."""
+  for path in _candidate_map_file_paths(map_id):
+    header = _parse_ccp4_mrc_header(path)
+    if not header:
+      continue
+    sampling_a = header["a"] / float(header["mx"])
+    sampling_b = header["b"] / float(header["my"])
+    sampling_c = header["c"] / float(header["mz"])
+    current_pixel_size = max(sampling_a, sampling_b, sampling_c)
+    resample_factor = current_pixel_size / target_pixel_size
+    return {
+      "resample_factor": resample_factor,
+      "current_pixel_size": current_pixel_size,
+      "new_grid": (
+        int(math.ceil(header["mx"] * resample_factor)),
+        int(math.ceil(header["my"] * resample_factor)),
+        int(math.ceil(header["mz"] * resample_factor)),
+      ),
+    }
+  return None
+
+
 def style_resampled_em_map(map_id):
   set_draw_map_standard_lines(map_id, 1)
   set_draw_solid_density_surface(map_id, 0)
@@ -3948,7 +4018,7 @@ def _restyle_active_map_without_resampling(map_id, contour_level_sigma, status_m
   return map_id
 
 
-def resample_active_map_for_em_half_angstrom(force=False):
+def resample_active_map_for_em_half_angstrom(force=False, allow_large_output=False):
   map_id = _scrollable_map_or_status()
   if map_id is None:
     return None
@@ -3961,15 +4031,15 @@ def resample_active_map_for_em_half_angstrom(force=False):
       contour_level_sigma,
       "Map is not an EM map",
     )
-  resample_factor, current_pixel_size = _resample_factor_for_target_pixel_size(
-    map_id, EM_TARGET_PIXEL_SIZE
-  )
-  if resample_factor is None:
+  resample_plan = _resample_plan_for_target_pixel_size(map_id, EM_TARGET_PIXEL_SIZE)
+  if resample_plan is None:
     return _restyle_active_map_without_resampling(
       map_id,
       contour_level_sigma,
       "Grid spacing could not be determined",
     )
+  resample_factor = resample_plan["resample_factor"]
+  current_pixel_size = resample_plan["current_pixel_size"]
   if current_pixel_size <= EM_TARGET_PIXEL_SIZE:
     style_resampled_em_map(map_id)
     set_contour_level_in_sigma(map_id, contour_level_sigma)
@@ -3983,6 +4053,27 @@ def resample_active_map_for_em_half_angstrom(force=False):
         pass
     add_status_bar_text("Map already finer than 0.5 A/pixel; restyled without resampling")
     return map_id
+  new_grid = resample_plan["new_grid"]
+  max_grid_dimension = max(new_grid)
+  if (
+    not allow_large_output
+    and max_grid_dimension > EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION
+  ):
+    generic_confirm_dialog(
+      "Resample/restyle current map",
+      "This will create a large resampled map "
+      "({0} x {1} x {2}; max dimension {3} > {4}).\n\n"
+      "Are you sure you want to continue?".format(
+        new_grid[0],
+        new_grid[1],
+        new_grid[2],
+        max_grid_dimension,
+        EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION,
+      ),
+      "Continue",
+      lambda: resample_active_map_for_em_half_angstrom(force=force, allow_large_output=True),
+    )
+    return None
   new_map_id = sharpen_blur_map_with_resampling(map_id, 0.0, resample_factor)
   if new_map_id == -1:
     return _restyle_active_map_without_resampling(
@@ -9449,6 +9540,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Switch all mols to CA representation",
     lambda func: all_mols_to_ca(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Resample/restyle current map",
+    lambda func: resample_active_map_for_em_half_angstrom(),
   )
   add_simple_coot_menu_menuitem(
     submenu_display,
