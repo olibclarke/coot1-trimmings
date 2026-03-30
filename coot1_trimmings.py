@@ -6,6 +6,7 @@ The main user-editable knobs live near the top of the file under
 """
 
 import math
+import base64
 import hashlib
 import json
 import os
@@ -13,8 +14,10 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import traceback
 import warnings
+from datetime import datetime, timezone
 from functools import lru_cache
 
 import gi
@@ -22,6 +25,11 @@ import coot
 import coot_utils
 import gap
 from mutate import three_letter_code2single_letter
+
+try:
+  import gemmi
+except Exception:
+  gemmi = None
 
 if not hasattr(gi, "require_version"):
   def _require_version(_namespace, _version):
@@ -100,6 +108,11 @@ HIGH_CONTRAST_BOND_THICKNESS = 2
 COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
 COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 WATER_REFINE_MAX_DISPLACEMENT = 1.0
+RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
+  os.environ.get("USER")
+  or os.environ.get("USERNAME")
+  or ""
+)
 
 # Map restyling defaults for the EM helper.
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
@@ -155,7 +168,12 @@ MODEL_HIGH_CONTRAST_MOLECULES = set()
 NAVIGATION_LAST_RESIDUE = None
 COMMON_MONOMER_FAVORITES_MENU = None
 COMMON_MONOMER_LAST_BROWSED_DIRECTORY = None
+RESIDUE_ANNOTATION_LAST_AUTHOR = RESIDUE_ANNOTATION_DEFAULT_AUTHOR
+RESIDUE_ANNOTATIONS_BY_MOLECULE = {}
 EMRINGER_HELPER_BACKBONE_ATOM_NAMES = {"N", "CA", "C", "O", "OXT", "CB"}
+RESIDUE_ANNOTATION_CATEGORY_PREFIX = "_cootnote_residue_note."
+RESIDUE_ANNOTATION_META_VERSION_TAG = "_cootnote_annotation_meta.version"
+RESIDUE_ANNOTATION_META_PROGRAM_TAG = "_cootnote_annotation_meta.program"
 
 
 def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
@@ -1821,6 +1839,147 @@ if GUI_PYTHON_AVAILABLE:
     info_dialog("Browse is unavailable in this Gtk build; please paste the CIF path manually.")
     return None
 
+  def _populate_entry_from_save_file_chooser(parent_window, target_entry, chooser_title):
+    """Open a GTK save chooser and copy the selected output path into an entry."""
+    def _gtk_gio_module():
+      gio_module = globals().get("Gio")
+      if gio_module is not None:
+        return gio_module
+      coot_gui_module = globals().get("coot_gui")
+      if coot_gui_module is not None and hasattr(coot_gui_module, "Gio"):
+        gio_module = coot_gui_module.Gio
+        globals()["Gio"] = gio_module
+        return gio_module
+      try:
+        from gi.repository import Gio as gio_module
+      except Exception:
+        return None
+      globals()["Gio"] = gio_module
+      return gio_module
+
+    current_path = os.path.abspath(os.path.expanduser(target_entry.get_text().strip() or ""))
+    current_directory = os.path.dirname(current_path) if current_path else ""
+    current_filename = os.path.basename(current_path) if current_path else ""
+
+    cif_filter = Gtk.FileFilter()
+    cif_filter.set_name("mmCIF files")
+    for pattern in ("*.cif", "*.mmcif"):
+      cif_filter.add_pattern(pattern)
+
+    all_filter = Gtk.FileFilter()
+    all_filter.set_name("All files")
+    all_filter.add_pattern("*")
+
+    if hasattr(Gtk, "FileDialog"):
+      gio_module = _gtk_gio_module()
+      chooser = Gtk.FileDialog()
+      chooser.set_title(chooser_title)
+
+      if gio_module is not None and hasattr(gio_module, "File") and current_directory and os.path.isdir(current_directory):
+        try:
+          chooser.set_initial_folder(gio_module.File.new_for_path(current_directory))
+        except Exception:
+          pass
+      if current_filename and hasattr(chooser, "set_initial_name"):
+        try:
+          chooser.set_initial_name(current_filename)
+        except Exception:
+          pass
+
+      if gio_module is not None and hasattr(gio_module, "ListStore"):
+        filters = gio_module.ListStore.new(Gtk.FileFilter)
+        filters.append(cif_filter)
+        filters.append(all_filter)
+        chooser.set_filters(filters)
+        chooser.set_default_filter(cif_filter)
+
+      def on_save_finished(dialog, result):
+        try:
+          chosen_file = dialog.save_finish(result)
+        except Exception:
+          return None
+        if chosen_file is not None and chosen_file.get_path():
+          target_entry.set_text(chosen_file.get_path())
+        return None
+
+      chooser.save(parent_window, None, on_save_finished)
+      return None
+
+    if hasattr(Gtk, "FileChooserNative"):
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        chooser = Gtk.FileChooserNative.new(
+          chooser_title,
+          parent_window,
+          Gtk.FileChooserAction.SAVE,
+          "Save",
+          "Cancel",
+        )
+        chooser.add_filter(cif_filter)
+        chooser.add_filter(all_filter)
+        if current_directory and hasattr(chooser, "set_current_folder"):
+          gio_module = _gtk_gio_module()
+          if gio_module is not None and hasattr(gio_module, "File") and os.path.isdir(current_directory):
+            try:
+              chooser.set_current_folder(gio_module.File.new_for_path(current_directory))
+            except Exception:
+              pass
+        if current_filename and hasattr(chooser, "set_current_name"):
+          try:
+            chooser.set_current_name(current_filename)
+          except Exception:
+            pass
+
+      def on_response(dialog, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT:
+          chosen_file = dialog.get_file()
+          if chosen_file is not None and chosen_file.get_path():
+            target_entry.set_text(chosen_file.get_path())
+        dialog.destroy()
+
+      chooser.connect("response", on_response)
+      chooser.show()
+      return None
+
+    if hasattr(Gtk, "FileChooserDialog"):
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        chooser = Gtk.FileChooserDialog(
+          title=chooser_title,
+          transient_for=parent_window,
+          action=Gtk.FileChooserAction.SAVE,
+        )
+        chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        chooser.add_button("Save", Gtk.ResponseType.ACCEPT)
+        chooser.add_filter(cif_filter)
+        chooser.add_filter(all_filter)
+        if current_directory and hasattr(chooser, "set_current_folder"):
+          gio_module = _gtk_gio_module()
+          if gio_module is not None and hasattr(gio_module, "File") and os.path.isdir(current_directory):
+            try:
+              chooser.set_current_folder(gio_module.File.new_for_path(current_directory))
+            except Exception:
+              pass
+        if current_filename and hasattr(chooser, "set_current_name"):
+          try:
+            chooser.set_current_name(current_filename)
+          except Exception:
+            pass
+
+      def on_response(dialog, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT:
+          chosen_file = dialog.get_file()
+          if chosen_file is not None and chosen_file.get_path():
+            target_entry.set_text(chosen_file.get_path())
+        dialog.destroy()
+
+      chooser.connect("response", on_response)
+      chooser.present()
+      return None
+
+    info_dialog("Browse is unavailable in this Gtk build; please paste the output path manually.")
+    return None
+
   def generic_double_entry_with_file_browse(
     function_label,
     entry_1_label,
@@ -1904,6 +2063,166 @@ if GUI_PYTHON_AVAILABLE:
     window.set_child(vbox)
     window.present()
     entry_1.grab_focus()
+
+  def generic_single_entry_with_file_browse(
+    function_label,
+    entry_1_default_text,
+    entry_1_browse_title,
+    go_button_label,
+    handle_go_function,
+  ):
+    """GTK4-safe one-entry prompt with a Browse button for save/export paths."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    entry_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    title_label = Gtk.Label(label=function_label)
+    entry = Gtk.Entry()
+    browse_button = Gtk.Button(label="Browse...")
+    cancel_button = Gtk.Button(label="Cancel")
+    go_button = Gtk.Button(label=go_button_label)
+
+    title_label.set_margin_start(12)
+    title_label.set_margin_end(12)
+    title_label.set_margin_top(12)
+    title_label.set_margin_bottom(4)
+    title_label.set_xalign(0.0)
+    entry_row.set_margin_start(12)
+    entry_row.set_margin_end(12)
+    entry_row.set_margin_bottom(8)
+    entry.set_hexpand(True)
+    hbox_buttons.set_margin_start(12)
+    hbox_buttons.set_margin_end(12)
+    hbox_buttons.set_margin_bottom(12)
+
+    if isinstance(entry_1_default_text, str):
+      entry.set_text(entry_1_default_text)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def submit(*_args):
+      status = handle_go_function(entry.get_text())
+      if status not in (0, False):
+        window.destroy()
+      return False
+
+    cancel_button.connect("clicked", close_window)
+    browse_button.connect(
+      "clicked",
+      lambda *_args: _populate_entry_from_save_file_chooser(window, entry, entry_1_browse_title),
+    )
+    go_button.connect("clicked", submit)
+    entry.connect("activate", submit)
+
+    entry_row.append(entry)
+    entry_row.append(browse_button)
+
+    vbox.append(title_label)
+    vbox.append(entry_row)
+    hbox_buttons.append(cancel_button)
+    hbox_buttons.append(go_button)
+    vbox.append(hbox_buttons)
+    window.set_child(vbox)
+    window.present()
+    entry.grab_focus()
+
+  def generic_author_note_entry(
+    function_label,
+    residue_label,
+    author_default_text,
+    note_default_text,
+    go_button_label,
+    handle_go_function,
+  ):
+    """Small GTK4 prompt for adding an authored multiline residue note."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+    window.set_default_size(520, 360)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    title_label = Gtk.Label(label=function_label)
+    residue_info_label = Gtk.Label(label=residue_label)
+    author_label = Gtk.Label(label="Author")
+    author_entry = Gtk.Entry()
+    note_label = Gtk.Label(label="Note")
+    note_scrolled = Gtk.ScrolledWindow()
+    note_view = Gtk.TextView()
+    note_buffer = note_view.get_buffer()
+    cancel_button = Gtk.Button(label="Cancel")
+    go_button = Gtk.Button(label=go_button_label)
+
+    title_label.set_margin_start(12)
+    title_label.set_margin_end(12)
+    title_label.set_margin_top(12)
+    title_label.set_margin_bottom(2)
+    title_label.set_xalign(0.0)
+    residue_info_label.set_margin_start(12)
+    residue_info_label.set_margin_end(12)
+    residue_info_label.set_margin_bottom(4)
+    residue_info_label.set_xalign(0.0)
+    author_label.set_margin_start(12)
+    author_label.set_margin_end(12)
+    author_entry.set_margin_start(12)
+    author_entry.set_margin_end(12)
+    note_label.set_margin_start(12)
+    note_label.set_margin_end(12)
+    note_label.set_margin_top(6)
+    note_scrolled.set_margin_start(12)
+    note_scrolled.set_margin_end(12)
+    note_scrolled.set_margin_bottom(8)
+    note_scrolled.set_hexpand(True)
+    note_scrolled.set_vexpand(True)
+    hbox_buttons.set_margin_start(12)
+    hbox_buttons.set_margin_end(12)
+    hbox_buttons.set_margin_bottom(12)
+
+    if isinstance(author_default_text, str):
+      author_entry.set_text(author_default_text)
+    if isinstance(note_default_text, str):
+      note_buffer.set_text(note_default_text)
+
+    note_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    note_scrolled.set_child(note_view)
+
+    def close_window(*_args):
+      window.destroy()
+      return False
+
+    def submit(*_args):
+      start_iter = note_buffer.get_start_iter()
+      end_iter = note_buffer.get_end_iter()
+      status = handle_go_function(
+        author_entry.get_text(),
+        note_buffer.get_text(start_iter, end_iter, False),
+      )
+      if status not in (0, False):
+        window.destroy()
+      return False
+
+    cancel_button.connect("clicked", close_window)
+    go_button.connect("clicked", submit)
+    author_entry.connect("activate", lambda *_args: note_view.grab_focus())
+
+    vbox.append(title_label)
+    vbox.append(residue_info_label)
+    vbox.append(author_label)
+    vbox.append(author_entry)
+    vbox.append(note_label)
+    vbox.append(note_scrolled)
+    hbox_buttons.append(cancel_button)
+    hbox_buttons.append(go_button)
+    vbox.append(hbox_buttons)
+    window.set_child(vbox)
+    window.present()
+    if author_entry.get_text().strip():
+      note_view.grab_focus()
+    else:
+      author_entry.grab_focus()
 
   def interesting_things_gui(dialog_name, thing_list):
     """Show a simple GTK4 list of jump targets as labeled buttons."""
@@ -2254,6 +2573,25 @@ else:
     _entry_2_label,
     _entry_2_default_text,
     _entry_2_browse_title,
+    _go_button_label,
+    _handle_go_function,
+  ):
+    info_dialog(_gui_unavailable_message(function_label))
+
+  def generic_single_entry_with_file_browse(
+    function_label,
+    _entry_1_default_text,
+    _entry_1_browse_title,
+    _go_button_label,
+    _handle_go_function,
+  ):
+    info_dialog(_gui_unavailable_message(function_label))
+
+  def generic_author_note_entry(
+    function_label,
+    _residue_label,
+    _author_default_text,
+    _note_default_text,
     _go_button_label,
     _handle_go_function,
   ):
@@ -3736,6 +4074,1093 @@ def find_odd_residues():
 def find_emringer_like_sidechain_density_outliers():
   """Backward-compatible entry point for the older menu/helper name."""
   return find_odd_residues()
+
+
+def _annotation_now_utc():
+  """Return a compact UTC timestamp for embedded residue notes."""
+  return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _annotation_text_or_empty(value):
+  if value in (None, ".", "?"):
+    return ""
+  return str(value)
+
+
+def _annotation_safe_int(value, default=None):
+  try:
+    return int(_annotation_text_or_empty(value).strip())
+  except Exception:
+    return default
+
+
+def _annotation_encode_text(value):
+  text = _annotation_text_or_empty(value)
+  if not text:
+    return "?"
+  return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _annotation_decode_text(value):
+  text = _annotation_text_or_empty(value)
+  if not text:
+    return ""
+  try:
+    return base64.urlsafe_b64decode(text.encode("ascii")).decode("utf-8")
+  except Exception:
+    # Fall back to the raw value so older/plain-text files still load.
+    return text
+
+
+def _annotation_residue_key(chain_id, resno, ins_code, residue_name_here=""):
+  return (chain_id or "", int(resno), ins_code or "", residue_name_here or "")
+
+
+def _annotation_source_path(mol_id, mmcif_only=False):
+  """Return Coot's source path for a model when it still points to a real file."""
+  try:
+    molecule_path = molecule_name(mol_id)
+  except Exception:
+    molecule_path = None
+  if not isinstance(molecule_path, str) or not molecule_path:
+    return None
+  normalized_path = os.path.abspath(os.path.expanduser(molecule_path))
+  if not os.path.isfile(normalized_path):
+    return None
+  if mmcif_only and not normalized_path.lower().endswith((".cif", ".mmcif")):
+    return None
+  return normalized_path
+
+
+def _annotation_source_display_name(mol_id):
+  source_path = _annotation_source_path(mol_id)
+  return os.path.basename(source_path) if source_path else None
+
+
+def _annotation_export_directory():
+  desktop_directory = os.path.expanduser("~/Desktop")
+  if os.path.isdir(desktop_directory):
+    return desktop_directory
+  return os.path.expanduser("~")
+
+
+def _annotation_entry_count_label(count):
+  return f"{count} residue annotation{'' if count == 1 else 's'}"
+
+
+def _annotation_entries_for_molecule(mol_id):
+  return RESIDUE_ANNOTATIONS_BY_MOLECULE.setdefault(mol_id, [])
+
+
+def _annotation_default_author():
+  return RESIDUE_ANNOTATION_LAST_AUTHOR or RESIDUE_ANNOTATION_DEFAULT_AUTHOR or ""
+
+
+def _annotation_next_id(mol_id):
+  max_id = 0
+  for entry in _annotation_entries_for_molecule(mol_id):
+    try:
+      max_id = max(max_id, int(entry.get("id", 0)))
+    except Exception:
+      continue
+  return max_id + 1
+
+
+def _annotation_prepare_note_fields(author_text, note_text):
+  normalized_note = (note_text or "").strip()
+  if not normalized_note:
+    info_dialog("Residue annotation note cannot be empty.")
+    return None
+  normalized_author = (author_text or "").strip() or _annotation_default_author() or "Unknown"
+  return normalized_author, normalized_note
+
+
+def _annotation_target_for_active_residue(expected_mol_id=None):
+  """Resolve the active residue into a noteable jump/display target."""
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  mol_id, chain_id, resno, ins_code = residue[0:4]
+  if expected_mol_id is not None and mol_id != expected_mol_id:
+    info_dialog(f"Please activate a residue in molecule #{expected_mol_id} first.")
+    return None
+  residue_name_here = residue_name(mol_id, chain_id, resno, ins_code) or ""
+  atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code)
+  point = _residue_display_point(atom_records, atom_xyz)
+  if point is None:
+    info_dialog("Failed to determine a display point for the active residue.")
+    return None
+  navigation_metadata = None
+  if _residue_is_polymer(mol_id, chain_id, resno, ins_code):
+    navigation_metadata = {
+      "type": "polymer_residue",
+      "mol_id": mol_id,
+      "chain_id": chain_id,
+      "resno": resno,
+      "ins_code": ins_code or "",
+      "serial_number": _residue_serial_number(mol_id, chain_id, resno, ins_code),
+    }
+  return {
+    "mol_id": mol_id,
+    "chain_id": chain_id,
+    "resno": resno,
+    "ins_code": ins_code or "",
+    "residue_name": residue_name_here,
+    "point": point,
+    "navigation_metadata": navigation_metadata,
+  }
+
+
+def _annotation_normalize_entry(raw_entry, fallback_id=None):
+  auth_seq_id = _annotation_safe_int(raw_entry.get("auth_seq_id"), None)
+  if auth_seq_id is None:
+    return None
+  entry_id = _annotation_text_or_empty(raw_entry.get("id")).strip()
+  if not entry_id:
+    entry_id = str(fallback_id) if fallback_id is not None else "?"
+  return {
+    "id": entry_id,
+    "auth_asym_id": _annotation_text_or_empty(raw_entry.get("auth_asym_id")).strip(),
+    "auth_seq_id": auth_seq_id,
+    "pdbx_PDB_ins_code": _annotation_text_or_empty(raw_entry.get("pdbx_PDB_ins_code")).strip(),
+    "label_comp_id": _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip(),
+    "author": _annotation_text_or_empty(raw_entry.get("author")).strip(),
+    "modified_utc": _annotation_text_or_empty(raw_entry.get("modified_utc")).strip(),
+    "note": _annotation_text_or_empty(raw_entry.get("note")).strip(),
+  }
+
+
+def _new_annotation_entry(target, author_text, note_text, note_id):
+  """Create one note row ready for in-memory storage and mmCIF export."""
+  return _annotation_normalize_entry(
+    {
+      "id": str(note_id),
+      "auth_asym_id": target["chain_id"],
+      "auth_seq_id": target["resno"],
+      "pdbx_PDB_ins_code": target["ins_code"] or "",
+      "label_comp_id": target["residue_name"] or "",
+      "author": author_text,
+      "modified_utc": _annotation_now_utc(),
+      "note": note_text,
+    },
+    fallback_id=note_id,
+  )
+
+
+def _annotation_group_sort_key(group):
+  chain_id, resno, ins_code, _residue_name_here = group["key"]
+  return (chain_id, int(resno), ins_code or "")
+
+
+def _annotation_entry_sort_key(entry):
+  return (
+    _annotation_text_or_empty(entry.get("modified_utc")),
+    int(entry.get("id", 0) or 0),
+  )
+
+
+def _annotation_groups_for_molecule(mol_id):
+  """Group note rows by residue so multiple authored comments stay threaded."""
+  grouped_entries = {}
+  for entry in _annotation_entries_for_molecule(mol_id):
+    try:
+      key = _annotation_residue_key(
+        entry.get("auth_asym_id", ""),
+        entry.get("auth_seq_id", 0),
+        entry.get("pdbx_PDB_ins_code", ""),
+        entry.get("label_comp_id", ""),
+      )
+    except Exception:
+      continue
+    grouped_entries.setdefault(key, []).append(entry)
+
+  residue_groups = []
+  for key, entries in grouped_entries.items():
+    sorted_entries = sorted(entries, key=_annotation_entry_sort_key)
+    chain_id, resno, ins_code, residue_name_here = key
+    residue_groups.append(
+      {
+        "key": key,
+        "dialog_label": _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here),
+        "entries": sorted_entries,
+      }
+    )
+  return sorted(residue_groups, key=_annotation_group_sort_key)
+
+
+def _annotation_browser_data(mol_id):
+  return {
+    "title": _annotation_browser_title(mol_id),
+    "groups": _annotation_groups_for_molecule(mol_id),
+  }
+
+
+def _annotation_group_detail_text(group):
+  """Format the full note thread for the selected residue."""
+  detail_lines = []
+  for entry_index, entry in enumerate(group["entries"], start=1):
+    author_text = _annotation_text_or_empty(entry.get("author")) or "Unknown author"
+    modified_text = _annotation_text_or_empty(entry.get("modified_utc")) or "Unknown time"
+    detail_lines.append(f"{entry_index}. {author_text} - {modified_text}")
+    detail_lines.append(_annotation_text_or_empty(entry.get("note")) or "(Empty note)")
+    if entry_index != len(group["entries"]):
+      detail_lines.append("")
+  return "\n".join(detail_lines)
+
+
+def _annotation_group_preview_text(group, max_length=56):
+  latest_note = _annotation_text_or_empty(group["entries"][-1].get("note")).splitlines()
+  preview_text = latest_note[0].strip() if latest_note else ""
+  if len(preview_text) > max_length:
+    preview_text = preview_text[:max_length - 1].rstrip() + "..."
+  note_count = len(group["entries"])
+  suffix = "note" if note_count == 1 else "notes"
+  if preview_text:
+    return f"{group['dialog_label']} ({note_count} {suffix}) - {preview_text}"
+  return f"{group['dialog_label']} ({note_count} {suffix})"
+
+
+def _annotation_mmcif_rows(mol_id):
+  rows = []
+  for entry in sorted(_annotation_entries_for_molecule(mol_id), key=_annotation_entry_sort_key):
+    rows.append(
+      [
+        _annotation_text_or_empty(entry.get("id")) or "?",
+        _annotation_text_or_empty(entry.get("auth_asym_id")) or "?",
+        str(entry.get("auth_seq_id", "")),
+        _annotation_text_or_empty(entry.get("pdbx_PDB_ins_code")) or "?",
+        _annotation_text_or_empty(entry.get("label_comp_id")) or "?",
+        _annotation_encode_text(entry.get("author")),
+        _annotation_text_or_empty(entry.get("modified_utc")) or "?",
+        _annotation_encode_text(entry.get("note")),
+      ]
+    )
+  return rows
+
+
+def _annotation_clear_existing_mmcif_items(block):
+  loop_item = block.find_loop_item(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id")
+  if loop_item is not None:
+    loop_item.erase()
+  for tag in (RESIDUE_ANNOTATION_META_VERSION_TAG, RESIDUE_ANNOTATION_META_PROGRAM_TAG):
+    pair_item = block.find_pair_item(tag)
+    if pair_item is not None:
+      pair_item.erase()
+
+
+def _load_annotations_from_mmcif_file(file_path):
+  """Read custom residue-note rows from a mmCIF file."""
+  if gemmi is None:
+    raise RuntimeError("gemmi is not available in this Coot Python environment.")
+  document = gemmi.cif.read_file(file_path)
+  block = document.sole_block()
+  column = block.find_loop(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id")
+  loop = column.get_loop()
+  if loop is None:
+    return []
+
+  tag_indices = {tag: index for index, tag in enumerate(loop.tags)}
+  required_tags = [
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_asym_id",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_seq_id",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "pdbx_PDB_ins_code",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "modified_utc",
+  ]
+  for required_tag in required_tags:
+    if required_tag not in tag_indices:
+      raise RuntimeError(f"Embedded annotation loop is missing required tag {required_tag}.")
+
+  author_tag = None
+  for candidate_tag in (
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author_b64",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author",
+  ):
+    if candidate_tag in tag_indices:
+      author_tag = candidate_tag
+      break
+  note_tag = None
+  for candidate_tag in (
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note_b64",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note",
+  ):
+    if candidate_tag in tag_indices:
+      note_tag = candidate_tag
+      break
+  if author_tag is None or note_tag is None:
+    raise RuntimeError("Embedded annotation loop is missing author or note text fields.")
+
+  entries = []
+  for row_index in range(loop.length()):
+    normalized_entry = _annotation_normalize_entry(
+      {
+        "id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id"]]),
+        "auth_asym_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_asym_id"]]),
+        "auth_seq_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_seq_id"]]),
+        "pdbx_PDB_ins_code": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "pdbx_PDB_ins_code"]]),
+        "label_comp_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id"]]),
+        "author": _annotation_decode_text(loop[row_index, tag_indices[author_tag]]),
+        "modified_utc": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "modified_utc"]]),
+        "note": _annotation_decode_text(loop[row_index, tag_indices[note_tag]]),
+      },
+      fallback_id=row_index + 1,
+    )
+    if normalized_entry is None:
+      print(f"Skipping malformed residue annotation row {row_index + 1} in {file_path}")
+      continue
+    entries.append(normalized_entry)
+  return entries
+
+
+def _write_annotations_into_mmcif_file(file_path, entries):
+  """Replace the embedded residue-note category in a mmCIF file."""
+  if gemmi is None:
+    raise RuntimeError("gemmi is not available in this Coot Python environment.")
+  document = gemmi.cif.read_file(file_path)
+  block = document.sole_block()
+  _annotation_clear_existing_mmcif_items(block)
+  block.set_pair(RESIDUE_ANNOTATION_META_VERSION_TAG, "1")
+  block.set_pair(RESIDUE_ANNOTATION_META_PROGRAM_TAG, "coot-trimmings")
+  if entries:
+    loop = block.init_loop(
+      RESIDUE_ANNOTATION_CATEGORY_PREFIX,
+      [
+        "id",
+        "auth_asym_id",
+        "auth_seq_id",
+        "pdbx_PDB_ins_code",
+        "label_comp_id",
+        "author_b64",
+        "modified_utc",
+        "note_b64",
+      ],
+    )
+    for row in entries:
+      loop.add_row(row)
+  document.write_file(file_path)
+
+
+def _load_residue_annotations_for_molecule(mol_id, file_path=None, show_status=True):
+  """Populate the in-memory annotation state for one model from embedded mmCIF."""
+  annotation_path = file_path or _annotation_source_path(mol_id, mmcif_only=True)
+  if not annotation_path:
+    if show_status:
+      info_dialog("The active molecule does not have an accessible mmCIF source file.")
+    return None
+  try:
+    loaded_entries = _load_annotations_from_mmcif_file(annotation_path)
+  except Exception as error:
+    if show_status:
+      info_dialog(f"Failed to load embedded residue annotations.\n{error}")
+    traceback.print_exc()
+    return None
+  RESIDUE_ANNOTATIONS_BY_MOLECULE[mol_id] = loaded_entries
+  if show_status:
+    add_status_bar_text(
+      f"Loaded {_annotation_entry_count_label(len(loaded_entries))} from {os.path.basename(annotation_path)}"
+    )
+  return loaded_entries
+
+
+def _write_model_with_embedded_annotations(mol_id, file_path):
+  """Write the current molecule as mmCIF and inject the custom note category."""
+  output_directory = os.path.dirname(os.path.abspath(file_path))
+  os.makedirs(output_directory, exist_ok=True)
+  temp_handle = None
+  temp_path = None
+  try:
+    temp_handle, temp_path = tempfile.mkstemp(suffix=".cif", dir=output_directory)
+    os.close(temp_handle)
+    temp_handle = None
+    write_cif_file(mol_id, temp_path)
+    if not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
+      raise RuntimeError("Coot failed to write a temporary mmCIF file.")
+    _write_annotations_into_mmcif_file(temp_path, _annotation_mmcif_rows(mol_id))
+    os.replace(temp_path, file_path)
+    return file_path
+  finally:
+    if temp_handle is not None:
+      os.close(temp_handle)
+    if temp_path and os.path.exists(temp_path):
+      try:
+        os.remove(temp_path)
+      except Exception:
+        pass
+
+
+def _default_annotation_export_path(mol_id):
+  """Suggest an output mmCIF path for annotated export."""
+  export_directory = _annotation_export_directory()
+  source_path = _annotation_source_path(mol_id)
+  if source_path:
+    source_stem = os.path.splitext(os.path.basename(source_path))[0]
+    return os.path.join(export_directory, f"{source_stem}.annotated.cif")
+  source_stub = molecule_name_stub_py(mol_id, 0) or f"molecule_{mol_id}"
+  return os.path.join(export_directory, f"{source_stub}.annotated.cif")
+
+
+def _export_residue_annotations_for_molecule(mol_id, output_path):
+  """Write the current molecule plus embedded notes to a chosen mmCIF path."""
+  raw_output_path = str(output_path or "").strip()
+  if not raw_output_path:
+    info_dialog("Please provide an output mmCIF path.")
+    return 0
+  normalized_path = os.path.abspath(os.path.expanduser(raw_output_path))
+  if not normalized_path.lower().endswith((".cif", ".mmcif")):
+    normalized_path += ".cif"
+  try:
+    _write_model_with_embedded_annotations(mol_id, normalized_path)
+  except Exception as error:
+    info_dialog(f"Failed to export annotated mmCIF.\n{error}")
+    traceback.print_exc()
+    return 0
+  add_status_bar_text(
+    f"Exported annotated mmCIF with {_annotation_entry_count_label(len(_annotation_entries_for_molecule(mol_id)))} "
+    f"to {os.path.basename(normalized_path)}"
+  )
+  return 1
+
+
+def _export_residue_annotations_with_confirmation(mol_id, output_path):
+  """Export annotations, prompting before overwriting an existing file."""
+  raw_output_path = str(output_path or "").strip()
+  if not raw_output_path:
+    info_dialog("Please provide an output mmCIF path.")
+    return 0
+
+  normalized_path = os.path.abspath(os.path.expanduser(raw_output_path))
+  if not normalized_path.lower().endswith((".cif", ".mmcif")):
+    normalized_path += ".cif"
+
+  if not os.path.exists(normalized_path):
+    return _export_residue_annotations_for_molecule(mol_id, normalized_path)
+
+  generic_confirm_dialog(
+    "Overwrite annotated mmCIF",
+    f"{os.path.basename(normalized_path)} already exists.\nOverwrite it?",
+    "Cancel",
+    lambda: None,
+    "Overwrite",
+    lambda: _export_residue_annotations_for_molecule(mol_id, normalized_path),
+  )
+  return 1
+
+
+def _ensure_residue_annotations_loaded(mol_id):
+  """Auto-load embedded notes the first time the widget is opened for a molecule."""
+  if mol_id in RESIDUE_ANNOTATIONS_BY_MOLECULE:
+    return _annotation_entries_for_molecule(mol_id)
+  return _load_residue_annotations_for_molecule(mol_id, show_status=False) or _annotation_entries_for_molecule(mol_id)
+
+
+def _annotation_active_molecule():
+  """Resolve the current model molecule for the annotation browser."""
+  model_molecules = model_molecule_list()
+  residue = active_residue()
+  if residue and residue[0] in model_molecules:
+    return residue[0]
+  mol_id = go_to_atom_molecule_number()
+  if mol_id in model_molecules:
+    return mol_id
+  if model_molecules:
+    return model_molecules[0]
+  return None
+
+
+def _annotation_active_molecule_or_status():
+  mol_id = _annotation_active_molecule()
+  if mol_id is not None:
+    return mol_id
+  info_dialog("You need an active model molecule for residue annotations.")
+  return None
+
+
+def _append_annotation_for_target(target, author_text, note_text, refresh_function=None):
+  """Add one authored note row for the chosen residue."""
+  global RESIDUE_ANNOTATION_LAST_AUTHOR
+  if not target:
+    return 0
+  note_fields = _annotation_prepare_note_fields(author_text, note_text)
+  if note_fields is None:
+    return 0
+  normalized_author, normalized_note = note_fields
+  RESIDUE_ANNOTATION_LAST_AUTHOR = normalized_author
+
+  mol_id = target["mol_id"]
+  annotation_entry = _new_annotation_entry(
+    target,
+    normalized_author,
+    normalized_note,
+    _annotation_next_id(mol_id),
+  )
+  _annotation_entries_for_molecule(mol_id).append(annotation_entry)
+  residue_label = _odd_residue_dialog_label(
+    target["chain_id"],
+    target["resno"],
+    target["ins_code"],
+    target["residue_name"],
+  )
+  add_status_bar_text(f"Added residue annotation for {residue_label}")
+  if callable(refresh_function):
+    refresh_function(
+      _annotation_residue_key(
+        target["chain_id"],
+        target["resno"],
+        target["ins_code"],
+        target["residue_name"],
+      )
+    )
+  return 1
+
+
+def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None):
+  """Prompt for a new authored note on the active residue."""
+  target = _annotation_target_for_active_residue(expected_mol_id=mol_id)
+  if target is None:
+    return 0
+  residue_label = _odd_residue_dialog_label(
+    target["chain_id"],
+    target["resno"],
+    target["ins_code"],
+    target["residue_name"],
+  )
+  generic_author_note_entry(
+    "Add residue annotation",
+    residue_label,
+    _annotation_default_author(),
+    "",
+    "Add note",
+    lambda author_text, note_text: _append_annotation_for_target(
+      target,
+      author_text,
+      note_text,
+      refresh_function,
+    ),
+  )
+  return 1
+
+
+def _annotation_note_choice_label(entry, entry_index, max_length=48):
+  """Compact chooser label for one authored note within a residue thread."""
+  author_text = _annotation_text_or_empty(entry.get("author")) or "Unknown author"
+  modified_text = _annotation_text_or_empty(entry.get("modified_utc")) or "Unknown time"
+  preview_lines = _annotation_text_or_empty(entry.get("note")).splitlines()
+  preview_text = preview_lines[0].strip() if preview_lines else ""
+  if len(preview_text) > max_length:
+    preview_text = preview_text[:max_length - 1].rstrip() + "..."
+  if preview_text:
+    return f"{entry_index}. {author_text} - {modified_text} - {preview_text}"
+  return f"{entry_index}. {author_text} - {modified_text}"
+
+
+def _update_annotation_entry(annotation_entry, author_text, note_text, refresh_function=None):
+  """Edit one existing note row in place."""
+  global RESIDUE_ANNOTATION_LAST_AUTHOR
+  note_fields = _annotation_prepare_note_fields(author_text, note_text)
+  if note_fields is None:
+    return 0
+  normalized_author, normalized_note = note_fields
+  RESIDUE_ANNOTATION_LAST_AUTHOR = normalized_author
+  annotation_entry["author"] = normalized_author
+  annotation_entry["note"] = normalized_note
+  annotation_entry["modified_utc"] = _annotation_now_utc()
+  if callable(refresh_function):
+    refresh_function()
+  add_status_bar_text("Updated residue annotation")
+  return 1
+
+
+def _delete_annotation_entry(mol_id, annotation_entry, refresh_function=None):
+  """Remove one note row from the current molecule."""
+  entries = _annotation_entries_for_molecule(mol_id)
+  try:
+    entries.remove(annotation_entry)
+  except ValueError:
+    info_dialog("That residue annotation is no longer present.")
+    return 0
+  if callable(refresh_function):
+    refresh_function()
+  add_status_bar_text("Deleted residue annotation")
+  return 1
+
+
+def _prompt_edit_annotation_entry(group, annotation_entry, refresh_function=None):
+  """Open the edit dialog for one existing note row."""
+  generic_author_note_entry(
+    "Edit residue annotation",
+    group["dialog_label"],
+    _annotation_text_or_empty(annotation_entry.get("author")) or _annotation_default_author(),
+    _annotation_text_or_empty(annotation_entry.get("note")),
+    "Save changes",
+    lambda author_text, note_text: _update_annotation_entry(
+      annotation_entry,
+      author_text,
+      note_text,
+      refresh_function,
+    ),
+  )
+  return 1
+
+
+def _choose_annotation_entry_action(group, action_name, action_function):
+  """If a residue has multiple notes, prompt for which one to edit/delete."""
+  entries = list(group.get("entries") or [])
+  if not entries:
+    info_dialog("No note is selected for this residue.")
+    return 0
+  if len(entries) == 1:
+    return action_function(entries[0])
+  button_list = []
+  for entry_index, annotation_entry in enumerate(entries, start=1):
+    button_list.append(
+      (
+        _annotation_note_choice_label(annotation_entry, entry_index),
+        lambda current_entry=annotation_entry: action_function(current_entry),
+      )
+    )
+  action_button_dialog(f"{action_name} - {group['dialog_label']}", button_list)
+  return 1
+
+
+def _annotation_jump_to_group(mol_id, group):
+  """Jump to a residue-annotation entry using the same polymer navigation path as Odd residues."""
+  chain_id, resno, ins_code, residue_name_here = group["key"]
+  residue_point = residue_centre_py(mol_id, chain_id, resno, ins_code)
+  if not isinstance(residue_point, (list, tuple)) or len(residue_point) != 3:
+    residue_point = None
+  jump_entry = [group["dialog_label"]]
+  if residue_point is not None:
+    jump_entry.extend(residue_point)
+  else:
+    jump_entry.extend([0.0, 0.0, 0.0])
+
+  if _residue_is_polymer(mol_id, chain_id, resno, ins_code):
+    jump_entry.append(
+      {
+        "type": "polymer_residue",
+        "mol_id": mol_id,
+        "chain_id": chain_id,
+        "resno": resno,
+        "ins_code": ins_code or "",
+        "serial_number": _residue_serial_number(mol_id, chain_id, resno, ins_code),
+      }
+    )
+  elif residue_point is None:
+    add_status_bar_text(group["dialog_label"])
+    return 0
+
+  _activate_interesting_entry(jump_entry)
+  return 1
+
+
+def _annotation_browser_title(mol_id):
+  source_display_name = _annotation_source_display_name(mol_id)
+  if source_display_name:
+    return (
+      f"Residue annotations for molecule #{mol_id}\n"
+      f"Source: {source_display_name}; use the widget to export an annotated mmCIF"
+    )
+  return f"Residue annotations for molecule #{mol_id}\n(No accessible source file path)"
+
+
+def _annotation_active_residue_header_text(mol_id):
+  """Describe the currently active residue for the annotation browser header."""
+  residue = active_residue()
+  if not residue:
+    return f"Active residue: none in molecule #{mol_id}"
+  active_mol_id, chain_id, resno, ins_code = residue[0:4]
+  residue_name_here = residue_name(active_mol_id, chain_id, resno, ins_code) or ""
+  residue_label = _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here)
+  if active_mol_id == mol_id:
+    return f"Active residue: {residue_label}"
+  return f"Active residue: {residue_label} (molecule #{active_mol_id})"
+
+
+def residue_annotations_gui():
+  """Browse, add, edit and export residue annotations for the active molecule."""
+  initial_mol_id = _annotation_active_molecule_or_status()
+  if initial_mol_id is None:
+    return 0
+
+  _ensure_residue_annotations_loaded(initial_mol_id)
+
+  if "Gtk" not in globals():
+    browser_data = _annotation_browser_data(initial_mol_id)
+    grouped = browser_data["groups"]
+    labels = [_annotation_group_preview_text(group) for group in grouped]
+    message = browser_data["title"]
+    if labels:
+      message += "\n\n" + "\n".join(labels)
+    info_dialog(message)
+    return len(grouped)
+
+  window = Gtk.Window()
+  window.set_title("Coot")
+  window.set_default_size(640, 620)
+
+  outer_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  action_row_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  action_row_bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  navigation_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  title_label = Gtk.Label(label=_annotation_browser_title(initial_mol_id))
+  list_scrolled = Gtk.ScrolledWindow()
+  list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  active_residue_label = Gtk.Label(label=_annotation_active_residue_header_text(initial_mol_id))
+  detail_header = Gtk.Label(label="Selected notes: none")
+  detail_scrolled = Gtk.ScrolledWindow()
+  detail_view = Gtk.TextView()
+  detail_buffer = detail_view.get_buffer()
+  add_button = Gtk.Button(label="Add note for active residue")
+  edit_button = Gtk.Button(label="Edit selected note...")
+  delete_button = Gtk.Button(label="Delete selected note...")
+  export_button = Gtk.Button(label="Export annotated mmCIF...")
+  clear_button = Gtk.Button(label="Clear all notes...")
+  refresh_button = Gtk.Button(label="Refresh list")
+  prev_button = Gtk.Button(label="<--Prev")
+  next_button = Gtk.Button(label="Next-->")
+  close_button = Gtk.Button(label="Close")
+
+  title_label.set_margin_start(12)
+  title_label.set_margin_end(12)
+  title_label.set_margin_top(12)
+  title_label.set_margin_bottom(4)
+  title_label.set_wrap(True)
+  title_label.set_xalign(0.0)
+  list_scrolled.set_margin_start(12)
+  list_scrolled.set_margin_end(12)
+  list_scrolled.set_margin_bottom(8)
+  list_scrolled.set_hexpand(True)
+  list_scrolled.set_vexpand(True)
+  list_box.set_valign(Gtk.Align.START)
+  list_scrolled.set_child(list_box)
+  active_residue_label.set_margin_start(12)
+  active_residue_label.set_margin_end(12)
+  active_residue_label.set_margin_bottom(2)
+  active_residue_label.set_xalign(0.0)
+  detail_header.set_margin_start(12)
+  detail_header.set_margin_end(12)
+  detail_header.set_margin_bottom(2)
+  detail_header.set_xalign(0.0)
+  detail_scrolled.set_margin_start(12)
+  detail_scrolled.set_margin_end(12)
+  detail_scrolled.set_margin_bottom(8)
+  detail_scrolled.set_hexpand(True)
+  detail_scrolled.set_vexpand(True)
+  detail_view.set_editable(False)
+  detail_view.set_cursor_visible(False)
+  detail_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+  detail_scrolled.set_child(detail_view)
+  action_row_top.set_halign(Gtk.Align.CENTER)
+  action_row_top.set_margin_start(12)
+  action_row_top.set_margin_end(12)
+  action_row_top.set_margin_bottom(4)
+  action_row_bottom.set_halign(Gtk.Align.CENTER)
+  action_row_bottom.set_margin_start(12)
+  action_row_bottom.set_margin_end(12)
+  action_row_bottom.set_margin_bottom(4)
+  navigation_row.set_halign(Gtk.Align.CENTER)
+  navigation_row.set_margin_start(12)
+  navigation_row.set_margin_end(12)
+  navigation_row.set_margin_bottom(4)
+  close_button.set_margin_start(12)
+  close_button.set_margin_end(12)
+  close_button.set_margin_bottom(12)
+  close_button.set_halign(Gtk.Align.CENTER)
+
+  glib_module = None
+
+  try:
+    from gi.repository import GLib as glib_module
+  except Exception:
+    glib_module = None
+
+  class AnnotationBrowserState:
+    """Mutable browser state and list-navigation helpers for the annotation widget."""
+
+    def __init__(self, mol_id):
+      self.current_mol_id = mol_id
+      self.grouped_annotations = []
+      self.selected_group_key = None
+      self.current_index = None
+      self.selected_button = None
+      self.row_buttons = []
+      self.active_residue_timer_id = None
+      self.last_active_residue_header = None
+
+    def mol_id(self):
+      return self.current_mol_id
+
+    def stop_polling(self):
+      if glib_module is not None and self.active_residue_timer_id is not None:
+        try:
+          glib_module.source_remove(self.active_residue_timer_id)
+        except Exception:
+          pass
+        self.active_residue_timer_id = None
+      return None
+
+    def close_window(self, *_args):
+      self.stop_polling()
+      window.destroy()
+      return False
+
+    def start_polling(self):
+      if glib_module is not None:
+        try:
+          self.active_residue_timer_id = glib_module.timeout_add(300, self.poll_active_residue_header)
+        except Exception:
+          self.active_residue_timer_id = None
+      return None
+
+    def selected_group(self):
+      if self.selected_group_key is None:
+        return None
+      for group in self.grouped_annotations:
+        if group["key"] == self.selected_group_key:
+          return group
+      return None
+
+    def selected_group_or_dialog(self):
+      selected_group = self.selected_group()
+      if selected_group is None:
+        info_dialog("Select a residue annotation first.")
+      return selected_group
+
+    def set_selected_button(self, button):
+      if self.selected_button is not None:
+        try:
+          self.selected_button.remove_css_class("suggested-action")
+        except Exception:
+          pass
+      self.selected_button = button
+      if button is not None:
+        try:
+          button.add_css_class("suggested-action")
+        except Exception:
+          pass
+
+    def clear_list_box_children(self):
+      child = list_box.get_first_child()
+      while child is not None:
+        next_child = child.get_next_sibling()
+        list_box.remove(child)
+        child = next_child
+
+    def update_selection_button_state(self):
+      has_selection = self.current_index is not None
+      edit_button.set_sensitive(has_selection)
+      delete_button.set_sensitive(has_selection)
+
+    def set_active_residue_header_text(self, header_text):
+      active_residue_label.set_text(header_text)
+      self.last_active_residue_header = header_text
+
+    def update_active_residue_header(self):
+      header_text = _annotation_active_residue_header_text(self.mol_id())
+      if header_text != self.last_active_residue_header:
+        self.set_active_residue_header_text(header_text)
+      return None
+
+    def clear_selected_group(self):
+      self.current_index = None
+      self.selected_group_key = None
+      detail_header.set_text("Selected notes: none")
+      detail_buffer.set_text("")
+      self.set_selected_button(None)
+      self.update_selection_button_state()
+
+    def show_group(self, entry_index, jump_to_residue=True):
+      if not self.grouped_annotations:
+        return None
+      entry_index = entry_index % len(self.grouped_annotations)
+      group = self.grouped_annotations[entry_index]
+      self.current_index = entry_index
+      self.selected_group_key = group["key"]
+      detail_header.set_text(f"Selected notes: {group['dialog_label']}")
+      detail_buffer.set_text(_annotation_group_detail_text(group))
+      button = self.row_buttons[entry_index] if entry_index < len(self.row_buttons) else None
+      self.set_selected_button(button)
+      self.update_selection_button_state()
+      if jump_to_residue:
+        _annotation_jump_to_group(self.mol_id(), group)
+      return group
+
+    def activate_prev(self, *_args):
+      if not self.grouped_annotations:
+        return None
+      if self.current_index is None:
+        return self.show_group(len(self.grouped_annotations) - 1)
+      return self.show_group(self.current_index - 1)
+
+    def activate_next(self, *_args):
+      if not self.grouped_annotations:
+        return None
+      if self.current_index is None:
+        return self.show_group(0)
+      return self.show_group(self.current_index + 1)
+
+    def render_groups(self, preferred_key=None, jump_to_selection=False):
+      browser_data = _annotation_browser_data(self.mol_id())
+      self.grouped_annotations[:] = browser_data["groups"]
+      title_label.set_text(browser_data["title"])
+      self.clear_selected_group()
+      self.row_buttons.clear()
+      self.clear_list_box_children()
+      self.set_active_residue_header_text(_annotation_active_residue_header_text(self.mol_id()))
+
+      if not self.grouped_annotations:
+        empty_label = Gtk.Label(label="No residue annotations for this molecule.")
+        empty_label.set_xalign(0.0)
+        list_box.append(empty_label)
+        prev_button.set_sensitive(False)
+        next_button.set_sensitive(False)
+        return None
+
+      selected_index = None
+      for entry_index, group in enumerate(self.grouped_annotations):
+        button = Gtk.Button(label=_annotation_group_preview_text(group))
+        button.connect("clicked", lambda _button, idx=entry_index: self.show_group(idx))
+        self.row_buttons.append(button)
+        list_box.append(button)
+        if preferred_key is not None and group["key"] == preferred_key:
+          selected_index = entry_index
+
+      prev_button.set_sensitive(True)
+      next_button.set_sensitive(True)
+      if selected_index is not None:
+        self.show_group(selected_index, jump_to_residue=jump_to_selection)
+      else:
+        self.update_active_residue_header()
+      return None
+
+    def refresh_groups(self, preferred_key=None):
+      self.render_groups(
+        preferred_key if preferred_key is not None else self.selected_group_key,
+        jump_to_selection=False,
+      )
+      return None
+
+    def poll_active_residue_header(self):
+      active_mol_id = _annotation_active_molecule()
+      if active_mol_id is not None and active_mol_id != self.mol_id():
+        self.current_mol_id = active_mol_id
+        _ensure_residue_annotations_loaded(active_mol_id)
+        self.render_groups()
+      self.update_active_residue_header()
+      return True
+
+    def add_note(self, *_args):
+      return prompt_add_annotation_for_active_residue(self.mol_id(), self.refresh_groups)
+
+    def edit_selected_note(self, *_args):
+      selected_group = self.selected_group_or_dialog()
+      if selected_group is None:
+        return None
+      return _choose_annotation_entry_action(
+        selected_group,
+        "Edit note",
+        lambda annotation_entry: _prompt_edit_annotation_entry(
+          selected_group,
+          annotation_entry,
+          lambda preferred_key=selected_group["key"]: self.refresh_groups(preferred_key),
+        ),
+      )
+
+    def delete_selected_note(self, *_args):
+      selected_group = self.selected_group_or_dialog()
+      if selected_group is None:
+        return None
+      selected_mol_id = self.mol_id()
+      return _choose_annotation_entry_action(
+        selected_group,
+        "Delete note",
+        lambda annotation_entry: generic_confirm_dialog(
+          "Delete residue annotation",
+          "Delete the selected note from this residue thread?",
+          "Cancel",
+          lambda: None,
+          "Delete note",
+          lambda: _delete_annotation_entry(
+            selected_mol_id,
+            annotation_entry,
+            lambda preferred_key=selected_group["key"]: self.refresh_groups(preferred_key),
+          ),
+        ),
+      )
+
+    def export_annotated_mmcif(self, *_args):
+      default_output_path = _default_annotation_export_path(self.mol_id())
+      generic_single_entry_with_file_browse(
+        "Export annotated mmCIF",
+        default_output_path,
+        "Choose annotated mmCIF output path",
+        "Export annotated mmCIF",
+        lambda output_path: _export_residue_annotations_with_confirmation(self.mol_id(), output_path),
+      )
+      return None
+
+    def clear_all_notes_for_molecule(self, target_mol_id):
+      _annotation_entries_for_molecule(target_mol_id).clear()
+      if target_mol_id == self.mol_id():
+        self.refresh_groups()
+      add_status_bar_text("Cleared all residue annotations for the current molecule")
+      return None
+
+    def clear_all_notes(self, *_args):
+      selected_mol_id = self.mol_id()
+      if not _annotation_entries_for_molecule(selected_mol_id):
+        info_dialog("No residue annotations are currently stored for this molecule.")
+        return None
+      generic_confirm_dialog(
+        "Clear all residue annotations",
+        "Delete all residue annotations for the current molecule?\n"
+        "This only affects the in-memory/browser state until you export an annotated mmCIF.",
+        "Cancel",
+        lambda: None,
+        "Clear all notes",
+        lambda: self.clear_all_notes_for_molecule(selected_mol_id),
+      )
+      return None
+
+  browser = AnnotationBrowserState(initial_mol_id)
+
+  add_button.connect("clicked", browser.add_note)
+  edit_button.connect("clicked", browser.edit_selected_note)
+  delete_button.connect("clicked", browser.delete_selected_note)
+  export_button.connect("clicked", browser.export_annotated_mmcif)
+  clear_button.connect("clicked", browser.clear_all_notes)
+  refresh_button.connect("clicked", lambda *_args: browser.refresh_groups())
+  prev_button.connect("clicked", browser.activate_prev)
+  next_button.connect("clicked", browser.activate_next)
+  close_button.connect("clicked", browser.close_window)
+  window.connect("close-request", lambda *_args: browser.stop_polling() or False)
+  export_button.set_sensitive(True)
+
+  browser.render_groups()
+  browser.start_polling()
+
+  action_row_top.append(add_button)
+  action_row_top.append(edit_button)
+  action_row_top.append(delete_button)
+  action_row_bottom.append(export_button)
+  action_row_bottom.append(clear_button)
+  action_row_bottom.append(refresh_button)
+  navigation_row.append(prev_button)
+  navigation_row.append(next_button)
+
+  outer_vbox.append(title_label)
+  outer_vbox.append(action_row_top)
+  outer_vbox.append(action_row_bottom)
+  outer_vbox.append(list_scrolled)
+  outer_vbox.append(active_residue_label)
+  outer_vbox.append(detail_header)
+  outer_vbox.append(detail_scrolled)
+  outer_vbox.append(navigation_row)
+  outer_vbox.append(close_button)
+  window.set_child(outer_vbox)
+  window.present()
+  return len(browser.grouped_annotations)
 
 
 def _generate_smart_local_extra_restraints_for_mol(mol_id, show_start_message=True):
@@ -10097,6 +11522,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Odd residues",
     lambda func: find_odd_residues(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Residue annotations...",
+    lambda func: residue_annotations_gui(),
   )
 
 
