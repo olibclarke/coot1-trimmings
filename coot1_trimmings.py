@@ -105,6 +105,7 @@ WATER_REFINE_MAX_DISPLACEMENT = 1.0
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
 EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
 EM_TARGET_PIXEL_SIZE = 0.5
+EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION = 1024
 EM_MASKED_MAP_RADIUS = 1.7
 EM_MASKED_MAP_COLOUR = (1.0, 0.0, 1.0)
 MAP_BRIGHTEN_SCALE_FACTOR = 1.05
@@ -114,17 +115,17 @@ MAP_BRIGHTNESS_MAX_COMPONENT = 1.0
 
 # EM-ringer-like side-chain density helper defaults.
 EMRINGER_HELPER_STEP_DEGREES = 15.0
-EMRINGER_HELPER_MIN_PEAK_TO_CONTOUR_RATIO = 1.0
-EMRINGER_HELPER_MIN_ABSOLUTE_DENSITY = 0.35
 EMRINGER_HELPER_OCCUPIED_DISTANCE = 1.2
 EMRINGER_HELPER_CA_CB_BOND_LENGTH = 1.53
 EMRINGER_HELPER_CB_CG_BOND_LENGTH = 1.52
 EMRINGER_HELPER_FINE_STEP_DEGREES = 5.0
 EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION = 0.75
 EMRINGER_HELPER_WEAK_LIGAND_OUTSIDE_FRACTION = 0.30
-EMRINGER_HELPER_MIN_LIGAND_HEAVY_ATOMS = 2
 EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER = 0.30
-EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION = 1024
+EMRINGER_HELPER_MISFIT_MIN_PEAK_TO_CONTOUR_RATIO = 1.25
+EMRINGER_HELPER_MISFIT_MIN_GAIN_TO_CONTOUR_RATIO = 0.50
+EMRINGER_HELPER_MISFIT_MIN_PROMINENCE_TO_CONTOUR_RATIO = 0.25
+EMRINGER_HELPER_MISFIT_SUPPORT_STEP_DEGREES = 5.0
 
 # Model lighting presets used by the high-contrast toggle.
 MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
@@ -528,7 +529,7 @@ ODD_RESIDUE_CATEGORY_ORDER = (
   "Possible Misfits",
   "Weak Sidechains",
   "Weak Backbone",
-  "Weak Waters",
+  "Weak Waters/Ions",
   "Weak Ligands",
 )
 
@@ -1936,11 +1937,9 @@ if GUI_PYTHON_AVAILABLE:
 
     def close_window(*_args):
       window.destroy()
-      return False
 
     def jump_to_entry(entry):
       _activate_interesting_entry(entry)
-      return False
 
     for entry in thing_list:
       if len(entry) < 4:
@@ -1960,7 +1959,7 @@ if GUI_PYTHON_AVAILABLE:
     window.set_child(vbox)
     window.present()
 
-  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists):
+  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None):
     """Show grouped clickable jump targets in a single scrollable dialog."""
     window = Gtk.Window()
     window.set_title("Coot")
@@ -1973,6 +1972,7 @@ if GUI_PYTHON_AVAILABLE:
     inside_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     prev_button = Gtk.Button(label="<--Prev")
     next_button = Gtk.Button(label="Next-->")
+    refresh_button = Gtk.Button(label="Refresh list")
     close_button = Gtk.Button(label="Close")
 
     label.set_margin_start(12)
@@ -1992,6 +1992,7 @@ if GUI_PYTHON_AVAILABLE:
     close_button.set_margin_end(12)
     close_button.set_margin_bottom(12)
     close_button.set_halign(Gtk.Align.CENTER)
+    refresh_button.set_halign(Gtk.Align.CENTER)
 
     scrolled.set_hexpand(True)
     scrolled.set_vexpand(True)
@@ -2000,73 +2001,129 @@ if GUI_PYTHON_AVAILABLE:
 
     def close_window(*_args):
       window.destroy()
-      return False
 
     def jump_to_entry(entry, category_name=None):
       _activate_interesting_entry(entry, category_name)
-      return False
 
     # Keep a flat ordered list for Prev/Next while still rendering grouped rows.
+    # `None` means the user has not navigated the list yet.
     flat_entry_specs = []
-    current_index = {"value": 0}
+    current_index = {"value": None}
+    selected_button = {"value": None}
+
+    def set_selected_button(button):
+      previous_button = selected_button["value"]
+      if previous_button is not None:
+        try:
+          previous_button.remove_css_class("suggested-action")
+        except Exception:
+          pass
+      selected_button["value"] = button
+      if button is not None:
+        try:
+          button.add_css_class("suggested-action")
+        except Exception:
+          pass
+
+    def render_categories(current_dialog_name, current_categorized_thing_lists):
+      label.set_text(current_dialog_name)
+      current_index["value"] = None
+      set_selected_button(None)
+      flat_entry_specs.clear()
+
+      child = inside_vbox.get_first_child()
+      while child is not None:
+        next_child = child.get_next_sibling()
+        inside_vbox.remove(child)
+        child = next_child
+
+      shown_any_category = False
+      for category_name, thing_list in current_categorized_thing_lists:
+        if not thing_list:
+          continue
+        shown_any_category = True
+
+        header = Gtk.Label(label=f"{category_name} ({len(thing_list)})")
+        header.set_xalign(0.0)
+        header.set_margin_top(6)
+        header.set_margin_bottom(2)
+        inside_vbox.append(header)
+
+        for entry in thing_list:
+          if len(entry) < 4:
+            continue
+          button = Gtk.Button(label=str(entry[0]))
+          entry_index = len(flat_entry_specs)
+          flat_entry_specs.append((category_name, entry, button))
+          button.connect(
+            "clicked",
+            lambda _button, idx=entry_index: activate_entry(idx),
+          )
+          inside_vbox.append(button)
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_margin_top(4)
+        separator.set_margin_bottom(2)
+        inside_vbox.append(separator)
+
+      if not shown_any_category:
+        empty_label = Gtk.Label(label="No results")
+        empty_label.set_xalign(0.0)
+        inside_vbox.append(empty_label)
+
+      prev_button.set_sensitive(bool(flat_entry_specs))
+      next_button.set_sensitive(bool(flat_entry_specs))
 
     def activate_entry(entry_index):
       if not flat_entry_specs:
-        return False
+        return None
       entry_index = entry_index % len(flat_entry_specs)
       current_index["value"] = entry_index
       category_name, entry, button = flat_entry_specs[entry_index]
       jump_to_entry(entry, category_name)
+      set_selected_button(button)
       try:
         button.grab_focus()
       except Exception:
         pass
-      return False
 
-    shown_any_category = False
-    for category_name, thing_list in categorized_thing_lists:
-      if not thing_list:
-        continue
-      shown_any_category = True
+    def activate_prev():
+      if not flat_entry_specs:
+        return None
+      if current_index["value"] is None:
+        return activate_entry(len(flat_entry_specs) - 1)
+      return activate_entry(current_index["value"] - 1)
 
-      header = Gtk.Label(label=f"{category_name} ({len(thing_list)})")
-      header.set_xalign(0.0)
-      header.set_margin_top(6)
-      header.set_margin_bottom(2)
-      inside_vbox.append(header)
+    def activate_next():
+      if not flat_entry_specs:
+        return None
+      if current_index["value"] is None:
+        return activate_entry(0)
+      return activate_entry(current_index["value"] + 1)
 
-      for entry in thing_list:
-        if len(entry) < 4:
-          continue
-        button = Gtk.Button(label=str(entry[0]))
-        entry_index = len(flat_entry_specs)
-        flat_entry_specs.append((category_name, entry, button))
-        button.connect(
-          "clicked",
-          lambda _button, idx=entry_index: activate_entry(idx),
-        )
-        inside_vbox.append(button)
+    def refresh_categories(*_args):
+      if not callable(refresh_function):
+        return None
+      refreshed_payload = refresh_function()
+      if not refreshed_payload:
+        return None
+      refreshed_dialog_name, refreshed_categorized_thing_lists = refreshed_payload
+      render_categories(refreshed_dialog_name, refreshed_categorized_thing_lists)
 
-      separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-      separator.set_margin_top(4)
-      separator.set_margin_bottom(2)
-      inside_vbox.append(separator)
-
-    if not shown_any_category:
-      empty_label = Gtk.Label(label="No results")
-      empty_label.set_xalign(0.0)
-      inside_vbox.append(empty_label)
-
-    prev_button.connect("clicked", lambda *_args: activate_entry(current_index["value"] - 1))
-    next_button.connect("clicked", lambda *_args: activate_entry(current_index["value"] + 1))
+    prev_button.connect("clicked", lambda *_args: activate_prev())
+    next_button.connect("clicked", lambda *_args: activate_next())
+    refresh_button.connect("clicked", refresh_categories)
     close_button.connect("clicked", close_window)
-    prev_button.set_sensitive(bool(flat_entry_specs))
-    next_button.set_sensitive(bool(flat_entry_specs))
+    refresh_button.set_sensitive(callable(refresh_function))
+
+    render_categories(dialog_name, categorized_thing_lists)
 
     vbox.append(label)
     vbox.append(scrolled)
     navigation_row.append(prev_button)
     navigation_row.append(next_button)
+    if callable(refresh_function):
+      navigation_row.append(refresh_button)
     vbox.append(navigation_row)
     vbox.append(close_button)
     window.set_child(vbox)
@@ -2128,7 +2185,6 @@ if GUI_PYTHON_AVAILABLE:
 
     def close_window(*_args):
       window.destroy()
-      return False
 
     for button_label, callback in button_list:
       button = Gtk.Button(label=str(button_label))
@@ -2137,7 +2193,6 @@ if GUI_PYTHON_AVAILABLE:
         action()
         if close_on_click:
           window.destroy()
-        return False
 
       button.connect("clicked", on_click)
       inside_vbox.append(button)
@@ -2206,6 +2261,18 @@ else:
 
   def interesting_things_gui(dialog_name, thing_list):
     labels = [str(entry[0]) for entry in thing_list if len(entry) >= 4]
+    message = dialog_name
+    if labels:
+      message += "\n\n" + "\n".join(labels)
+    info_dialog(message)
+
+  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None):
+    labels = []
+    for category_name, thing_list in categorized_thing_lists:
+      if not thing_list:
+        continue
+      labels.append(f"{category_name} ({len(thing_list)})")
+      labels.extend(str(entry[0]) for entry in thing_list if len(entry) >= 4)
     message = dialog_name
     if labels:
       message += "\n\n" + "\n".join(labels)
@@ -2883,11 +2950,15 @@ def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
   best_density = None
   best_angle = None
   best_point = None
+  coarse_density_sum = 0.0
+  coarse_density_count = 0
   n_steps = max(1, int(round(360.0 / step_degrees)))
   for step_index in range(n_steps):
     angle_degrees = (360.0 * step_index) / n_steps
     sample_point = _virtual_torsion_point(ring_frame, bond_length, angle_degrees)
     density_value = density_at_point(map_id, sample_point[0], sample_point[1], sample_point[2])
+    coarse_density_sum += density_value
+    coarse_density_count += 1
     if best_density is None or density_value > best_density:
       best_density = density_value
       best_angle = angle_degrees
@@ -2895,6 +2966,7 @@ def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
 
   if best_density is None:
     return None
+  ring_mean_density = coarse_density_sum / float(coarse_density_count)
 
   if fine_step_degrees > 0.0 and fine_step_degrees < step_degrees and best_angle is not None:
     search_start = best_angle - step_degrees
@@ -2913,6 +2985,7 @@ def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
     "density": best_density,
     "angle_degrees": best_angle % 360.0 if best_angle is not None else None,
     "point": best_point,
+    "ring_mean_density": ring_mean_density,
   }
 
 
@@ -3072,13 +3145,15 @@ def _mean_density_at_atoms(map_id, atom_records):
   if not atom_records:
     return None
 
-  density_values = []
+  density_sum = 0.0
+  density_count = 0
   for atom in atom_records:
     xyz = atom["xyz"]
-    density_values.append(density_at_point(map_id, xyz[0], xyz[1], xyz[2]))
-  if not density_values:
+    density_sum += density_at_point(map_id, xyz[0], xyz[1], xyz[2])
+    density_count += 1
+  if density_count == 0:
     return None
-  return sum(density_values) / float(len(density_values))
+  return density_sum / float(density_count)
 
 
 def _backbone_support_positions(atom_xyz):
@@ -3122,9 +3197,28 @@ def _evaluate_emringer_stage(map_id, stage_spec):
   if peak is None:
     return None
 
+  peak_angle = peak["angle_degrees"]
+  max_local_support_density = None
+  support_density_sum = peak["density"]
+  support_density_count = 1
+  if peak_angle is not None and EMRINGER_HELPER_MISFIT_SUPPORT_STEP_DEGREES > 0.0:
+    for angle_offset in (-EMRINGER_HELPER_MISFIT_SUPPORT_STEP_DEGREES, EMRINGER_HELPER_MISFIT_SUPPORT_STEP_DEGREES):
+      support_point = _virtual_torsion_point(
+        stage_spec["ring_frame"],
+        stage_spec["bond_length"],
+        peak_angle + angle_offset,
+      )
+      support_density = density_at_point(map_id, support_point[0], support_point[1], support_point[2])
+      if max_local_support_density is None or support_density > max_local_support_density:
+        max_local_support_density = support_density
+      support_density_sum += support_density
+      support_density_count += 1
+
   current_stage_density = _mean_density_at_atoms(map_id, stage_spec["blocker_atoms"])
   nearest_blocker_name, nearest_distance_sq = _nearest_stage_blocker(stage_spec, peak["point"])
   density_gain = peak["density"] - current_stage_density if current_stage_density is not None else peak["density"]
+  ring_prominence = peak["density"] - peak["ring_mean_density"]
+  mean_triplet_density = support_density_sum / float(support_density_count)
   return {
     "label": stage_spec["label"],
     "bond_length": stage_spec["bond_length"],
@@ -3134,6 +3228,9 @@ def _evaluate_emringer_stage(map_id, stage_spec):
     "nearest_blocker_name": nearest_blocker_name,
     "nearest_distance_sq": nearest_distance_sq,
     "density_gain": density_gain,
+    "ring_prominence": ring_prominence,
+    "max_local_support_density": max_local_support_density,
+    "mean_triplet_density": mean_triplet_density,
   }
 
 
@@ -3150,6 +3247,39 @@ def _weak_stage_inset_peak_density(map_id, stage_result, inset_buffer=EMRINGER_H
   if inset_peak is None:
     return stage_result["peak"]["density"]
   return max(stage_result["peak"]["density"], inset_peak["density"])
+
+
+def _heavy_atom_density_summary(map_id, atom_records, density_threshold=None):
+  """Sample heavy-atom density once and return the summary statistics."""
+  heavy_atoms = []
+  max_density = None
+  max_atom = None
+  density_sum = 0.0
+  outside_count = 0
+
+  for atom in atom_records:
+    if atom["element"] in ("H", "D"):
+      continue
+    heavy_atoms.append(atom)
+    x, y, z = atom["xyz"]
+    density_value = density_at_point(map_id, x, y, z)
+    density_sum += density_value
+    if max_density is None or density_value > max_density:
+      max_density = density_value
+      max_atom = atom
+    if density_threshold is not None and density_value < density_threshold:
+      outside_count += 1
+
+  heavy_atom_count = len(heavy_atoms)
+  mean_density = density_sum / float(heavy_atom_count) if heavy_atom_count else None
+  return {
+    "heavy_atoms": heavy_atoms,
+    "count": heavy_atom_count,
+    "max_density": max_density,
+    "max_atom": max_atom,
+    "mean_density": mean_density,
+    "outside_count": outside_count,
+  }
 
 
 def _format_residue_id(chain_id, resno, ins_code):
@@ -3185,20 +3315,6 @@ def _log_odd_residue_results(mol_id, map_id, peak_threshold, categorized_details
       print(f"  {detail_line}")
 
 
-def _heavy_non_hydrogen_atoms(atom_records):
-  """Return non-hydrogen atoms for water/ligand density checks."""
-  return [atom for atom in atom_records if atom["element"] not in ("H", "D")]
-
-
-def _atom_density_values(map_id, atom_records):
-  """Sample map density at each listed atom position."""
-  density_values = []
-  for atom in atom_records:
-    x, y, z = atom["xyz"]
-    density_values.append(density_at_point(map_id, x, y, z))
-  return density_values
-
-
 def _append_odd_residue_entry(categorized_entries, category_name, sort_key, dialog_label, point, detail_label,
                               navigation_metadata=None):
   """Store one GUI/log entry tuple in the requested odd-residue category."""
@@ -3208,15 +3324,32 @@ def _append_odd_residue_entry(categorized_entries, category_name, sort_key, dial
   categorized_entries[category_name].append((sort_key, gui_entry, detail_label))
 
 
-def _sorted_odd_residue_outputs(categorized_entries):
+def _sorted_categorized_outputs(categorized_entries, category_order=None):
   """Sort each category once, then split into GUI entries and log-detail lines."""
   gui_categories = []
   detail_categories = []
-  for category_name in ODD_RESIDUE_CATEGORY_ORDER:
+  ordered_categories = category_order or tuple(categorized_entries.keys())
+  for category_name in ordered_categories:
     sorted_entries = sorted(categorized_entries[category_name], key=lambda item: item[0])
     gui_categories.append((category_name, [entry for _sort_key, entry, _detail in sorted_entries]))
     detail_categories.append((category_name, [detail for _sort_key, _entry, detail in sorted_entries]))
   return gui_categories, detail_categories
+
+
+def _numbered_gui_categories(gui_categories):
+  """Prefix categorized hit labels with per-category numbers for easier navigation."""
+  numbered_categories = []
+  for category_name, entries in gui_categories:
+    numbered_entries = []
+    for entry_index, entry in enumerate(entries, start=1):
+      if not isinstance(entry, list) or not entry:
+        numbered_entries.append(entry)
+        continue
+      numbered_entry = list(entry)
+      numbered_entry[0] = f"{entry_index}. {numbered_entry[0]}"
+      numbered_entries.append(numbered_entry)
+    numbered_categories.append((category_name, numbered_entries))
+  return numbered_categories
 
 
 def _odd_residue_navigation_metadata(mol_id, chain_id, resno, ins_code, serial_number):
@@ -3237,7 +3370,7 @@ def _odd_residue_status_suffix(category_name):
     "Possible Misfits": "Possible Misfit?",
     "Weak Sidechains": "Weak Sidechain",
     "Weak Backbone": "Weak Backbone",
-    "Weak Waters": "Weak Water",
+    "Weak Waters/Ions": "Weak Water/Ion",
     "Weak Ligands": "Weak Ligand",
   }
   return status_suffixes.get(category_name, category_name)
@@ -3268,8 +3401,144 @@ def _missing_atom_residue_keys(mol_id):
   return residue_keys
 
 
-def find_odd_residues():
-  """Find odd residues in the active molecule using density-based heuristics."""
+def _odd_residue_peak_threshold_or_status(map_id):
+  """Return the current positive contour level used as the odd-residues threshold."""
+  contour_level = get_contour_level_absolute(map_id)
+  if contour_level <= 0.0:
+    info_dialog(
+      "Odd residues requires a positive scrollable-map contour level.\n"
+      f"Coot reported {contour_level:.4f} for map #{map_id}."
+    )
+    return None
+  return contour_level
+
+
+def _odd_residue_dialog_title(mol_id, map_id):
+  """Return the odd-residues dialog title with current map level details."""
+  contour_level = get_contour_level_absolute(map_id)
+  try:
+    contour_sigma = get_contour_level_in_sigma(map_id)
+  except Exception:
+    contour_sigma = None
+
+  if contour_sigma is not None and contour_sigma is not False:
+    return (
+      "Odd residues in molecule #{0} at the current threshold of the scrollable map\n"
+      "(Map #{1} at level {2:.3f}, {3:.1f} sigma):"
+    ).format(mol_id, map_id, contour_level, contour_sigma)
+
+  return (
+    "Odd residues in molecule #{0} at the current threshold of the scrollable map\n"
+    "(Map #{1} at level {2:.3f}):"
+  ).format(mol_id, map_id, contour_level)
+
+
+def _stage_result_has_local_support(stage_result, peak_threshold):
+  """Require the misfit peak to be supported by nearby torsion samples."""
+  max_local_support_density = stage_result["max_local_support_density"]
+  return (
+    (max_local_support_density is not None and max_local_support_density >= peak_threshold)
+    or stage_result["mean_triplet_density"] >= peak_threshold
+  )
+
+
+def _stage_result_is_possible_misfit(stage_result, peak_threshold, misfit_peak_threshold,
+                                     misfit_gain_threshold, occupied_distance_sq):
+  """Return True if this torsion-stage peak looks like a genuine possible misfit."""
+  current_stage_density = stage_result["current_stage_density"]
+  nearest_distance_sq = stage_result["nearest_distance_sq"]
+  prominence_threshold = peak_threshold * EMRINGER_HELPER_MISFIT_MIN_PROMINENCE_TO_CONTOUR_RATIO
+  if stage_result["peak"]["density"] < misfit_peak_threshold:
+    return False
+  if stage_result["ring_prominence"] < prominence_threshold:
+    return False
+  if not _stage_result_has_local_support(stage_result, peak_threshold):
+    return False
+  if current_stage_density is not None and stage_result["peak"]["density"] <= current_stage_density:
+    return False
+  if current_stage_density is not None and stage_result["density_gain"] < misfit_gain_threshold:
+    return False
+  if nearest_distance_sq is not None and nearest_distance_sq <= occupied_distance_sq:
+    return False
+  return True
+
+
+def _possible_misfit_detail_label(residue_id, residue_name_here, stage_result, peak_threshold):
+  """Format the log detail for one possible-misfit stage hit."""
+  contour_ratio = stage_result["peak"]["density"] / peak_threshold if peak_threshold > 0.0 else 0.0
+  if stage_result["nearest_distance_sq"] is None:
+    placement_note = f"no {stage_result['label']}-stage atoms placed"
+  else:
+    placement_note = "{0} is {1:.1f} A away".format(
+      stage_result["nearest_blocker_name"] or f"nearest {stage_result['label']}-stage atom",
+      math.sqrt(stage_result["nearest_distance_sq"]),
+    )
+  if stage_result["current_stage_density"] is None:
+    density_note = "current stage unbuilt"
+  else:
+    density_note = "current stage density {0:.4f}, gain {1:.4f}".format(
+      stage_result["current_stage_density"],
+      stage_result["density_gain"],
+    )
+  return (
+    f"{residue_id} {residue_name_here}: peak {stage_result['peak']['density']:.4f} "
+    f"({contour_ratio:.1f}x threshold) at {stage_result['label']} {stage_result['peak']['angle_degrees']:.0f} deg; "
+    f"{density_note}; ring mean {stage_result['peak']['ring_mean_density']:.4f}, "
+    f"prominence {stage_result['ring_prominence']:.4f}; local support max {stage_result['max_local_support_density'] or 0.0:.4f}, "
+    f"triplet mean {stage_result['mean_triplet_density']:.4f}; {placement_note}"
+  )
+
+
+def _scan_polymer_stages(map_id, residue_id, residue_name_here, stage_specs, peak_threshold,
+                         misfit_peak_threshold, misfit_gain_threshold, occupied_distance_sq):
+  """Evaluate all torsion stages for one polymer residue."""
+  best_stage_result = None
+  strongest_current_density = None
+  strongest_buffered_peak_density = None
+  has_stage_atoms = False
+  possible_misfits = []
+
+  for stage_index, stage_spec in enumerate(stage_specs):
+    stage_result = _evaluate_emringer_stage(map_id, stage_spec)
+    if stage_result is None:
+      continue
+
+    if best_stage_result is None or stage_result["peak"]["density"] > best_stage_result["peak"]["density"]:
+      best_stage_result = stage_result
+
+    current_stage_density = stage_result["current_stage_density"]
+    if current_stage_density is not None and (
+      strongest_current_density is None or current_stage_density > strongest_current_density
+    ):
+      strongest_current_density = current_stage_density
+
+    buffered_peak_density = _weak_stage_inset_peak_density(map_id, stage_result)
+    if strongest_buffered_peak_density is None or buffered_peak_density > strongest_buffered_peak_density:
+      strongest_buffered_peak_density = buffered_peak_density
+
+    if stage_result["nearest_distance_sq"] is not None:
+      has_stage_atoms = True
+
+    if _stage_result_is_possible_misfit(
+      stage_result,
+      peak_threshold,
+      misfit_peak_threshold,
+      misfit_gain_threshold,
+      occupied_distance_sq,
+    ):
+      possible_misfits.append((stage_index, stage_result))
+
+  return {
+    "best_stage_result": best_stage_result,
+    "strongest_current_density": strongest_current_density,
+    "strongest_buffered_peak_density": strongest_buffered_peak_density,
+    "has_stage_atoms": has_stage_atoms,
+    "possible_misfits": possible_misfits,
+  }
+
+
+def _collect_odd_residue_dialog_data():
+  """Build the current Odd residues dialog payload from the active model/map."""
   map_id = _active_analysis_map_or_status()
   if map_id is None:
     return None
@@ -3278,11 +3547,11 @@ def find_odd_residues():
   if mol_id is None:
     return None
 
-  contour_level = abs(get_contour_level_absolute(map_id))
-  if contour_level > 0.0:
-    peak_threshold = contour_level * EMRINGER_HELPER_MIN_PEAK_TO_CONTOUR_RATIO
-  else:
-    peak_threshold = EMRINGER_HELPER_MIN_ABSOLUTE_DENSITY
+  peak_threshold = _odd_residue_peak_threshold_or_status(map_id)
+  if peak_threshold is None:
+    return None
+  misfit_peak_threshold = peak_threshold * EMRINGER_HELPER_MISFIT_MIN_PEAK_TO_CONTOUR_RATIO
+  misfit_gain_threshold = peak_threshold * EMRINGER_HELPER_MISFIT_MIN_GAIN_TO_CONTOUR_RATIO
   occupied_distance_sq = EMRINGER_HELPER_OCCUPIED_DISTANCE * EMRINGER_HELPER_OCCUPIED_DISTANCE
 
   categorized_entries = {category_name: [] for category_name in ODD_RESIDUE_CATEGORY_ORDER}
@@ -3298,75 +3567,60 @@ def find_odd_residues():
       if not atom_xyz:
         continue
       residue_id = _format_residue_id(chain_id, resno, ins_code)
+      residue_point = _residue_display_point(atom_records, atom_xyz)
       dialog_label = _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here)
       if (chain_id, resno, ins_code or "") in missing_atom_residue_keys:
         dialog_label = f"{dialog_label} (Missing atoms)"
+      navigation_metadata = _odd_residue_navigation_metadata(mol_id, chain_id, resno, ins_code, serial_number)
 
-      if residue_name_here in WATER_RESIDUE_NAMES:
-        heavy_atoms = _heavy_non_hydrogen_atoms(atom_records)
-        if not heavy_atoms:
-          continue
-        atom_densities = _atom_density_values(map_id, heavy_atoms)
-        max_density = max(atom_densities)
-        if max_density < peak_threshold:
-          point = heavy_atoms[atom_densities.index(max_density)]["xyz"]
-          detail_label = (
-            f"{residue_id} {residue_name_here}: max atom density {max_density:.4f} "
-            f"below threshold {peak_threshold:.4f}"
-          )
-          _append_odd_residue_entry(
-            categorized_entries,
-            "Weak Waters",
-            (max_density, chain_index, serial_number),
-            dialog_label,
-            point,
-            detail_label,
-          )
-        continue
+      def add_result(category_name, sort_key, detail_label, point=None, use_navigation=False):
+        _append_odd_residue_entry(
+          categorized_entries,
+          category_name,
+          sort_key,
+          dialog_label,
+          point if point is not None else residue_point,
+          detail_label,
+          navigation_metadata if use_navigation else None,
+        )
 
       if residue_name_here not in POLYMER_RESIDUE_NAMES:
-        heavy_atoms = _heavy_non_hydrogen_atoms(atom_records)
-        if len(heavy_atoms) < EMRINGER_HELPER_MIN_LIGAND_HEAVY_ATOMS:
+        density_summary = _heavy_atom_density_summary(map_id, atom_records, peak_threshold)
+        if density_summary["count"] == 0:
           continue
-        atom_densities = _atom_density_values(map_id, heavy_atoms)
-        outside_count = sum(1 for density_value in atom_densities if density_value < peak_threshold)
-        outside_fraction = outside_count / float(len(heavy_atoms))
+        if residue_name_here in WATER_RESIDUE_NAMES or density_summary["count"] == 1:
+          max_density = density_summary["max_density"]
+          if max_density < peak_threshold:
+            add_result(
+              "Weak Waters/Ions",
+              (max_density, chain_index, serial_number),
+              f"{residue_id} {residue_name_here}: max atom density {max_density:.4f} "
+              f"below threshold {peak_threshold:.4f}",
+              point=density_summary["max_atom"]["xyz"],
+            )
+          continue
+        outside_fraction = density_summary["outside_count"] / float(density_summary["count"])
         if outside_fraction > EMRINGER_HELPER_WEAK_LIGAND_OUTSIDE_FRACTION:
-          point = _residue_display_point(atom_records, atom_xyz)
-          mean_density = sum(atom_densities) / float(len(atom_densities))
-          detail_label = (
-            f"{residue_id} {residue_name_here}: {outside_count}/{len(heavy_atoms)} heavy atoms "
-            f"({outside_fraction:.0%}) outside contour; mean density {mean_density:.4f}"
-          )
-          _append_odd_residue_entry(
-            categorized_entries,
+          mean_density = density_summary["mean_density"]
+          add_result(
             "Weak Ligands",
             (-outside_fraction, mean_density, chain_index, serial_number),
-            dialog_label,
-            point,
-            detail_label,
+            f"{residue_id} {residue_name_here}: {density_summary['outside_count']}/{density_summary['count']} heavy atoms "
+            f"({outside_fraction:.0%}) outside contour; mean density {mean_density:.4f}",
           )
         continue
 
       if residue_name_here == "GLY":
         continue
 
-      navigation_metadata = _odd_residue_navigation_metadata(mol_id, chain_id, resno, ins_code, serial_number)
       support_fraction, supported_points, total_points = _backbone_density_support(map_id, atom_xyz, peak_threshold)
       if total_points == 0 or support_fraction < EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION:
-        point = _residue_display_point(atom_records, atom_xyz)
-        detail_label = (
-          f"{residue_id} {residue_name_here}: backbone support {supported_points}/{total_points} "
-          f"({support_fraction:.0%}) below threshold"
-        )
-        _append_odd_residue_entry(
-          categorized_entries,
+        add_result(
           "Weak Backbone",
           (support_fraction, chain_index, serial_number),
-          dialog_label,
-          point,
-          detail_label,
-          navigation_metadata,
+          f"{residue_id} {residue_name_here}: backbone support {supported_points}/{total_points} "
+          f"({support_fraction:.0%}) below threshold",
+          use_navigation=True,
         )
         continue
 
@@ -3374,112 +3628,109 @@ def find_odd_residues():
       if not stage_specs:
         continue
 
-      best_stage_result = None
-      strongest_current_density = None
-      strongest_buffered_peak_density = None
-      has_stage_atoms = False
-      for stage_index, stage_spec in enumerate(stage_specs):
-        stage_result = _evaluate_emringer_stage(map_id, stage_spec)
-        if stage_result is None:
-          continue
-        if best_stage_result is None or stage_result["peak"]["density"] > best_stage_result["peak"]["density"]:
-          best_stage_result = stage_result
+      stage_scan = _scan_polymer_stages(
+        map_id,
+        residue_id,
+        residue_name_here,
+        stage_specs,
+        peak_threshold,
+        misfit_peak_threshold,
+        misfit_gain_threshold,
+        occupied_distance_sq,
+      )
 
-        current_stage_density = stage_result["current_stage_density"]
-        if current_stage_density is not None:
-          if strongest_current_density is None or current_stage_density > strongest_current_density:
-            strongest_current_density = current_stage_density
-        buffered_peak_density = _weak_stage_inset_peak_density(map_id, stage_result)
-        if strongest_buffered_peak_density is None or buffered_peak_density > strongest_buffered_peak_density:
-          strongest_buffered_peak_density = buffered_peak_density
-        if stage_result["nearest_distance_sq"] is not None:
-          has_stage_atoms = True
-
-        if stage_result["peak"]["density"] < peak_threshold:
-          continue
-        if current_stage_density is not None and stage_result["peak"]["density"] <= current_stage_density:
-          continue
-        if stage_result["nearest_distance_sq"] is not None and stage_result["nearest_distance_sq"] <= occupied_distance_sq:
-          continue
-
-        contour_ratio = stage_result["peak"]["density"] / peak_threshold if peak_threshold > 0.0 else 0.0
-        if stage_result["nearest_distance_sq"] is None:
-          placement_note = f"no {stage_result['label']}-stage atoms placed"
-        else:
-          placement_note = "{0} is {1:.1f} A away".format(
-            stage_result["nearest_blocker_name"] or f"nearest {stage_result['label']}-stage atom",
-            math.sqrt(stage_result["nearest_distance_sq"]),
-          )
-        if stage_result["current_stage_density"] is None:
-          density_note = "current stage unbuilt"
-        else:
-          density_note = "current stage density {0:.4f}, gain {1:.4f}".format(
-            current_stage_density,
-            stage_result["density_gain"],
-          )
-        detail_label = (
-          f"{residue_id} {residue_name_here}: peak {stage_result['peak']['density']:.4f} "
-          f"({contour_ratio:.1f}x threshold) at {stage_result['label']} {stage_result['peak']['angle_degrees']:.0f} deg; "
-          f"{density_note}; {placement_note}"
-        )
-        _append_odd_residue_entry(
-          categorized_entries,
+      for stage_index, stage_result in stage_scan["possible_misfits"]:
+        add_result(
           "Possible Misfits",
           (-stage_result["density_gain"], -stage_result["peak"]["density"], chain_index, serial_number, stage_index),
-          dialog_label,
-          stage_result["peak"]["point"],
-          detail_label,
-          navigation_metadata,
+          _possible_misfit_detail_label(residue_id, residue_name_here, stage_result, peak_threshold),
+          point=stage_result["peak"]["point"],
+          use_navigation=True,
         )
 
+      best_stage_result = stage_scan["best_stage_result"]
       if best_stage_result is None or best_stage_result["peak"]["density"] >= peak_threshold:
         continue
 
-      if not has_stage_atoms:
+      if not stage_scan["has_stage_atoms"]:
         continue
 
+      strongest_buffered_peak_density = stage_scan["strongest_buffered_peak_density"]
       if strongest_buffered_peak_density is not None and strongest_buffered_peak_density >= peak_threshold:
         continue
 
+      strongest_current_density = stage_scan["strongest_current_density"]
       if strongest_current_density is not None and strongest_current_density >= peak_threshold:
         continue
 
-      point = best_stage_result["peak"]["point"] if best_stage_result["peak"]["point"] else _residue_display_point(atom_records, atom_xyz)
       if strongest_current_density is None:
         current_density_note = "no current stage atoms placed"
       else:
         current_density_note = "strongest current stage density {0:.4f}".format(strongest_current_density)
-      detail_label = (
-        f"{residue_id} {residue_name_here}: best {best_stage_result['label']} peak "
-        f"{best_stage_result['peak']['density']:.4f} below threshold {peak_threshold:.4f}; "
-        f"{current_density_note}; strongest inset-ring peak {0:.4f}".format(strongest_buffered_peak_density or 0.0)
-      )
-      _append_odd_residue_entry(
-        categorized_entries,
+      add_result(
         "Weak Sidechains",
         (best_stage_result["peak"]["density"], -(strongest_current_density or 0.0), chain_index, serial_number),
-        dialog_label,
-        point,
-        detail_label,
-        navigation_metadata,
+        f"{residue_id} {residue_name_here}: best {best_stage_result['label']} peak "
+        f"{best_stage_result['peak']['density']:.4f} below threshold {peak_threshold:.4f}; "
+        f"{current_density_note}; strongest inset-ring peak {0:.4f}".format(strongest_buffered_peak_density or 0.0),
+        point=(best_stage_result["peak"]["point"] or residue_point),
+        use_navigation=True,
       )
 
-  if not any(categorized_entries.values()):
+  sorted_gui_categories, sorted_detail_categories = _sorted_categorized_outputs(
+    categorized_entries,
+    ODD_RESIDUE_CATEGORY_ORDER,
+  )
+  numbered_gui_categories = _numbered_gui_categories(sorted_gui_categories)
+  total_hits = sum(len(entries) for entries in categorized_entries.values())
+  return {
+    "mol_id": mol_id,
+    "map_id": map_id,
+    "peak_threshold": peak_threshold,
+    "gui_categories": numbered_gui_categories,
+    "detail_categories": sorted_detail_categories,
+    "title": _odd_residue_dialog_title(mol_id, map_id),
+    "total_hits": total_hits,
+  }
+
+
+def find_odd_residues():
+  """Find odd residues in the active molecule using density-based heuristics."""
+  dialog_data = _collect_odd_residue_dialog_data()
+  if dialog_data is None:
+    return None
+
+  if dialog_data["total_hits"] == 0:
     info_dialog(
       "No odd residues found in the current molecule\n"
-      f"at the current threshold ({peak_threshold:.4f})."
+      f"at the current threshold ({dialog_data['peak_threshold']:.4f})."
     )
     return 0
 
-  sorted_gui_categories, sorted_detail_categories = _sorted_odd_residue_outputs(categorized_entries)
+  def refresh_payload():
+    refreshed_data = _collect_odd_residue_dialog_data()
+    if refreshed_data is None:
+      return None
+    _log_odd_residue_results(
+      refreshed_data["mol_id"],
+      refreshed_data["map_id"],
+      refreshed_data["peak_threshold"],
+      refreshed_data["detail_categories"],
+    )
+    return refreshed_data["title"], refreshed_data["gui_categories"]
 
   categorized_interesting_things_gui(
-    "Odd residues in molecule #{0} at the current threshold of the "
-    "scrollable map (Map #{1}):".format(mol_id, map_id),
-    sorted_gui_categories,
+    dialog_data["title"],
+    dialog_data["gui_categories"],
+    refresh_function=refresh_payload,
   )
-  _log_odd_residue_results(mol_id, map_id, peak_threshold, sorted_detail_categories)
-  return sum(len(entries) for entries in categorized_entries.values())
+  _log_odd_residue_results(
+    dialog_data["mol_id"],
+    dialog_data["map_id"],
+    dialog_data["peak_threshold"],
+    dialog_data["detail_categories"],
+  )
+  return dialog_data["total_hits"]
 
 
 def find_emringer_like_sidechain_density_outliers():
@@ -3984,6 +4235,26 @@ def display_only_active():
       next_mol=model_molecule_list()[0]
     set_mol_displayed(displayed_mol,0)
     set_mol_displayed(next_mol,1)
+
+
+def _map_level_summary(map_id):
+  """Return the current map level in absolute and sigma units."""
+  contour_absolute = get_contour_level_absolute(map_id)
+  contour_sigma = get_contour_level_in_sigma(map_id)
+  return contour_absolute, contour_sigma
+
+
+def _post_map_level_status(map_id, prefix="set to"):
+  """Report the current map level in a consistent status-bar format."""
+  contour_absolute, contour_sigma = _map_level_summary(map_id)
+  add_status_bar_text(
+    "Map #{0} {1} level {2:.3f}, {3:.1f} sigma".format(
+      map_id,
+      prefix,
+      contour_absolute,
+      contour_sigma,
+    )
+  )
     
 def _step_map_sigma(mol_id, delta):
   """Adjust contour sigma in coarse 0.1 steps within the usual trimmings range."""
@@ -3995,6 +4266,7 @@ def _step_map_sigma(mol_id, delta):
   else:
     new_level = 10.0
   set_contour_level_in_sigma(mol_id, new_level)
+  _post_map_level_status(mol_id, "set to")
 
 
 def step_map_coarse_up(mol_id):
@@ -4010,6 +4282,7 @@ def set_current_map_sigma(level):
   if map_id is None:
     return None
   set_contour_level_in_sigma(map_id, level)
+  _post_map_level_status(map_id, "set to")
 
 
 def step_current_map_coarse_up():
@@ -7743,14 +8016,15 @@ def set_map_level_quickly():
   if scroll_wheel_map()!=-1 and map_is_displayed(scroll_wheel_map())!=0:
     current_map_level=get_contour_level_in_sigma(scroll_wheel_map())
     current_map_level="{0:.2f}".format(current_map_level)
-    def set_map_level_quickly(X):
+    def set_map_level_quickly_from_entry(X):
       try:
         map_level=float(X)
         map_id=scroll_wheel_map()
         set_contour_level_in_sigma(map_id, map_level)
+        _post_map_level_status(map_id, "set to")
       except ValueError:
         info_dialog("Has to be a number!") 
-    generic_single_entry("New map level in sigma/RMS?",current_map_level,"Set map level",set_map_level_quickly)
+    generic_single_entry("New map level in sigma/RMS?",current_map_level,"Set map level",set_map_level_quickly_from_entry)
   else:
     info_dialog("You need a (scrollable, displayed) map!")
 
