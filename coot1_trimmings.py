@@ -16,15 +16,90 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import types
 import warnings
 from datetime import datetime, timezone
 from functools import lru_cache
 
-import gi
-import coot
-import coot_utils
-import gap
-from mutate import three_letter_code2single_letter
+STARTUP_DIAGNOSTIC_MESSAGES = []
+_STARTUP_DIAGNOSTIC_DIALOGS_SHOWN = set()
+
+
+def _record_startup_diagnostic(level, message):
+  prefix = f"coot_trimmings startup {level}: "
+  full_message = prefix + message
+  print(full_message)
+  STARTUP_DIAGNOSTIC_MESSAGES.append((level, message))
+
+
+def _show_startup_diagnostic_once(key, message):
+  if key in _STARTUP_DIAGNOSTIC_DIALOGS_SHOWN:
+    return None
+  _STARTUP_DIAGNOSTIC_DIALOGS_SHOWN.add(key)
+  try:
+    coot.info_dialog(message)
+  except Exception:
+    print("coot_trimmings startup notice:", message)
+  return None
+
+
+try:
+  import gi
+except Exception as error:
+  _record_startup_diagnostic(
+    "warning",
+    f"Could not import gi ({error!r}). Gtk-based helpers may be unavailable.",
+  )
+  gi = types.SimpleNamespace()
+
+try:
+  import coot
+except Exception as error:
+  _record_startup_diagnostic(
+    "fatal",
+    f"Could not import the coot Python module ({error!r}). This script must be run inside Coot.",
+  )
+  raise
+
+try:
+  import coot_utils
+except Exception as error:
+  fatal_message = (
+    "Could not import coot_utils. This Coot build is missing a required Python helper module, "
+    f"so coot_trimmings cannot load.\n\nOriginal error: {error!r}"
+  )
+  _record_startup_diagnostic("fatal", fatal_message)
+  _show_startup_diagnostic_once("missing_coot_utils", fatal_message)
+  raise
+
+try:
+  import gap
+except Exception as error:
+  gap = None
+  _record_startup_diagnostic(
+    "warning",
+    f"Could not import gap ({error!r}). Gap-fitting helpers will be disabled.",
+  )
+
+try:
+  from mutate import three_letter_code2single_letter
+except Exception as error:
+  _record_startup_diagnostic(
+    "warning",
+    f"Could not import mutate.three_letter_code2single_letter ({error!r}). "
+    "Using a built-in residue-code fallback.",
+  )
+
+  _THREE_TO_ONE_FALLBACK = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "MSE": "M", "PHE": "F",
+    "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y",
+    "VAL": "V", "ASX": "B", "GLX": "Z", "SEC": "U", "PYL": "O",
+  }
+
+  def three_letter_code2single_letter(resname):
+    return _THREE_TO_ONE_FALLBACK.get(str(resname or "").upper(), "X")
 
 try:
   import gemmi
@@ -57,9 +132,10 @@ def _gap_residue_info_compat(imol, chain_id, resno, ins_code):
   """Match gap.py's older expectation that residue_info() returns a list."""
   return coot.residue_info_py(imol, chain_id, resno, ins_code) or []
 
-gap.residue_info = _gap_residue_info_compat
-if not hasattr(gap, "sys"):
-  gap.sys = sys
+if gap is not None:
+  gap.residue_info = _gap_residue_info_compat
+  if not hasattr(gap, "sys"):
+    gap.sys = sys
 
 
 # ============================================================================
@@ -184,6 +260,9 @@ def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restr
   directions and keep the better answer" logic, while making cleanup and error
   handling predictable.
   """
+  if gap is None:
+    add_status_bar_text("Gap fitting is unavailable in this Coot Python build")
+    return None
   imol_map = coot.imol_refinement_map()
   if imol_map == -1:
     coot.info_dialog("Need to set a map to fit a loop")
@@ -273,7 +352,8 @@ def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restr
     if backup_mode == 1:
       coot.turn_on_backup(imol)
 
-gap.fit_gap = fit_gap
+if gap is not None:
+  gap.fit_gap = fit_gap
 
 
 def _residue_spec_to_cid_compat(residue_spec):
@@ -2635,6 +2715,13 @@ else:
 
 
 def add_key_binding(name, key, thunk):
+  if not hasattr(coot, "add_key_binding_gtk4_py"):
+    _show_startup_diagnostic_once(
+      "missing_gtk4_keybinding_api",
+      "This Coot build does not expose add_key_binding_gtk4_py, so coot_trimmings "
+      "custom keybindings are disabled. Menus and non-keybinding helpers may still load.",
+    )
+    return None
   ctrl_key = 0
   key_value = key
   if isinstance(key, str) and key.startswith("Control_"):
@@ -3019,18 +3106,32 @@ def smart_copy_active_non_polymer_residue():
   add_status_bar_text("Copied {resname} for smart paste".format(resname=SMART_COPY_RESIDUE_NAME))
 
 
-def smart_paste_copied_non_polymer_residue():
+def _smart_paste_target_molecule():
+  residue = active_residue()
+  if residue:
+    return residue[0]
+  target_mol_id = go_to_atom_molecule_number()
+  if target_mol_id in model_molecule_list():
+    return target_mol_id
+  return None
+
+
+def _smart_paste_target_label(target_mol_id):
+  molecule_label = molecule_name_stub_py(target_mol_id, 0) or molecule_name(target_mol_id) or ""
+  molecule_label = os.path.basename(str(molecule_label).strip()) or f"molecule_{target_mol_id}"
+  return f"Molecule #{target_mol_id}, {molecule_label}"
+
+
+def _merge_molecules_explicitly_failed(merge_result):
+  if not isinstance(merge_result, (list, tuple)) or not merge_result:
+    return False
+  return merge_result[0] in (0, False, None)
+
+
+def _prepare_smart_paste_molecule():
   if SMART_COPY_TEMPLATE_IMOL not in molecule_number_list():
     add_status_bar_text("No copied ligand, ion, or water available")
     return None
-  residue = active_residue()
-  if residue:
-    target_mol_id = residue[0]
-  else:
-    target_mol_id = go_to_atom_molecule_number()
-    if target_mol_id not in model_molecule_list():
-      add_status_bar_text("No active model for smart paste")
-      return None
   if SMART_COPY_SOURCE_CENTRE is None:
     add_status_bar_text("Copied residue centre is unavailable")
     return None
@@ -3042,19 +3143,63 @@ def smart_paste_copied_non_polymer_residue():
   dx = pointer_position[0] - SMART_COPY_SOURCE_CENTRE[0]
   dy = pointer_position[1] - SMART_COPY_SOURCE_CENTRE[1]
   dz = pointer_position[2] - SMART_COPY_SOURCE_CENTRE[2]
+  translate_molecule_by(paste_imol, dx, dy, dz)
+  return paste_imol
+
+
+def _smart_paste_new_molecule():
+  paste_imol = _prepare_smart_paste_molecule()
+  if paste_imol is None:
+    return None
+  set_mol_displayed(paste_imol, 1)
+  set_mol_active(paste_imol, 1)
+  add_status_bar_text(
+    "Pasted {resname} as a new molecule ({target})".format(
+      resname=(SMART_COPY_RESIDUE_NAME or "copied residue"),
+      target=_smart_paste_target_label(paste_imol),
+    )
+  )
+  return paste_imol
+
+
+def _smart_paste_into_molecule(target_mol_id):
+  paste_imol = _prepare_smart_paste_molecule()
+  if paste_imol is None:
+    return None
   try:
-    translate_molecule_by(paste_imol, dx, dy, dz)
     merge_result = merge_molecules_py([paste_imol], target_mol_id)
-    if not merge_result or merge_result[0] != 1:
+    if _merge_molecules_explicitly_failed(merge_result):
       add_status_bar_text("Unable to merge pasted residue into active model")
       return None
   finally:
     if paste_imol in molecule_number_list():
       close_molecule(paste_imol)
   add_status_bar_text(
-    "Pasted {resname} at pointer".format(
-      resname=(SMART_COPY_RESIDUE_NAME or "copied residue")
+    "Pasted {resname} at pointer in {target}".format(
+      resname=(SMART_COPY_RESIDUE_NAME or "copied residue"),
+      target=_smart_paste_target_label(target_mol_id),
     )
+  )
+  return target_mol_id
+
+
+def smart_paste_copied_non_polymer_residue():
+  if SMART_COPY_TEMPLATE_IMOL not in molecule_number_list():
+    add_status_bar_text("No copied ligand, ion, or water available")
+    return None
+  target_mol_id = _smart_paste_target_molecule()
+  if target_mol_id is None:
+    return _smart_paste_new_molecule()
+  if "Gtk" not in globals():
+    return _smart_paste_into_molecule(target_mol_id)
+  generic_confirm_dialog(
+    "Smart paste copied residue",
+    "Do you want to paste into the active molecule "
+    f"({_smart_paste_target_label(target_mol_id)}), or create a new molecule?",
+    "Create a new molecule",
+    lambda: _smart_paste_new_molecule(),
+    "Paste into active",
+    lambda: _smart_paste_into_molecule(target_mol_id),
   )
 
 
