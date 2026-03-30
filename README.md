@@ -185,6 +185,7 @@ The `Maps` menu currently contains small map-management helpers:
 
 - Go to the centre of the scrollable map
 - Set the refinement map to the current scrollable map
+- Make masked map (EM); Uses the active molecule to mask the map. Can be useful for fitting ligands & ions (by preventing them from wandering into nearby protein density, before they have been merged with the active molecule).
 
 ## Example use case/Tutorial
 1. Load up an EM-map and model (e.g. 8HEZ & EMD-34705)
