@@ -132,7 +132,7 @@ If the active residue is not of the correct type, the helper stops and tells you
 
 ### Display
 
-The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes. Also added a "High contrast toggle" which makes the view higher contrast by changing to ambient lighting for the model.
+The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes. Also added a "High contrast toggle" which makes the view higher contrast by changing to ambient lighting for the model. Recently added the "Odd residues" validation helper, and the "residue annotation" tool for addind/browsing notes.
 
 #### Odd residues
 "Odd residues" scans the active model against the current scrollable map contour and groups suspicious features into _Possible Misfits_, _Weak Sidechains_, _Weak Backbone_, _Weak Waters_, and _Weak Ligands_. 
@@ -140,6 +140,9 @@ The `Display` menu collects GUI-accessible versions of common viewing and analys
 Protein and nucleic-acid residues use torsion-based virtual-atom sampling (a la [EM-Ringer](https://www.nature.com/articles/nmeth.3541)) to detect sidechain/base density peaks that suggest alternate conformations or misfit rotamers, while waters and ligands are flagged when too much of the placed model falls outside the current contour. 
 
 Results are shown as a clickable categorized list with Previous/Next navigation buttons; diagnostics are printed to the log.
+
+#### Residue Annotations
+`Residue annotations` lets you attach plain text notes to residues in the active model, browse annotated residues in a simple navigable list, and export the structure as an annotated mmCIF with the notes embedded. Notes are grouped by residue, can be edited or deleted individually, store author and timestamp information, and are reloaded automatically when the widget is opened on a structure that already contains embedded annotations.
 
 ### Fit
 
