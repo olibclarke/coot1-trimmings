@@ -99,6 +99,7 @@ DEFAULT_NEW_HELIX_CHAIN_ID = "A"
 HIGH_CONTRAST_BOND_THICKNESS = 2
 COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
 COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
+WATER_REFINE_MAX_DISPLACEMENT = 1.0
 
 # Map restyling defaults for the EM helper.
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
@@ -667,6 +668,21 @@ def _active_model_molecule_for_map_tools(action_name):
 
   add_status_bar_text(f"No active model for {action_name}")
   return None
+
+
+def _mask_map_by_all_atoms(map_id, mol_id, invert_flag):
+  """Mask a map using an explicit all-atoms selection when possible."""
+  # Some Coot masking paths appear to treat the convenience molecule-wide call
+  # a bit differently for hetero content. Prefer the explicit all-atoms
+  # selection string first, then fall back to the broader helper.
+  for atom_selection in ("/ /", "//"):
+    try:
+      masked_map_id = mask_map_by_atom_selection(map_id, mol_id, atom_selection, invert_flag)
+    except Exception:
+      masked_map_id = -1
+    if masked_map_id != -1 and masked_map_id in map_molecule_list():
+      return masked_map_id
+  return mask_map_by_molecule(map_id, mol_id, invert_flag)
 
 
 def _residue_is_polymer(mol_id, chain_id, resno, ins_code):
@@ -3709,22 +3725,44 @@ def add_water_and_refine():
   mol_id = place_water_in_active_molecule()
   if mol_id is None:
     return None
+  placed_residue = _active_residue_or_status()
+  if not placed_residue:
+    return None
+  placed_water_atom = _residue_first_atom_for_refinement_guard(
+    placed_residue[0],
+    placed_residue[1],
+    placed_residue[2],
+    placed_residue[3],
+  )
   if imol_refinement_map()==-1:
-    add_status_bar_text("You need to set a refinement map")
+    add_status_bar_text("Water added; no refinement map set")
     return None
-  residue = _active_residue_or_status()
-  if not residue:
-    return None
-  ch_id = residue[1]
-  resno = residue[2]
-  altloc = residue[5]
   previous_immediate_replacement = refinement_immediate_replacement_state()
   try:
     set_refinement_immediate_replacement(1)
-    refine_zone(mol_id, ch_id, resno, resno, altloc)
-    accept_regularizement()
+    if hasattr(coot, "rsr_sphere_refine"):
+      rsr_sphere_refine()
+      accept_result = accept_moving_atoms_py()
+      if accept_result is False:
+        add_status_bar_text("Water added, but local refinement could not be accepted")
+        return None
+    else:
+      residue = _active_residue_or_status()
+      if not residue:
+        return None
+      ch_id = residue[1]
+      resno = residue[2]
+      altloc = residue[5]
+      refine_zone(mol_id, ch_id, resno, resno, altloc)
+      accept_regularizement()
   finally:
     set_refinement_immediate_replacement(previous_immediate_replacement)
+  _restore_water_if_refined_too_far(
+    placed_residue,
+    placed_water_atom,
+    WATER_REFINE_MAX_DISPLACEMENT,
+  )
+  return mol_id
 
 
 def place_water_in_active_molecule():
@@ -3742,6 +3780,64 @@ def place_water_in_active_molecule():
     pass
   place_typed_atom_at_pointer("Water")
   return mol_id
+
+
+def _residue_first_atom_for_refinement_guard(mol_id, ch_id, resno, ins_code):
+  """Return the first atom in a residue with enough metadata to restore xyz."""
+  atom_info = residue_info_py(mol_id, ch_id, resno, ins_code)
+  if not isinstance(atom_info, list):
+    return None
+  for atom in atom_info:
+    try:
+      atom_name = atom[0][0]
+      alt_conf = atom[0][1]
+      xyz = list(atom[2])
+    except Exception:
+      continue
+    if atom_name and len(xyz) == 3:
+      return {
+        "atom_name": atom_name,
+        "alt_conf": alt_conf or "",
+        "xyz": xyz,
+      }
+  return None
+
+
+def _restore_atom_xyz(mol_id, ch_id, resno, ins_code, atom_name, alt_conf, xyz):
+  """Move one atom back to a stored Cartesian position."""
+  for attribute_name, value in zip(("x", "y", "z"), xyz):
+    set_atom_attribute(mol_id, ch_id, resno, ins_code, atom_name, alt_conf, attribute_name, value)
+
+
+def _restore_water_if_refined_too_far(placed_residue, placed_water_atom, max_displacement):
+  """Undo pathological water refinement jumps by restoring the original placement."""
+  if not placed_residue or not placed_water_atom:
+    return None
+  refined_water_atom = _residue_first_atom_for_refinement_guard(
+    placed_residue[0],
+    placed_residue[1],
+    placed_residue[2],
+    placed_residue[3],
+  )
+  if not refined_water_atom:
+    return None
+  if _distance_sq(placed_water_atom["xyz"], refined_water_atom["xyz"]) <= (max_displacement * max_displacement):
+    return None
+  _restore_atom_xyz(
+    placed_residue[0],
+    placed_residue[1],
+    placed_residue[2],
+    placed_residue[3],
+    refined_water_atom["atom_name"],
+    refined_water_atom["alt_conf"],
+    placed_water_atom["xyz"],
+  )
+  add_status_bar_text(
+    "Water moved more than {0:.1f} A during refinement; restored original placement".format(
+      max_displacement,
+    )
+  )
+  return 1
 
 
 def undo_symmetry_view_safe():
@@ -4196,10 +4292,21 @@ def resample_active_map_for_em_half_angstrom(force=False, allow_large_output=Fal
   return new_map_id
 
 
-def make_masked_map_em():
+def make_masked_map_em(skip_non_em_confirmation=False):
   """Mask the active map by the active molecule and display the result in magenta."""
   map_id = _scrollable_map_or_status()
   if map_id is None:
+    return None
+
+  if not skip_non_em_confirmation and not _map_looks_em_like(map_id):
+    generic_confirm_dialog(
+      "Make masked map (EM)",
+      "This is not an EM map. Are you sure?",
+      "Cancel",
+      lambda: None,
+      "Continue",
+      lambda: make_masked_map_em(skip_non_em_confirmation=True),
+    )
     return None
 
   mol_id = _active_model_molecule_for_map_tools("masked map")
@@ -4216,7 +4323,7 @@ def make_masked_map_em():
 
   try:
     set_map_mask_atom_radius(EM_MASKED_MAP_RADIUS)
-    new_map_id = mask_map_by_molecule(map_id, mol_id, 0)
+    new_map_id = _mask_map_by_all_atoms(map_id, mol_id, 0)
   finally:
     if previous_mask_radius is not None:
       set_map_mask_atom_radius(previous_mask_radius)
