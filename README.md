@@ -25,6 +25,8 @@ cp coot1_trimmings.py ~/.config/Coot/
 
 _Note: If you see an errror like <!DOCTYPE html> ^ SyntaxError: invalid syntax, you have downloaded the webpage rather than the actual Python script. Make sure you clicked "download raw file" when downloading._
 
+_Note 2: If you are using CCP4-bundled Coot 1, it should work out of the box; if you are using a version installed with homebrew, it may require some tweaking, see [here](https://github.com/pemsley/coot/issues/286#issuecomment-4131011003)._
+
 ## Startup behavior
 
 The script changes a few defaults at startup, including:
