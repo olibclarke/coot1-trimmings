@@ -4558,12 +4558,8 @@ def _load_annotations_from_mmcif_file(file_path):
   return entries
 
 
-def _write_annotations_into_mmcif_file(file_path, entries):
-  """Replace the embedded residue-note category in a mmCIF file."""
-  if gemmi is None:
-    raise RuntimeError("gemmi is not available in this Coot Python environment.")
-  document = gemmi.cif.read_file(file_path)
-  block = document.sole_block()
+def _annotation_write_entries_to_mmcif_block(block, entries):
+  """Replace the embedded residue-note category in one mmCIF block."""
   _annotation_clear_existing_mmcif_items(block)
   block.set_pair(RESIDUE_ANNOTATION_META_VERSION_TAG, "1")
   block.set_pair(RESIDUE_ANNOTATION_META_PROGRAM_TAG, "coot-trimmings")
@@ -4583,7 +4579,300 @@ def _write_annotations_into_mmcif_file(file_path, entries):
     )
     for row in entries:
       loop.add_row(row)
+
+
+def _write_annotations_into_mmcif_file(file_path, entries):
+  """Replace the embedded residue-note category in a mmCIF file."""
+  if gemmi is None:
+    raise RuntimeError("gemmi is not available in this Coot Python environment.")
+  document = gemmi.cif.read_file(file_path)
+  _annotation_write_entries_to_mmcif_block(document.sole_block(), entries)
   document.write_file(file_path)
+
+
+def _annotation_atom_invalid_for_export(atom):
+  """Coot can emit placeholder atom rows with blank names; strip them for export."""
+  atom_name = (getattr(atom, "name", "") or "").strip()
+  element_name = getattr(getattr(atom, "element", None), "name", "") or ""
+  return (
+    not atom_name
+    or atom_name in (".", "?")
+    or element_name in ("", ".", "?", "X")
+  )
+
+
+def _annotation_clear_loop_category(block, first_tag):
+  """Erase a loop-backed mmCIF category if it exists."""
+  loop_item = block.find_loop_item(first_tag)
+  if loop_item is not None:
+    loop_item.erase()
+
+
+def _annotation_prepare_mmcif_table(block, prefix, tags):
+  """Return a writable mmCIF table, preserving tags when the category already exists."""
+  expected_tags = [prefix + tag for tag in tags]
+  table = block.find_mmcif_category(prefix)
+  if table is not None and table.width() == len(tags) and list(table.tags) == expected_tags:
+    while len(table):
+      table.remove_row(len(table) - 1)
+    return table
+  _annotation_clear_loop_category(block, expected_tags[0])
+  pair_item = block.find_pair_item(expected_tags[0])
+  if pair_item is not None:
+    pair_item.erase()
+  block.init_loop(prefix, tags)
+  return block.find_mmcif_category(prefix)
+
+
+def _annotation_polymer_type_cif_name(polymer_type):
+  """Map Gemmi polymer types onto mmCIF entity_poly.type strings."""
+  polymer_name = getattr(polymer_type, "name", "")
+  return {
+    "PeptideL": "polypeptide(L)",
+    "PeptideD": "polypeptide(D)",
+    "Dna": "polydeoxyribonucleotide",
+    "Rna": "polyribonucleotide",
+    "DnaRnaHybrid": "polydeoxyribonucleotide/polyribonucleotide hybrid",
+    "Pna": "peptide nucleic acid",
+  }.get(polymer_name, "other")
+
+
+def _annotation_export_ins_code(seqid):
+  """Normalize Gemmi seqid insertion codes for export matching."""
+  ins_code = getattr(seqid, "icode", "") or ""
+  if ins_code in (" ", "\x00"):
+    return ""
+  return ins_code
+
+
+def _annotation_nonpoly_asym_id(chain_id, record_index):
+  """Generate a stable label_asym_id for exported non-polymer residues."""
+  chain_prefix = chain_id or "X"
+  return f"{chain_prefix}_np_{record_index}"
+
+
+def _annotation_residue_export_key(chain_id, residue):
+  """Build a residue key that matches atom_site auth-chain/auth-seq rows."""
+  return (
+    chain_id or "",
+    str(residue.seqid.num),
+    _annotation_export_ins_code(residue.seqid),
+    residue.name or "",
+  )
+
+
+def _annotation_export_entity_records(structure):
+  """Derive per-chain entity/sequence records for the exported annotated mmCIF."""
+  if len(structure) == 0:
+    return []
+
+  records = []
+  next_entity_id = 1
+  for chain in structure[0]:
+    chain_id = chain.name or ""
+    if not chain_id:
+      continue
+
+    polymer_span = chain.get_polymer()
+    polymer_keys = set()
+    if len(polymer_span):
+      polymer_keys = {_annotation_residue_export_key(chain_id, residue) for residue in polymer_span}
+      residue_names = [residue.name for residue in polymer_span]
+      records.append({
+        "kind": "polymer",
+        "chain_id": chain_id,
+        "asym_id": chain_id,
+        "entity_id": str(next_entity_id),
+        "entity_type": "polymer",
+        "polymer_type": _annotation_polymer_type_cif_name(polymer_span.check_polymer_type()),
+        "one_letter_sequence": polymer_span.make_one_letter_sequence() or "?",
+        "sequence": residue_names,
+        "residue_key_to_label_seq": {
+          _annotation_residue_export_key(chain_id, residue): str(index)
+          for index, residue in enumerate(polymer_span, start=1)
+        },
+      })
+      next_entity_id += 1
+
+    nonpoly_record_index = 1
+    for residue in chain:
+      residue_key = _annotation_residue_export_key(chain_id, residue)
+      if residue_key in polymer_keys:
+        continue
+      records.append({
+        "kind": "nonpolymer",
+        "chain_id": chain_id,
+        "asym_id": _annotation_nonpoly_asym_id(chain_id, nonpoly_record_index),
+        "entity_id": str(next_entity_id),
+        "entity_type": "water" if residue.name in WATER_RESIDUE_NAMES else "non-polymer",
+        "polymer_type": None,
+        "one_letter_sequence": None,
+        "sequence": [],
+        "comp_id": residue.name or "?",
+        "residue_key": residue_key,
+      })
+      next_entity_id += 1
+      nonpoly_record_index += 1
+  return records
+
+
+def _annotation_apply_export_entity_metadata(block, structure):
+  """Replace entity/sequence categories with explicit per-chain metadata."""
+  entity_records = _annotation_export_entity_records(structure)
+  if not entity_records:
+    return
+
+  entity_table = _annotation_prepare_mmcif_table(block, "_entity.", ["id", "type"])
+  struct_asym_table = _annotation_prepare_mmcif_table(block, "_struct_asym.", ["id", "entity_id"])
+  polymer_records = [record for record in entity_records if record["kind"] == "polymer"]
+  nonpoly_records = [record for record in entity_records if record["kind"] == "nonpolymer"]
+  entity_poly_table = None
+  entity_poly_seq_table = None
+  if polymer_records:
+    entity_poly_table = _annotation_prepare_mmcif_table(
+      block,
+      "_entity_poly.",
+      ["entity_id", "type", "pdbx_strand_id", "pdbx_seq_one_letter_code"],
+    )
+    entity_poly_seq_table = _annotation_prepare_mmcif_table(block, "_entity_poly_seq.", ["entity_id", "num", "mon_id"])
+  nonpoly_table = None
+  if nonpoly_records:
+    nonpoly_table = _annotation_prepare_mmcif_table(block, "_pdbx_entity_nonpoly.", ["entity_id", "comp_id"])
+
+  asym_to_entity_id = {}
+  for record in entity_records:
+    entity_table.append_row([record["entity_id"], record["entity_type"]])
+    struct_asym_table.append_row([record["asym_id"], record["entity_id"]])
+    asym_to_entity_id[record["asym_id"]] = record["entity_id"]
+    if record["kind"] == "polymer" and entity_poly_table is not None and entity_poly_seq_table is not None:
+      entity_poly_table.append_row([
+        record["entity_id"],
+        record["polymer_type"] or "other",
+        record["asym_id"],
+        record["one_letter_sequence"] or "?",
+      ])
+      for index, mon_id in enumerate(record["sequence"], start=1):
+        entity_poly_seq_table.append_row([record["entity_id"], str(index), mon_id or "?"])
+    elif record["kind"] == "nonpolymer" and nonpoly_table is not None:
+      nonpoly_table.append_row([record["entity_id"], record["comp_id"] or "?"])
+
+  return entity_records
+
+
+def _annotation_apply_export_atom_site_metadata(block, entity_records):
+  """Align atom-site sequence ids with the explicit polymer sequence table."""
+  required_columns = {
+    tag: block.find_values(tag)
+    for tag in (
+      "_atom_site.group_PDB",
+      "_atom_site.label_comp_id",
+      "_atom_site.label_asym_id",
+      "_atom_site.label_entity_id",
+      "_atom_site.auth_asym_id",
+      "_atom_site.auth_seq_id",
+      "_atom_site.pdbx_PDB_ins_code",
+      "_atom_site.label_seq_id",
+    )
+  }
+  if any(column is None for column in required_columns.values()):
+    return
+
+  group_column = required_columns["_atom_site.group_PDB"]
+  comp_id_column = required_columns["_atom_site.label_comp_id"]
+  chain_column = required_columns["_atom_site.label_asym_id"]
+  entity_column = required_columns["_atom_site.label_entity_id"]
+  auth_chain_column = required_columns["_atom_site.auth_asym_id"]
+  auth_seq_column = required_columns["_atom_site.auth_seq_id"]
+  ins_code_column = required_columns["_atom_site.pdbx_PDB_ins_code"]
+  label_seq_column = required_columns["_atom_site.label_seq_id"]
+  if not (
+    len(group_column)
+    == len(comp_id_column)
+    == len(chain_column)
+    == len(entity_column)
+    == len(auth_chain_column)
+    == len(auth_seq_column)
+    == len(ins_code_column)
+    == len(label_seq_column)
+  ):
+    return
+
+  polymer_residue_map = {}
+  nonpoly_residue_map = {}
+  for record in entity_records:
+    if record["kind"] == "polymer":
+      polymer_residue_map[record["chain_id"]] = record
+    elif record["kind"] == "nonpolymer":
+      nonpoly_residue_map[record["residue_key"]] = record
+
+  for row_index in range(len(group_column)):
+    auth_chain_id = auth_chain_column[row_index]
+    ins_code = ins_code_column[row_index]
+    residue_key = (
+      auth_chain_id,
+      auth_seq_column[row_index],
+      "" if ins_code in (".", "?") else ins_code,
+      comp_id_column[row_index],
+    )
+    nonpoly_record = nonpoly_residue_map.get(residue_key)
+    if nonpoly_record is not None:
+      chain_column[row_index] = nonpoly_record["asym_id"]
+      entity_column[row_index] = nonpoly_record["entity_id"]
+      label_seq_column[row_index] = "."
+      continue
+
+    polymer_record = polymer_residue_map.get(auth_chain_id)
+    if polymer_record is None:
+      label_seq_column[row_index] = "."
+      continue
+
+    chain_column[row_index] = polymer_record["asym_id"]
+    entity_column[row_index] = polymer_record["entity_id"]
+    label_seq_column[row_index] = polymer_record["residue_key_to_label_seq"].get(residue_key, ".")
+
+
+def _annotation_sanitize_export_structure(structure):
+  """Normalize Gemmi's view of the current model before writing final mmCIF."""
+  for model in structure:
+    for chain in model:
+      for residue in chain:
+        invalid_atoms = [
+          (atom.name, atom.altloc, atom.element)
+          for atom in residue
+          if _annotation_atom_invalid_for_export(atom)
+        ]
+        for atom_name, altloc, element in invalid_atoms:
+          residue.remove_atom(atom_name, altloc, element)
+  try:
+    structure.setup_entities()
+  except Exception:
+    pass
+  try:
+    structure.add_entity_types(True)
+  except Exception:
+    pass
+  try:
+    structure.add_entity_ids(True)
+  except Exception:
+    pass
+  try:
+    structure.assign_label_seq_id(True)
+  except Exception:
+    pass
+  return structure
+
+
+def _annotation_export_document_from_coot_cif(file_path):
+  """Convert Coot's current-model CIF into a cleaner Gemmi-written mmCIF document."""
+  if gemmi is None:
+    raise RuntimeError("gemmi is not available in this Coot Python environment.")
+  structure = gemmi.read_structure(file_path)
+  _annotation_sanitize_export_structure(structure)
+  document = structure.make_mmcif_document()
+  block = document.sole_block()
+  entity_records = _annotation_apply_export_entity_metadata(block, structure)
+  _annotation_apply_export_atom_site_metadata(block, entity_records)
+  return document
 
 
 def _load_residue_annotations_for_molecule(mol_id, file_path=None, show_status=True):
@@ -4609,27 +4898,41 @@ def _load_residue_annotations_for_molecule(mol_id, file_path=None, show_status=T
 
 
 def _write_model_with_embedded_annotations(mol_id, file_path):
-  """Write the current molecule as mmCIF and inject the custom note category."""
+  """Write the current molecule as a sanitized mmCIF and inject the custom note category."""
   output_directory = os.path.dirname(os.path.abspath(file_path))
   os.makedirs(output_directory, exist_ok=True)
-  temp_handle = None
-  temp_path = None
+  source_handle = None
+  source_path = None
+  export_handle = None
+  export_path = None
   try:
-    temp_handle, temp_path = tempfile.mkstemp(suffix=".cif", dir=output_directory)
-    os.close(temp_handle)
-    temp_handle = None
-    write_cif_file(mol_id, temp_path)
-    if not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
+    source_handle, source_path = tempfile.mkstemp(suffix=".cif", dir=output_directory)
+    os.close(source_handle)
+    source_handle = None
+    write_cif_file(mol_id, source_path)
+    if not os.path.isfile(source_path) or os.path.getsize(source_path) == 0:
       raise RuntimeError("Coot failed to write a temporary mmCIF file.")
-    _write_annotations_into_mmcif_file(temp_path, _annotation_mmcif_rows(mol_id))
-    os.replace(temp_path, file_path)
+    export_document = _annotation_export_document_from_coot_cif(source_path)
+    _annotation_write_entries_to_mmcif_block(export_document.sole_block(), _annotation_mmcif_rows(mol_id))
+    export_handle, export_path = tempfile.mkstemp(suffix=".cif", dir=output_directory)
+    os.close(export_handle)
+    export_handle = None
+    export_document.write_file(export_path)
+    os.replace(export_path, file_path)
     return file_path
   finally:
-    if temp_handle is not None:
-      os.close(temp_handle)
-    if temp_path and os.path.exists(temp_path):
+    if source_handle is not None:
+      os.close(source_handle)
+    if export_handle is not None:
+      os.close(export_handle)
+    if source_path and os.path.exists(source_path):
       try:
-        os.remove(temp_path)
+        os.remove(source_path)
+      except Exception:
+        pass
+    if export_path and os.path.exists(export_path):
+      try:
+        os.remove(export_path)
       except Exception:
         pass
 
