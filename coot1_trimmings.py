@@ -11516,6 +11516,34 @@ def _merge_ligand_and_make_named_link(required_resname, required_label, ligand_c
       coot.close_molecule(ligand_imol)
 
 
+def _merge_ligand_and_make_named_link_for_active_residue(link_specs_by_resname, modification_label):
+  """Dispatch a merge-link modification based on the active residue type."""
+  residue = active_residue()
+  if not residue:
+    info_dialog(f"{modification_label} requires an active residue.")
+    return 0
+
+  mol_id, ch_id, resno, ins_code = residue[:4]
+  current_resname = residue_name(mol_id, ch_id, resno, ins_code)
+  link_spec = link_specs_by_resname.get(current_resname)
+  if not link_spec:
+    valid_labels = [spec["required_label"] for _resname, spec in sorted(link_specs_by_resname.items())]
+    valid_text = " or ".join(valid_labels)
+    info_dialog(f"{modification_label} requires the active residue to be {valid_text}.")
+    return 0
+
+  return _merge_ligand_and_make_named_link(
+    link_spec["required_resname"],
+    link_spec["required_label"],
+    link_spec["ligand_comp_id"],
+    link_spec["link_name"],
+    link_spec["ligand_atom_name"],
+    link_spec["residue_atom_name"],
+    link_spec["bond_length"],
+    modification_label,
+  )
+
+
 COVALENT_MODIFICATION_MENU = [
   ("Palmitoylation (Cys)", {
     "mode": "replace",
@@ -11606,6 +11634,30 @@ COVALENT_MODIFICATION_MENU = [
     "target_resname": "TPO",
     "modification_label": "Phosphothreonine",
   }),
+  ("O-linked NAG (Ser/Thr)", {
+    "mode": "merge_link_by_resname",
+    "modification_label": "O-linked NAG",
+    "link_specs_by_resname": {
+      "SER": {
+        "required_resname": "SER",
+        "required_label": "Ser",
+        "ligand_comp_id": "NAG",
+        "link_name": "pyr-SER",
+        "ligand_atom_name": " C1 ",
+        "residue_atom_name": " OG ",
+        "bond_length": 1.404,
+      },
+      "THR": {
+        "required_resname": "THR",
+        "required_label": "Thr",
+        "ligand_comp_id": "NAG",
+        "link_name": "pyr-THR",
+        "ligand_atom_name": " C1 ",
+        "residue_atom_name": " OG1",
+        "bond_length": 1.391,
+      },
+    },
+  }),
   ("Phosphotyrosine (Tyr)", {
     "mode": "replace",
     "required_resname": "TYR",
@@ -11676,6 +11728,11 @@ def _apply_covalent_modification(spec):
       spec["ligand_atom_name"],
       spec["residue_atom_name"],
       spec["bond_length"],
+      spec["modification_label"],
+    )
+  if spec["mode"] == "merge_link_by_resname":
+    return _merge_ligand_and_make_named_link_for_active_residue(
+      spec["link_specs_by_resname"],
       spec["modification_label"],
     )
   raise ValueError("Unknown covalent modification mode: {0}".format(spec["mode"]))
