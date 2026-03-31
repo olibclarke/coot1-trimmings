@@ -13,18 +13,16 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 import sys
 import tempfile
 import traceback
-import types
 import warnings
 from datetime import datetime, timezone
 from functools import lru_cache
 
 STARTUP_DIAGNOSTIC_MESSAGES = []
 _STARTUP_DIAGNOSTIC_DIALOGS_SHOWN = set()
-gi = None
+_GTK_REPOSITORY_WARNINGS_SHOWN = set()
 
 
 def _record_startup_diagnostic(level, message):
@@ -326,46 +324,27 @@ def _call_optional_coot_api(api_name, *args):
   return api_function(*args)
 
 
-def _lazy_import_gi():
-  """Import gi only on demand, to avoid mixing GTK stacks unnecessarily."""
-  global gi
-  if gi is not None:
-    return gi
-  try:
-    import gi as gi_module
-  except Exception as error:
-    _record_startup_diagnostic(
-      "warning",
-      f"Could not import gi ({error!r}). Gtk-based helpers may be unavailable.",
-    )
-    gi = types.SimpleNamespace()
-    return gi
-  if not hasattr(gi_module, "require_version"):
-    def _require_version(_namespace, _version):
-      return None
-    gi_module.require_version = _require_version
-  gi = gi_module
-  return gi
-
-
 def _coot_gui_repository_module(module_name):
-  """Prefer Gtk/Gio/GLib objects exposed by coot_gui over direct gi imports."""
+  """Use Gtk/Gio/GLib objects exposed by coot_gui only.
+
+  Importing gi.repository directly inside some bundled Coot builds can pull in
+  a second GTK/Rsvg stack and break themed icons. Stay on the objects Coot has
+  already initialized, and degrade gracefully if they are unavailable.
+  """
+  existing_module = globals().get(module_name)
+  if existing_module is not None:
+    return existing_module
   coot_gui_module = globals().get("coot_gui")
   if coot_gui_module is not None and hasattr(coot_gui_module, module_name):
     return getattr(coot_gui_module, module_name)
-  gi_module = _lazy_import_gi()
-  if not hasattr(gi_module, "repository"):
-    try:
-      return __import__("gi.repository", fromlist=[module_name]).__dict__.get(module_name)
-    except Exception:
-      return None
-  try:
-    return getattr(gi_module.repository, module_name)
-  except Exception:
-    try:
-      return __import__("gi.repository", fromlist=[module_name]).__dict__.get(module_name)
-    except Exception:
-      return None
+  if module_name not in _GTK_REPOSITORY_WARNINGS_SHOWN:
+    _GTK_REPOSITORY_WARNINGS_SHOWN.add(module_name)
+    _record_startup_diagnostic(
+      "warning",
+      "This Coot build does not expose coot_gui.{module_name}; "
+      "Gtk helper features depending on it will be limited.".format(module_name=module_name),
+    )
+  return None
 
 
 def _gap_residue_info_compat(imol, chain_id, resno, ins_code):
@@ -1034,6 +1013,80 @@ def _active_model_molecule_for_map_tools(action_name):
 
   add_status_bar_text(f"No active model for {action_name}")
   return None
+
+
+def _active_chain_context_or_status():
+  """Return the active residue's chain context as a stable snapshot."""
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  return {
+    "mol_id": residue[0],
+    "chain_id": residue[1],
+    "resno": residue[2],
+    "ins_code": residue[3],
+  }
+
+
+def _active_atom_context_or_status():
+  """Return the active atom context as a stable snapshot."""
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  return {
+    "mol_id": residue[0],
+    "chain_id": residue[1],
+    "resno": residue[2],
+    "ins_code": residue[3],
+    "atom_name": residue[4],
+    "alt_conf": residue[5] if len(residue) > 5 else "",
+  }
+
+
+def _segment_range_for_residue(mol_id, chain_id, resno):
+  """Return the contiguous polymer segment containing a residue number."""
+  for _mol_id, seg_chain_id, seg_start, seg_end in segment_list_chain(mol_id, chain_id):
+    if seg_chain_id == chain_id and seg_start <= resno <= seg_end:
+      return (seg_start, seg_end)
+  return None
+
+
+def _active_segment_context_or_status():
+  """Return active atom/segment context for segment-level helpers."""
+  atom_context = _active_atom_context_or_status()
+  if not atom_context:
+    return None
+  segment_range = _segment_range_for_residue(
+    atom_context["mol_id"],
+    atom_context["chain_id"],
+    atom_context["resno"],
+  )
+  if segment_range is None:
+    add_status_bar_text("No active segment")
+    return None
+  atom_context["segment_start"] = segment_range[0]
+  atom_context["segment_end"] = segment_range[1]
+  return atom_context
+
+
+def _refresh_extra_restraints_display(mol_id):
+  """Rebuild the displayed extra-restraints state after editing/renumbering."""
+  delete_all_extra_restraints(mol_id)
+  set_show_extra_restraints(mol_id, 0)
+  set_show_extra_restraints(mol_id, 1)
+
+
+def _parse_int_entry(value, error_message, minimum_value=None):
+  """Parse an integer entry, showing a dialog on invalid input."""
+  try:
+    parsed_value = int(str(value).strip())
+  except Exception:
+    info_dialog(error_message)
+    return None
+  if minimum_value is not None and parsed_value < minimum_value:
+    info_dialog(error_message)
+    return None
+  return parsed_value
 
 
 def _mask_map_by_all_atoms(map_id, mol_id, invert_flag):
@@ -6626,10 +6679,9 @@ def hide_active_mol():
   set_mol_displayed(mol_id,0)
 
 def display_only_active():
-  try:
-    mol_id_active=active_residue()[0]
-  except:
-    mol_id_active=model_molecule_list()[0]
+  mol_id_active = _active_model_molecule_for_map_tools("display-only toggle")
+  if mol_id_active is None:
+    return None
   displayed_mols_count=0
   for mol_id in model_molecule_list():
     displayed_mols_count=displayed_mols_count+mol_is_displayed(mol_id)
@@ -7252,11 +7304,13 @@ def toggle_map_display():
 
 #Colour active segment
 def colour_active_segment():
-  mol_id=active_residue()[0]
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
   segments=segment_list(mol_id)
-  res_here=active_residue()[2]
-  ins_code=active_residue()[3]
-  ch_id=active_residue()[1]
+  res_here = chain_context["resno"]
+  ch_id = chain_context["chain_id"]
   colour_list=[]
   blank_list=[]
   segment_colour=34
@@ -7267,15 +7321,13 @@ def colour_active_segment():
       res_end=seg[3]
       ch_id=seg[1]
       for res in range(res_start,res_end+1):
-        res_color_spec=[([ch_id,res,""],segment_colour)]
-        colour_list=colour_list+res_color_spec
+        colour_list.append(([ch_id,res,""],segment_colour))
     else:
       res_start=seg[2]
       res_end=seg[3]
       ch_id_here=seg[1]
       for res in range(res_start,res_end+1):
-        blank_color_spec=[([ch_id_here,res,""],blank_colour)]
-        blank_list=blank_list+blank_color_spec
+        blank_list.append(([ch_id_here,res,""],blank_colour))
   _apply_user_defined_residue_colours(mol_id, blank_list, colour_list)
 
 
@@ -7692,191 +7744,6 @@ def color_by_clash_score_for_active_molecule():
     return None
   return color_by_clash_score(mol_id)
 
-
-def color_emringer_outliers(mol_id,map_id):
-  if find_exe("phenix.emringer"):
-    import subprocess
-    import sys
-    mmtbx_path=find_exe("phenix")[:-16]+"modules/cctbx_project/"
-    sys.path.insert(0,mmtbx_path)
-    import mmtbx
-    import pickle as pickle
-    pwd=os.getcwd()
-    model_name=molecule_name(mol_id)
-    map_name=molecule_name(map_id)
-    make_directory_maybe("coot-emringer")
-    coot_emringer_path=pwd+"/coot-emringer/"
-    output_file_name=coot_emringer_path+"mol_{mol_id}_cablam_output.txt".format(mol_id=mol_id)
-    p=subprocess.Popen("phenix.emringer {model_name} {map_name}".format(model_name=model_name,map_name=map_name),shell=True)
-    p.communicate()
-    emringer_outlier_list=[]
-    emringer_outlier_color=30
-    emringer_outlier_pkl=pwd+"/"+molecule_name_stub(mol_id,2)+"_emringer_plots/Outliers.pkl"
-    outlier_string=str(pickle.load(open(emringer_outlier_pkl,"rb")))
-    with open(output_file_name,"a") as outlier_file: 
-      outlier_file.write(outlier_string)
-    with open(output_file_name) as f:
-      emringer_output = [x.strip('\n') for x in f.readlines()] #make a list of lines in cablam output file, stripping newlines
-      for line in emringer_output:
-        line_list=line.split()
-        if len(line_list)>=5:
-          ch_id=str(line_list[2]) # string.split() defaults to splitting by spaces and making into a list
-          print(("ch_id:",ch_id))
-          resid=int(line_list[1]) #If second column has trailing letters (as it will if there is an insertion code) then strip them
-          print(("resid",resid))
-          ins_id=""
-          emringer_outlier_color_spec=[([ch_id,resid,ins_id],emringer_outlier_color)]
-          emringer_outlier_list=emringer_outlier_list+emringer_outlier_color_spec
-      print(("outlier_list",emringer_outlier_list))
-      set_user_defined_atom_colour_by_residue_py(mol_id,emringer_outlier_list)
-      graphics_to_user_defined_atom_colours_representation(mol_id)
-  else:
-    info_dialog("Sorry, you need phenix.cablam_validate, sed and awk installed and accessible from the terminal for this to work!")
-
-def color_by_cablam2(mol_id):
-  if find_exe("phenix.cablam_validate") and find_exe("awk") and find_exe("sed"):
-    import subprocess
-    pwd=os.getcwd() #dir where coot was launched
-    make_directory_maybe("coot-cablam") #Put coot droppings here
-    coot_cablam_path=pwd+"/coot-cablam/"
-    file_name=molecule_name(mol_id)
-    file_name_output=coot_cablam_path+"mol_{mol_id}_cablam_output.txt".format(mol_id=mol_id) #this file will have info on cablam outliers
-#     write_pdb_file(mol_id,file_name) # write a copy of the active mol to the cablam dir
-    p=subprocess.Popen("phenix.cablam_validate {file_name} outlier_cutoff=0.01 | tail -n +2 | awk '{{FS=\":\"}} {{print $1,$2,$5}}' | sed 's/CaBLAM Outlier/1/g' | sed 's/CaBLAM Disfavored/2/g' | sed 's/CA Geom Outlier/3/g' | sed 's/try alpha helix/4/g' | sed 's/try beta sheet/5/g' | sed 's/try three-ten/6/g' | sed 's/[0123456789-]/ &/' > {file_name_output}".format(file_name=file_name,file_name_output=file_name_output),shell=True)
-    p.communicate() #wait for cablam to finish
-    cablam_outlier_list=[]
-    cablam_beta_list=[]
-    cablam_alpha_list=[]
-    cablam_3_10_list=[]
-    cablam_disfavored_list=[]
-    cablam_outlier_colour=30
-    cablam_disfavored_colour=27
-    cablam_alpha_colour=10
-    cablam_beta_colour=39
-    cablam_3_10_colour=15
-    cablam_ca_geom_colour=10
-    blank_colour=0
-    outlier_flag=0
-    with open(file_name_output) as f:
-      cablam_output = [x.strip('\n') for x in f.readlines()] #make a list of lines in cablam output file, stripping newlines
-      for line in cablam_output:
-        line_list=line.split()
-        if len(line_list)>=3:
-          ch_id=line_list[0] # string.split() defaults to splitting by spaces and making into a list
-          resid=int(line_list[1].rstrip('abcdefghjklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')) #If second column has trailing letters (as it will if there is an insertion code) then strip them
-          ins_id=str(line_list[1].lstrip('0123456789')) #If second column has trailing characters, these correspond to the insertion code. Strip leading numbers.
-          resname=line_list[2]
-          if len(line_list)>3:
-            outlier_flag=int(line_list[3]) #1 is Cablam outlier 2 is cablam disfavored, and 3 is ca geom outlier
-            if outlier_flag==1: #CaBLAM outliers
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],cablam_outlier_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-            elif outlier_flag==2: #CaBLAM disfavored
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],cablam_disfavored_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-            elif outlier_flag==3: #CaBLAM disfavored
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],cablam_ca_geom_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-            elif outlier_flag==4: #alpha
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],cablam_alpha_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-            elif outlier_flag==5: #beta
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],cablam_beta_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-            elif outlier_flag==6: #3-10 helix
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],cablam_3_10_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-            else:
-              cablam_outlier_colour_spec=[([ch_id,resid,ins_id],blank_colour)]
-              cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec
-          else:
-            cablam_outlier_colour_spec=[([ch_id,resid,ins_id],blank_colour)]
-            cablam_outlier_list=cablam_outlier_list+cablam_outlier_colour_spec 
-#     os.remove(file_name)
-    os.remove(file_name_output)
-    set_user_defined_atom_colour_by_residue_py(mol_id,cablam_outlier_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-    info_dialog("CaBLAM coloring scheme (predicted SS and outliers): \n  \n Teal = alpha \n \n Green = 3-10 \n \n Purple = beta \n \n Yellow = Ca geometry outlier \n \n Orange = CaBLAM disfavored (5% cutoff) \n \n Red = CaBLAM outlier (1% cutoff)")
-  else:
-    info_dialog("Sorry, you need phenix.cablam_validate, sed and awk installed and accessible from the terminal for this to work!")
-
-def color_by_rama(mol_id):
-  if find_exe("phenix.ramalyze") and find_exe("awk") and find_exe("sed"):
-    import subprocess
-    pwd=os.getcwd() #dir where coot was launched
-    make_directory_maybe("coot-ramalyze") #Put coot droppings here
-    coot_ramalyze_path=pwd+"/coot-ramalyze/"
-    file_name=molecule_name(mol_id)
-    file_name_output=coot_ramalyze_path+"mol_{mol_id}_ramalyze_output.txt".format(mol_id=mol_id) #this file will have info on ramalyze outliers
-#     write_pdb_file(mol_id,file_name) # write a copy of the active mol to the ramalyze dir
-    p=subprocess.Popen("phenix.ramalyze {file_name} outliers_only=true rama_potential=emsley | awk '{{FS=\":\"}} {{print $1}}' | sed 's/[0123456789-]/ &/' | awk '{{if (NF==3) print}}' > {file_name_output}".format(file_name=file_name,file_name_output=file_name_output),shell=True)
-    p.communicate() #wait for ramalyze to finish
-    ramalyze_outlier_list=[]
-    ramalyze_outlier_colour=34
-    blank_res_list=[]
-    blank_colour=0
-    for ch_id in chain_ids(mol_id):
-      sn_max=chain_n_residues(ch_id,mol_id)
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
-    with open(file_name_output) as f:
-      ramalyze_output = [x.strip('\n') for x in f.readlines()] #make a list of lines in ramalyze output file, stripping newlines
-      for line in ramalyze_output:
-        line_list=line.split()
-        ch_id=line_list[0] # string.split() defaults to splitting by spaces and making into a list
-        resid=int(line_list[1].rstrip('abcdefghjklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')) #If second column has trailing letters (as it will if there is an insertion code) then strip them
-        ins_id=str(line_list[1].lstrip('0123456789')) #If second column has trailing characters, these correspond to the insertion code. Strip leading numbers.
-        resname=line_list[2]
-        ramalyze_outlier_colour_spec=[([ch_id,resid,ins_id],ramalyze_outlier_colour)]
-        ramalyze_outlier_list=ramalyze_outlier_list+ramalyze_outlier_colour_spec
-#     os.remove(file_name)
-    os.remove(file_name_output)
-    set_user_defined_atom_colour_by_residue_py(mol_id,blank_res_list)
-    set_user_defined_atom_colour_by_residue_py(mol_id,ramalyze_outlier_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  else:
-    info_dialog("Sorry, you need phenix.ramalyze, sed and awk installed and accessible from the terminal for this to work!")
-
-def color_by_cc(mol_id):
-  if find_exe("phenix.model_map_cc") and find_exe("awk") and find_exe("sed") and find_exe("grep") and imol_refinement_map()!=-1 and space_group(imol_refinement_map())=="P 1":
-    import subprocess
-    pwd=os.getcwd() #dir where coot was launched
-    make_directory_maybe("coot-cc") #Put coot droppings here
-    coot_cc_path=pwd+"/coot-cc/"
-    pdb_name=molecule_name(mol_id)
-    map_id=int(imol_refinement_map())
-    map_name=molecule_name(map_id)
-#     write_pdb_file(mol_id,pdb_name) # write a copy of the active mol to the cc dir
-    if not (map_name.endswith(".ccp4") or map_name.endswith(".mrc") or map_name.endswith(".map")):
-      map_name=coot_cc_path+"mol_{mol_id}.ccp4".format(mol_id=mol_id)
-      export_map(map_id,map_name)
-    file_name_output=coot_cc_path+"mol_{mol_id}_cc_output.txt".format(mol_id=mol_id) #this file will have info on cc outliers
-    p=subprocess.Popen("phenix.model_map_cc {pdb_name} {map_name} resolution=4.0 | awk '{{if (NF==7) print}}' | grep chain > {file_name_output}".format(pdb_name=pdb_name,map_name=map_name,file_name_output=file_name_output),shell=True)
-    p.communicate() #wait for cc to finish
-    cc_list=[]
-    with open(file_name_output) as f:
-      cc_output = [x.strip('\n') for x in f.readlines()] #make a list of lines in cc output file, stripping newlines
-      for line in cc_output:
-        line_list=line.split()
-        ch_id=line_list[2] # string.split() defaults to splitting by spaces and making into a list
-        resid=int(line_list[4].rstrip('abcdefghjklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')) #If second column has trailing letters (as it will if there is an insertion code) then strip them
-        ins_id=str(line_list[4].lstrip('0123456789')) #If second column has trailing characters, these correspond to the insertion code. Strip leading numbers.
-        cc=float(line_list[6])
-        if cc<0.0:
-          cc=0.0
-        cc_colour=int((1.0-cc)*31+2)
-        print(("cc=",cc,"color=",cc_colour))
-        cc_colour_spec=[([ch_id,resid,ins_id],cc_colour)]
-        cc_list=cc_list+cc_colour_spec
-    set_user_defined_atom_colour_by_residue_py(mol_id,cc_list)
-    graphics_to_user_defined_atom_colours_representation(mol_id)
-  else:
-    info_dialog("Sorry, you need phenix.model_map_cc, sed and awk installed and accessible from the terminal for this to work! Also, needs to be P1 map right now, sorry.")
-    
-
 #Set refinement map to currently scrollable map
 def set_map_to_scrollable_map():
   if map_molecule_list()!=[]:
@@ -7986,7 +7853,8 @@ def cycle_rep_down_current():
 def key_binding_refine_triple():
     active_atom = active_residue()
     if not active_atom:
-       print("No active atom")
+       add_status_bar_text("No active atom")
+       return None
     else:
        imol = active_atom[0]
        residue_spec = _coot_residue_spec_from_spec(atom_spec_to_residue_spec(active_atom))
@@ -8093,14 +7961,16 @@ def cycle_rotamers():
   alt_conf=""
   n_rots=n_rotamers(mol_id, ch_id, res_here, ins_code)-1
   turn_off_backup(mol_id)
-  update_go_to_atom_from_current_position()
-  if rotamer_number>=n_rots:
-    rotamer_number=0
-    set_residue_to_rotamer_number(mol_id,ch_id,res_here,ins_code,alt_conf,rotamer_number)
-  else:
-    rotamer_number=rotamer_number+1
-    set_residue_to_rotamer_number(mol_id,ch_id,res_here,ins_code,alt_conf,rotamer_number)
-  turn_on_backup(mol_id)
+  try:
+    update_go_to_atom_from_current_position()
+    if rotamer_number>=n_rots:
+      rotamer_number=0
+      set_residue_to_rotamer_number(mol_id,ch_id,res_here,ins_code,alt_conf,rotamer_number)
+    else:
+      rotamer_number=rotamer_number+1
+      set_residue_to_rotamer_number(mol_id,ch_id,res_here,ins_code,alt_conf,rotamer_number)
+  finally:
+    turn_on_backup(mol_id)
   
 #Toggle environment distances
 def toggle_env_dist():
@@ -8297,15 +8167,16 @@ def last_residue_in_seg(mol_id,ch_id,resno):
 
 #Get serial number of active residue
 def sn_of_active_res():
-  sn=0
-  resn_to_match=active_residue()[2]
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  current_resn=seqnum_from_serial_number(mol_id,"%s"%(ch_id),sn)
-  while (current_resn!=resn_to_match):
-    sn=sn+1
-    current_resn=seqnum_from_serial_number(mol_id,"%s"%(ch_id),sn)
-  return sn
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id = chain_context["chain_id"]
+  resn_to_match = chain_context["resno"]
+  for sn in range(chain_n_residues(ch_id, mol_id) + 1):
+    if seqnum_from_serial_number(mol_id, "%s" % ch_id, sn) == resn_to_match:
+      return sn
+  return None
     
 #Get monomer and delete hydrogens
 def get_monomer_no_H(mon):
@@ -8540,160 +8411,182 @@ def auto_refine():
 #**** "Custom menu item functions ****
 #Fits all polymer chains to map
 def rigid_fit_all_chains():
-  mol_id=active_residue()[0]
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
   turn_off_backup(mol_id)
-  for ch_id in chain_ids(mol_id): #Rigid body refine each chain
-    if is_polymer(mol_id,ch_id)==1:
-      rigid_body_refine_by_atom_selection(mol_id, "//%s//"%(ch_id))
-      accept_regularizement()
-  turn_on_backup(mol_id)
+  try:
+    for ch_id in chain_ids(mol_id):
+      if is_polymer(mol_id, ch_id) == 1:
+        rigid_body_refine_by_atom_selection(mol_id, "//%s//" % ch_id)
+        accept_regularizement()
+  finally:
+    turn_on_backup(mol_id)
   
 #Fits active chain to map
 def rigid_fit_active_chain():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  rigid_body_refine_by_atom_selection(mol_id, "//%s//"%(ch_id))
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  rigid_body_refine_by_atom_selection(chain_context["mol_id"], "//%s//" % chain_context["chain_id"])
   
 #Copies active chain
 def copy_active_chain():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  new_molecule_by_atom_selection(mol_id, "//%s//"%(ch_id))
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  new_molecule_by_atom_selection(chain_context["mol_id"], "//%s//" % chain_context["chain_id"])
   
 #Cuts active chain
 def cut_active_chain():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  new_molecule_by_atom_selection(mol_id, "//%s//"%(ch_id))
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id = chain_context["chain_id"]
+  new_molecule_by_atom_selection(mol_id, "//%s//" % ch_id)
   turn_off_backup(mol_id)
-  while (is_polymer(mol_id,ch_id)==1) or (is_solvent_chain_p(mol_id,ch_id)!=-1):
-    first_res=first_residue(mol_id,ch_id)
-    last_res=last_residue(mol_id,ch_id)
-    delete_residue_range(mol_id,ch_id,first_res,last_res)
-  turn_on_backup(mol_id)
+  try:
+    while (is_polymer(mol_id, ch_id) == 1) or (is_solvent_chain_p(mol_id, ch_id) != -1):
+      first_res = first_residue(mol_id, ch_id)
+      last_res = last_residue(mol_id, ch_id)
+      delete_residue_range(mol_id, ch_id, first_res, last_res)
+  finally:
+    turn_on_backup(mol_id)
 
 #Faster rigid body fit (not relevant for smaller ranges, but much faster for larger ranges)
 def fast_rigid_fit(res_start,res_end,ch_id,mol_id):
   if (mol_id in model_molecule_number_list()) and (ch_id in chain_ids(mol_id)):
     turn_off_backup(mol_id)
-    ins_code=""
-    sn_max=chain_n_residues(ch_id,mol_id)-1
-    res_min=seqnum_from_serial_number(mol_id,ch_id,0)
-    res_max=seqnum_from_serial_number(mol_id,ch_id,sn_max)
-    if res_start>res_end:
-      res_start,res_end=res_end,res_start
-    while not residue_exists_qm(mol_id,ch_id,res_start,ins_code) and res_start<=res_max:
-     res_start=res_start+1
-    while not residue_exists_qm(mol_id,ch_id,res_end,ins_code) and res_end>=res_min:
-     res_end=res_end-1
-    if res_start<=res_end:
-      new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id,res_start=res_start,res_end=res_end))
-      mol_id_new=model_molecule_number_list()[-1]
-      rigid_body_refine_by_atom_selection(mol_id_new,"/ /")
-      accept_regularizement()
-      delete_residue_range(mol_id,ch_id,res_start,res_end) #delete copied range from original mol
-      merge_molecules([mol_id_new],mol_id) #Merge fit segment back into original mol
-      change_chain_id_with_result(mol_id,chain_ids(mol_id)[-1],ch_id,1,res_start,res_end) #Merge chains
-      close_molecule(mol_id_new)
-    turn_on_backup(mol_id)
+    try:
+      ins_code=""
+      sn_max=chain_n_residues(ch_id,mol_id)-1
+      res_min=seqnum_from_serial_number(mol_id,ch_id,0)
+      res_max=seqnum_from_serial_number(mol_id,ch_id,sn_max)
+      if res_start>res_end:
+        res_start,res_end=res_end,res_start
+      while not residue_exists_qm(mol_id,ch_id,res_start,ins_code) and res_start<=res_max:
+       res_start=res_start+1
+      while not residue_exists_qm(mol_id,ch_id,res_end,ins_code) and res_end>=res_min:
+       res_end=res_end-1
+      if res_start<=res_end:
+        new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id,res_start=res_start,res_end=res_end))
+        mol_id_new=model_molecule_number_list()[-1]
+        rigid_body_refine_by_atom_selection(mol_id_new,"/ /")
+        accept_regularizement()
+        delete_residue_range(mol_id,ch_id,res_start,res_end) #delete copied range from original mol
+        merge_molecules([mol_id_new],mol_id) #Merge fit segment back into original mol
+        change_chain_id_with_result(mol_id,chain_ids(mol_id)[-1],ch_id,1,res_start,res_end) #Merge chains
+        close_molecule(mol_id_new)
+    finally:
+      turn_on_backup(mol_id)
   else:
     info_dialog("The specified chain or molecule does not exist!")
 
 #Copy active segment
 def copy_active_segment():
-  mol_id=active_residue()[0]
-  segments=segment_list(mol_id)
-  res_here=active_residue()[2]
-  ch_id=active_residue()[1]
-  for seg in segments:
-    if (res_here>=seg[2]) and (res_here<=seg[3]) and (ch_id==seg[1]):
-      res_start=seg[2]
-      res_end=seg[3]
-      ch_id=seg[1]
-      new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id,res_start=res_start,res_end=res_end))
+  segment_context = _active_segment_context_or_status()
+  if not segment_context:
+    return None
+  new_molecule_by_atom_selection(
+    segment_context["mol_id"],
+    "//{ch_id}/{res_start}-{res_end}/".format(
+      ch_id=segment_context["chain_id"],
+      res_start=segment_context["segment_start"],
+      res_end=segment_context["segment_end"],
+    ),
+  )
 
 #Cut active segment
 def cut_active_segment():
-  mol_id=active_residue()[0]
-  segments=segment_list(mol_id)
-  res_here=active_residue()[2]
-  ch_id=active_residue()[1]
-  for seg in segments:
-    if (res_here>=seg[2]) and (res_here<=seg[3]) and (ch_id==seg[1]):
-      res_start=seg[2]
-      res_end=seg[3]
-      ch_id=seg[1]
-      new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id,res_start=res_start,res_end=res_end))
-      delete_residue_range(mol_id,ch_id,res_start,res_end)
+  segment_context = _active_segment_context_or_status()
+  if not segment_context:
+    return None
+  mol_id = segment_context["mol_id"]
+  ch_id = segment_context["chain_id"]
+  res_start = segment_context["segment_start"]
+  res_end = segment_context["segment_end"]
+  new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id, res_start=res_start, res_end=res_end))
+  delete_residue_range(mol_id, ch_id, res_start, res_end)
 
 #Delete active segment
 def delete_active_segment():
-  mol_id=active_residue()[0]
-  segments=segment_list(mol_id)
-  res_here=active_residue()[2]
-  ch_id=active_residue()[1]
-  for seg in segments:
-    if (res_here>=seg[2]) and (res_here<=seg[3]) and (ch_id==seg[1]):
-      res_start=seg[2]
-      res_end=seg[3]
-      ch_id=seg[1]
-      delete_residue_range(mol_id,ch_id,res_start,res_end)
+  segment_context = _active_segment_context_or_status()
+  if not segment_context:
+    return None
+  delete_residue_range(
+    segment_context["mol_id"],
+    segment_context["chain_id"],
+    segment_context["segment_start"],
+    segment_context["segment_end"],
+  )
 
 
 #Jiggle-fits active chain to map
 def jiggle_fit_active_chain():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else:
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    fit_chain_to_map_by_random_jiggle(mol_id,ch_id,1000,0.1)
+    return None
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  fit_chain_to_map_by_random_jiggle(chain_context["mol_id"], chain_context["chain_id"], 1000, 0.1)
 
 #Jiggle-fit active chain to B-smoothed map
 def jiggle_fit_active_chain_smooth():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else:
-    sharpen(imol_refinement_map(),200)
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    fit_chain_to_map_by_random_jiggle(mol_id,ch_id,1000,0.1)
+    return None
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  sharpen(imol_refinement_map(),200)
+  try:
+    fit_chain_to_map_by_random_jiggle(chain_context["mol_id"], chain_context["chain_id"], 1000, 0.1)
+  finally:
     sharpen(imol_refinement_map(),0)
     
 #Jiggle-fits active chain to map (more thorough)
 def jiggle_fit_active_chain_slow():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else:
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    score_string=""
-    for scale_fac in range(1,1000,100):
-      scale_fac2=scale_fac/10.0
-      score=fit_chain_to_map_by_random_jiggle(mol_id,ch_id,100,scale_fac2)
-      score_string=score_string+"scale:"+str(scale_fac2)+"score:"+str(score)
-    print(score_string)
+    return None
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  score_strings=[]
+  for scale_fac in range(1,1000,100):
+    scale_fac2=scale_fac/10.0
+    score=fit_chain_to_map_by_random_jiggle(chain_context["mol_id"], chain_context["chain_id"], 100, scale_fac2)
+    score_strings.append("scale:{scale} score:{score}".format(scale=scale_fac2, score=score))
+  print(" ".join(score_strings))
     
 #Fits all polymer chains to map
 def jiggle_fit_all_chains():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else:
-    mol_id=active_residue()[0]
-    turn_off_backup(mol_id)
-    for ch_id in chain_ids(mol_id): #Rigid body refine each chain
+    return None
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  turn_off_backup(mol_id)
+  try:
+    for ch_id in chain_ids(mol_id):
       if is_polymer(mol_id,ch_id)==1:
         fit_chain_to_map_by_random_jiggle(mol_id,ch_id,1000,0.1)
         accept_regularizement()
+  finally:
     turn_on_backup(mol_id)
 
 #Jiggle-fit current molecule to map
 def jiggle_fit_active_mol():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else:
-    mol_id=active_residue()[0]
-    fit_molecule_to_map_by_random_jiggle(mol_id,1000,0.1)
+    return None
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  fit_molecule_to_map_by_random_jiggle(mol_id,1000,0.1)
     
 #Clear labels and distances
 def clear_distances_and_labels():
@@ -8821,56 +8714,57 @@ def refine_residues_range(mol_id,ch_id,resno_1,resno_2,ins_code_1):
   refine_residues(mol_id,res_list)
 
   
+def _clicked_same_chain_residue_range(res1, res2, allow_single_residue=True, error_message="Start and end residues must be in the same molecule and chain!"):
+  mol_id_1=_click_spec_imol(res1)
+  mol_id_2=_click_spec_imol(res2)
+  ch_id_1=_click_spec_chain_id(res1)
+  ch_id_2=_click_spec_chain_id(res2)
+  resno_1=_click_spec_res_no(res1)
+  resno_2=_click_spec_res_no(res2)
+  if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2):
+    info_dialog(error_message)
+    return None
+  if resno_1 == resno_2 and not allow_single_residue:
+    info_dialog(error_message)
+    return None
+  return (mol_id_1, ch_id_1, min(resno_1, resno_2), max(resno_1, resno_2))
+
+
+def _atom_selection_for_residue_range(ch_id, res_start, res_end):
+  if res_start == res_end:
+    return "//%s/%s" % (ch_id, res_start)
+  return "//%s/%s-%s" % (ch_id, res_start, res_end)
+
+
   
 #Copy fragment (click start and end)
 def copy_frag_by_click():
   def copy_frag(res1,res2):
-    mol_id_1=_click_spec_imol(res1)
-    mol_id_2=_click_spec_imol(res2)
-    ch_id_1=_click_spec_chain_id(res1)
-    ch_id_2=_click_spec_chain_id(res2)
-    resno_1=_click_spec_res_no(res1)
-    resno_2=_click_spec_res_no(res2)
-    if (mol_id_1==mol_id_2) and (ch_id_1==ch_id_2):
-      if resno_1>resno_2:
-        atom_sel="//%s/%s-%s" %(ch_id_1,resno_2,resno_1)
-        new_molecule_by_atom_selection(mol_id_1,atom_sel)
-      elif resno_2>resno_1:
-        atom_sel="//%s/%s-%s" %(ch_id_1,resno_1,resno_2)
-        new_molecule_by_atom_selection(mol_id_1,atom_sel)
-      else:
-        atom_sel="//%s/%s" %(ch_id_1,resno_2)
-        new_molecule_by_atom_selection(mol_id_1,atom_sel)
-    else:
-      info_dialog("Start and end residues must be in the same molecule and chain!")
+    clicked_range = _clicked_same_chain_residue_range(res1, res2)
+    if clicked_range is None:
+      return None
+    mol_id, ch_id, res_start, res_end = clicked_range
+    atom_sel = _atom_selection_for_residue_range(ch_id, res_start, res_end)
+    new_molecule_by_atom_selection(mol_id, atom_sel)
   user_defined_click(2,copy_frag)
   
 #Cut fragment (click start and end)
 def cut_frag_by_click():
   def cut_frag(res1,res2):
-    mol_id_1=_click_spec_imol(res1)
-    mol_id_2=_click_spec_imol(res2)
-    ch_id_1=_click_spec_chain_id(res1)
-    ch_id_2=_click_spec_chain_id(res2)
-    resno_1=_click_spec_res_no(res1)
-    resno_2=_click_spec_res_no(res2)
-    if (mol_id_1==mol_id_2) and (ch_id_1==ch_id_2):
-      turn_off_backup(mol_id_1)
-      if resno_1>resno_2:
-        atom_sel="//%s/%s-%s" %(ch_id_1,resno_2,resno_1)
-        new_molecule_by_atom_selection(mol_id_1,atom_sel)
-        delete_residue_range(mol_id_1,ch_id_1,resno_2,resno_1)
-      elif resno_2>resno_1:
-        atom_sel="//%s/%s-%s" %(ch_id_1,resno_1,resno_2)
-        new_molecule_by_atom_selection(mol_id_1,atom_sel)
-        delete_residue_range(mol_id_1,ch_id_1,resno_1,resno_2)
+    clicked_range = _clicked_same_chain_residue_range(res1, res2)
+    if clicked_range is None:
+      return None
+    mol_id, ch_id, res_start, res_end = clicked_range
+    atom_sel = _atom_selection_for_residue_range(ch_id, res_start, res_end)
+    turn_off_backup(mol_id)
+    try:
+      new_molecule_by_atom_selection(mol_id, atom_sel)
+      if res_start == res_end:
+        delete_residue_range(mol_id, ch_id, res_start)
       else:
-        atom_sel="//%s/%s" %(ch_id_1,resno_2)
-        new_molecule_by_atom_selection(mol_id_1,atom_sel)
-        delete_residue_range(mol_id_1,ch_id_1,resno_2)
-      turn_on_backup(mol_id_1)
-    else:
-      info_dialog("Start and end residues must be in the same molecule and chain!")
+        delete_residue_range(mol_id, ch_id, res_start, res_end)
+    finally:
+      turn_on_backup(mol_id)
   user_defined_click(2,cut_frag)
 
 
@@ -8882,60 +8776,44 @@ def delete_sidechain_range(mol_id, ch_id, res_start, res_end):
 #Mutate range to poly-unk
 def mutate_residue_range_by_click_a():
   def mutate_residue_range_by_click_b(res1,res2):
-    mol_id_1=_click_spec_imol(res1)
-    mol_id_2=_click_spec_imol(res2)
-    ch_id_1=_click_spec_chain_id(res1)
-    ch_id_2=_click_spec_chain_id(res2)
-    resno_1=_click_spec_res_no(res1)
-    resno_2=_click_spec_res_no(res2)
-    if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2) or (resno_1==resno_2):
-      info_dialog("Start and end points must be in the same mol and chain!")
-    else:
-      if (resno_1 > resno_2):
-        res_start=resno_2
-        res_end=resno_1
-        n=res_end-res_start+1
-      else:
-        res_start=resno_1
-        res_end=resno_2
-        n=res_end-res_start+1
-      mol_id=mol_id_1
-      ch_id=ch_id_1
-      target_seq=n*"A"
-      turn_off_backup(mol_id)
+    clicked_range = _clicked_same_chain_residue_range(
+      res1,
+      res2,
+      allow_single_residue=False,
+      error_message="Start and end points must be in the same mol and chain!",
+    )
+    if clicked_range is None:
+      return None
+    mol_id, ch_id, res_start, res_end = clicked_range
+    target_seq=(res_end-res_start+1)*"A"
+    turn_off_backup(mol_id)
+    try:
       mutate_residue_range(mol_id,ch_id,res_start,res_end,target_seq)
-      for n in range(res_start,res_end+1):
-        set_residue_name(mol_id,ch_id,n,"","UNK")
+      for resno in range(res_start,res_end+1):
+        set_residue_name(mol_id,ch_id,resno,"","UNK")
+    finally:
       turn_on_backup(mol_id)
   user_defined_click(2,mutate_residue_range_by_click_b)
 
 #Mutate range to polyala
 def mutate_residue_range_by_click_ala_a():
   def mutate_residue_range_by_click_ala_b(res1,res2):
-    mol_id_1=_click_spec_imol(res1)
-    mol_id_2=_click_spec_imol(res2)
-    ch_id_1=_click_spec_chain_id(res1)
-    ch_id_2=_click_spec_chain_id(res2)
-    resno_1=_click_spec_res_no(res1)
-    resno_2=_click_spec_res_no(res2)
-    if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2) or (resno_1==resno_2):
-      info_dialog("Start and end points must be in the same mol and chain!")
-    else:
-      if (resno_1 > resno_2):
-        res_start=resno_2
-        res_end=resno_1
-        n=res_end-res_start+1
-      else:
-        res_start=resno_1
-        res_end=resno_2
-        n=res_end-res_start+1
-      mol_id=mol_id_1
-      ch_id=ch_id_1
-      target_seq=n*"A"
-      turn_off_backup(mol_id)
+    clicked_range = _clicked_same_chain_residue_range(
+      res1,
+      res2,
+      allow_single_residue=False,
+      error_message="Start and end points must be in the same mol and chain!",
+    )
+    if clicked_range is None:
+      return None
+    mol_id, ch_id, res_start, res_end = clicked_range
+    target_seq=(res_end-res_start+1)*"A"
+    turn_off_backup(mol_id)
+    try:
       mutate_residue_range(mol_id,ch_id,res_start,res_end,target_seq)
-      for n in range(res_start,res_end+1):
-        set_residue_name(mol_id,ch_id,n,"","ALA")
+      for resno in range(res_start,res_end+1):
+        set_residue_name(mol_id,ch_id,resno,"","ALA")
+    finally:
       turn_on_backup(mol_id)
   user_defined_click(2,mutate_residue_range_by_click_ala_b)
   
@@ -8992,7 +8870,8 @@ def force_add_terminal_residue_noclick_strand(mol_id,ch_id,res_no):
 def key_binding_terminal_spin():
     active_atom = active_residue()
     if not active_atom:
-       print("No active atom")
+       add_status_bar_text("No active atom")
+       return None
     else:
        imol = active_atom[0]
        residue_spec = _coot_residue_spec_from_spec(atom_spec_to_residue_spec(active_atom))
@@ -9008,442 +8887,88 @@ residue_phi_cycle=0
 residue_psi_cycle=0
 current_phi=-60
 current_psi=-50
+RESIDUE_TORSION_CYCLE_VALUES = (-180, -150, -120, -90, -60, -30, 0, 30, 60, 90, 120)
 #should chamnge this to incorporate measurement of starting phi/psi using get_torsion (and maybe setting using set_torsion?)
 #get_torsion(0,["A",2393,""," C  ",""], ["A",2394,"", " N  ", ""], ["A", 2394, "", " CA ", ""], ["A", 2394, "", " C  ",""])
 #set_torsion(imol, chain_id, res_no, ins_code_alt_conf, atom_name_1,atom_name_2, atom_name_3, atom_name_4)
-def cycle_residue_phi():
+def _cycle_terminal_residue_torsion(vary_phi):
   global residue_phi_cycle
-  global current_phi
-  global current_psi
-  res_type="auto"
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  resn=active_residue()[2]
-  atom_name=active_residue()[4]
-  set_go_to_atom_molecule(mol_id)
-  ins_code=""
-  first_in_seg=first_residue_in_seg(mol_id,ch_id,resn)
-  last_in_seg=last_residue_in_seg(mol_id,ch_id,resn)
-  delta_first=abs(first_in_seg-resn)
-  delta_last=abs(last_in_seg-resn)
-  set_new_atom_b_fac_to_mean()
-  if delta_first<=delta_last:
-    set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-    if (residue_phi_cycle==0):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=-180
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=1
-    elif (residue_phi_cycle==1):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=-150
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=2
-    elif (residue_phi_cycle==2):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=-120
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=3
-    elif (residue_phi_cycle==3):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=-90
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=4
-    elif (residue_phi_cycle==4):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=-60
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=5
-    elif (residue_phi_cycle==5):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=-30
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=6
-    elif (residue_phi_cycle==6):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=0
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=7
-    elif (residue_phi_cycle==7):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=30
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=8
-    elif (residue_phi_cycle==8):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=60
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=9
-    elif (residue_phi_cycle==9):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=90
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=10
-    elif (residue_phi_cycle==10):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=120
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_phi_cycle=0
-  else:
-    set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-    if (residue_phi_cycle==0):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=-180
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=1
-    elif (residue_phi_cycle==1):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=-150
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=2
-    elif (residue_phi_cycle==2):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=-120
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=3
-    elif (residue_phi_cycle==3):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=-90
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=4
-    elif (residue_phi_cycle==4):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=-60
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=5
-    elif (residue_phi_cycle==5):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=-30
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=6
-    elif (residue_phi_cycle==6):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=0
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=7
-    elif (residue_phi_cycle==7):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=30
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=8
-    elif (residue_phi_cycle==8):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=60
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=9
-    elif (residue_phi_cycle==9):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=90
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=10
-    elif (residue_phi_cycle==10):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=120
-      psi=current_psi
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_phi_cycle=0
-  current_phi=phi
-def cycle_residue_psi():
   global residue_psi_cycle
   global current_phi
   global current_psi
-  res_type="auto"
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  resn=active_residue()[2]
-  atom_name=active_residue()[4]
-  set_go_to_atom_molecule(mol_id)
-  ins_code=""
-  first_in_seg=first_residue_in_seg(mol_id,ch_id,resn)
-  last_in_seg=last_residue_in_seg(mol_id,ch_id,resn)
-  delta_first=abs(first_in_seg-resn)
-  delta_last=abs(last_in_seg-resn)
-  set_new_atom_b_fac_to_mean()
-  if delta_first<=delta_last:
-    set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-    if (residue_psi_cycle==0):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=-180
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=1
-    elif (residue_psi_cycle==1):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=-150
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=2
-    elif (residue_psi_cycle==2):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=-120
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=3
-    elif (residue_psi_cycle==3):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=-90
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=4
-    elif (residue_psi_cycle==4):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=-60
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=5
-    elif (residue_psi_cycle==5):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=-30
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=6
-    elif (residue_psi_cycle==6):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=0
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=7
-    elif (residue_psi_cycle==7):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=30
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=8
-    elif (residue_psi_cycle==8):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=60
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=9
-    elif (residue_psi_cycle==9):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=90
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=10
-    elif (residue_psi_cycle==10):
-      delete_residue(mol_id,ch_id,first_in_seg,ins_code)
-      phi=current_phi
-      psi=120
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,first_in_seg+1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      residue_psi_cycle=0
+  growth_context = _active_terminal_growth_context_or_status()
+  if not growth_context:
+    return None
+  cycle_index = residue_phi_cycle if vary_phi else residue_psi_cycle
+  chosen_angle = RESIDUE_TORSION_CYCLE_VALUES[cycle_index]
+  mol_id = growth_context["mol_id"]
+  ch_id = growth_context["chain_id"]
+  atom_name = growth_context["atom_name"]
+  anchor_resno = growth_context["first_in_seg"] if growth_context["grow_from_n_term"] else growth_context["last_in_seg"]
+  insertion_resno = anchor_resno + 1 if growth_context["grow_from_n_term"] else anchor_resno - 1
+  next_cycle_index = (cycle_index + 1) % len(RESIDUE_TORSION_CYCLE_VALUES)
+  if vary_phi:
+    phi = chosen_angle
+    psi = current_psi
+    residue_phi_cycle = next_cycle_index
   else:
-    set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-    if (residue_psi_cycle==0):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=-180
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=1
-    elif (residue_psi_cycle==1):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=-150
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=2
-    elif (residue_psi_cycle==2):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=-120
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=3
-    elif (residue_psi_cycle==3):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=-90
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=4
-    elif (residue_psi_cycle==4):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=-60
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=5
-    elif (residue_psi_cycle==5):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=-30
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=6
-    elif (residue_psi_cycle==6):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=0
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=7
-    elif (residue_psi_cycle==7):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=30
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=8
-    elif (residue_psi_cycle==8):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=60
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=9
-    elif (residue_psi_cycle==9):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=90
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=10
-    elif (residue_psi_cycle==10):
-      delete_residue(mol_id,ch_id,last_in_seg,ins_code)
-      phi=current_phi
-      psi=120
-      force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,last_in_seg-1,phi,psi)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      residue_psi_cycle=0
-  current_psi=psi
+    phi = current_phi
+    psi = chosen_angle
+    residue_psi_cycle = next_cycle_index
+  set_go_to_atom_molecule(mol_id)
+  set_new_atom_b_fac_to_mean()
+  set_go_to_atom_chain_residue_atom_name(ch_id, anchor_resno, atom_name)
+  delete_residue(mol_id, ch_id, anchor_resno, "")
+  force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, insertion_resno, phi, psi)
+  sort_residues(mol_id)
+  set_go_to_atom_chain_residue_atom_name(ch_id, anchor_resno, atom_name)
+  current_phi = phi
+  current_psi = psi
+  return 1
+
+
+def cycle_residue_phi():
+  return _cycle_terminal_residue_torsion(vary_phi=True)
+
+
+def cycle_residue_psi():
+  return _cycle_terminal_residue_torsion(vary_phi=False)
+
+
+def _mutate_all_residue_type(source_resname, target_resname):
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  map_id = imol_refinement_map()
+  turn_off_backup(mol_id)
+  try:
+    for ch_id in chain_ids(mol_id):
+      for resn in range(0, chain_n_residues(ch_id, mol_id)):
+        if resname_from_serial_number(mol_id, ch_id, resn) == source_resname:
+          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
+          ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,resn))
+          delete_residue_with_full_spec(mol_id,1,ch_id,seqnum,ins_id,"B")
+          delete_residue_with_full_spec(mol_id,1,ch_id,seqnum,ins_id,"C")
+          mutate(mol_id,ch_id,seqnum,ins_id,target_resname)
+          if (map_id!=-1):
+            auto_fit_best_rotamer(seqnum,"",ins_id,ch_id,mol_id,map_id,1,0.01)
+  finally:
+    turn_on_backup(mol_id)
 
 
 #Mutate mets to MSE
 def mutate_all_mets_to_mse():
-  mol_id=active_residue()[0]
-  turn_off_backup(mol_id)
-  for ch_id in chain_ids(mol_id):
-    for resn in range(0,chain_n_residues(ch_id,mol_id)):
-      if (resname_from_serial_number(mol_id,ch_id,resn)=="MET"):
-        seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,resn))
-        delete_residue_with_full_spec(mol_id,1,ch_id,seqnum,ins_id,"B")
-        delete_residue_with_full_spec(mol_id,1,ch_id,seqnum,ins_id,"C")
-        mutate(mol_id,ch_id,seqnum,ins_id,"MSE")
-        map_id=imol_refinement_map()
-        if (map_id!=-1):
-          auto_fit_best_rotamer(seqnum,"",ins_id,ch_id,mol_id,map_id,1,0.01)
-  turn_on_backup(mol_id)
+  return _mutate_all_residue_type("MET", "MSE")
   
 #Mutate MSEs to MET
 def mutate_all_mse_to_met():
-  mol_id=active_residue()[0]
-  turn_off_backup(mol_id)
-  for ch_id in chain_ids(mol_id):
-    for resn in range(0,chain_n_residues(ch_id,mol_id)):
-      if (resname_from_serial_number(mol_id,ch_id,resn)=="MSE"):
-        seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,resn))
-        delete_residue_with_full_spec(mol_id,1,ch_id,seqnum,ins_id,"B")
-        delete_residue_with_full_spec(mol_id,1,ch_id,seqnum,ins_id,"C")
-        mutate(mol_id,ch_id,seqnum,ins_id,"MET")
-        map_id=imol_refinement_map()
-        if (map_id!=-1):
-          auto_fit_best_rotamer(seqnum,"",ins_id,ch_id,mol_id,map_id,1,0.01)
-  turn_on_backup(mol_id)
+  return _mutate_all_residue_type("MSE", "MET")
   
 #Shorten loop by one residue
 def shorten_loop():
-  active_atom=active_residue()
+  active_atom=_active_residue_or_status()
+  if not active_atom:
+    return None
   mol_id=active_atom[0]
   ch_id=active_atom[1]
   resn=active_atom[2]
@@ -9451,9 +8976,7 @@ def shorten_loop():
   delete_residue(mol_id,ch_id,resn,ins_code)
   first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
   renumber_residue_range(mol_id,ch_id,first_res,resn,1)
-  delete_all_extra_restraints(mol_id)
-  set_show_extra_restraints(mol_id,0)
-  set_show_extra_restraints(mol_id,1)
+  _refresh_extra_restraints_display(mol_id)
   r1=resn-1
   r2=resn+2
   set_refinement_immediate_replacement(1)
@@ -9463,16 +8986,16 @@ def shorten_loop():
 
 #Lengthen loop by one residue
 def lengthen_loop():
-  active_atom=active_residue()
+  active_atom=_active_residue_or_status()
+  if not active_atom:
+    return None
   mol_id=active_atom[0]
   ch_id=active_atom[1]
   resn=active_atom[2]
   first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
   renumber_residue_range(mol_id,ch_id,first_res,resn,-1)
   sort_residues(mol_id)
-  delete_all_extra_restraints(mol_id)
-  set_show_extra_restraints(mol_id,0)
-  set_show_extra_restraints(mol_id,1)
+  _refresh_extra_restraints_display(mol_id)
   r1=resn-1
   r2=resn
   set_refinement_immediate_replacement(1)
@@ -9488,17 +9011,20 @@ def lengthen_loop():
 
 #Get fractional coordinates of active atom. Useful when inspecting heavy atom sites.
 def get_fract_coords():
-  a=active_residue()
+  a=_active_residue_or_status()
+  if not a:
+    return None
   x_cart=atom_specs(a[0],a[1],a[2],a[3],a[4],a[5])[3]
   y_cart=atom_specs(a[0],a[1],a[2],a[3],a[4],a[5])[4]
   z_cart=atom_specs(a[0],a[1],a[2],a[3],a[4],a[5])[5]
-  mol_id=active_residue()[0]
-  cell_a=cell(mol_id)[0]
-  cell_b=cell(mol_id)[1]
-  cell_c=cell(mol_id)[2]
-  cell_alpha=math.radians(cell(mol_id)[3])
-  cell_beta=math.radians(cell(mol_id)[4])
-  cell_gamma=math.radians(cell(mol_id)[5])
+  mol_id=a[0]
+  molecule_cell = cell(mol_id)
+  cell_a=molecule_cell[0]
+  cell_b=molecule_cell[1]
+  cell_c=molecule_cell[2]
+  cell_alpha=math.radians(molecule_cell[3])
+  cell_beta=math.radians(molecule_cell[4])
+  cell_gamma=math.radians(molecule_cell[5])
   cos_alpha_star=(math.cos(cell_beta)*math.cos(cell_gamma)-math.cos(cell_alpha))/(math.sin(cell_beta)*math.sin(cell_gamma))
   sin_alpha_star=math.sqrt(1-cos_alpha_star**2)
   z_fract=z_cart/(cell_c*math.sin(cell_beta)*sin_alpha_star)
@@ -9509,17 +9035,17 @@ def get_fract_coords():
   
 #Go to center of scroll wheel map.
 def goto_center_of_map():
-  if (scroll_wheel_map()==-1):
+  map_id = _scrollable_map_or_status()
+  if map_id is None:
     info_dialog("You need a map!")
-  else:
-    mol_id=scroll_wheel_map()
-    a=float(cell(mol_id)[0])
-    b=float(cell(mol_id)[1])
-    c=float(cell(mol_id)[2])
-    x=a*0.5
-    y=b*0.5
-    z=c*0.5
-    set_rotation_centre(x,y,z)
+    return None
+  a=float(cell(map_id)[0])
+  b=float(cell(map_id)[1])
+  c=float(cell(map_id)[2])
+  x=a*0.5
+  y=b*0.5
+  z=c*0.5
+  set_rotation_centre(x,y,z)
     
 #Switch all models to CA representation
 def all_mols_to_ca():
@@ -9528,7 +9054,9 @@ def all_mols_to_ca():
     
 #Set b-factor color scaling based on mean B of active mol
 def autoscale_b_factor():
-  mol_id=active_residue()[0]
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
   mean_b=average_temperature_factor(mol_id)
   scale_fac=50/mean_b
   set_b_factor_bonds_scale_factor(mol_id,scale_fac)
@@ -9638,64 +9166,59 @@ def color_by_charge(mol_id):
   colour_list = pos_res_list + neg_res_list
   _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
 
+
+def _append_chain_residue_colours(colour_rows, mol_id, ch_id, colour_index):
+  sn_max = chain_n_residues(ch_id, mol_id)
+  for sn in range(0, sn_max+1):
+    resn = seqnum_from_serial_number(mol_id, ch_id, sn)
+    ins_id = str(insertion_code_from_serial_number(mol_id, ch_id, sn))
+    colour_rows.append(([ch_id, resn, ins_id], colour_index))
+
+
 def uncolor_other_chains():
-  mol_id=active_residue()[0]
-  ch_id_here=active_residue()[1]  
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id_here = chain_context["chain_id"]
   blank_colour=0
   blank_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
     if ch_id!=ch_id_here:
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
+      _append_chain_residue_colours(blank_res_list, mol_id, ch_id, blank_colour)
   _apply_user_defined_residue_colours(mol_id, blank_res_list, [])
 
 def color_active_chain():
-  mol_id=active_residue()[0]
-  ch_id_here=active_residue()[1]  
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id_here = chain_context["chain_id"]
   blank_colour=0
   chain_colour=22 #yellow
   blank_res_list=[]
   chain_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
     if ch_id!=ch_id_here:
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
-    if ch_id==ch_id_here:
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],chain_colour)]
-        chain_res_list=chain_res_list+residue_to_color
+      _append_chain_residue_colours(blank_res_list, mol_id, ch_id, blank_colour)
+    else:
+      _append_chain_residue_colours(chain_res_list, mol_id, ch_id, chain_colour)
   _apply_user_defined_residue_colours(mol_id, blank_res_list, chain_res_list)
 
 def color_active_chain_by_num(chain_colour):
-  mol_id=active_residue()[0]
-  ch_id_here=active_residue()[1]
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id_here = chain_context["chain_id"]
   blank_colour=0
   blank_res_list=[]
   chain_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
     if ch_id!=ch_id_here:
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
-    if ch_id==ch_id_here:
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],chain_colour)]
-        chain_res_list=chain_res_list+residue_to_color
+      _append_chain_residue_colours(blank_res_list, mol_id, ch_id, blank_colour)
+    else:
+      _append_chain_residue_colours(chain_res_list, mol_id, ch_id, chain_colour)
   _apply_user_defined_residue_colours(mol_id, blank_res_list, chain_res_list)
     
 def color_protein_na(mol_id):
@@ -9706,25 +9229,12 @@ def color_protein_na(mol_id):
   na_res_list=[]
   blank_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
     if is_nucleotide_chain_p(mol_id,ch_id):
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],na_colour)]
-        na_res_list=na_res_list+residue_to_color
-    if is_protein_chain_p(mol_id,ch_id):
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],protein_colour)]
-        protein_res_list=protein_res_list+residue_to_color
+      _append_chain_residue_colours(na_res_list, mol_id, ch_id, na_colour)
+    elif is_protein_chain_p(mol_id,ch_id):
+      _append_chain_residue_colours(protein_res_list, mol_id, ch_id, protein_colour)
     else:
-      for sn in range(0,sn_max+1):
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
+      _append_chain_residue_colours(blank_res_list, mol_id, ch_id, blank_colour)
   colour_list = protein_res_list + na_res_list
   _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
 
@@ -9738,17 +9248,49 @@ def color_waters(mol_id):
     sn_max=chain_n_residues(ch_id,mol_id)
     for sn in range(0,sn_max+1):
       resname_here=resname_from_serial_number(mol_id,ch_id,sn)
+      resn=seqnum_from_serial_number(mol_id,ch_id,sn)
+      ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
+      colour_entry = ([ch_id,resn,ins_id], water_colour if resname_here=="HOH" else blank_colour)
       if resname_here=="HOH":
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],water_colour)]
-        water_list=water_list+residue_to_color
+        water_list.append(colour_entry)
       else:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
+        blank_res_list.append(colour_entry)
   _apply_user_defined_residue_colours(mol_id, blank_res_list, water_list)
+
+
+def color_rotamer_outliers_and_missing_atoms_for_active_molecule():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  return color_rotamer_outliers_and_missing_atoms(mol_id)
+
+
+def color_polars_and_hphobs_for_active_molecule():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  return color_polars_and_hphobs(mol_id)
+
+
+def color_by_charge_for_active_molecule():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  return color_by_charge(mol_id)
+
+
+def color_protein_na_for_active_molecule():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  return color_protein_na(mol_id)
+
+
+def color_waters_for_active_molecule():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  return color_waters(mol_id)
 
   
 #Search PDB by active chain
@@ -9792,228 +9334,139 @@ def color_waters(mol_id):
 #   else:
 #     print "Failed to retrieve results" 
   
-#Highlight various items with ball-and-stick and lines
-def highlight_chain_breaks():
-  mol_id=active_residue()[0]
-  clear_ball_and_stick(mol_id)
-  turn_off_backup(mol_id)
-  obj_number=generic_object_with_name("chain_breaks_{mol_id}".format(mol_id=mol_id))
-  generic_object_clear(obj_number)
-  protein_resnames=['ALA','UNK','ARG','ASN','ASP','CYS','GLU','GLN','GLY','HIS','ILE','LEU','LYS','MET','MSE','PHE','PRO','SER','THR','TRP','TYR','VAL']
-  na_resnames=['A','C','T','G','U']
-  missing_segments_list=[]
-  for ch_id in chain_ids(mol_id):
-    for resn in range(0,chain_n_residues(ch_id,mol_id)):
-      resname=resname_from_serial_number(mol_id,ch_id,resn)
-      print(resname)
-      if (resname in protein_resnames):
-        if ((is_term_type_mc_sn(mol_id,ch_id,resn)==1) or (is_term_type_mn_sn(mol_id,ch_id,resn)==1)):
-          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-#         sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-#         make_ball_and_stick(mol_id,sel_string,0,0.5,1
-          if (is_term_type_mn_sn(mol_id,ch_id,resn)==1):
-            x_mn=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-3]
-            y_mn=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-2]
-            z_mn=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-1]
-            x_mid=(x_mn+x_here)/2
-            y_mid=(y_mn+y_here)/2
-            z_mid=(z_mn+z_here)/2
-            res_missing=seqnum-seqnum_from_serial_number(mol_id,ch_id,resn-1)
-            #formula: sqrt((x1-x2)^2+(y1-y2)^2+(z1-z2)^2)
-            distance=((x_here-x_mn)**2+(y_here-y_mn)**2+(z_here-z_mn)**2)**0.5
-            print(("distance",distance))
-            distance_per_residue=distance/res_missing
-            print(("per residue distance",distance_per_residue))
-            label_string="{ch_id}  {res_start}...{res_end} ({res_missing} missing residues)".format(ch_id=ch_id,res_start=seqnum_from_serial_number(mol_id,ch_id,resn-1),res_end=seqnum,res_missing=res_missing)
-            if distance_per_residue>3.8:
-              label_string="MIND THE GAP! {ch_id}  {res_start}...{res_end} ({res_missing} missing residues for {distance:6.1f} A)".format(ch_id=ch_id,res_start=seqnum_from_serial_number(mol_id,ch_id,resn-1),res_end=seqnum,res_missing=res_missing,distance=distance)
-            if res_missing >=50:
-              label_string="!!!  {ch_id}  {res_start}...{res_end} ({res_missing} missing residues)".format(ch_id=ch_id,res_start=seqnum_from_serial_number(mol_id,ch_id,resn-1),res_end=seqnum,res_missing=res_missing)
-            list_entry=[label_string,x_mid,y_mid,z_mid]
-            missing_segments_list.append(list_entry)
-            if res_missing <=15:
-              gap_color="gray"
-            elif (res_missing > 15) and (res_missing<50):
-              gap_color="orange"
-            else:
-              gap_color="red"
-            if distance_per_residue>3.8:
-              gap_color="cyan" 
-            line_width=4
-            dash_density=3
-            to_generic_object_add_dashed_line(obj_number,gap_color,line_width,dash_density,x_here,y_here,z_here,x_mn,y_mn,z_mn)
-            #if res_missing>=20:
-            #  place_text(str(res_missing),x_mid,y_mid,z_mid,1)
-          else: #By definition we always pass through here first (need to hit a term_type_mc befor term_type_mn)
-            x_here=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-3]
-            y_here=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-2]
-            z_here=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-1]
-        if (resn==0):
-          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-          sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-          make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-        if (is_last_polymer_residue_sn(mol_id,ch_id,resn)==1):
-          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-          sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-          make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-      if (resname in na_resnames):
-        if ((is_term_type_mc_sn(mol_id,ch_id,resn)==1) or (is_term_type_mn_sn(mol_id,ch_id,resn)==1)):
-          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-#         sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-#         make_ball_and_stick(mol_id,sel_string,0,0.5,1
-          if (is_term_type_mn_sn(mol_id,ch_id,resn)==1):
-            x_mn=atom_specs(mol_id,ch_id,seqnum,"","P","")[-3]
-            y_mn=atom_specs(mol_id,ch_id,seqnum,"","P","")[-2]
-            z_mn=atom_specs(mol_id,ch_id,seqnum,"","P","")[-1]
-            x_mid=(x_mn+x_here)/2
-            y_mid=(y_mn+y_here)/2
-            z_mid=(z_mn+z_here)/2
-            res_missing=seqnum-seqnum_from_serial_number(mol_id,ch_id,resn-1)
-            #formula: sqrt((x1-x2)^2+(y1-y2)^2+(z1-z2)^2)
-            distance=((x_here-x_mn)**2+(y_here-y_mn)**2+(z_here-z_mn)**2)**0.5
-            distance_per_residue=distance/res_missing
-            label_string="{ch_id}  {res_start}...{res_end} ({res_missing} missing residues)".format(ch_id=ch_id,res_start=seqnum_from_serial_number(mol_id,ch_id,resn-1),res_end=seqnum,res_missing=res_missing)
-            if distance_per_residue>5.9:
-              label_string="MIND THE GAP! {ch_id}  {res_start}...{res_end} ({res_missing} missing residues for {distance:6.1f} A)".format(ch_id=ch_id,res_start=seqnum_from_serial_number(mol_id,ch_id,resn-1),res_end=seqnum,res_missing=res_missing,distance=distance)
-            if res_missing >=50:
-              label_string="!!!  {ch_id}  {res_start}...{res_end} ({res_missing} missing residues)".format(ch_id=ch_id,res_start=seqnum_from_serial_number(mol_id,ch_id,resn-1),res_end=seqnum,res_missing=res_missing)
-            list_entry=[label_string,x_mid,y_mid,z_mid]
-            missing_segments_list.append(list_entry)
-            if res_missing <=15:
-              gap_color="gray"
-            elif (res_missing > 15) and (res_missing<50):
-              gap_color="orange"
-            else:
-              gap_color="red"
-            if distance_per_residue>5.9:
-              gap_color="cyan" 
-            line_width=4
-            dash_density=3
-            to_generic_object_add_dashed_line(obj_number,gap_color,line_width,dash_density,x_here,y_here,z_here,x_mn,y_mn,z_mn)
-            #if res_missing>=20:
-            #  place_text(str(res_missing),x_mid,y_mid,z_mid,1)
-          else: #By definition we always pass through here first (need to hit a term_type_mc befor term_type_mn)
-            x_here=atom_specs(mol_id,ch_id,seqnum,"","P","")[-3]
-            y_here=atom_specs(mol_id,ch_id,seqnum,"","P","")[-2]
-            z_here=atom_specs(mol_id,ch_id,seqnum,"","P","")[-1]
-        if (resn==0):
-          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-          sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/P"
-          make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-        if (is_last_polymer_residue_sn(mol_id,ch_id,resn)==1):
-          seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-          sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/P"
-          make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-  set_display_generic_object(obj_number,1)
+CHAIN_BREAK_PROTEIN_RESNAMES = {'ALA','UNK','ARG','ASN','ASP','CYS','GLU','GLN','GLY','HIS','ILE','LEU','LYS','MET','MSE','PHE','PRO','SER','THR','TRP','TYR','VAL'}
+CHAIN_BREAK_NA_RESNAMES = {'A','C','T','G','U'}
+
+
+def _chain_break_config_for_resname(resname):
+  if resname in CHAIN_BREAK_PROTEIN_RESNAMES:
+    return ("CA", 3.8)
+  if resname in CHAIN_BREAK_NA_RESNAMES:
+    return ("P", 5.9)
+  return None
+
+
+def _atom_xyz_or_none(mol_id, ch_id, resno, atom_name):
   try:
-    attach_generic_object_to_molecule(obj_number, mol_id)
-  except NameError:
-    info_dialog("attach_generic_object_to_molecule is only present in Coot r6057 and later, sorry.")
-    pass
-  turn_on_backup(mol_id)
-  interesting_things_gui("Missing segments",missing_segments_list)
+    atom_spec = atom_specs(mol_id, ch_id, resno, "", atom_name, "")
+    return (atom_spec[-3], atom_spec[-2], atom_spec[-1])
+  except Exception:
+    return None
 
 
-def highlight_all_chain_breaks():
-  protein_resnames=['ALA','UNK','ARG','ASN','ASP','CYS','GLU','GLN','GLY','HIS','ILE','LEU','LYS','MET','MSE','PHE','PRO','SER','THR','TRP','TYR','VAL']
-  na_resnames=['A','C','T','G','U']
-  for mol_id in model_molecule_list():
-    clear_ball_and_stick(mol_id)
-    turn_off_backup(mol_id)
-    obj_number=generic_object_with_name("chain_breaks_{mol_id}".format(mol_id=mol_id))
+def _chain_break_gap_color(res_missing, distance_per_residue, warning_threshold):
+  if res_missing <= 15:
+    gap_color = "gray"
+  elif res_missing < 50:
+    gap_color = "orange"
+  else:
+    gap_color = "red"
+  if distance_per_residue > warning_threshold:
+    gap_color = "cyan"
+  return gap_color
+
+
+def _chain_break_label(ch_id, start_resno, end_resno, res_missing, distance, distance_per_residue, warning_threshold):
+  label_string = "{ch_id}  {res_start}...{res_end} ({res_missing} missing residues)".format(
+    ch_id=ch_id,
+    res_start=start_resno,
+    res_end=end_resno,
+    res_missing=res_missing,
+  )
+  if distance_per_residue > warning_threshold:
+    label_string = "MIND THE GAP! {ch_id}  {res_start}...{res_end} ({res_missing} missing residues for {distance:6.1f} A)".format(
+      ch_id=ch_id,
+      res_start=start_resno,
+      res_end=end_resno,
+      res_missing=res_missing,
+      distance=distance,
+    )
+  if res_missing >= 50:
+    label_string = "!!!  {ch_id}  {res_start}...{res_end} ({res_missing} missing residues)".format(
+      ch_id=ch_id,
+      res_start=start_resno,
+      res_end=end_resno,
+      res_missing=res_missing,
+    )
+  return label_string
+
+
+def _highlight_chain_breaks_for_molecule(mol_id, collect_missing_segments):
+  clear_ball_and_stick(mol_id)
+  missing_segments_list = []
+  turn_off_backup(mol_id)
+  try:
+    obj_number = generic_object_with_name("chain_breaks_{mol_id}".format(mol_id=mol_id))
     generic_object_clear(obj_number)
     for ch_id in chain_ids(mol_id):
-      for resn in range(0,chain_n_residues(ch_id,mol_id)):
-        resname=resname_from_serial_number(mol_id,ch_id,resn)
-        print(resname)
-        if (resname in protein_resnames):
-          if ((is_term_type_mc_sn(mol_id,ch_id,resn)==1) or (is_term_type_mn_sn(mol_id,ch_id,resn)==1)):
-            seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-  #         sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-  #         make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-            if (is_term_type_mn_sn(mol_id,ch_id,resn)==1):
-              x_mn=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-3]
-              y_mn=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-2]
-              z_mn=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-1]
-              x_mid=(x_mn+x_here)/2
-              y_mid=(y_mn+y_here)/2
-              z_mid=(z_mn+z_here)/2
-              res_missing=seqnum-seqnum_from_serial_number(mol_id,ch_id,resn-1)
-              #formula: sqrt((x1-x2)^2+(y1-y2)^2+(z1-z2)^2)
-              distance=((x_here-x_mn)**2+(y_here-y_mn)**2+(z_here-z_mn)**2)**0.5
-              distance_per_residue=distance/res_missing
-              if res_missing <=15:
-                gap_color="gray"
-              elif (res_missing > 15) and (res_missing<50):
-                gap_color="orange"
-              else:
-                gap_color="red"
-              if distance_per_residue>3.8:
-                gap_color="cyan" 
-              line_width=4
-              dash_density=3
-              to_generic_object_add_dashed_line(obj_number,gap_color,line_width,dash_density,x_here,y_here,z_here,x_mn,y_mn,z_mn)
-              #res_missing=seqnum-seqnum_from_serial_number(mol_id,ch_id,resn-1)
-              #if res_missing>=20:
-              #  place_text(str(res_missing),x_mid,y_mid,z_mid,1)
-            else: #By definition we always pass through here first (need to hit a term_type_mc befor term_type_mn)
-              x_here=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-3]
-              y_here=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-2]
-              z_here=atom_specs(mol_id,ch_id,seqnum,"","CA","")[-1]
-          if (resn==0):
-            seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-            sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-            make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-          if (is_last_polymer_residue_sn(mol_id,ch_id,resn)==1):
-            seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-            sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/CA"
-            make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-        if (resname in na_resnames):
-          if ((is_term_type_mc_sn(mol_id,ch_id,resn)==1) or (is_term_type_mn_sn(mol_id,ch_id,resn)==1)):
-            seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-            if (is_term_type_mn_sn(mol_id,ch_id,resn)==1):
-              x_mn=atom_specs(mol_id,ch_id,seqnum,"","P","")[-3]
-              y_mn=atom_specs(mol_id,ch_id,seqnum,"","P","")[-2]
-              z_mn=atom_specs(mol_id,ch_id,seqnum,"","P","")[-1]
-              x_mid=(x_mn+x_here)/2
-              y_mid=(y_mn+y_here)/2
-              z_mid=(z_mn+z_here)/2
-              res_missing=seqnum-seqnum_from_serial_number(mol_id,ch_id,resn-1)
-              #formula: sqrt((x1-x2)^2+(y1-y2)^2+(z1-z2)^2)
-              distance=((x_here-x_mn)**2+(y_here-y_mn)**2+(z_here-z_mn)**2)**0.5
-              distance_per_residue=distance/res_missing
-              if res_missing <=15:
-                gap_color="gray"
-              elif (res_missing > 15) and (res_missing<50):
-                gap_color="orange"
-              else:
-                gap_color="red"
-              if distance_per_residue>5.9:
-                gap_color="cyan" 
-              line_width=4
-              dash_density=3
-              to_generic_object_add_dashed_line(obj_number,gap_color,line_width,dash_density,x_here,y_here,z_here,x_mn,y_mn,z_mn)
-              #if res_missing>=20:
-              #  place_text(str(res_missing),x_mid,y_mid,z_mid,1)
-            else: #By definition we always pass through here first (need to hit a term_type_mc befor term_type_mn)
-              x_here=atom_specs(mol_id,ch_id,seqnum,"","P","")[-3]
-              y_here=atom_specs(mol_id,ch_id,seqnum,"","P","")[-2]
-              z_here=atom_specs(mol_id,ch_id,seqnum,"","P","")[-1]
-          if (resn==0):
-            seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-            sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/P"
-            make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-          if (is_last_polymer_residue_sn(mol_id,ch_id,resn)==1):
-            seqnum=seqnum_from_serial_number(mol_id,ch_id,resn)
-            sel_string="//"+str(ch_id)+"/"+str(seqnum)+"/P"
-            make_ball_and_stick(mol_id,sel_string,0,0.5,1)
-    set_display_generic_object(obj_number,1) 
+      previous_terminus_xyz = {}
+      for resn in range(0, chain_n_residues(ch_id, mol_id)):
+        resname = resname_from_serial_number(mol_id, ch_id, resn)
+        config = _chain_break_config_for_resname(resname)
+        if not config:
+          continue
+        atom_name, warning_threshold = config
+        seqnum = seqnum_from_serial_number(mol_id, ch_id, resn)
+        if seqnum == -10000:
+          continue
+        if (resn == 0) or (is_last_polymer_residue_sn(mol_id, ch_id, resn) == 1):
+          sel_string = "//{ch_id}/{seqnum}/{atom_name}".format(ch_id=ch_id, seqnum=seqnum, atom_name=atom_name)
+          make_ball_and_stick(mol_id, sel_string, 0, 0.5, 1)
+        if is_term_type_mc_sn(mol_id, ch_id, resn) == 1:
+          previous_xyz = _atom_xyz_or_none(mol_id, ch_id, seqnum, atom_name)
+          if previous_xyz is not None:
+            previous_terminus_xyz[atom_name] = previous_xyz
+        if is_term_type_mn_sn(mol_id, ch_id, resn) == 1:
+          previous_xyz = previous_terminus_xyz.get(atom_name)
+          current_xyz = _atom_xyz_or_none(mol_id, ch_id, seqnum, atom_name)
+          previous_seqnum = seqnum_from_serial_number(mol_id, ch_id, resn-1)
+          if previous_xyz is None or current_xyz is None or previous_seqnum == -10000:
+            continue
+          res_missing = seqnum - previous_seqnum
+          if res_missing <= 0:
+            continue
+          x_here, y_here, z_here = previous_xyz
+          x_mn, y_mn, z_mn = current_xyz
+          x_mid=(x_mn+x_here)/2
+          y_mid=(y_mn+y_here)/2
+          z_mid=(z_mn+z_here)/2
+          distance=((x_here-x_mn)**2+(y_here-y_mn)**2+(z_here-z_mn)**2)**0.5
+          distance_per_residue=distance/res_missing
+          gap_color = _chain_break_gap_color(res_missing, distance_per_residue, warning_threshold)
+          if collect_missing_segments:
+            label_string = _chain_break_label(
+              ch_id,
+              previous_seqnum,
+              seqnum,
+              res_missing,
+              distance,
+              distance_per_residue,
+              warning_threshold,
+            )
+            missing_segments_list.append([label_string, x_mid, y_mid, z_mid])
+          to_generic_object_add_dashed_line(obj_number, gap_color, 4, 3, x_here, y_here, z_here, x_mn, y_mn, z_mn)
+    set_display_generic_object(obj_number,1)
     try:
       attach_generic_object_to_molecule(obj_number, mol_id)
     except NameError:
       info_dialog("attach_generic_object_to_molecule is only present in Coot r6057 and later, sorry.")
-      pass
+  finally:
     turn_on_backup(mol_id)
+  return missing_segments_list
+
+
+#Highlight various items with ball-and-stick and lines
+def highlight_chain_breaks():
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  missing_segments_list = _highlight_chain_breaks_for_molecule(mol_id, True)
+  interesting_things_gui("Missing segments",missing_segments_list)
+
+
+def highlight_all_chain_breaks():
+  for mol_id in model_molecule_list():
+    _highlight_chain_breaks_for_molecule(mol_id, False)
 
 #Place helix and add helix restraints
 def place_helix_with_restraints():
@@ -10052,134 +9505,154 @@ def merge_chains():
 def rigid_body_fit_segments():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else:
-    mol_id=active_residue()[0]
-    segments=segment_list(mol_id)
-    for seg in segments:
+    return None
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
+  previous_immediate_replacement = refinement_immediate_replacement_state()
+  turn_off_backup(mol_id)
+  try:
+    for seg in segment_list(mol_id):
       res_start=seg[2]
       res_end=seg[3]
       ch_id=seg[1]
-      turn_off_backup(mol_id)
       set_refinement_immediate_replacement(1)
       rigid_body_refine_zone(mol_id,ch_id,res_start,res_end)
       accept_regularizement()
-      set_refinement_immediate_replacement(0)
-      turn_on_backup(mol_id)
+  finally:
+    set_refinement_immediate_replacement(previous_immediate_replacement)
+    turn_on_backup(mol_id)
       
 #Fit current segment
 def fit_this_segment():
   if (imol_refinement_map()==-1):
     info_dialog("You must set a refinement map!")
-  else: 
-    mol_id=active_residue()[0]
-    segments=segment_list(mol_id)
-    res_here=active_residue()[2]
-    ch_id=active_residue()[1]
-    for seg in segments:
-      if (res_here>=seg[2]) and (res_here<=seg[3]) and (ch_id==seg[1]):
-        res_start=seg[2]
-        res_end=seg[3]
-        ch_id=seg[1]
-        turn_off_backup(mol_id)
-        set_refinement_immediate_replacement(1)
-        rigid_body_refine_zone(mol_id,ch_id,res_start,res_end)
-        accept_regularizement()
-        set_refinement_immediate_replacement(0)
-        turn_on_backup(mol_id)
+    return None
+  segment_context = _active_segment_context_or_status()
+  if not segment_context:
+    return None
+  mol_id = segment_context["mol_id"]
+  previous_immediate_replacement = refinement_immediate_replacement_state()
+  turn_off_backup(mol_id)
+  try:
+    set_refinement_immediate_replacement(1)
+    rigid_body_refine_zone(
+      mol_id,
+      segment_context["chain_id"],
+      segment_context["segment_start"],
+      segment_context["segment_end"],
+    )
+    accept_regularizement()
+  finally:
+    set_refinement_immediate_replacement(previous_immediate_replacement)
+    turn_on_backup(mol_id)
 
 #Set default b-fac for new atoms to mean B for active mol
 def set_new_atom_b_fac_to_mean():
-  mol_id=active_residue()[0]
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
   mean_b=average_temperature_factor(mol_id)
   set_default_temperature_factor_for_new_atoms(mean_b)
+  
+
+def _active_terminal_growth_context_or_status():
+  active_atom = _active_atom_context_or_status()
+  if not active_atom:
+    return None
+  mol_id = active_atom["mol_id"]
+  ch_id = active_atom["chain_id"]
+  resn = active_atom["resno"]
+  first_in_seg = first_residue_in_seg(mol_id, ch_id, resn)
+  last_in_seg = last_residue_in_seg(mol_id, ch_id, resn)
+  active_atom["first_in_seg"] = first_in_seg
+  active_atom["last_in_seg"] = last_in_seg
+  active_atom["grow_from_n_term"] = abs(first_in_seg - resn) <= abs(last_in_seg - resn)
+  return active_atom
+
+
+def _run_terminal_growth_action(builder):
+  growth_context = _active_terminal_growth_context_or_status()
+  if not growth_context:
+    return None
+  set_go_to_atom_molecule(growth_context["mol_id"])
+  set_new_atom_b_fac_to_mean()
+  if growth_context["grow_from_n_term"]:
+    anchor_resno = growth_context["first_in_seg"]
+    destination_resno = anchor_resno - 1
+  else:
+    anchor_resno = growth_context["last_in_seg"]
+    destination_resno = anchor_resno + 1
+  set_go_to_atom_chain_residue_atom_name(growth_context["chain_id"], anchor_resno, growth_context["atom_name"])
+  builder(growth_context, anchor_resno)
+  sort_residues(growth_context["mol_id"])
+  set_go_to_atom_chain_residue_atom_name(growth_context["chain_id"], destination_resno, growth_context["atom_name"])
+  return 1
   
   
 #Shortcut for adding terminal residue (to bind to key)
 def add_term_shortcut():
-  if imol_refinement_map()!=-1:
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    resn=active_residue()[2]
-    atom_name=active_residue()[4]
-    first_in_seg=first_residue_in_seg(mol_id,ch_id,resn)
-    last_in_seg=last_residue_in_seg(mol_id,ch_id,resn)
-    delta_first=abs(first_in_seg-resn)
-    delta_last=abs(last_in_seg-resn)
-    set_new_atom_b_fac_to_mean()
-    if delta_first<=delta_last:
-      set_go_to_atom_molecule(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-      add_terminal_residue(mol_id,ch_id,first_in_seg,"auto",1)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg-1,atom_name)
-    else:
-      set_go_to_atom_molecule(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-      add_terminal_residue(mol_id,ch_id,last_in_seg,"auto",1)
-      sort_residues(mol_id)
-      set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg+1,atom_name)
-  else:
+  if imol_refinement_map()==-1:
     info_dialog("You must set a refinement map!")
+    return None
+  return _run_terminal_growth_action(
+    lambda growth_context, anchor_resno: add_terminal_residue(
+      growth_context["mol_id"],
+      growth_context["chain_id"],
+      anchor_resno,
+      "auto",
+      1,
+    )
+  )
     
 def add_term_shortcut_force():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  resn=active_residue()[2]
-  atom_name=active_residue()[4]
-  set_go_to_atom_molecule(mol_id)
-  first_in_seg=first_residue_in_seg(mol_id,ch_id,resn)
-  last_in_seg=last_residue_in_seg(mol_id,ch_id,resn)
-  delta_first=abs(first_in_seg-resn)
-  delta_last=abs(last_in_seg-resn)
-  set_new_atom_b_fac_to_mean()
-  if delta_first<=delta_last:
-    set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-    force_add_terminal_residue_noclick(mol_id,ch_id,first_in_seg)
-    sort_residues(mol_id)
-    set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg-1,atom_name)
-  else:
-    set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-    force_add_terminal_residue_noclick(mol_id,ch_id,last_in_seg)
-    sort_residues(mol_id)
-    set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg+1,atom_name)
+  return _run_terminal_growth_action(
+    lambda growth_context, anchor_resno: force_add_terminal_residue_noclick(
+      growth_context["mol_id"],
+      growth_context["chain_id"],
+      anchor_resno,
+    )
+  )
     
 def add_term_shortcut_force_strand():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
-  resn=active_residue()[2]
-  atom_name=active_residue()[4]
-  set_go_to_atom_molecule(mol_id)
-  first_in_seg=first_residue_in_seg(mol_id,ch_id,resn)
-  last_in_seg=last_residue_in_seg(mol_id,ch_id,resn)
-  delta_first=abs(first_in_seg-resn) 
-  delta_last=abs(last_in_seg-resn)
-  set_new_atom_b_fac_to_mean()
-  if delta_first<=delta_last:
-    set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg,atom_name)
-    force_add_terminal_residue_noclick_strand(mol_id,ch_id,first_in_seg)
-    sort_residues(mol_id)
-    set_go_to_atom_chain_residue_atom_name(ch_id,first_in_seg-1,atom_name)
-  else:
-    set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg,atom_name)
-    force_add_terminal_residue_noclick_strand(mol_id,ch_id,last_in_seg)
-    sort_residues(mol_id)
-    set_go_to_atom_chain_residue_atom_name(ch_id,last_in_seg+1,atom_name)
+  return _run_terminal_growth_action(
+    lambda growth_context, anchor_resno: force_add_terminal_residue_noclick_strand(
+      growth_context["mol_id"],
+      growth_context["chain_id"],
+      anchor_resno,
+    )
+  )
 
 #Fix all atoms in active residue
 def fix_active_residue():
-  ar=active_residue() #ar[0] is mol_id, 1 is ch_id, 2 is resnum, 3 is ins code, 4 is atom name (CA) and 5 is alt conf 
-  residue_info_list=residue_info(ar[0],ar[1],ar[2],ar[3])
+  active_atom = _active_atom_context_or_status()
+  if not active_atom:
+    return None
+  residue_info_list=residue_info_py(
+    active_atom["mol_id"],
+    active_atom["chain_id"],
+    active_atom["resno"],
+    active_atom["ins_code"],
+  )
   atom_list=[]
-  for item in residue_info_list: # residue item is list of list of lists. first item in first list of each list in the list is the atom name :-)
+  for item in residue_info_list:
     atom_name=item[0][0]
-    atom_info=[ar[1],ar[2],ar[3],atom_name,ar[5]] #Make a list of chain id, res number, ins code, atom name and alt conf. Not sure if alt conf and ins code are right way around here...
+    atom_info=[
+      active_atom["chain_id"],
+      active_atom["resno"],
+      active_atom["ins_code"],
+      atom_name,
+      active_atom["alt_conf"],
+    ]
     atom_list.append(atom_info)
-  mark_multiple_atoms_as_fixed(ar[0],atom_list,1)
+  mark_multiple_atoms_as_fixed(active_atom["mol_id"],atom_list,1)
   
 #Save and overwrite active model:
 def quicksave_active():
   import shutil
-  mol_id=active_residue()[0]
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
   filename=molecule_name(mol_id)
   filename_bak=filename+".bak"
   shutil.copy(filename,filename_bak)
@@ -10188,32 +9661,39 @@ def quicksave_active():
 
 #Refresh model from file (if changed externally for example)
 def reload_model():
-  mol_id=active_residue()[0]
+  mol_id = _active_molecule_or_status()
+  if mol_id is None:
+    return None
   filename=molecule_name(mol_id)
   clear_and_update_model_molecule_from_file(mol_id,filename)
 
 #Copy changes from active chain to NCS equivalents.
 def copy_ncs_chain_from_active():
-  mol_id=active_residue()[0]
-  ch_id=active_residue()[1]
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id = chain_context["chain_id"]
   turn_off_backup(mol_id)
-  ncs_control_change_ncs_master_to_chain_id(mol_id,ch_id)
-  copy_from_ncs_master_to_others(mol_id,ch_id)
-  turn_on_backup(mol_id)
+  try:
+    ncs_control_change_ncs_master_to_chain_id(mol_id, ch_id)
+    copy_from_ncs_master_to_others(mol_id, ch_id)
+  finally:
+    turn_on_backup(mol_id)
 
 def return_seq_as_string(mol_id,ch_id):
-  seq=''
+  seq_chars=[]
   for sn in range(0,chain_n_residues(ch_id,mol_id)):
     resno=seqnum_from_serial_number(mol_id,ch_id,sn)
     ins_code=insertion_code_from_serial_number(mol_id,ch_id,sn)
     residue_name_3_letter=residue_name(mol_id,ch_id,resno,ins_code)
     aa_code=three_letter_code2single_letter(residue_name_3_letter)
-    if (len(residue_name(mol_id,ch_id,resno,ins_code))==1):
+    if len(residue_name_3_letter)==1:
       aa_code=residue_name_3_letter
-    if (residue_name(mol_id,ch_id,resno,ins_code)!="ALA") and (aa_code=="A") and (len(residue_name(mol_id,ch_id,resno,ins_code))!=1):
+    elif residue_name_3_letter!="ALA" and aa_code=="A":
       aa_code="X"
-    seq=seq+aa_code
-  return seq
+    seq_chars.append(aa_code)
+  return "".join(seq_chars)
 
 def _compile_sequence_pattern(subseq):
   """Compile simple sequence search syntax such as X and (A/S)."""
@@ -10301,42 +9781,6 @@ def _sequence_match_list_entry(mol_id, ch_id, seq, sn_start, pattern_length):
   ]
 
 
-def _sequence_match_jump_target(mol_id, ch_id, serial_number):
-  """Return the residue-centred jump target for a sequence match."""
-  resno=seqnum_from_serial_number(mol_id,ch_id,serial_number)
-  ins_code=insertion_code_from_serial_number(mol_id,ch_id,serial_number)
-  alt_confs=residue_alt_confs(mol_id,ch_id,resno,ins_code)
-  # Try the blank alt-conf first: in Coot 1 a residue can report sidechain
-  # alternate conformers while the backbone CA/P atom itself is unalted.
-  alt_conf_candidates=[""]
-  for alt_conf in alt_confs:
-    if alt_conf not in alt_conf_candidates:
-      alt_conf_candidates.append(alt_conf)
-  for atom_name in ["CA", "P"]:
-    for alt_conf in alt_conf_candidates:
-      try:
-        atom_spec=atom_specs(mol_id,ch_id,resno,ins_code,atom_name,alt_conf)
-        return {
-          "resno": resno,
-          "atom_name": atom_name,
-          "x": atom_spec[-3],
-          "y": atom_spec[-2],
-          "z": atom_spec[-1],
-        }
-      except TypeError:
-        pass
-  residue_centre = residue_centre_py(mol_id, ch_id, resno, ins_code)
-  if isinstance(residue_centre, (list, tuple)) and len(residue_centre) == 3:
-    return {
-      "resno": resno,
-      "atom_name": " CA ",
-      "x": residue_centre[0],
-      "y": residue_centre[1],
-      "z": residue_centre[2],
-    }
-  return None
-
-
 def find_sequence_in_current_chain(subseq):
   subseq=subseq.upper().strip()
   residue=_active_residue_or_status()
@@ -10362,13 +9806,11 @@ def find_sequence_in_current_chain(subseq):
       index=index+1
   if len(sn_list)==1:
     sn_start=sn_list[0]
-    target=_sequence_match_jump_target(mol_id, ch_id, sn_start)
-    if not target:
+    interesting_entry=_sequence_match_list_entry(mol_id,ch_id,seq,sn_start,pattern_length)
+    if not interesting_entry:
       info_dialog("Found the sequence match, but could not locate a CA/P atom to center on.")
       return None
-    set_rotation_centre(target["x"],target["y"],target["z"])
-    set_go_to_atom_molecule(mol_id)
-    set_go_to_atom_chain_residue_atom_name(ch_id,target["resno"],target["atom_name"])
+    return _activate_interesting_entry(interesting_entry)
   elif len(sn_list)==0:
     info_dialog("Sequence not found!")
   elif len(sn_list)>1:
@@ -10447,217 +9889,215 @@ def find_sequence_in_current_chain(subseq):
 # executed at startup via exec(...); keeping them as direct code preserves
 # behavior while removing that startup-time string execution path.
 def set_map_level_quickly():
-  if scroll_wheel_map()!=-1 and map_is_displayed(scroll_wheel_map())!=0:
-    current_map_level=get_contour_level_in_sigma(scroll_wheel_map())
-    current_map_level="{0:.2f}".format(current_map_level)
-    def set_map_level_quickly_from_entry(X):
-      try:
-        map_level=float(X)
-        map_id=scroll_wheel_map()
-        set_contour_level_in_sigma(map_id, map_level)
-        _post_map_level_status(map_id, "set to")
-      except ValueError:
-        info_dialog("Has to be a number!") 
-    generic_single_entry("New map level in sigma/RMS?",current_map_level,"Set map level",set_map_level_quickly_from_entry)
-  else:
+  map_id = _scrollable_map_or_status()
+  if map_id is None:
+    return None
+  if map_is_displayed(map_id)==0:
     info_dialog("You need a (scrollable, displayed) map!")
+    return None
+  current_map_level="{0:.2f}".format(get_contour_level_in_sigma(map_id))
+  def set_map_level_quickly_from_entry(X):
+    try:
+      map_level=float(str(X).strip())
+    except ValueError:
+      info_dialog("Has to be a number!")
+      return 0
+    set_contour_level_in_sigma(map_id, map_level)
+    _post_map_level_status(map_id, "set to")
+    return 1
+  generic_single_entry("New map level in sigma/RMS?",current_map_level,"Set map level",set_map_level_quickly_from_entry)
+
+def _grow_secondary_structure_from_click(prompt_label, button_label, phi, psi, set_b_factor_range=True):
+  """Grow a secondary-structure segment from the clicked terminus."""
+  def grow_post_click(res1):
+    mol_id=_click_spec_imol(res1)
+    ch_id=_click_spec_chain_id(res1)
+    res_no_start=_click_spec_res_no(res1)
+    if mol_id == -1 or ch_id is False or res_no_start is False:
+      info_dialog(f"{button_label} requires a valid clicked residue.")
+      return 0
+
+    def grow_from_entry(n):
+      count = _parse_int_entry(n, f"{button_label} requires a positive integer.", minimum_value=1)
+      if count is None:
+        return 0
+      res_no=res_no_start
+      res_no_0=res_no
+      for _i in range(1, count+1):
+        add_terminal_residue_using_phi_psi(mol_id, ch_id, res_no, "auto", phi, psi)
+        sort_residues(mol_id)
+        if res_no == (first_residue_in_seg(mol_id, ch_id, res_no)+1):
+          res_no=res_no-1
+        elif res_no == (last_residue_in_seg(mol_id, ch_id, res_no)-1):
+          res_no=res_no+1
+      if set_b_factor_range:
+        set_b_factor_residue_range(mol_id, ch_id, res_no_0, res_no, default_new_atoms_b_factor())
+      return 1
+
+    generic_single_entry(prompt_label, "10", button_label, grow_from_entry)
+  user_defined_click(1, grow_post_click)
+
 
 #Grow helix from selected terminus
 def grow_helix():
-  def grow_helix_post_click(res1):
-    mol_id=_click_spec_imol(res1)
-    ch_id=_click_spec_chain_id(res1)
-    res_no_start=_click_spec_res_no(res1)
-    def grow_helix_enter_resn(n):
-      mol_id_local=mol_id
-      ch_id_local=ch_id
-      res_no=res_no_start
-      res_no_0=res_no
-      for i in range(1,(int(n)+1)):
-        res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
-        res_type,-57.82,-47)
-        sort_residues(mol_id_local)
-        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
-          res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
-          res_no=res_no+1
-      set_b_factor_residue_range(mol_id_local,ch_id_local,res_no_0,res_no,default_new_atoms_b_factor())
-    generic_single_entry("How many residues for helix?",
-    "10","Grow helix",grow_helix_enter_resn)
-  user_defined_click(1,grow_helix_post_click)
+  return _grow_secondary_structure_from_click(
+    "How many residues for helix?",
+    "Grow helix",
+    -57.82,
+    -47,
+    set_b_factor_range=True,
+  )
   
 #Grow strand from selected terminus
 def grow_strand():
-  def grow_strand_post_click(res1):
-    mol_id=_click_spec_imol(res1)
-    ch_id=_click_spec_chain_id(res1)
-    res_no_start=_click_spec_res_no(res1)
-    def grow_strand_enter_resn(n):
-      mol_id_local=mol_id
-      ch_id_local=ch_id
-      res_no=res_no_start
-      res_no_0=res_no
-      for i in range(1,(int(n)+1)):
-        res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
-        res_type,-139,135)
-        sort_residues(mol_id_local)
-        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
-          res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
-          res_no=res_no+1
-      set_b_factor_residue_range(mol_id_local,ch_id_local,res_no_0,res_no,default_new_atoms_b_factor())
-    generic_single_entry("How many residues for strand?",
-    "10","Grow strand",grow_strand_enter_resn)
-  user_defined_click(1,grow_strand_post_click)
+  return _grow_secondary_structure_from_click(
+    "How many residues for strand?",
+    "Grow strand",
+    -139,
+    135,
+    set_b_factor_range=True,
+  )
   
 #Grow para strand from selected terminus
 def grow_parallel_strand():
-  def grow_parallel_strand_post_click(res1):
-    mol_id=_click_spec_imol(res1)
-    ch_id=_click_spec_chain_id(res1)
-    res_no_start=_click_spec_res_no(res1)
-    def grow_parallel_strand_enter_resn(n):
-      mol_id_local=mol_id
-      ch_id_local=ch_id
-      res_no=res_no_start
-      for i in range(1,(int(n)+1)):
-        res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
-        res_type,-119,113)
-        sort_residues(mol_id_local)
-        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
-          res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
-          res_no=res_no+1
-    generic_single_entry("How many residues for parallel strand?",
-    "10","Grow parallel strand",grow_parallel_strand_enter_resn)
-  user_defined_click(1,grow_parallel_strand_post_click)
+  return _grow_secondary_structure_from_click(
+    "How many residues for parallel strand?",
+    "Grow parallel strand",
+    -119,
+    113,
+    set_b_factor_range=False,
+  )
 
 #Grow 3-10 helix from selected terminus
 def grow_helix_3_10():
-  def grow_helix_post_click(res1):
-    mol_id=_click_spec_imol(res1)
-    ch_id=_click_spec_chain_id(res1)
-    res_no_start=_click_spec_res_no(res1)
-    def grow_helix_enter_resn(n):
-      mol_id_local=mol_id
-      ch_id_local=ch_id
-      res_no=res_no_start
-      for i in range(1,(int(n)+1)):
-        res_type="auto"
-        add_terminal_residue_using_phi_psi(mol_id_local,ch_id_local,res_no,
-        res_type,-49,-26)
-        sort_residues(mol_id_local)
-        if (res_no==(first_residue_in_seg(mol_id_local,ch_id_local,res_no)+1)):
-          res_no=res_no-1
-        elif (res_no==(last_residue_in_seg(mol_id_local,ch_id_local,res_no)-1)):
-          res_no=res_no+1
-    generic_single_entry("How many residues for helix?",
-    "10","Grow 3-10 helix",grow_helix_enter_resn)
-  user_defined_click(1,grow_helix_post_click)
+  return _grow_secondary_structure_from_click(
+    "How many residues for helix?",
+    "Grow 3-10 helix",
+    -49,
+    -26,
+    set_b_factor_range=False,
+  )
 
 #Renumbers the active chain (from active_residue()). User enters new starting residue number.
 def renumber_by_first_res():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id=chain_context["mol_id"]
+  ch_id=chain_context["chain_id"]
+  first_res=first_residue(mol_id,ch_id)
+  last_res=last_residue(mol_id,ch_id)
   def renum_chain(new_num):
-    new_num=int(new_num)
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    first_res=first_residue(mol_id,ch_id)
-    last_res=last_residue(mol_id,ch_id)
+    new_num = _parse_int_entry(new_num, "Renumbering requires an integer residue number.")
+    if new_num is None:
+      return 0
     offset=new_num-first_res
     renumber_residue_range(mol_id,ch_id,first_res,last_res,int(offset))
-    delete_all_extra_restraints(mol_id)
-    set_show_extra_restraints(mol_id,0)
-    set_show_extra_restraints(mol_id,1)
+    _refresh_extra_restraints_display(mol_id)
+    return 1
   generic_single_entry("New number for first residue in this chain?",
-  str(seqnum_from_serial_number(active_residue()[0],
-  "%s"%(active_residue()[1]),0)),"Renumber",renum_chain)
+  str(first_res),"Renumber",renum_chain)
   
 #Renumbers the active chain (from active_residue()). User enters new last residue number.
 def renumber_by_last_res():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id=chain_context["mol_id"]
+  ch_id=chain_context["chain_id"]
+  first_res=first_residue(mol_id,ch_id)
+  last_res=last_residue(mol_id,ch_id)
   def renum_chain(new_num):
-    new_num=int(new_num)
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    first_res=first_residue(mol_id,ch_id)
-    last_res=last_residue(mol_id,ch_id)
+    new_num = _parse_int_entry(new_num, "Renumbering requires an integer residue number.")
+    if new_num is None:
+      return 0
     offset=new_num-last_res
     renumber_residue_range(mol_id,ch_id,first_res,last_res,int(offset))
-    delete_all_extra_restraints(mol_id)
-    set_show_extra_restraints(mol_id,0)
-    set_show_extra_restraints(mol_id,1)
+    _refresh_extra_restraints_display(mol_id)
+    return 1
   generic_single_entry("New number for last residue in this chain?",
-  str(seqnum_from_serial_number(active_residue()[0],
-  "%s"%(active_residue()[1]),
-  (chain_n_residues(active_residue()[1],active_residue()[0])-1))),"Renumber",renum_chain)
+  str(last_res),"Renumber",renum_chain)
   
 #Renumbers the active chain (from active_residue()). User enters new active residue number.
 def renumber_by_active_res():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id=chain_context["mol_id"]
+  ch_id=chain_context["chain_id"]
+  current_num=chain_context["resno"]
+  first_res=first_residue(mol_id,ch_id)
+  last_res=last_residue(mol_id,ch_id)
   def renum_chain(new_num):
-    new_num=int(new_num)
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    current_num=active_residue()[2]
-    first_res=first_residue(mol_id,ch_id)
-    last_res=last_residue(mol_id,ch_id)
+    new_num = _parse_int_entry(new_num, "Renumbering requires an integer residue number.")
+    if new_num is None:
+      return 0
     offset=new_num-current_num
     renumber_residue_range(mol_id,ch_id,first_res,last_res,int(offset))
-    delete_all_extra_restraints(mol_id)
-    set_show_extra_restraints(mol_id,0)
-    set_show_extra_restraints(mol_id,1)
+    _refresh_extra_restraints_display(mol_id)
+    return 1
   generic_single_entry("New number for this residue?",
-  str(active_residue()[2]),"Renumber",renum_chain)
+  str(current_num),"Renumber",renum_chain)
 
 #Renumber from N-term to current residue
 def renumber_n_term_segment():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id=chain_context["mol_id"]
+  ch_id=chain_context["chain_id"]
+  resn=chain_context["resno"]
+  first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
   def renumber_n_term_segment_entry(new_resn):
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    resn=active_residue()[2]
-    first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
-    offset=int(new_resn)-resn
+    new_resn = _parse_int_entry(new_resn, "Renumbering requires an integer residue number.")
+    if new_resn is None:
+      return 0
+    offset=new_resn-resn
     renumber_residue_range(mol_id,ch_id,first_res,resn,offset)
-    delete_all_extra_restraints(mol_id)
-    set_show_extra_restraints(mol_id,0)
-    set_show_extra_restraints(mol_id,1)
+    _refresh_extra_restraints_display(mol_id)
+    return 1
   generic_single_entry("New residue number?",
-  str(active_residue()[2]),"Renumber",renumber_n_term_segment_entry)
+  str(resn),"Renumber",renumber_n_term_segment_entry)
   
 #Renumber from current residue to C-term
 def renumber_c_term_segment():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id=chain_context["mol_id"]
+  ch_id=chain_context["chain_id"]
+  resn=chain_context["resno"]
+  last_res=last_residue(mol_id,ch_id)
   def renumber_c_term_segment_entry(new_resn):
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
-    resn=active_residue()[2]
-    def last_residue(mol_id,ch_id):
-      n=chain_n_residues(ch_id,mol_id)-1
-      result=seqnum_from_serial_number(mol_id,"%s"%(ch_id),n)
-      return result
-    last_res=last_residue(mol_id,ch_id)
-    offset=int(new_resn)-resn
+    new_resn = _parse_int_entry(new_resn, "Renumbering requires an integer residue number.")
+    if new_resn is None:
+      return 0
+    offset=new_resn-resn
     renumber_residue_range(mol_id,ch_id,resn,last_res,offset)
-    delete_all_extra_restraints(mol_id)
-    set_show_extra_restraints(mol_id,0)
-    set_show_extra_restraints(mol_id,1)
+    _refresh_extra_restraints_display(mol_id)
+    return 1
   generic_single_entry("New residue number?",
-  str(active_residue()[2]),"Renumber",renumber_c_term_segment_entry)
+  str(resn),"Renumber",renumber_c_term_segment_entry)
   
 #Reload map with different hi-res limit
 def change_hires_limit():
-  if (scroll_wheel_map()==-1):
+  map_id = _scrollable_map_or_status()
+  if map_id is None:
     info_dialog("You need a map!")
   else:
     def change_hires_by_entry(new_res):
-      mol=scroll_wheel_map()
-      new_res=float(new_res)
-      mtz_file=map_parameters(mol)[0]
-      F_col=map_parameters(mol)[1]
-      PHI_col=map_parameters(mol)[2]
+      try:
+        new_res=float(str(new_res).strip())
+      except Exception:
+        info_dialog("High-resolution limit must be a number.")
+        return 0
+      mtz_file=map_parameters(map_id)[0]
+      F_col=map_parameters(map_id)[1]
+      PHI_col=map_parameters(map_id)[2]
       make_and_draw_map_with_reso_with_refmac_params(mtz_file,F_col,PHI_col,"",0,0,0,"Fobs:None-specified",
       "SigF:None-specified","RFree:None-specified",0,0,1,1000.0,new_res)
-      close_molecule(mol)
+      close_molecule(map_id)
+      return 1
     generic_single_entry("New high-res limit for map?",
     "5.0","Change high resolution limit for active map",change_hires_by_entry)
     
@@ -12325,9 +11765,12 @@ def add_common_monomer_menu_entries(menu, entries):
 
 #Colors subset of protein residues red, provided by user as string of single-letter ids.
 def color_protein_residue_subset():
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  mol_id = residue[0]
   def color_from_string(X):
     entry=str(X).upper() #capitalize
-    mol_id=active_residue()[0]
     aa_dic={'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS','E':'GLU','Q':'GLN','G':'GLY','H':'HIS','I':'ILE','L':'LEU','K':'LYS','M':'MET','F':'PHE','P':'PRO','S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL','X':'UNK'}
     highlight_colour=34 #red
     blank_colour=0 #light grey
@@ -12335,8 +11778,7 @@ def color_protein_residue_subset():
     resname_list=[]
     for char in entry:
       if (aa_dic.get(char,0)!=0): #make a list of 3-letter resnames from user supplied string by checking aa_dic
-        resname=[(aa_dic.get(char,0))]
-        resname_list=resname_list+resname
+        resname_list.append(aa_dic.get(char,0))
     for ch_id in chain_ids(mol_id):
       sn_max=chain_n_residues(ch_id,mol_id)
       for sn in  range(0,sn_max+1):
@@ -12345,23 +11787,48 @@ def color_protein_residue_subset():
           if resname==resname_here:
             resn=seqnum_from_serial_number(mol_id,ch_id,sn)
             ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-            residue_to_color=[([ch_id,resn,ins_id],highlight_colour)]
-            residue_list=residue_list+residue_to_color
+            residue_list.append(([ch_id,resn,ins_id],highlight_colour))
         if resname_here not in resname_list:
           resn=seqnum_from_serial_number(mol_id,ch_id,sn)
           ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-          residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-          residue_list=residue_list+residue_to_color
+          residue_list.append(([ch_id,resn,ins_id],blank_colour))
     _apply_user_defined_residue_colours(mol_id, [], residue_list)
   generic_single_entry("Residues to color? Single letter code (e.g. DE or de will color Asp/Glu)","A","Color entered residue types!",color_from_string)
+
+def _place_new_secondary_structure(prompt_label, button_label, phi, psi):
+  """Create a new poly-Ala secondary-structure fragment with idealized torsions."""
+  def place_from_entry(n):
+    count = _parse_int_entry(n, f"{button_label} requires a positive integer.", minimum_value=1)
+    if count is None:
+      return 0
+    get_monomer_no_H("ALA")
+    if not model_molecule_list():
+      info_dialog(f"Failed to create the starting monomer for {button_label}.")
+      return 0
+    mol_id=model_molecule_list()[-1]
+    ch_id=chain_ids(mol_id)[0]
+    res_no=1
+    ins_code=""
+    altloc=""
+    delete_atom(mol_id,ch_id,1,ins_code," OXT",altloc)
+    for _i in range(1, count):
+      add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,"auto",phi,psi)
+      res_no=res_no+1
+    return 1
+  generic_single_entry(prompt_label, "10", button_label, place_from_entry)
 
 #Mutate active chain to entered sequence
 default_seq="MAAAA"
 def mutate_by_resnum():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  mol_id = chain_context["mol_id"]
+  ch_id = chain_context["chain_id"]
   def enter_seq(seq):
     global default_seq
     seq=str(seq).upper()
-    seq.replace(" ", "")
+    seq=seq.replace(" ", "")
     seq_dic={}
     len_seq=len(seq)
     n=0
@@ -12369,12 +11836,13 @@ def mutate_by_resnum():
     aa_dic={'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS','E':'GLU',
     'Q':'GLN','G':'GLY','H':'HIS','I':'ILE','L':'LEU','K':'LYS','M':'MET',
     'F':'PHE','P':'PRO','S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL'}
-    clean_seq=''
+    valid_polymer_resnames = set(aa_dic.values()) | {"MSE"}
+    clean_seq_chars=[]
     while (n<len_seq): 
       if ((seq[n].isalpha() and (seq[n] in aa_dic))):
-        clean_seq=clean_seq+seq[n]
+        clean_seq_chars.append(seq[n])
       n=n+1
-    seq=clean_seq
+    seq="".join(clean_seq_chars)
     default_seq=seq
     len_seq=len(seq)
     n=0
@@ -12382,97 +11850,72 @@ def mutate_by_resnum():
       value=aa_dic[seq[n]]
       seq_dic[n+1]=value
       n=n+1
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
     sn=0
     last_sn=chain_n_residues(ch_id,mol_id)-1
     turn_off_backup(mol_id)
-    while (sn<=last_sn):
-      res=resname_from_serial_number(mol_id,ch_id,sn)
-      seqnum=seqnum_from_serial_number(mol_id,ch_id,sn)
-      ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-      if ((res!=seq_dic.get(seqnum)) and ((res in list(aa_dic.values())) or (res=="MSE"))):
-        if seq_dic.get(seqnum):
-          mutate(mol_id,ch_id,seqnum,ins_id,seq_dic.get(seqnum))
-          if seq_dic.get(seqnum)!="PRO":
-            delete_residue_sidechain(mol_id,ch_id,seqnum,ins_id,0)
-      sn=sn+1
-    turn_on_backup(mol_id)
+    try:
+      while (sn<=last_sn):
+        res=resname_from_serial_number(mol_id,ch_id,sn)
+        seqnum=seqnum_from_serial_number(mol_id,ch_id,sn)
+        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
+        if ((res!=seq_dic.get(seqnum)) and (res in valid_polymer_resnames)):
+          if seq_dic.get(seqnum):
+            mutate(mol_id,ch_id,seqnum,ins_id,seq_dic.get(seqnum))
+            if seq_dic.get(seqnum)!="PRO":
+              delete_residue_sidechain(mol_id,ch_id,seqnum,ins_id,0)
+        sn=sn+1
+    finally:
+      turn_on_backup(mol_id)
   generic_single_entry("Enter raw amino acid sequence (must be complete!)",
   default_seq,"Mutate active chain to match sequence using PDB numbering", enter_seq)
 
 #Make new helix (don't fit)
 def place_new_helix():
-  def place_new_helix_entry(n):
-    get_monomer_no_H("ALA")
-    mol_id=model_molecule_list()[-1]
-    ch_id=chain_ids(mol_id)[0]
-    res_no=1
-    ins_code=""
-    altloc=""
-    delete_atom(mol_id,ch_id,1,ins_code," OXT",altloc)
-    res_type="auto"
-    for i in range(1,int(n)):
-      add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-      res_type,-57.82,-47)
-      res_no=res_no+1
-  generic_single_entry("How many residues for helix?",
-  "10","Place helix",place_new_helix_entry)
+  return _place_new_secondary_structure(
+    "How many residues for helix?",
+    "Place helix",
+    -57.82,
+    -47,
+  )
   
 #Make new strand (don't fit)
 def place_new_strand():
-  def place_new_strand_entry(n):
-    get_monomer_no_H("ALA")
-    mol_id=model_molecule_list()[-1]
-    ch_id=chain_ids(mol_id)[0]
-    res_no=1
-    ins_code=""
-    altloc=""
-    delete_atom(mol_id,ch_id,1,ins_code," OXT",altloc)
-    res_type="auto"
-    for i in range(1,int(n)):
-      add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-      res_type,-139,135)
-      res_no=res_no+1
-  generic_single_entry("How many residues for strand?",
-  "10","Place strand",place_new_strand_entry)
+  return _place_new_secondary_structure(
+    "How many residues for strand?",
+    "Place strand",
+    -139,
+    135,
+  )
 
 #Make new 3-10 helix (don't fit)
 def place_new_3_10_helix():
-  def place_new_3_10_helix_entry(n):
-    get_monomer_no_H("ALA")
-    mol_id=model_molecule_list()[-1]
-    ch_id=chain_ids(mol_id)[0]
-    res_no=1
-    ins_code=""
-    altloc=""
-    delete_atom(mol_id,ch_id,1,ins_code," OXT",altloc)
-    res_type="auto"
-    for i in range(1,int(n)):
-      add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-      res_type,-49,-26)
-      res_no=res_no+1
-  generic_single_entry("How many residues for 3-10 helix?",
-  "10","Place 3-10 helix",place_new_3_10_helix_entry)
+  return _place_new_secondary_structure(
+    "How many residues for 3-10 helix?",
+    "Place 3-10 helix",
+    -49,
+    -26,
+  )
 
 #Renumber active segment by active residue
 def renumber_seg_by_active_res():
+  chain_context = _active_chain_context_or_status()
+  if not chain_context:
+    return None
+  current_num=chain_context["resno"]
+  mol_id=chain_context["mol_id"]
+  ch_id=chain_context["chain_id"]
   def renum_seg(new_num):
-    new_num=int(new_num)
-    current_num=active_residue()[2]
-    mol_id=active_residue()[0]
-    ch_id=active_residue()[1]
+    new_num = _parse_int_entry(new_num, "Renumbering requires an integer residue number.")
+    if new_num is None:
+      return 0
     seg_count=0
     segments=segment_list(mol_id)
     last_res=last_polymer_residue(mol_id,ch_id)
-    print(last_res)
     first_res=first_residue(mol_id,ch_id)
-    print(first_res)
     new_seg_list=[]
     for seg in segments:
       if ch_id==seg[1]:
         new_seg_list.append(seg) 
-    print(new_seg_list)
     for seg in new_seg_list:
       seg_count=seg_count+1
       if (current_num>=seg[2]) and (current_num<=seg[3]):
@@ -12488,11 +11931,11 @@ def renumber_seg_by_active_res():
           renumber_residue_range(mol_id,ch_id,res_start,res_end,int(offset))
         else:
           info_dialog("No can do, this would result in overlapping sequence numbering!")
-        delete_all_extra_restraints(mol_id)
-        set_show_extra_restraints(mol_id,0)
-        set_show_extra_restraints(mol_id,1)
+        _refresh_extra_restraints_display(mol_id)
+        return 1
+    return 0
   generic_single_entry("New number for this residue?",
-  str(active_residue()[2]),"Renumber",renum_seg)
+  str(current_num),"Renumber",renum_seg)
 
 def find_sequence_with_entry():
   generic_single_entry("Enter sequence fragment to find\n(X=wildcard, (A/S)=either residue)",
@@ -12513,7 +11956,6 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
         atom_spec_1 = args[0]
         atom_spec_2 = args[1]
         imol = atom_spec_1[1]
-        print("BL DEBUG:: imol: %s spec 1: %s and 2: %s" %(imol, atom_spec_1, atom_spec_2))
         add_extra_bond_restraint(imol, atom_spec_1[2], atom_spec_1[3], atom_spec_1[4], atom_spec_1[5], atom_spec_1[6], atom_spec_2[2], atom_spec_2[3], atom_spec_2[4], atom_spec_2[5], atom_spec_2[6], bl, 0.035)
       user_defined_click(2, make_restr_dist)
       if continue_qm:
@@ -12939,13 +12381,13 @@ add_simple_coot_menu_menuitem(submenu_display,
 "Switch all mols to CA representation",lambda func: all_mols_to_ca())
 
 add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by rotamer prob (outliers magenta) and missing atoms (blue)", lambda func: color_rotamer_outliers_and_missing_atoms(active_residue()[0]))
+"Color active mol by rotamer prob (outliers magenta) and missing atoms (blue)", lambda func: color_rotamer_outliers_and_missing_atoms_for_active_molecule())
 
 add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by hydrophobics (orange), polars (blue), glys (magenta) and pros (green)", lambda func: color_polars_and_hphobs(active_residue()[0]))
+"Color active mol by hydrophobics (orange), polars (blue), glys (magenta) and pros (green)", lambda func: color_polars_and_hphobs_for_active_molecule())
 
 add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by charge (+ve blue, -ve red)", lambda func: color_by_charge(active_residue()[0]))
+"Color active mol by charge (+ve blue, -ve red)", lambda func: color_by_charge_for_active_molecule())
 
 add_simple_coot_menu_menuitem(submenu_colour,
 "Uncolor other chains in active mol", lambda func: uncolor_other_chains())
@@ -12957,11 +12399,11 @@ add_simple_coot_menu_menuitem(submenu_colour,
 "Color active segment", lambda func: colour_active_segment())
 
 add_simple_coot_menu_menuitem(submenu_colour,
-"Color by protein/nucleic acid", lambda func: color_protein_na(active_residue()[0]))
+"Color by protein/nucleic acid", lambda func: color_protein_na_for_active_molecule())
 
 
 add_simple_coot_menu_menuitem(submenu_colour,
-"Color waters", lambda func: color_waters(active_residue()[0]))
+"Color waters", lambda func: color_waters_for_active_molecule())
 
 add_simple_coot_menu_menuitem(submenu_colour, "Colour entered subset of protein residues for active mol", lambda func: color_protein_residue_subset())
 
