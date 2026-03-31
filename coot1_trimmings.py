@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -23,6 +24,7 @@ from functools import lru_cache
 
 STARTUP_DIAGNOSTIC_MESSAGES = []
 _STARTUP_DIAGNOSTIC_DIALOGS_SHOWN = set()
+gi = None
 
 
 def _record_startup_diagnostic(level, message):
@@ -42,15 +44,6 @@ def _show_startup_diagnostic_once(key, message):
     print("coot_trimmings startup notice:", message)
   return None
 
-
-try:
-  import gi
-except Exception as error:
-  _record_startup_diagnostic(
-    "warning",
-    f"Could not import gi ({error!r}). Gtk-based helpers may be unavailable.",
-  )
-  gi = types.SimpleNamespace()
 
 try:
   import coot
@@ -106,11 +99,6 @@ try:
 except Exception:
   gemmi = None
 
-if not hasattr(gi, "require_version"):
-  def _require_version(_namespace, _version):
-    return None
-  gi.require_version = _require_version
-
 from coot import *
 from coot_utils import *
 
@@ -128,9 +116,261 @@ if not hasattr(coot_utils, "regularize_zone"):
 if not hasattr(coot_utils, "get_view_matrix_element"):
   coot_utils.get_view_matrix_element = coot.get_view_matrix_element
 
+_OPTIONAL_COOT_API_WARNINGS_SHOWN = set()
+_COOT_RESIDUE_COMPAT_WARNINGS_SHOWN = set()
+_raw_residue_info_py = coot.residue_info_py
+_raw_residue_name = globals().get("_raw_residue_name", residue_name)
+_raw_residue_exists_qm = globals().get("_raw_residue_exists_qm", residue_exists_qm)
+_raw_residue_centre_py = globals().get("_raw_residue_centre_py", residue_centre_py)
+
+
+def _coot_text_arg(value):
+  """Normalize Python values for Coot APIs that expect char const *."""
+  if value in (None, False):
+    return ""
+  if isinstance(value, bytes):
+    try:
+      return value.decode("utf-8")
+    except Exception:
+      return value.decode("latin-1", errors="ignore")
+  return str(value)
+
+
+def _coot_int_arg(value):
+  """Normalize Python values for Coot APIs that expect an integer residue number."""
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    return int(value)
+  if isinstance(value, int):
+    return value
+  if isinstance(value, float):
+    return int(value)
+  if isinstance(value, str):
+    stripped_value = value.strip()
+    if not stripped_value:
+      return None
+    try:
+      return int(stripped_value)
+    except Exception:
+      match = re.search(r"[-+]?\d+", stripped_value)
+      if match:
+        try:
+          return int(match.group(0))
+        except Exception:
+          return None
+      return None
+  if isinstance(value, (list, tuple)):
+    for item in value:
+      normalized_item = _coot_int_arg(item)
+      if normalized_item is not None:
+        return normalized_item
+    return None
+  for attr_name in ("num", "resno", "seqnum", "value"):
+    if hasattr(value, attr_name):
+      normalized_item = _coot_int_arg(getattr(value, attr_name))
+      if normalized_item is not None:
+        return normalized_item
+  try:
+    return int(value)
+  except Exception:
+    return None
+
+
+def _coot_residue_spec_tuple(chain_id, resno, ins_code):
+  """Return a normalized residue-spec tuple suitable for Coot C++ bindings."""
+  return (_coot_text_arg(chain_id), _coot_int_arg(resno), _coot_text_arg(ins_code))
+
+
+def _coot_residue_spec_from_spec(spec):
+  """Parse common Coot residue-spec payload variants into (chain, resno, ins_code)."""
+  if not isinstance(spec, (list, tuple)):
+    return None
+
+  candidate_specs = []
+  spec_list = list(spec)
+  candidate_specs.append(spec_list)
+
+  if len(spec_list) >= 4:
+    candidate_specs.append(spec_list[1:4])
+
+  for item in spec_list[:2]:
+    if isinstance(item, (list, tuple)):
+      nested_spec = list(item)
+      candidate_specs.append(nested_spec)
+      if len(nested_spec) >= 4:
+        candidate_specs.append(nested_spec[1:4])
+
+  seen_candidates = set()
+  for candidate in candidate_specs:
+    candidate_key = tuple(repr(value) for value in candidate)
+    if candidate_key in seen_candidates:
+      continue
+    seen_candidates.add(candidate_key)
+    try:
+      chain_id = residue_spec_to_chain_id(candidate)
+      resno = residue_spec_to_res_no(candidate)
+      ins_code = residue_spec_to_ins_code(candidate)
+    except Exception:
+      continue
+    if chain_id is False or resno is False or ins_code is False:
+      continue
+    residue_spec = _coot_residue_spec_tuple(chain_id, resno, ins_code)
+    if residue_spec[0] and residue_spec[1] is not None:
+      return residue_spec
+  return None
+
+
+def residue_info_py(imol, chain_id, resno, ins_code):
+  """Compatibility wrapper around Coot's residue_info_py for stricter builds."""
+  normalized_chain_id, normalized_resno, normalized_ins_code = _coot_residue_spec_tuple(
+    chain_id, resno, ins_code
+  )
+  if normalized_resno is None:
+    warning_key = ("bad_residue_info_resno", repr(resno))
+    if warning_key not in _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN:
+      _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN.add(warning_key)
+      print(
+        "coot_trimmings compatibility warning: could not normalize residue number for residue_info_py:",
+        repr((chain_id, resno, ins_code)),
+      )
+    return []
+  try:
+    return _raw_residue_info_py(imol, normalized_chain_id, normalized_resno, normalized_ins_code) or []
+  except TypeError:
+    warning_key = ("residue_info_typeerror", repr((normalized_chain_id, normalized_resno, normalized_ins_code)))
+    if warning_key not in _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN:
+      _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN.add(warning_key)
+      print(
+        "coot_trimmings compatibility warning: residue_info_py rejected normalized residue spec:",
+        repr((normalized_chain_id, normalized_resno, normalized_ins_code)),
+      )
+      traceback.print_exc()
+    return []
+
+
+def residue_name(imol, chain_id, resno, ins_code):
+  """Compatibility wrapper around residue_name for stricter Python/C++ bindings."""
+  normalized_chain_id, normalized_resno, normalized_ins_code = _coot_residue_spec_tuple(
+    chain_id, resno, ins_code
+  )
+  if normalized_resno is None:
+    return ""
+  try:
+    return _raw_residue_name(imol, normalized_chain_id, normalized_resno, normalized_ins_code) or ""
+  except TypeError:
+    warning_key = ("residue_name_typeerror", repr((normalized_chain_id, normalized_resno, normalized_ins_code)))
+    if warning_key not in _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN:
+      _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN.add(warning_key)
+      print(
+        "coot_trimmings compatibility warning: residue_name rejected normalized residue spec:",
+        repr((normalized_chain_id, normalized_resno, normalized_ins_code)),
+      )
+      traceback.print_exc()
+    return ""
+
+
+def residue_exists_qm(imol, chain_id, resno, ins_code):
+  """Compatibility wrapper around residue_exists_qm for stricter Python/C++ bindings."""
+  normalized_chain_id, normalized_resno, normalized_ins_code = _coot_residue_spec_tuple(
+    chain_id, resno, ins_code
+  )
+  if normalized_resno is None:
+    return 0
+  try:
+    return _raw_residue_exists_qm(imol, normalized_chain_id, normalized_resno, normalized_ins_code)
+  except TypeError:
+    warning_key = ("residue_exists_typeerror", repr((normalized_chain_id, normalized_resno, normalized_ins_code)))
+    if warning_key not in _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN:
+      _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN.add(warning_key)
+      print(
+        "coot_trimmings compatibility warning: residue_exists_qm rejected normalized residue spec:",
+        repr((normalized_chain_id, normalized_resno, normalized_ins_code)),
+      )
+      traceback.print_exc()
+    return 0
+
+
+def residue_centre_py(imol, chain_id, resno, ins_code):
+  """Compatibility wrapper around residue_centre_py for stricter Python/C++ bindings."""
+  normalized_chain_id, normalized_resno, normalized_ins_code = _coot_residue_spec_tuple(
+    chain_id, resno, ins_code
+  )
+  if normalized_resno is None:
+    return None
+  try:
+    return _raw_residue_centre_py(imol, normalized_chain_id, normalized_resno, normalized_ins_code)
+  except TypeError:
+    warning_key = ("residue_centre_typeerror", repr((normalized_chain_id, normalized_resno, normalized_ins_code)))
+    if warning_key not in _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN:
+      _COOT_RESIDUE_COMPAT_WARNINGS_SHOWN.add(warning_key)
+      print(
+        "coot_trimmings compatibility warning: residue_centre_py rejected normalized residue spec:",
+        repr((normalized_chain_id, normalized_resno, normalized_ins_code)),
+      )
+      traceback.print_exc()
+    return None
+
+
+def _call_optional_coot_api(api_name, *args):
+  """Call a non-essential Coot API if this build exposes it."""
+  api_function = globals().get(api_name, getattr(coot, api_name, None))
+  if not callable(api_function):
+    if api_name not in _OPTIONAL_COOT_API_WARNINGS_SHOWN:
+      _OPTIONAL_COOT_API_WARNINGS_SHOWN.add(api_name)
+      _record_startup_diagnostic(
+        "warning",
+        f"This Coot build does not expose optional API {api_name}(), so that startup tweak was skipped.",
+      )
+    return None
+  return api_function(*args)
+
+
+def _lazy_import_gi():
+  """Import gi only on demand, to avoid mixing GTK stacks unnecessarily."""
+  global gi
+  if gi is not None:
+    return gi
+  try:
+    import gi as gi_module
+  except Exception as error:
+    _record_startup_diagnostic(
+      "warning",
+      f"Could not import gi ({error!r}). Gtk-based helpers may be unavailable.",
+    )
+    gi = types.SimpleNamespace()
+    return gi
+  if not hasattr(gi_module, "require_version"):
+    def _require_version(_namespace, _version):
+      return None
+    gi_module.require_version = _require_version
+  gi = gi_module
+  return gi
+
+
+def _coot_gui_repository_module(module_name):
+  """Prefer Gtk/Gio/GLib objects exposed by coot_gui over direct gi imports."""
+  coot_gui_module = globals().get("coot_gui")
+  if coot_gui_module is not None and hasattr(coot_gui_module, module_name):
+    return getattr(coot_gui_module, module_name)
+  gi_module = _lazy_import_gi()
+  if not hasattr(gi_module, "repository"):
+    try:
+      return __import__("gi.repository", fromlist=[module_name]).__dict__.get(module_name)
+    except Exception:
+      return None
+  try:
+    return getattr(gi_module.repository, module_name)
+  except Exception:
+    try:
+      return __import__("gi.repository", fromlist=[module_name]).__dict__.get(module_name)
+    except Exception:
+      return None
+
+
 def _gap_residue_info_compat(imol, chain_id, resno, ins_code):
   """Match gap.py's older expectation that residue_info() returns a list."""
-  return coot.residue_info_py(imol, chain_id, resno, ins_code) or []
+  return residue_info_py(imol, chain_id, resno, ins_code) or []
 
 if gap is not None:
   gap.residue_info = _gap_residue_info_compat
@@ -282,7 +522,7 @@ def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restr
     else:
       res_limits = [start_resno - 1, stop_resno + 1]
 
-    if all([coot_utils.residue_exists_qm(imol, chain_id, resno, "") for resno in res_limits]):
+    if all([residue_exists_qm(imol, chain_id, resno, "") for resno in res_limits]):
       imol_backwards = coot.copy_molecule(imol)
       if valid_model_molecule_qm(imol_backwards):
         temp_imols.add(imol_backwards)
@@ -729,10 +969,12 @@ def _apply_startup_settings():
   set_symmetry_size(STARTUP_SYMMETRY_SIZE)
   set_nomenclature_errors_on_read(STARTUP_NOMENCLATURE_ERRORS_MODE)
   set_reorienting_next_residue_mode(STARTUP_REORIENTING_NEXT_RESIDUE_MODE)
-  set_user_defined_rotation_centre_crosshairs_size_scale_factor(
+  _call_optional_coot_api(
+    "set_user_defined_rotation_centre_crosshairs_size_scale_factor",
     STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE
   )
-  set_rotation_centre_cross_hairs_colour(
+  _call_optional_coot_api(
+    "set_rotation_centre_cross_hairs_colour",
     *STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR
   )
 
@@ -750,6 +992,31 @@ def _scrollable_map_or_status():
   """Return the current scroll-wheel map, or show a short status message."""
   map_id = scroll_wheel_map()
   if map_id != -1 and map_id in map_molecule_list():
+    return map_id
+  map_id = imol_refinement_map()
+  if map_id != -1 and map_id in map_molecule_list():
+    try:
+      set_scroll_wheel_map(map_id)
+      set_scrollable_map(map_id)
+    except Exception:
+      pass
+    return map_id
+  for map_id in map_molecule_list():
+    if map_is_displayed(map_id):
+      try:
+        set_scroll_wheel_map(map_id)
+        set_scrollable_map(map_id)
+      except Exception:
+        pass
+      return map_id
+  map_ids = map_molecule_list()
+  if map_ids:
+    map_id = map_ids[0]
+    try:
+      set_scroll_wheel_map(map_id)
+      set_scrollable_map(map_id)
+    except Exception:
+      pass
     return map_id
   add_status_bar_text("No active map")
   return None
@@ -1477,7 +1744,7 @@ def _find_model_molecule_for_click_spec(chain_id, resno, ins_code):
 
 def _click_spec_field(click_spec, long_index, short_index, default=None):
   """Read a field from either of the common Coot 1.x click-spec layouts."""
-  if not isinstance(click_spec, list):
+  if not isinstance(click_spec, (list, tuple)):
     return default
   if len(click_spec) >= 7:
     return click_spec[long_index]
@@ -1494,11 +1761,11 @@ def _click_spec_imol(click_spec):
   back to a residue lookup and finally the active residue.
   """
   valid_model_mols = model_molecule_list()
-  if not isinstance(click_spec, list):
+  if not isinstance(click_spec, (list, tuple)):
     residue = active_residue()
     return residue[0] if residue and residue[0] in valid_model_mols else -1
-  first_imol = _click_spec_field(click_spec, 0, 0, -1)
-  second_imol = _click_spec_field(click_spec, 1, 0, -1)
+  first_imol = _coot_int_arg(_click_spec_field(click_spec, 0, 0, -1))
+  second_imol = _coot_int_arg(_click_spec_field(click_spec, 1, 0, -1))
   if isinstance(first_imol, int) and first_imol in valid_model_mols:
     return first_imol
   if len(click_spec) >= 7 and isinstance(second_imol, int) and second_imol in valid_model_mols:
@@ -1516,23 +1783,25 @@ def _click_spec_imol(click_spec):
 
 
 def _click_spec_chain_id(click_spec):
-  return _click_spec_field(click_spec, 2, 1, False)
+  chain_id = _click_spec_field(click_spec, 2, 1, False)
+  return False if chain_id is False else _coot_text_arg(chain_id)
 
 
 def _click_spec_res_no(click_spec):
-  return _click_spec_field(click_spec, 3, 2, False)
+  resno = _coot_int_arg(_click_spec_field(click_spec, 3, 2, False))
+  return resno if resno is not None else False
 
 
 def _click_spec_ins_code(click_spec):
-  return _click_spec_field(click_spec, 4, 3, "")
+  return _coot_text_arg(_click_spec_field(click_spec, 4, 3, ""))
 
 
 def _click_spec_atom_name(click_spec):
-  return _click_spec_field(click_spec, 5, 4, "")
+  return _coot_text_arg(_click_spec_field(click_spec, 5, 4, ""))
 
 
 def _click_spec_alt_conf(click_spec):
-  return _click_spec_field(click_spec, 6, 5, "")
+  return _coot_text_arg(_click_spec_field(click_spec, 6, 5, ""))
 
 
 def ncs_master_chain_id(imol):
@@ -1655,16 +1924,27 @@ if GUI_PYTHON_AVAILABLE:
     """Small GTK4-safe two-option dialog for potentially expensive actions."""
     window = Gtk.Window()
     window.set_title("Coot")
+    try:
+      window.set_modal(True)
+    except Exception:
+      pass
 
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    title_label = Gtk.Label(label=function_label)
     label = Gtk.Label(label=message_text)
     cancel_button = Gtk.Button(label=cancel_button_label)
     confirm_button = Gtk.Button(label=confirm_button_label)
 
+    title_label.set_margin_start(12)
+    title_label.set_margin_end(12)
+    title_label.set_margin_top(12)
+    title_label.set_margin_bottom(4)
+    title_label.set_wrap(True)
+    title_label.set_xalign(0.0)
     label.set_margin_start(12)
     label.set_margin_end(12)
-    label.set_margin_top(12)
+    label.set_margin_top(0)
     label.set_margin_bottom(8)
     label.set_wrap(True)
     label.set_xalign(0.0)
@@ -1690,6 +1970,7 @@ if GUI_PYTHON_AVAILABLE:
     cancel_button.connect("clicked", cancel)
     confirm_button.connect("clicked", submit)
 
+    vbox.append(title_label)
     vbox.append(label)
     hbox_buttons.append(cancel_button)
     hbox_buttons.append(confirm_button)
@@ -1774,16 +2055,11 @@ if GUI_PYTHON_AVAILABLE:
     """Open a GTK file chooser and copy the selected path into an entry."""
     def _gtk_gio_module():
       gio_module = globals().get("Gio")
-      if gio_module is not None:
-        return gio_module
-      coot_gui_module = globals().get("coot_gui")
-      if coot_gui_module is not None and hasattr(coot_gui_module, "Gio"):
-        gio_module = coot_gui_module.Gio
-        globals()["Gio"] = gio_module
-        return gio_module
-      try:
-        from gi.repository import Gio as gio_module
-      except Exception:
+      if gio_module is None:
+        gio_module = _coot_gui_repository_module("Gio")
+        if gio_module is not None:
+          globals()["Gio"] = gio_module
+      if gio_module is None:
         return None
       globals()["Gio"] = gio_module
       return gio_module
@@ -1923,16 +2199,11 @@ if GUI_PYTHON_AVAILABLE:
     """Open a GTK save chooser and copy the selected output path into an entry."""
     def _gtk_gio_module():
       gio_module = globals().get("Gio")
-      if gio_module is not None:
-        return gio_module
-      coot_gui_module = globals().get("coot_gui")
-      if coot_gui_module is not None and hasattr(coot_gui_module, "Gio"):
-        gio_module = coot_gui_module.Gio
-        globals()["Gio"] = gio_module
-        return gio_module
-      try:
-        from gi.repository import Gio as gio_module
-      except Exception:
+      if gio_module is None:
+        gio_module = _coot_gui_repository_module("Gio")
+        if gio_module is not None:
+          globals()["Gio"] = gio_module
+      if gio_module is None:
         return None
       globals()["Gio"] = gio_module
       return gio_module
@@ -1997,6 +2268,8 @@ if GUI_PYTHON_AVAILABLE:
         )
         chooser.add_filter(cif_filter)
         chooser.add_filter(all_filter)
+        if hasattr(chooser, "set_do_overwrite_confirmation"):
+          chooser.set_do_overwrite_confirmation(True)
         if current_directory and hasattr(chooser, "set_current_folder"):
           gio_module = _gtk_gio_module()
           if gio_module is not None and hasattr(gio_module, "File") and os.path.isdir(current_directory):
@@ -2033,6 +2306,8 @@ if GUI_PYTHON_AVAILABLE:
         chooser.add_button("Save", Gtk.ResponseType.ACCEPT)
         chooser.add_filter(cif_filter)
         chooser.add_filter(all_filter)
+        if hasattr(chooser, "set_do_overwrite_confirmation"):
+          chooser.set_do_overwrite_confirmation(True)
         if current_directory and hasattr(chooser, "set_current_folder"):
           gio_module = _gtk_gio_module()
           if gio_module is not None and hasattr(gio_module, "File") and os.path.isdir(current_directory):
@@ -2354,6 +2629,120 @@ if GUI_PYTHON_AVAILABLE:
 
     vbox.append(label)
     vbox.append(scrolled)
+    vbox.append(close_button)
+    window.set_child(vbox)
+    window.present()
+
+  def navigable_interesting_things_gui(dialog_name, thing_list):
+    """Show a flat clickable jump-target list with selection highlighting and Prev/Next."""
+    window = Gtk.Window()
+    window.set_title("Coot")
+    window.set_default_size(520, 420)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    navigation_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    label = Gtk.Label(label=dialog_name)
+    scrolled = Gtk.ScrolledWindow()
+    inside_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    prev_button = Gtk.Button(label="<--Prev")
+    next_button = Gtk.Button(label="Next-->")
+    close_button = Gtk.Button(label="Close")
+
+    label.set_margin_start(12)
+    label.set_margin_end(12)
+    label.set_margin_top(12)
+    label.set_margin_bottom(4)
+    label.set_wrap(True)
+    label.set_xalign(0.0)
+    scrolled.set_margin_start(12)
+    scrolled.set_margin_end(12)
+    scrolled.set_margin_bottom(8)
+    navigation_row.set_halign(Gtk.Align.CENTER)
+    navigation_row.set_margin_start(12)
+    navigation_row.set_margin_end(12)
+    navigation_row.set_margin_bottom(4)
+    close_button.set_margin_start(12)
+    close_button.set_margin_end(12)
+    close_button.set_margin_bottom(12)
+    close_button.set_halign(Gtk.Align.CENTER)
+
+    scrolled.set_hexpand(True)
+    scrolled.set_vexpand(True)
+    inside_vbox.set_valign(Gtk.Align.START)
+    scrolled.set_child(inside_vbox)
+
+    def close_window(*_args):
+      window.destroy()
+
+    flat_entry_specs = []
+    current_index = {"value": None}
+    selected_button = {"value": None}
+
+    def set_selected_button(button):
+      previous_button = selected_button["value"]
+      if previous_button is not None:
+        try:
+          previous_button.remove_css_class("suggested-action")
+        except Exception:
+          pass
+      selected_button["value"] = button
+      if button is not None:
+        try:
+          button.add_css_class("suggested-action")
+        except Exception:
+          pass
+
+    def activate_entry(entry_index):
+      if not flat_entry_specs:
+        return None
+      entry_index = entry_index % len(flat_entry_specs)
+      current_index["value"] = entry_index
+      entry, button = flat_entry_specs[entry_index]
+      _activate_interesting_entry(entry)
+      set_selected_button(button)
+      try:
+        button.grab_focus()
+      except Exception:
+        pass
+      return None
+
+    def activate_prev():
+      if not flat_entry_specs:
+        return None
+      if current_index["value"] is None:
+        return activate_entry(len(flat_entry_specs) - 1)
+      return activate_entry(current_index["value"] - 1)
+
+    def activate_next():
+      if not flat_entry_specs:
+        return None
+      if current_index["value"] is None:
+        return activate_entry(0)
+      return activate_entry(current_index["value"] + 1)
+
+    for entry in thing_list:
+      if len(entry) < 4:
+        continue
+      button = Gtk.Button(label=str(entry[0]))
+      entry_index = len(flat_entry_specs)
+      flat_entry_specs.append((entry, button))
+      button.connect(
+        "clicked",
+        lambda _button, idx=entry_index: activate_entry(idx),
+      )
+      inside_vbox.append(button)
+
+    prev_button.set_sensitive(bool(flat_entry_specs))
+    next_button.set_sensitive(bool(flat_entry_specs))
+    prev_button.connect("clicked", lambda *_args: activate_prev())
+    next_button.connect("clicked", lambda *_args: activate_next())
+    close_button.connect("clicked", close_window)
+
+    vbox.append(label)
+    vbox.append(scrolled)
+    navigation_row.append(prev_button)
+    navigation_row.append(next_button)
+    vbox.append(navigation_row)
     vbox.append(close_button)
     window.set_child(vbox)
     window.present()
@@ -2683,6 +3072,9 @@ else:
     if labels:
       message += "\n\n" + "\n".join(labels)
     info_dialog(message)
+
+  def navigable_interesting_things_gui(dialog_name, thing_list):
+    interesting_things_gui(dialog_name, thing_list)
 
   def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None):
     labels = []
@@ -4483,6 +4875,44 @@ def _annotation_mmcif_rows(mol_id):
   return rows
 
 
+def _annotation_markdown_cell(value):
+  text = _annotation_text_or_empty(value).strip()
+  if not text:
+    return ""
+  return (
+    text
+    .replace("\\", "\\\\")
+    .replace("|", "\\|")
+    .replace("\r\n", "\n")
+    .replace("\r", "\n")
+    .replace("\n", "<br>")
+  )
+
+
+def _annotation_markdown_table_text(mol_id):
+  source_display_name = _annotation_source_display_name(mol_id) or "Unknown source"
+  lines = [
+    f"# Residue annotations for molecule #{mol_id}",
+    "",
+    f"Source: `{source_display_name}`",
+    "",
+    "| Residue | Author | Timestamp | Note |",
+    "| --- | --- | --- | --- |",
+  ]
+  for group in _annotation_groups_for_molecule(mol_id):
+    residue_label = _annotation_markdown_cell(group["dialog_label"])
+    for entry in group["entries"]:
+      lines.append(
+        "| {0} | {1} | {2} | {3} |".format(
+          residue_label,
+          _annotation_markdown_cell(entry.get("author")) or "Unknown",
+          _annotation_markdown_cell(entry.get("modified_utc")) or "",
+          _annotation_markdown_cell(entry.get("note")) or "",
+        )
+      )
+  return "\n".join(lines) + "\n"
+
+
 def _annotation_clear_existing_mmcif_items(block):
   loop_item = block.find_loop_item(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id")
   if loop_item is not None:
@@ -4500,6 +4930,8 @@ def _load_annotations_from_mmcif_file(file_path):
   document = gemmi.cif.read_file(file_path)
   block = document.sole_block()
   column = block.find_loop(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id")
+  if column is None:
+    return []
   loop = column.get_loop()
   if loop is None:
     return []
@@ -4948,15 +5380,61 @@ def _default_annotation_export_path(mol_id):
   return os.path.join(export_directory, f"{source_stub}.annotated.cif")
 
 
-def _export_residue_annotations_for_molecule(mol_id, output_path):
+def _default_annotation_markdown_export_path(mol_id):
+  """Suggest an output Markdown path for plain-text annotation export."""
+  export_directory = _annotation_export_directory()
+  source_path = _annotation_source_path(mol_id)
+  if source_path:
+    source_stem = os.path.splitext(os.path.basename(source_path))[0]
+    return os.path.join(export_directory, f"{source_stem}.annotations.md")
+  source_stub = molecule_name_stub_py(mol_id, 0) or f"molecule_{mol_id}"
+  return os.path.join(export_directory, f"{source_stub}.annotations.md")
+
+
+def _annotation_normalize_export_path(raw_output_path, allowed_suffixes, default_suffix, path_label):
+  """Normalize an export path and reject blank or directory destinations."""
+  raw_path = str(raw_output_path or "").strip()
+  if not raw_path:
+    info_dialog(f"Please provide an output {path_label} path.")
+    return None
+  normalized_path = os.path.abspath(os.path.expanduser(raw_path))
+  if os.path.isdir(normalized_path):
+    info_dialog(f"Please choose a file name, not a directory, for the {path_label} export.")
+    return None
+  if not normalized_path.lower().endswith(tuple(allowed_suffixes)):
+    normalized_path += default_suffix
+  return normalized_path
+
+
+def _annotation_confirm_export_overwrite(dialog_title, normalized_path, retry_function):
+  """Ask before overwriting an existing export target."""
+  generic_confirm_dialog(
+    dialog_title,
+    f"{os.path.basename(normalized_path)} already exists.\nOverwrite it?",
+    "Cancel",
+    lambda: None,
+    "Overwrite",
+    retry_function,
+  )
+  return 0
+
+
+def _export_residue_annotations_for_molecule(mol_id, output_path, allow_overwrite=False):
   """Write the current molecule plus embedded notes to a chosen mmCIF path."""
-  raw_output_path = str(output_path or "").strip()
-  if not raw_output_path:
-    info_dialog("Please provide an output mmCIF path.")
+  normalized_path = _annotation_normalize_export_path(
+    output_path,
+    (".cif", ".mmcif"),
+    ".cif",
+    "mmCIF",
+  )
+  if normalized_path is None:
     return 0
-  normalized_path = os.path.abspath(os.path.expanduser(raw_output_path))
-  if not normalized_path.lower().endswith((".cif", ".mmcif")):
-    normalized_path += ".cif"
+  if os.path.lexists(normalized_path) and not allow_overwrite:
+    return _annotation_confirm_export_overwrite(
+      "Overwrite annotated mmCIF",
+      normalized_path,
+      lambda: _export_residue_annotations_for_molecule(mol_id, normalized_path, allow_overwrite=True),
+    )
   try:
     _write_model_with_embedded_annotations(mol_id, normalized_path)
   except Exception as error:
@@ -4970,29 +5448,47 @@ def _export_residue_annotations_for_molecule(mol_id, output_path):
   return 1
 
 
-def _export_residue_annotations_with_confirmation(mol_id, output_path):
-  """Export annotations, prompting before overwriting an existing file."""
-  raw_output_path = str(output_path or "").strip()
-  if not raw_output_path:
-    info_dialog("Please provide an output mmCIF path.")
+def _export_residue_annotations_markdown_for_molecule(mol_id, output_path, allow_overwrite=False):
+  """Write the current annotation set as a plain-text Markdown table."""
+  normalized_path = _annotation_normalize_export_path(
+    output_path,
+    (".md",),
+    ".md",
+    "Markdown",
+  )
+  if normalized_path is None:
     return 0
-
-  normalized_path = os.path.abspath(os.path.expanduser(raw_output_path))
-  if not normalized_path.lower().endswith((".cif", ".mmcif")):
-    normalized_path += ".cif"
-
-  if not os.path.exists(normalized_path):
-    return _export_residue_annotations_for_molecule(mol_id, normalized_path)
-
-  generic_confirm_dialog(
-    "Overwrite annotated mmCIF",
-    f"{os.path.basename(normalized_path)} already exists.\nOverwrite it?",
-    "Cancel",
-    lambda: None,
-    "Overwrite",
-    lambda: _export_residue_annotations_for_molecule(mol_id, normalized_path),
+  if os.path.lexists(normalized_path) and not allow_overwrite:
+    return _annotation_confirm_export_overwrite(
+      "Overwrite annotation Markdown",
+      normalized_path,
+      lambda: _export_residue_annotations_markdown_for_molecule(mol_id, normalized_path, allow_overwrite=True),
+    )
+  try:
+    output_directory = os.path.dirname(normalized_path)
+    if output_directory:
+      os.makedirs(output_directory, exist_ok=True)
+    with open(normalized_path, "w", encoding="utf-8") as handle:
+      handle.write(_annotation_markdown_table_text(mol_id))
+  except Exception as error:
+    info_dialog(f"Failed to export annotation Markdown.\n{error}")
+    traceback.print_exc()
+    return 0
+  add_status_bar_text(
+    f"Exported annotation Markdown with {_annotation_entry_count_label(len(_annotation_entries_for_molecule(mol_id)))} "
+    f"to {os.path.basename(normalized_path)}"
   )
   return 1
+
+
+def _export_residue_annotations_with_confirmation(mol_id, output_path):
+  """Export annotations, prompting before overwriting an existing file."""
+  return _export_residue_annotations_for_molecule(mol_id, output_path, allow_overwrite=False)
+
+
+def _export_residue_annotations_markdown_with_confirmation(mol_id, output_path):
+  """Export Markdown annotations, prompting before overwriting an existing file."""
+  return _export_residue_annotations_markdown_for_molecule(mol_id, output_path, allow_overwrite=False)
 
 
 def _ensure_residue_annotations_loaded(mol_id):
@@ -5263,6 +5759,7 @@ def residue_annotations_gui():
   edit_button = Gtk.Button(label="Edit selected note...")
   delete_button = Gtk.Button(label="Delete selected note...")
   export_button = Gtk.Button(label="Export annotated mmCIF...")
+  export_markdown_button = Gtk.Button(label="Export Markdown table...")
   clear_button = Gtk.Button(label="Clear all notes...")
   refresh_button = Gtk.Button(label="Refresh list")
   prev_button = Gtk.Button(label="<--Prev")
@@ -5319,7 +5816,7 @@ def residue_annotations_gui():
   glib_module = None
 
   try:
-    from gi.repository import GLib as glib_module
+    glib_module = _coot_gui_repository_module("GLib")
   except Exception:
     glib_module = None
 
@@ -5329,6 +5826,7 @@ def residue_annotations_gui():
     def __init__(self, mol_id):
       self.current_mol_id = mol_id
       self.grouped_annotations = []
+      self.group_index_by_key = {}
       self.selected_group_key = None
       self.current_index = None
       self.selected_button = None
@@ -5364,9 +5862,16 @@ def residue_annotations_gui():
     def selected_group(self):
       if self.selected_group_key is None:
         return None
-      for group in self.grouped_annotations:
-        if group["key"] == self.selected_group_key:
-          return group
+      group_index = self.group_index_by_key.get(self.selected_group_key)
+      if group_index is None or group_index >= len(self.grouped_annotations):
+        return None
+      return self.grouped_annotations[group_index]
+
+    def current_mol_id_or_dialog(self):
+      mol_id = self.mol_id()
+      if mol_id in model_molecule_list():
+        return mol_id
+      info_dialog("The current annotation molecule is no longer available.")
       return None
 
     def selected_group_or_dialog(self):
@@ -5451,6 +5956,7 @@ def residue_annotations_gui():
     def render_groups(self, preferred_key=None, jump_to_selection=False):
       browser_data = _annotation_browser_data(self.mol_id())
       self.grouped_annotations[:] = browser_data["groups"]
+      self.group_index_by_key = {}
       title_label.set_text(browser_data["title"])
       self.clear_selected_group()
       self.row_buttons.clear()
@@ -5467,6 +5973,7 @@ def residue_annotations_gui():
 
       selected_index = None
       for entry_index, group in enumerate(self.grouped_annotations):
+        self.group_index_by_key[group["key"]] = entry_index
         button = Gtk.Button(label=_annotation_group_preview_text(group))
         button.connect("clicked", lambda _button, idx=entry_index: self.show_group(idx))
         self.row_buttons.append(button)
@@ -5490,18 +5997,27 @@ def residue_annotations_gui():
       return None
 
     def poll_active_residue_header(self):
+      model_molecules = model_molecule_list()
       active_mol_id = _annotation_active_molecule()
-      if active_mol_id is not None and active_mol_id != self.mol_id():
-        self.current_mol_id = active_mol_id
-        _ensure_residue_annotations_loaded(active_mol_id)
+      target_mol_id = active_mol_id
+      if target_mol_id is None and self.mol_id() in model_molecules:
+        target_mol_id = self.mol_id()
+      if target_mol_id is not None and target_mol_id != self.mol_id():
+        self.current_mol_id = target_mol_id
+        _ensure_residue_annotations_loaded(target_mol_id)
         self.render_groups()
       self.update_active_residue_header()
       return True
 
     def add_note(self, *_args):
-      return prompt_add_annotation_for_active_residue(self.mol_id(), self.refresh_groups)
+      mol_id = self.current_mol_id_or_dialog()
+      if mol_id is None:
+        return None
+      return prompt_add_annotation_for_active_residue(mol_id, self.refresh_groups)
 
     def edit_selected_note(self, *_args):
+      if self.current_mol_id_or_dialog() is None:
+        return None
       selected_group = self.selected_group_or_dialog()
       if selected_group is None:
         return None
@@ -5516,10 +6032,12 @@ def residue_annotations_gui():
       )
 
     def delete_selected_note(self, *_args):
+      selected_mol_id = self.current_mol_id_or_dialog()
+      if selected_mol_id is None:
+        return None
       selected_group = self.selected_group_or_dialog()
       if selected_group is None:
         return None
-      selected_mol_id = self.mol_id()
       return _choose_annotation_entry_action(
         selected_group,
         "Delete note",
@@ -5538,13 +6056,30 @@ def residue_annotations_gui():
       )
 
     def export_annotated_mmcif(self, *_args):
-      default_output_path = _default_annotation_export_path(self.mol_id())
+      mol_id = self.current_mol_id_or_dialog()
+      if mol_id is None:
+        return None
+      default_output_path = _default_annotation_export_path(mol_id)
       generic_single_entry_with_file_browse(
         "Export annotated mmCIF",
         default_output_path,
         "Choose annotated mmCIF output path",
         "Export annotated mmCIF",
-        lambda output_path: _export_residue_annotations_with_confirmation(self.mol_id(), output_path),
+        lambda output_path: _export_residue_annotations_with_confirmation(mol_id, output_path),
+      )
+      return None
+
+    def export_markdown_table(self, *_args):
+      mol_id = self.current_mol_id_or_dialog()
+      if mol_id is None:
+        return None
+      default_output_path = _default_annotation_markdown_export_path(mol_id)
+      generic_single_entry_with_file_browse(
+        "Export annotation Markdown",
+        default_output_path,
+        "Choose annotation Markdown output path",
+        "Export Markdown table",
+        lambda output_path: _export_residue_annotations_markdown_with_confirmation(mol_id, output_path),
       )
       return None
 
@@ -5556,7 +6091,9 @@ def residue_annotations_gui():
       return None
 
     def clear_all_notes(self, *_args):
-      selected_mol_id = self.mol_id()
+      selected_mol_id = self.current_mol_id_or_dialog()
+      if selected_mol_id is None:
+        return None
       if not _annotation_entries_for_molecule(selected_mol_id):
         info_dialog("No residue annotations are currently stored for this molecule.")
         return None
@@ -5577,6 +6114,7 @@ def residue_annotations_gui():
   edit_button.connect("clicked", browser.edit_selected_note)
   delete_button.connect("clicked", browser.delete_selected_note)
   export_button.connect("clicked", browser.export_annotated_mmcif)
+  export_markdown_button.connect("clicked", browser.export_markdown_table)
   clear_button.connect("clicked", browser.clear_all_notes)
   refresh_button.connect("clicked", lambda *_args: browser.refresh_groups())
   prev_button.connect("clicked", browser.activate_prev)
@@ -5592,6 +6130,7 @@ def residue_annotations_gui():
   action_row_top.append(edit_button)
   action_row_top.append(delete_button)
   action_row_bottom.append(export_button)
+  action_row_bottom.append(export_markdown_button)
   action_row_bottom.append(clear_button)
   action_row_bottom.append(refresh_button)
   navigation_row.append(prev_button)
@@ -5624,17 +6163,17 @@ def _generate_smart_local_extra_restraints_for_mol(mol_id, show_start_message=Tr
   backbone_donor_names = {"N"}
   backbone_acceptor_names = {"O", "OXT"}
 
-  residue_serial_entries = all_residues_with_serial_numbers_py(mol_id) or []
   sequence_index_by_residue = {}
   next_sequence_index_by_chain = {}
   ordered_residue_specs_by_chain = {}
-  for residue_entry in residue_serial_entries:
-    if not residue_entry or len(residue_entry) < 4:
+  for residue_spec_list in _all_residue_specs_for_colouring(mol_id):
+    residue_spec = _coot_residue_spec_from_spec(residue_spec_list)
+    if residue_spec is None:
       continue
-    chain_id, resno, ins_code = residue_entry[1:4]
-    sequence_index_by_residue[(chain_id, resno, ins_code)] = next_sequence_index_by_chain.get(chain_id, 0)
+    chain_id, resno, ins_code = residue_spec
+    sequence_index_by_residue[residue_spec] = next_sequence_index_by_chain.get(chain_id, 0)
     next_sequence_index_by_chain[chain_id] = next_sequence_index_by_chain.get(chain_id, 0) + 1
-    ordered_residue_specs_by_chain.setdefault(chain_id, []).append((chain_id, resno, ins_code))
+    ordered_residue_specs_by_chain.setdefault(chain_id, []).append(residue_spec)
 
   def atom_distance(atom_1, atom_2):
     dx = atom_1["position"][0] - atom_2["position"][0]
@@ -5767,9 +6306,9 @@ def _generate_smart_local_extra_restraints_for_mol(mol_id, show_start_message=Tr
       continue
     nearby_residue_specs = residues_near_residue(mol_id, list(residue_spec_1), distance_cutoff) or []
     for nearby_spec in nearby_residue_specs:
-      if not nearby_spec or len(nearby_spec) < 3:
+      residue_spec_2 = _coot_residue_spec_from_spec(nearby_spec)
+      if residue_spec_2 is None:
         continue
-      residue_spec_2 = tuple(nearby_spec[:3])
       if residue_spec_1 == residue_spec_2:
         continue
       pair_key = ordered_pair_key(residue_spec_1, residue_spec_2)
@@ -6227,20 +6766,22 @@ def start_measure_distance():
 def _map_looks_em_like(map_id):
   if not is_valid_map_molecule(map_id):
     return False
-  if map_is_difference_map(map_id):
-    return False
   try:
     cell = map_cell(map_id)
   except Exception:
-    return False
-  if not cell or len(cell) < 6:
-    return False
-  alpha, beta, gamma = cell[3], cell[4], cell[5]
-  return (
-    abs(alpha - 90.0) < 0.5
-    and abs(beta - 90.0) < 0.5
-    and abs(gamma - 90.0) < 0.5
-  )
+    cell = None
+  if cell and len(cell) >= 6:
+    alpha, beta, gamma = cell[3], cell[4], cell[5]
+    if (
+      abs(alpha - 90.0) < 0.5
+      and abs(beta - 90.0) < 0.5
+      and abs(gamma - 90.0) < 0.5
+    ):
+      return True
+  for path in _candidate_map_file_paths(map_id):
+    if path.lower().endswith((".mrc", ".map", ".ccp4")):
+      return True
+  return False
 
 
 def _candidate_map_file_paths(map_id):
@@ -6342,11 +6883,9 @@ def style_resampled_em_map(map_id):
 
 
 def _restyle_active_map_without_resampling(map_id, contour_level_sigma, status_message):
-  if map_is_difference_map(map_id):
-    add_status_bar_text(status_message)
-    return None
   style_resampled_em_map(map_id)
-  set_contour_level_in_sigma(map_id, contour_level_sigma)
+  if isinstance(contour_level_sigma, (int, float)):
+    set_contour_level_in_sigma(map_id, contour_level_sigma)
   set_map_displayed(map_id, 1)
   set_scroll_wheel_map(map_id)
   set_scrollable_map(map_id)
@@ -6357,6 +6896,9 @@ def _restyle_active_map_without_resampling(map_id, contour_level_sigma, status_m
 def resample_active_map_for_em_half_angstrom(force=False, allow_large_output=False):
   map_id = _scrollable_map_or_status()
   if map_id is None:
+    return None
+  if map_is_difference_map(map_id):
+    add_status_bar_text("Scroll-wheel map is a difference map; resample/restyle skipped")
     return None
   original_refinement_map = imol_refinement_map()
   old_map_was_refinement_map = (original_refinement_map == map_id)
@@ -6740,15 +7282,15 @@ def colour_active_segment():
 def _all_residue_specs_for_colouring(mol_id):
   residue_specs=[]
   for residue_entry in all_residues_with_serial_numbers(mol_id) or []:
-    if not residue_entry or len(residue_entry) < 4:
+    if not isinstance(residue_entry, list) or len(residue_entry) < 4:
       continue
-    residue_spec=residue_entry[1:]
-    chain_id=residue_spec_to_chain_id(residue_spec)
-    resno=residue_spec_to_res_no(residue_spec)
-    ins_code=residue_spec_to_ins_code(residue_spec)
+    residue_spec = residue_entry[1:]
+    chain_id = residue_spec_to_chain_id(residue_spec)
+    resno = residue_spec_to_res_no(residue_spec)
+    ins_code = residue_spec_to_ins_code(residue_spec)
     if chain_id is False or resno is False or ins_code is False:
       continue
-    residue_specs.append([chain_id,resno,ins_code])
+    residue_specs.append([chain_id, resno, ins_code])
   return residue_specs
 
 
@@ -6925,14 +7467,14 @@ def color_by_rama_native(mol_id):
   for item in scored_residues:
     if not isinstance(item, list) or len(item) < 3:
       continue
-    residue_spec=item[1]
+    residue_spec = _coot_residue_spec_from_spec(item[1])
     rama_score=item[2]
-    if not isinstance(residue_spec, list):
+    if residue_spec is None:
       continue
     if rama_score < 0.002:
-      rama_colour_list.append((residue_spec[1:], rama_outlier_colour))
+      rama_colour_list.append((list(residue_spec), rama_outlier_colour))
     elif rama_score < 0.02:
-      rama_colour_list.append((residue_spec[1:], rama_allowed_colour))
+      rama_colour_list.append((list(residue_spec), rama_allowed_colour))
   _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
@@ -6966,16 +7508,16 @@ def color_by_density_fit_native(mol_id):
   for item in correlation_results:
     if not isinstance(item, list) or len(item) < 2:
       continue
-    residue_spec=item[0]
+    residue_spec = _coot_residue_spec_from_spec(item[0])
     score=item[1]
-    if not isinstance(residue_spec, list):
+    if residue_spec is None:
       continue
     if score < 0.0:
       score=0.0
     if score > 1.0:
       score=1.0
     colour_index=int((1.0-score)*31+2)
-    density_colour_list.append((residue_spec[1:], colour_index))
+    density_colour_list.append((list(residue_spec), colour_index))
   _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
@@ -7447,14 +7989,13 @@ def key_binding_refine_triple():
        print("No active atom")
     else:
        imol = active_atom[0]
-       residue_spec = atom_spec_to_residue_spec(active_atom)
-       N_terminal_residue_spec = [residue_spec_to_chain_id(residue_spec),
-                                  residue_spec_to_res_no(residue_spec)-1,
-                                  residue_spec_to_ins_code(residue_spec)]
-       C_terminal_residue_spec = [residue_spec_to_chain_id(residue_spec),
-                                  residue_spec_to_res_no(residue_spec)+1,
-                                  residue_spec_to_ins_code(residue_spec)]
-       spec_list = [N_terminal_residue_spec, residue_spec, C_terminal_residue_spec]
+       residue_spec = _coot_residue_spec_from_spec(atom_spec_to_residue_spec(active_atom))
+       if residue_spec is None:
+         add_status_bar_text("Could not resolve the active residue for triple refinement")
+         return None
+       N_terminal_residue_spec = [residue_spec[0], residue_spec[1]-1, residue_spec[2]]
+       C_terminal_residue_spec = [residue_spec[0], residue_spec[1]+1, residue_spec[2]]
+       spec_list = [N_terminal_residue_spec, list(residue_spec), C_terminal_residue_spec]
        refine_residues(imol, spec_list)
     
 #Cycle symmetry represntation mode forward/back
@@ -7833,13 +8374,22 @@ def auto_refine():
   max_gap_to_fill = 4
 
   def nearest_polymer_residue(molecule_id, chain_id, residue_no, ins_code):
-    active_spec = [chain_id, residue_no, ins_code]
-    if is_polymer_residue_spec(molecule_id, tuple(active_spec)):
-      return [chain_id, residue_no, ins_code]
+    normalized_active_spec = _coot_residue_spec_from_spec([chain_id, residue_no, ins_code])
+    if normalized_active_spec is None:
+      return None
+    active_spec = list(normalized_active_spec)
+    if is_polymer_residue_spec(molecule_id, normalized_active_spec):
+      return active_spec
 
     for search_radius in (4.0, 6.0, 8.0, 10.0):
       nearby_specs = residues_near_residue(molecule_id, active_spec, search_radius)
-      polymer_specs = [spec for spec in nearby_specs if spec and len(spec) == 3 and is_polymer_residue_spec(molecule_id, tuple(spec))]
+      polymer_specs = []
+      for spec in nearby_specs or []:
+        normalized_spec = _coot_residue_spec_from_spec(spec)
+        if normalized_spec is None:
+          continue
+        if is_polymer_residue_spec(molecule_id, normalized_spec):
+          polymer_specs.append(list(normalized_spec))
       if polymer_specs:
         return polymer_specs[0]
 
@@ -7961,8 +8511,8 @@ def auto_refine():
   direct_non_polymer_contact_specs = set()
   for spec in seed_residue_specs:
     for nearby_residue in residues_near_residue(mol_id, spec, contact_radius):
-      if nearby_residue and len(nearby_residue) == 3:
-        nearby_spec = tuple(nearby_residue)
+      nearby_spec = _coot_residue_spec_from_spec(nearby_residue)
+      if nearby_spec is not None:
         if nearby_spec not in main_range_specs:
           secondary_residue_specs.add(nearby_spec)
           if not is_polymer_residue_spec(mol_id, nearby_spec):
@@ -8445,9 +8995,12 @@ def key_binding_terminal_spin():
        print("No active atom")
     else:
        imol = active_atom[0]
-       residue_spec = atom_spec_to_residue_spec(active_atom)
+       residue_spec = _coot_residue_spec_from_spec(atom_spec_to_residue_spec(active_atom))
+       if residue_spec is None:
+         add_status_bar_text("Could not resolve the active residue for terminal spin")
+         return None
        print(('spin_N {} {} {}'.format(imol, residue_spec, 120)))
-       spin_N_py(imol, residue_spec, 120)
+       spin_N_py(imol, list(residue_spec), 120)
 
 #This works, but should alter to be more flexible. ideally, have one key to tweak phi, one to tweak psi.
 #Will need two global cycle variables - residue_phi_cycle and residue_psi_cycle - as well as two variables to keep the current value of phi and psi.
@@ -9737,6 +10290,14 @@ def _sequence_match_list_entry(mol_id, ch_id, seq, sn_start, pattern_length):
     residue_centre[0],
     residue_centre[1],
     residue_centre[2],
+    {
+      "type": "polymer_residue",
+      "mol_id": mol_id,
+      "chain_id": ch_id,
+      "resno": resno,
+      "ins_code": ins_code or "",
+      "serial_number": sn_start,
+    },
   ]
 
 
@@ -9819,7 +10380,7 @@ def find_sequence_in_current_chain(subseq):
     if not interesting_list:
       info_dialog("Found matching sequence positions, but could not locate jump atoms for them.")
       return None
-    interesting_things_gui("Matches to entered sequence",interesting_list)
+    navigable_interesting_things_gui("Matches to entered sequence",interesting_list)
 
 #Test post manipulation background func
 # import time, threading
@@ -11386,12 +11947,7 @@ def _replace_active_residue_with_monomer(required_resname, required_label, targe
 
 
 def _coot_py_residue_spec_to_tuple(res_spec_py):
-  if isinstance(res_spec_py, (list, tuple)):
-    if len(res_spec_py) >= 4 and isinstance(res_spec_py[0], bool):
-      return (res_spec_py[1], res_spec_py[2], res_spec_py[3])
-    if len(res_spec_py) >= 3:
-      return (res_spec_py[0], res_spec_py[1], res_spec_py[2])
-  return None
+  return _coot_residue_spec_from_spec(res_spec_py)
 
 
 def _regularize_linked_residues(imol, base_spec, new_res_spec_py):
