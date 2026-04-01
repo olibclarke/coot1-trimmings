@@ -471,6 +471,40 @@ RESIDUE_ANNOTATION_META_VERSION_TAG = "_cootnote_annotation_meta.version"
 RESIDUE_ANNOTATION_META_PROGRAM_TAG = "_cootnote_annotation_meta.program"
 
 
+@lru_cache(maxsize=1)
+def _coot_trimmings_file_path():
+  candidates = []
+
+  runtime_file = globals().get("__file__", "")
+  module_file = getattr(sys.modules.get(__name__), "__file__", "")
+
+  for candidate in (
+    runtime_file,
+    module_file,
+    os.path.expanduser("~/.config/Coot/coot_trimmings.py"),
+    os.path.expanduser("~/Library/Application Support/Coot/coot_trimmings.py"),
+    os.path.join(os.getcwd(), "coot_trimmings.py"),
+  ):
+    if isinstance(candidate, str) and candidate:
+      normalized = os.path.abspath(candidate)
+      if normalized not in candidates:
+        candidates.append(normalized)
+
+  for candidate in candidates:
+    if os.path.isfile(candidate):
+      return candidate
+
+  if candidates:
+    return candidates[0]
+  return os.path.abspath("coot_trimmings.py")
+
+
+@lru_cache(maxsize=1)
+def _coot_trimmings_dir():
+  return os.path.dirname(_coot_trimmings_file_path())
+
+
+
 def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restraints=1):
   """Coot 1.x-safe wrapper around the bundled gap fitter.
 
@@ -4666,8 +4700,21 @@ def find_emringer_like_sidechain_density_outliers():
   return find_odd_residues()
 
 
+
+RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
+  os.environ.get("USER")
+  or os.environ.get("USERNAME")
+  or ""
+)
+RESIDUE_ANNOTATION_LAST_AUTHOR = RESIDUE_ANNOTATION_DEFAULT_AUTHOR
+RESIDUE_ANNOTATIONS_BY_MOLECULE = {}
+RESIDUE_ANNOTATION_CATEGORY_PREFIX = "_cootnote_residue_note."
+RESIDUE_ANNOTATION_META_VERSION_TAG = "_cootnote_annotation_meta.version"
+RESIDUE_ANNOTATION_META_PROGRAM_TAG = "_cootnote_annotation_meta.program"
+
+
+
 def _annotation_now_utc():
-  """Return a compact UTC timestamp for embedded residue notes."""
   return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -4679,16 +4726,15 @@ def _annotation_text_or_empty(value):
 
 def _annotation_safe_int(value, default=None):
   try:
-    return int(_annotation_text_or_empty(value).strip())
+    return int(str(value).strip())
   except Exception:
     return default
 
 
 def _annotation_encode_text(value):
   text = _annotation_text_or_empty(value)
-  if not text:
-    return "?"
-  return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+  encoded = base64.b64encode(text.encode("utf-8"))
+  return encoded.decode("ascii")
 
 
 def _annotation_decode_text(value):
@@ -4696,46 +4742,50 @@ def _annotation_decode_text(value):
   if not text:
     return ""
   try:
-    return base64.urlsafe_b64decode(text.encode("ascii")).decode("utf-8")
+    return base64.b64decode(text.encode("ascii")).decode("utf-8")
   except Exception:
-    # Fall back to the raw value so older/plain-text files still load.
     return text
 
 
 def _annotation_residue_key(chain_id, resno, ins_code, residue_name_here=""):
-  return (chain_id or "", int(resno), ins_code or "", residue_name_here or "")
+  return (str(chain_id), int(resno), str(ins_code or ""), str(residue_name_here or ""))
 
 
 def _annotation_source_path(mol_id, mmcif_only=False):
-  """Return Coot's source path for a model when it still points to a real file."""
-  try:
-    molecule_path = molecule_name(mol_id)
-  except Exception:
-    molecule_path = None
-  if not isinstance(molecule_path, str) or not molecule_path:
-    return None
-  normalized_path = os.path.abspath(os.path.expanduser(molecule_path))
-  if not os.path.isfile(normalized_path):
-    return None
-  if mmcif_only and not normalized_path.lower().endswith((".cif", ".mmcif")):
-    return None
-  return normalized_path
+  candidates = []
+  for candidate in (
+    molecule_name_stub_py(mol_id, 0),
+    molecule_name_stub_py(mol_id, 1),
+    molecule_name(mol_id),
+  ):
+    if isinstance(candidate, str) and candidate:
+      expanded = os.path.abspath(os.path.expanduser(candidate))
+      if expanded not in candidates:
+        candidates.append(expanded)
+  for candidate in candidates:
+    if os.path.isfile(candidate):
+      if mmcif_only and not candidate.lower().endswith((".cif", ".mmcif")):
+        continue
+      return candidate
+  return None
 
 
 def _annotation_source_display_name(mol_id):
   source_path = _annotation_source_path(mol_id)
-  return os.path.basename(source_path) if source_path else None
+  if source_path:
+    return os.path.basename(source_path)
+  return None
 
 
 def _annotation_export_directory():
-  desktop_directory = os.path.expanduser("~/Desktop")
-  if os.path.isdir(desktop_directory):
-    return desktop_directory
-  return os.path.expanduser("~")
+  desktop_path = os.path.expanduser("~/Desktop")
+  if os.path.isdir(desktop_path):
+    return desktop_path
+  return _coot_trimmings_dir()
 
 
 def _annotation_entry_count_label(count):
-  return f"{count} residue annotation{'' if count == 1 else 's'}"
+  return f"{count} annotation{'s' if count != 1 else ''}"
 
 
 def _annotation_entries_for_molecule(mol_id):
@@ -4747,155 +4797,124 @@ def _annotation_default_author():
 
 
 def _annotation_next_id(mol_id):
+  entries = _annotation_entries_for_molecule(mol_id)
   max_id = 0
-  for entry in _annotation_entries_for_molecule(mol_id):
-    try:
-      max_id = max(max_id, int(entry.get("id", 0)))
-    except Exception:
-      continue
+  for entry in entries:
+    entry_id = _annotation_safe_int(entry.get("id"), default=0)
+    if entry_id > max_id:
+      max_id = entry_id
   return max_id + 1
 
 
 def _annotation_prepare_note_fields(author_text, note_text):
-  normalized_note = (note_text or "").strip()
+  normalized_author = _annotation_text_or_empty(author_text).strip() or _annotation_default_author()
+  normalized_note = _annotation_text_or_empty(note_text).strip()
   if not normalized_note:
-    info_dialog("Residue annotation note cannot be empty.")
+    info_dialog("Please enter a note before saving the residue annotation.")
     return None
-  normalized_author = (author_text or "").strip() or _annotation_default_author() or "Unknown"
   return normalized_author, normalized_note
 
 
 def _annotation_target_for_active_residue(expected_mol_id=None):
-  """Resolve the active residue into a noteable jump/display target."""
-  residue = _active_residue_or_status()
+  residue = active_residue()
   if not residue:
+    info_dialog("Select an active residue first.")
     return None
-  mol_id, chain_id, resno, ins_code = residue[0:4]
+  mol_id, chain_id, resno, ins_code = residue[:4]
   if expected_mol_id is not None and mol_id != expected_mol_id:
-    info_dialog(f"Please activate a residue in molecule #{expected_mol_id} first.")
+    info_dialog(
+      f"The active residue is now in molecule #{mol_id}, not the annotation browser molecule #{expected_mol_id}."
+    )
     return None
   residue_name_here = residue_name(mol_id, chain_id, resno, ins_code) or ""
-  atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code)
-  point = _residue_display_point(atom_records, atom_xyz)
-  if point is None:
-    info_dialog("Failed to determine a display point for the active residue.")
+  if not residue_name_here:
+    info_dialog("Failed to determine the active residue name.")
     return None
-  navigation_metadata = None
-  if _residue_is_polymer(mol_id, chain_id, resno, ins_code):
-    navigation_metadata = {
-      "type": "polymer_residue",
-      "mol_id": mol_id,
-      "chain_id": chain_id,
-      "resno": resno,
-      "ins_code": ins_code or "",
-      "serial_number": _residue_serial_number(mol_id, chain_id, resno, ins_code),
-    }
   return {
     "mol_id": mol_id,
-    "chain_id": chain_id,
-    "resno": resno,
-    "ins_code": ins_code or "",
+    "chain_id": str(chain_id),
+    "resno": int(resno),
+    "ins_code": str(ins_code or ""),
     "residue_name": residue_name_here,
-    "point": point,
-    "navigation_metadata": navigation_metadata,
   }
 
 
 def _annotation_normalize_entry(raw_entry, fallback_id=None):
-  auth_seq_id = _annotation_safe_int(raw_entry.get("auth_seq_id"), None)
-  if auth_seq_id is None:
+  auth_asym_id = _annotation_text_or_empty(raw_entry.get("auth_asym_id")).strip()
+  auth_seq_id = _annotation_safe_int(raw_entry.get("auth_seq_id"), default=None)
+  if not auth_asym_id or auth_seq_id is None:
     return None
-  entry_id = _annotation_text_or_empty(raw_entry.get("id")).strip()
-  if not entry_id:
-    entry_id = str(fallback_id) if fallback_id is not None else "?"
-  return {
+  entry_id = _annotation_safe_int(raw_entry.get("id"), default=fallback_id)
+  if entry_id is None:
+    return None
+  normalized_entry = {
     "id": entry_id,
-    "auth_asym_id": _annotation_text_or_empty(raw_entry.get("auth_asym_id")).strip(),
+    "auth_asym_id": auth_asym_id,
     "auth_seq_id": auth_seq_id,
     "pdbx_PDB_ins_code": _annotation_text_or_empty(raw_entry.get("pdbx_PDB_ins_code")).strip(),
-    "label_comp_id": _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip(),
-    "author": _annotation_text_or_empty(raw_entry.get("author")).strip(),
-    "modified_utc": _annotation_text_or_empty(raw_entry.get("modified_utc")).strip(),
+    "label_comp_id": _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip() or "?",
+    "author": _annotation_text_or_empty(raw_entry.get("author")).strip() or _annotation_default_author(),
+    "modified_utc": _annotation_text_or_empty(raw_entry.get("modified_utc")).strip() or _annotation_now_utc(),
     "note": _annotation_text_or_empty(raw_entry.get("note")).strip(),
   }
-
-
-def _new_annotation_entry(target, author_text, note_text, note_id):
-  """Create one note row ready for in-memory storage and mmCIF export."""
-  return _annotation_normalize_entry(
-    {
-      "id": str(note_id),
-      "auth_asym_id": target["chain_id"],
-      "auth_seq_id": target["resno"],
-      "pdbx_PDB_ins_code": target["ins_code"] or "",
-      "label_comp_id": target["residue_name"] or "",
-      "author": author_text,
-      "modified_utc": _annotation_now_utc(),
-      "note": note_text,
-    },
-    fallback_id=note_id,
-  )
+  if not normalized_entry["note"]:
+    return None
+  return normalized_entry
 
 
 def _annotation_group_sort_key(group):
-  chain_id, resno, ins_code, _residue_name_here = group["key"]
-  return (chain_id, int(resno), ins_code or "")
+  first_entry = group["entries"][0]
+  return (group["key"][0], group["key"][1], group["key"][2], first_entry.get("id", 0))
 
 
 def _annotation_entry_sort_key(entry):
-  return (
-    _annotation_text_or_empty(entry.get("modified_utc")),
-    int(entry.get("id", 0) or 0),
-  )
+  return (entry.get("modified_utc", ""), entry.get("id", 0))
 
 
 def _annotation_groups_for_molecule(mol_id):
-  """Group note rows by residue so multiple authored comments stay threaded."""
-  grouped_entries = {}
+  grouped = {}
   for entry in _annotation_entries_for_molecule(mol_id):
-    try:
-      key = _annotation_residue_key(
-        entry.get("auth_asym_id", ""),
-        entry.get("auth_seq_id", 0),
-        entry.get("pdbx_PDB_ins_code", ""),
-        entry.get("label_comp_id", ""),
-      )
-    except Exception:
-      continue
-    grouped_entries.setdefault(key, []).append(entry)
-
-  residue_groups = []
-  for key, entries in grouped_entries.items():
-    sorted_entries = sorted(entries, key=_annotation_entry_sort_key)
-    chain_id, resno, ins_code, residue_name_here = key
-    residue_groups.append(
-      {
-        "key": key,
-        "dialog_label": _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here),
-        "entries": sorted_entries,
-      }
+    group_key = _annotation_residue_key(
+      entry["auth_asym_id"],
+      entry["auth_seq_id"],
+      entry.get("pdbx_PDB_ins_code", ""),
+      entry.get("label_comp_id", ""),
     )
-  return sorted(residue_groups, key=_annotation_group_sort_key)
+    grouped.setdefault(group_key, []).append(entry)
+
+  groups = []
+  for group_key, entries in grouped.items():
+    entries.sort(key=_annotation_entry_sort_key)
+    chain_id, resno, ins_code, residue_name_here = group_key
+    groups.append({
+      "key": group_key,
+      "dialog_label": _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here),
+      "entries": entries,
+    })
+  groups.sort(key=_annotation_group_sort_key)
+  return groups
 
 
 def _annotation_browser_data(mol_id):
+  groups = _annotation_groups_for_molecule(mol_id)
   return {
+    "mol_id": mol_id,
     "title": _annotation_browser_title(mol_id),
-    "groups": _annotation_groups_for_molecule(mol_id),
+    "groups": groups,
   }
 
 
 def _annotation_group_detail_text(group):
-  """Format the full note thread for the selected residue."""
-  detail_lines = []
+  lines = [group["dialog_label"], ""]
   for entry_index, entry in enumerate(group["entries"], start=1):
-    author_text = _annotation_text_or_empty(entry.get("author")) or "Unknown author"
-    modified_text = _annotation_text_or_empty(entry.get("modified_utc")) or "Unknown time"
-    detail_lines.append(f"{entry_index}. {author_text} - {modified_text}")
-    detail_lines.append(_annotation_text_or_empty(entry.get("note")) or "(Empty note)")
+    lines.append(f"Note {entry_index}")
+    lines.append(f"Author: {_annotation_text_or_empty(entry.get('author')) or 'Unknown'}")
+    lines.append(f"Timestamp: {_annotation_text_or_empty(entry.get('modified_utc')) or 'Unknown'}")
+    lines.append("")
+    lines.append(_annotation_text_or_empty(entry.get("note")) or "")
     if entry_index != len(group["entries"]):
-      detail_lines.append("")
-  return "\n".join(detail_lines)
+      lines.extend(["", "-" * 40, ""])
+  return "\n".join(lines)
 
 
 def _annotation_group_preview_text(group, max_length=56):
@@ -4977,7 +4996,6 @@ def _annotation_clear_existing_mmcif_items(block):
 
 
 def _load_annotations_from_mmcif_file(file_path):
-  """Read custom residue-note rows from a mmCIF file."""
   if gemmi is None:
     raise RuntimeError("gemmi is not available in this Coot Python environment.")
   document = gemmi.cif.read_file(file_path)
@@ -5044,7 +5062,6 @@ def _load_annotations_from_mmcif_file(file_path):
 
 
 def _annotation_write_entries_to_mmcif_block(block, entries):
-  """Replace the embedded residue-note category in one mmCIF block."""
   _annotation_clear_existing_mmcif_items(block)
   block.set_pair(RESIDUE_ANNOTATION_META_VERSION_TAG, "1")
   block.set_pair(RESIDUE_ANNOTATION_META_PROGRAM_TAG, "coot-trimmings")
@@ -5067,7 +5084,6 @@ def _annotation_write_entries_to_mmcif_block(block, entries):
 
 
 def _write_annotations_into_mmcif_file(file_path, entries):
-  """Replace the embedded residue-note category in a mmCIF file."""
   if gemmi is None:
     raise RuntimeError("gemmi is not available in this Coot Python environment.")
   document = gemmi.cif.read_file(file_path)
@@ -5076,7 +5092,6 @@ def _write_annotations_into_mmcif_file(file_path, entries):
 
 
 def _annotation_atom_invalid_for_export(atom):
-  """Coot can emit placeholder atom rows with blank names; strip them for export."""
   atom_name = (getattr(atom, "name", "") or "").strip()
   element_name = getattr(getattr(atom, "element", None), "name", "") or ""
   return (
@@ -5087,14 +5102,12 @@ def _annotation_atom_invalid_for_export(atom):
 
 
 def _annotation_clear_loop_category(block, first_tag):
-  """Erase a loop-backed mmCIF category if it exists."""
   loop_item = block.find_loop_item(first_tag)
   if loop_item is not None:
     loop_item.erase()
 
 
 def _annotation_prepare_mmcif_table(block, prefix, tags):
-  """Return a writable mmCIF table, preserving tags when the category already exists."""
   expected_tags = [prefix + tag for tag in tags]
   table = block.find_mmcif_category(prefix)
   if table is not None and table.width() == len(tags) and list(table.tags) == expected_tags:
@@ -5110,7 +5123,6 @@ def _annotation_prepare_mmcif_table(block, prefix, tags):
 
 
 def _annotation_polymer_type_cif_name(polymer_type):
-  """Map Gemmi polymer types onto mmCIF entity_poly.type strings."""
   polymer_name = getattr(polymer_type, "name", "")
   return {
     "PeptideL": "polypeptide(L)",
@@ -5123,7 +5135,6 @@ def _annotation_polymer_type_cif_name(polymer_type):
 
 
 def _annotation_export_ins_code(seqid):
-  """Normalize Gemmi seqid insertion codes for export matching."""
   ins_code = getattr(seqid, "icode", "") or ""
   if ins_code in (" ", "\x00"):
     return ""
@@ -5131,13 +5142,11 @@ def _annotation_export_ins_code(seqid):
 
 
 def _annotation_nonpoly_asym_id(chain_id, record_index):
-  """Generate a stable label_asym_id for exported non-polymer residues."""
   chain_prefix = chain_id or "X"
   return f"{chain_prefix}_np_{record_index}"
 
 
 def _annotation_residue_export_key(chain_id, residue):
-  """Build a residue key that matches atom_site auth-chain/auth-seq rows."""
   return (
     chain_id or "",
     str(residue.seqid.num),
@@ -5147,7 +5156,6 @@ def _annotation_residue_export_key(chain_id, residue):
 
 
 def _annotation_export_entity_records(structure):
-  """Derive per-chain entity/sequence records for the exported annotated mmCIF."""
   if len(structure) == 0:
     return []
 
@@ -5202,10 +5210,9 @@ def _annotation_export_entity_records(structure):
 
 
 def _annotation_apply_export_entity_metadata(block, structure):
-  """Replace entity/sequence categories with explicit per-chain metadata."""
   entity_records = _annotation_export_entity_records(structure)
   if not entity_records:
-    return
+    return []
 
   entity_table = _annotation_prepare_mmcif_table(block, "_entity.", ["id", "type"])
   struct_asym_table = _annotation_prepare_mmcif_table(block, "_struct_asym.", ["id", "entity_id"])
@@ -5224,11 +5231,9 @@ def _annotation_apply_export_entity_metadata(block, structure):
   if nonpoly_records:
     nonpoly_table = _annotation_prepare_mmcif_table(block, "_pdbx_entity_nonpoly.", ["entity_id", "comp_id"])
 
-  asym_to_entity_id = {}
   for record in entity_records:
     entity_table.append_row([record["entity_id"], record["entity_type"]])
     struct_asym_table.append_row([record["asym_id"], record["entity_id"]])
-    asym_to_entity_id[record["asym_id"]] = record["entity_id"]
     if record["kind"] == "polymer" and entity_poly_table is not None and entity_poly_seq_table is not None:
       entity_poly_table.append_row([
         record["entity_id"],
@@ -5245,7 +5250,6 @@ def _annotation_apply_export_entity_metadata(block, structure):
 
 
 def _annotation_apply_export_atom_site_metadata(block, entity_records):
-  """Align atom-site sequence ids with the explicit polymer sequence table."""
   required_columns = {
     tag: block.find_values(tag)
     for tag in (
@@ -5317,7 +5321,6 @@ def _annotation_apply_export_atom_site_metadata(block, entity_records):
 
 
 def _annotation_sanitize_export_structure(structure):
-  """Normalize Gemmi's view of the current model before writing final mmCIF."""
   for model in structure:
     for chain in model:
       for residue in chain:
@@ -5348,7 +5351,6 @@ def _annotation_sanitize_export_structure(structure):
 
 
 def _annotation_export_document_from_coot_cif(file_path):
-  """Convert Coot's current-model CIF into a cleaner Gemmi-written mmCIF document."""
   if gemmi is None:
     raise RuntimeError("gemmi is not available in this Coot Python environment.")
   structure = gemmi.read_structure(file_path)
@@ -5361,7 +5363,6 @@ def _annotation_export_document_from_coot_cif(file_path):
 
 
 def _load_residue_annotations_for_molecule(mol_id, file_path=None, show_status=True):
-  """Populate the in-memory annotation state for one model from embedded mmCIF."""
   annotation_path = file_path or _annotation_source_path(mol_id, mmcif_only=True)
   if not annotation_path:
     if show_status:
@@ -5383,7 +5384,6 @@ def _load_residue_annotations_for_molecule(mol_id, file_path=None, show_status=T
 
 
 def _write_model_with_embedded_annotations(mol_id, file_path):
-  """Write the current molecule as a sanitized mmCIF and inject the custom note category."""
   output_directory = os.path.dirname(os.path.abspath(file_path))
   os.makedirs(output_directory, exist_ok=True)
   source_handle = None
@@ -5423,7 +5423,6 @@ def _write_model_with_embedded_annotations(mol_id, file_path):
 
 
 def _default_annotation_export_path(mol_id):
-  """Suggest an output mmCIF path for annotated export."""
   export_directory = _annotation_export_directory()
   source_path = _annotation_source_path(mol_id)
   if source_path:
@@ -5434,7 +5433,6 @@ def _default_annotation_export_path(mol_id):
 
 
 def _default_annotation_markdown_export_path(mol_id):
-  """Suggest an output Markdown path for plain-text annotation export."""
   export_directory = _annotation_export_directory()
   source_path = _annotation_source_path(mol_id)
   if source_path:
@@ -5445,7 +5443,6 @@ def _default_annotation_markdown_export_path(mol_id):
 
 
 def _annotation_normalize_export_path(raw_output_path, allowed_suffixes, default_suffix, path_label):
-  """Normalize an export path and reject blank or directory destinations."""
   raw_path = str(raw_output_path or "").strip()
   if not raw_path:
     info_dialog(f"Please provide an output {path_label} path.")
@@ -5460,7 +5457,6 @@ def _annotation_normalize_export_path(raw_output_path, allowed_suffixes, default
 
 
 def _annotation_confirm_export_overwrite(dialog_title, normalized_path, retry_function):
-  """Ask before overwriting an existing export target."""
   generic_confirm_dialog(
     dialog_title,
     f"{os.path.basename(normalized_path)} already exists.\nOverwrite it?",
@@ -5473,7 +5469,6 @@ def _annotation_confirm_export_overwrite(dialog_title, normalized_path, retry_fu
 
 
 def _export_residue_annotations_for_molecule(mol_id, output_path, allow_overwrite=False):
-  """Write the current molecule plus embedded notes to a chosen mmCIF path."""
   normalized_path = _annotation_normalize_export_path(
     output_path,
     (".cif", ".mmcif"),
@@ -5502,7 +5497,6 @@ def _export_residue_annotations_for_molecule(mol_id, output_path, allow_overwrit
 
 
 def _export_residue_annotations_markdown_for_molecule(mol_id, output_path, allow_overwrite=False):
-  """Write the current annotation set as a plain-text Markdown table."""
   normalized_path = _annotation_normalize_export_path(
     output_path,
     (".md",),
@@ -5535,24 +5529,20 @@ def _export_residue_annotations_markdown_for_molecule(mol_id, output_path, allow
 
 
 def _export_residue_annotations_with_confirmation(mol_id, output_path):
-  """Export annotations, prompting before overwriting an existing file."""
   return _export_residue_annotations_for_molecule(mol_id, output_path, allow_overwrite=False)
 
 
 def _export_residue_annotations_markdown_with_confirmation(mol_id, output_path):
-  """Export Markdown annotations, prompting before overwriting an existing file."""
   return _export_residue_annotations_markdown_for_molecule(mol_id, output_path, allow_overwrite=False)
 
 
 def _ensure_residue_annotations_loaded(mol_id):
-  """Auto-load embedded notes the first time the widget is opened for a molecule."""
   if mol_id in RESIDUE_ANNOTATIONS_BY_MOLECULE:
     return _annotation_entries_for_molecule(mol_id)
   return _load_residue_annotations_for_molecule(mol_id, show_status=False) or _annotation_entries_for_molecule(mol_id)
 
 
 def _annotation_active_molecule():
-  """Resolve the current model molecule for the annotation browser."""
   model_molecules = model_molecule_list()
   residue = active_residue()
   if residue and residue[0] in model_molecules:
@@ -5574,7 +5564,6 @@ def _annotation_active_molecule_or_status():
 
 
 def _append_annotation_for_target(target, author_text, note_text, refresh_function=None):
-  """Add one authored note row for the chosen residue."""
   global RESIDUE_ANNOTATION_LAST_AUTHOR
   if not target:
     return 0
@@ -5612,7 +5601,6 @@ def _append_annotation_for_target(target, author_text, note_text, refresh_functi
 
 
 def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None):
-  """Prompt for a new authored note on the active residue."""
   target = _annotation_target_for_active_residue(expected_mol_id=mol_id)
   if target is None:
     return 0
@@ -5639,7 +5627,6 @@ def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None)
 
 
 def _annotation_note_choice_label(entry, entry_index, max_length=48):
-  """Compact chooser label for one authored note within a residue thread."""
   author_text = _annotation_text_or_empty(entry.get("author")) or "Unknown author"
   modified_text = _annotation_text_or_empty(entry.get("modified_utc")) or "Unknown time"
   preview_lines = _annotation_text_or_empty(entry.get("note")).splitlines()
@@ -5652,7 +5639,6 @@ def _annotation_note_choice_label(entry, entry_index, max_length=48):
 
 
 def _update_annotation_entry(annotation_entry, author_text, note_text, refresh_function=None):
-  """Edit one existing note row in place."""
   global RESIDUE_ANNOTATION_LAST_AUTHOR
   note_fields = _annotation_prepare_note_fields(author_text, note_text)
   if note_fields is None:
@@ -5669,7 +5655,6 @@ def _update_annotation_entry(annotation_entry, author_text, note_text, refresh_f
 
 
 def _delete_annotation_entry(mol_id, annotation_entry, refresh_function=None):
-  """Remove one note row from the current molecule."""
   entries = _annotation_entries_for_molecule(mol_id)
   try:
     entries.remove(annotation_entry)
@@ -5683,7 +5668,6 @@ def _delete_annotation_entry(mol_id, annotation_entry, refresh_function=None):
 
 
 def _prompt_edit_annotation_entry(group, annotation_entry, refresh_function=None):
-  """Open the edit dialog for one existing note row."""
   generic_author_note_entry(
     "Edit residue annotation",
     group["dialog_label"],
@@ -5701,7 +5685,6 @@ def _prompt_edit_annotation_entry(group, annotation_entry, refresh_function=None
 
 
 def _choose_annotation_entry_action(group, action_name, action_function):
-  """If a residue has multiple notes, prompt for which one to edit/delete."""
   entries = list(group.get("entries") or [])
   if not entries:
     info_dialog("No note is selected for this residue.")
@@ -5721,7 +5704,6 @@ def _choose_annotation_entry_action(group, action_name, action_function):
 
 
 def _annotation_jump_to_group(mol_id, group):
-  """Jump to a residue-annotation entry using the same polymer navigation path as Odd residues."""
   chain_id, resno, ins_code, residue_name_here = group["key"]
   residue_point = residue_centre_py(mol_id, chain_id, resno, ins_code)
   if not isinstance(residue_point, (list, tuple)) or len(residue_point) != 3:
@@ -5762,7 +5744,6 @@ def _annotation_browser_title(mol_id):
 
 
 def _annotation_active_residue_header_text(mol_id):
-  """Describe the currently active residue for the annotation browser header."""
   residue = active_residue()
   if not residue:
     return f"Active residue: none in molecule #{mol_id}"
@@ -5775,7 +5756,6 @@ def _annotation_active_residue_header_text(mol_id):
 
 
 def residue_annotations_gui():
-  """Browse, add, edit and export residue annotations for the active molecule."""
   initial_mol_id = _annotation_active_molecule_or_status()
   if initial_mol_id is None:
     return 0
@@ -5874,8 +5854,6 @@ def residue_annotations_gui():
     glib_module = None
 
   class AnnotationBrowserState:
-    """Mutable browser state and list-navigation helpers for the annotation widget."""
-
     def __init__(self, mol_id):
       self.current_mol_id = mol_id
       self.grouped_annotations = []
@@ -7807,24 +7785,6 @@ def cycle_rep_up(mol_id,flag=None):
   next_flag = (current_flag + 1) % len(REPRESENTATION_SEQUENCE)
   return _apply_representation_index(mol_id, next_flag)
 
-# def add_partial_water():
-#   place_typed_atom_at_pointer("Water")
-#   refine_active_residue()
-#   mol_id=active_residue()[0]
-#   ch_id=active_residue()[1]
-#   resno=active_residue()[2]
-#   ins_code=active_residue()[3]
-#   atom_name=active_residue()[4]
-#   alt_conf=""
-#   set_atom_attribute(mol_id,ch_id,resno,ins_code,atom_name,alt_conf,"occ",0.5)
-# add_key_binding("Add partial water","w",
-# lambda: add_partial_water())
-
-# def delete_alt_confs():
-#   mol_id=active_residue()[0]
-#   for ch_id in chain_ids(mol_id):
-#     for resn in (first_residue(mol_id,ch_id),last_residue(mol_id,ch_id)+1):
-#      residue_inf=residue_info(mol_id,ch_id,resn,"")      
 
     
 def cycle_rep_down(mol_id,flag=None):
@@ -8650,13 +8610,6 @@ def fit_polyala_gui():
   user_defined_click(2,fit_polyala)
   
 # Try to rebuild with db_mainchain after fit_gap?
-# def fit_polyala_gui2():
-#   def fit_polyala(res1,res2):
-#     length=abs(res1[3]-res2[3])-1
-#     loop_seq=length*"A"
-#     fit_gap(res1[1],res1[2],res1[3],res2[3],loop_seq,1)
-#     db_mainchain?
-#   user_defined_click(2,fit_polyala)
 
 #Real space refine for keyboard shortcut
 def refine_click():
@@ -9292,48 +9245,7 @@ def color_waters_for_active_molecule():
     return None
   return color_waters(mol_id)
 
-  
-#Search PDB by active chain
-#Modify example below. Need to get (clean - waters etc removed) sequence of 
-#active chain, search PDB using REST (look up RCSB REST for details), parse output line by line (try using first four characters of each line, or everything between numeric and :, 
-#load PDBs (get_ebi_pdb pdb_id) and SSM superpose (superpose imol1 imol2 move_imol2_flag;
-#superpose-with-chain-selection imol1 imol2 chain_imol1 chain_imol2 chain_used_flag_imol1 chain_used_flag_imol2 
-#move_imol2_copy_flag) each on active chain. Would probably be useful to optionally only load the best matching chain
-#of each struc; but equally might be good to keep everything, so that ligands, conserved waters, binding partners etc can be seen.
-# should probably restrict to top 10, and exclude those that are 90%+identical... or maybe take min_idpct and max_idpct as parameters?
-#
-# def query_pdb_by_active_chain():
-#   import urllib2
-#   url = 'http://www.rcsb.org/pdb/rest/search'
-#   mol_id=active_residue()[0]
-#   ch_id=active_residue()[1]
-#   seq=print_sequence_chain(mol_id,ch_id) # print_seq won't work, as does not return seq but pipes to stdout. need to write func.
-#   print seq
-#   seq.replace("X","")
-#   print seq
-#   
-#   queryText = """
-# <?xml version="1.0" encoding="UTF-8"?>
-# <orgPdbQuery>
-# <queryType>org.pdb.query.simple.SequenceQuery</queryType>
-# <sequence>{sequence}</sequence>
-# <eCutOff>0.00001</eCutOff>
-# <searchTool>blast</searchTool>
-# <sequenceIdentityCutoff>50</sequenceIdentityCutoff>
-# </orgPdbQuery>
-#   """.format(sequence=seq)
-#   
-#   print "query:\n", queryText
-#   print "querying PDB...\n"
-#   req = urllib2.Request(url, data=queryText)
-#   f = urllib2.urlopen(req)
-#   result = f.read()
-#   if result:
-#     print "Found number of PDB entries:", result.count('\n')
-#     print result
-#   else:
-#     print "Failed to retrieve results" 
-  
+
 CHAIN_BREAK_PROTEIN_RESNAMES = {'ALA','UNK','ARG','ASN','ASP','CYS','GLU','GLN','GLY','HIS','ILE','LEU','LYS','MET','MSE','PHE','PRO','SER','THR','TRP','TYR','VAL'}
 CHAIN_BREAK_NA_RESNAMES = {'A','C','T','G','U'}
 
@@ -9824,26 +9736,6 @@ def find_sequence_in_current_chain(subseq):
       return None
     navigable_interesting_things_gui("Matches to entered sequence",interesting_list)
 
-#Test post manipulation background func
-# import time, threading
-# def background_func():
-#   threading.Timer(0.01, post_manip_background).start()
-#   if condition:
-#     do something
-# post_manip_background()
-
-# def post_manipulation_script(imol, mode):
-#   print "BL DEBUG:: imol and mode", imol, mode
-#   if (mode == DELETED):
-#     print "BL DEBUG:: deleted something in mol ", imol
-#     return 1
-# 
-# def post_manipulation_script2(imol, mode):
-#   print "BL DEBUG:: imol and mode", imol, mode
-#   if (mode == MUTATED):
-#     print "BL DEBUG:: moved something in mol ", imol
-#     return 1
-
 # ---------------------------------------------------------------------------
 # Legacy Gtk archive
 # ---------------------------------------------------------------------------
@@ -9851,13 +9743,8 @@ def find_sequence_in_current_chain(subseq):
 # preserve older Gtk-heavy helpers so we can either revive them selectively or
 # refer back to the original implementations when porting features.
 #
-# There are two archives here:
-#   * GTK_DIALOG_FUNCTION_ARCHIVE: historical dialog-backed helpers. We still
-#     exec() these after the GTK4-safe fallback dialogs are defined so older
-#     tool functions remain available when they are still useful.
-#   * GTK_UI_ARCHIVE: the old bulk menu-construction block. It is preserved
-#     verbatim and still exec()'d on Gtk-capable builds, but it is no longer
-#     the main place to edit the Coot 1 menu layout.
+# Historical dialog-backed helper implementations promoted back into normal
+# Python. The remaining legacy notes below are kept only as brief reference.
 #
 # Archived startup wiring that is currently non-functional in this build:
 #
@@ -9885,9 +9772,7 @@ def find_sequence_in_current_chain(subseq):
 # coot_toolbar_button("Accept RSR", "accept_regularizement()", icon_name="")
 #
 # Historical dialog-backed helper implementations promoted back into normal
-# Python. These used to live inside GTK_DIALOG_FUNCTION_ARCHIVE and were
-# executed at startup via exec(...); keeping them as direct code preserves
-# behavior while removing that startup-time string execution path.
+# Python code.
 def set_map_level_quickly():
   map_id = _scrollable_map_or_status()
   if map_id is None:
@@ -10101,382 +9986,119 @@ def change_hires_limit():
     generic_single_entry("New high-res limit for map?",
     "5.0","Change high resolution limit for active map",change_hires_by_entry)
     
-#Hierarchical menu for commonly inserted CCP4 monomers
+
+
+import hashlib
+import json
+import os
+import shutil
+import traceback
+from functools import lru_cache
+
+
+COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
+COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
+COMMON_MONOMER_FAVORITES_MENU = None
+
 COMMON_MONOMER_MENU = [
-  ("Buffers", [
-    ("Bicine (BCN)", "BCN"),
-    ("Bis-Tris (BTB)", "BTB"),
-    ("Cacodylate (CAC)", "CAC"),
-    ("HEPES (EPE)", "EPE"),
-    ("MES (MES)", "MES"),
-    ("TAPS (T3A)", "T3A"),
-    ("Triethanolamine (TAM)", "TAM"),
-    ("Tris (TRS)", "TRS"),
-  ]),
-  ("Detergents / lipids", [
-    ("Detergents", [
-      ("Alpha-DDM / dodecyl-alpha-maltoside (LMU)", "LMU"),
-      ("BGL / beta-2-octylglucoside (BGL)", "BGL"),
-      ("BNG / beta-nonylglucoside (BNG)", "BNG"),
-      ("BOG / beta-octylglucoside (BOG)", "BOG"),
-      ("C10E6 (C10)", "C10"),
-      ("C8E4 (C8E)", "C8E"),
-      ("CHAPS (CPS)", "CPS"),
-      ("CHAPSO (1N7)", "1N7"),
-      ("Cyclohexyl-hexyl-beta-D-maltoside (MA4)", "MA4"),
-      ("CYMAL-4 (CVM)", "CVM"),
-      ("CYMAL-5 (CM5)", "CM5"),
-      ("DDM (dodecyl maltoside) (LMT)", "LMT"),
-      ("Digitonin (AJP)", "AJP"),
-      ("DM (decyl maltoside) (DMU)", "DMU"),
-      ("LDAO (LDA)", "LDA"),
-      ("LMNG (LMN)", "LMN"),
-      ("Octyl beta-D-galactopyranoside (HSH)", "HSH"),
-      ("OGNG (37X)", "37X"),
-      ("Seleno-DDM / dodecyl-beta-selenomaltoside (LSM)", "LSM"),
-      ("Undecyl maltoside (UMQ)", "UMQ"),
+  ("Common ions", [
+    ("Alkalis / earths", [
+      ("Li", "LI"),
+      ("Na", "NA"),
+      ("K", "K"),
+      ("Rb", "RB"),
+      ("Cs", "CS"),
+      ("NH4", "NH4"),
+      ("Mg", "MG"),
+      ("Ca", "CA"),
+      ("Sr", "SR"),
+      ("Ba", "BA"),
     ]),
-    ("Lipids", [
-      ("Bile salts", [
-        ("Cholic acid (CHD)", "CHD"),
-        ("Deoxycholic acid (DXC)", "DXC"),
-        ("Taurodeoxycholate (6SB)", "6SB"),
-      ]),
-      ("Dicaproyl phosphatidylserine (PSF)", "PSF"),
-      ("Dioleoyl phosphatidylcholine (PCW)", "PCW"),
-      ("Dipalmitoyl phosphatidic acid (PX6)", "PX6"),
-      ("Dipalmitoyl phosphatidylethanolamine (PEF)", "PEF"),
-      ("Dipalmitoyl phosphatidylglycerol (LHG)", "LHG"),
-      ("Diundecyl phosphatidylcholine (PLC)", "PLC"),
-      ("PIPs / inositides", [
-        ("Dihexadecanoyl PI(3,4,5)P3 (PIZ)", "PIZ"),
-        ("Dihexadecanoyl PI(4,5)P2 (PIK)", "PIK"),
-        ("Dioctanoyl PI(3,4)P2 (52N)", "52N"),
-        ("Dioctanoyl PI(3,4,5)P3 (IP9)", "IP9"),
-        ("Phosphatidylinositol (T7X)", "T7X"),
-      ]),
-      ("Sphingolipids", [
-        ("Sphingomyelin (FO4)", "FO4"),
-        ("Sphingosine (SPH)", "SPH"),
-        ("Sphingosine-1-phosphate (S1P)", "S1P"),
-        ("Sulfatide (SLF)", "SLF"),
-        ("Sulfogalactocerebroside (SFT)", "SFT"),
-      ]),
+    ("Halides / pseudohalides", [
+      ("F", "F"),
+      ("Cl", "CL"),
+      ("Br", "BR"),
+      ("I", "IOD"),
+      ("SCN", "SCN"),
+      ("N3", "AZI"),
     ]),
-    ("Sterols", [
-      ("Cholesterol (CLR)", "CLR"),
-      ("Cholesteryl hemisuccinate (Y01)", "Y01"),
+    ("Transition metals", [
+      ("Mn", "MN"),
+      ("Fe", "FE"),
+      ("Co", "CO"),
+      ("Ni", "NI"),
+      ("Cu", "CU"),
+      ("Zn", "ZN"),
+      ("Cd", "CD"),
+      ("Hg", "HG"),
+    ]),
+    ("Heavier / special metals", [
+      ("Pb", "PB"),
+      ("Pt", "PT"),
+      ("Au", "AU"),
+      ("Ir", "IR"),
+      ("Os", "OS"),
+      ("Gd", "GD3"),
+      ("La", "LA"),
+      ("Sm", "SM"),
+      ("Eu", "EU3"),
+      ("Tb", "TB"),
+      ("Ho", "HO3"),
+      ("Lu", "LU"),
+      ("Yb", "YB"),
+      ("U", "U1"),
     ]),
   ]),
-  ("Ions / metals", [
-    ("Cations", [
-      ("Ammonium (NH4)", "NH4"),
-      ("Barium (BA)", "BA"),
-      ("Calcium (CA)", "CA"),
-      ("Cesium (CS)", "CS"),
-      ("Lithium (LI)", "LI"),
-      ("Magnesium (MG)", "MG"),
-      ("Potassium (K)", "K"),
-      ("Rubidium (RB)", "RB"),
-      ("Sodium (NA)", "NA"),
-      ("Strontium (SR)", "SR"),
-    ]),
-    ("Halides", [
-      ("Bromide (BR)", "BR"),
-      ("Chloride (CL)", "CL"),
-      ("Fluoride (F)", "F"),
-      ("Iodide (IOD)", "IOD"),
-    ]),
-    ("Heavy atoms", [
-      ("Europium(III) ion (EU3)", "EU3"),
-      ("Gadolinium ion (GD3)", "GD3"),
-      ("Gold ion (AU)", "AU"),
-      ("Holmium(III) ion (HO3)", "HO3"),
-      ("Iridium ion (IR)", "IR"),
-      ("Krypton (KR)", "KR"),
-      ("Lanthanum(III) ion (LA)", "LA"),
-      ("Lead(II) ion (PB)", "PB"),
-      ("Lutetium(III) ion (LU)", "LU"),
-      ("Mercury(II) ion (HG)", "HG"),
-      ("Osmium ion (OS)", "OS"),
-      ("Platinum(II) ion (PT)", "PT"),
-      ("Samarium(III) ion (SM)", "SM"),
-      ("Terbium(III) ion (TB)", "TB"),
-      ("Uranium (U1)", "U1"),
-      ("Uranyl(VI) ion (IUM)", "IUM"),
-      ("Xenon (XE)", "XE"),
-      ("Ytterbium(III) ion (YB)", "YB"),
-    ]),
-    ("Metal clusters", [
-      ("Fe-S cluster (35L)", "35L"),
-      ("Fe-S cluster (FS1)", "FS1"),
-      ("Fe-S cluster / cubane (SF4)", "SF4"),
-      ("FeMo cofactor-like cluster (ICS)", "ICS"),
-      ("Ni-Fe cluster (82N)", "82N"),
-      ("Tetranuclear copper-sulfide cluster (CUZ)", "CUZ"),
-    ]),
-    ("Other anions", [
-      ("Azide (AZI)", "AZI"),
-      ("Biselenite (BSY)", "BSY"),
-      ("Carbonate (CO3)", "CO3"),
-      ("Nitrate (NO3)", "NO3"),
-      ("Perchlorate (LCP)", "LCP"),
-      ("Phosphite (PO3)", "PO3"),
-      ("Sulfite (SO3)", "SO3"),
-      ("Thiocyanate (SCN)", "SCN"),
-    ]),
-    ("Oxyanions", [
-      ("Arsenate (ART)", "ART"),
-      ("Molybdate (MOO)", "MOO"),
-      ("Phosphate (PO4)", "PO4"),
-      ("Selenate (SE4)", "SE4"),
-      ("Sulfate (SO4)", "SO4"),
-      ("Tungstate (WO4)", "WO4"),
-      ("Vanadate (VO4)", "VO4"),
-    ]),
-    ("Transition / heavy metals", [
-      ("Barium (BA)", "BA"),
-      ("Cadmium (CD)", "CD"),
-      ("Cobalt (CO)", "CO"),
-      ("Copper (CU)", "CU"),
-      ("Gold ion (AU)", "AU"),
-      ("Iron (FE)", "FE"),
-      ("Manganese (MN)", "MN"),
-      ("Mercury(II) ion (HG)", "HG"),
-      ("Nickel (NI)", "NI"),
-      ("Platinum(II) ion (PT)", "PT"),
-      ("Strontium (SR)", "SR"),
-      ("Zinc (ZN)", "ZN"),
-    ]),
+  ("Buffers / small ions", [
+    ("Phosphate", "PO4"),
+    ("Sulfate", "SO4"),
+    ("Carbonate", "CO3"),
+    ("Nitrate", "NO3"),
+    ("Formate", "FMT"),
+    ("Acetate", "ACT"),
+    ("Citrate", "FLC"),
+    ("Tartrate", "TAR"),
+    ("Thiocyanate", "SCN"),
+    ("Azide", "AZI"),
+    ("Urea", "URE"),
   ]),
-  ("Ligands", [
-    ("Bases / nucleosides", [
-      ("Adenine (ADE)", "ADE"),
-      ("Cytosine (CYT)", "CYT"),
-      ("Guanosine (GMP)", "GMP"),
-      ("Uracil (URA)", "URA"),
-      ("Uridine (URI)", "URI"),
-    ]),
-    ("Cofactors", [
-      ("Acidic NAD+ form (NAJ)", "NAJ"),
-      ("Adenosine 5'-pentaphosphate (5FA)", "5FA"),
-      ("ADP-ribose (APR)", "APR"),
-      ("Coenzyme A (COA)", "COA"),
-      ("Cyclic ADP-ribose (CXR)", "CXR"),
-      ("Diadenosine pentaphosphate (AP5)", "AP5"),
-      ("Diadenosine tetraphosphate (B4P)", "B4P"),
-      ("Diadenosine triphosphate (BA3)", "BA3"),
-      ("Diguanosine pentaphosphate (GP5)", "GP5"),
-      ("Diguanosine triphosphate (GP3)", "GP3"),
-      ("Flavin adenine dinucleotide (FAD)", "FAD"),
-      ("Flavin mononucleotide (FMN)", "FMN"),
-      ("Nicotinamide adenine dinucleotide (NAD)", "NAD"),
-      ("Nicotinamide adenine dinucleotide phosphate (NAP)", "NAP"),
-      ("Nicotinic acid adenine dinucleotide phosphate (DN4)", "DN4"),
-      ("ppGpp / guanosine 5',3'-tetraphosphate (G4P)", "G4P"),
-      ("Reduced nicotinamide adenine dinucleotide (NAI)", "NAI"),
-      ("Reduced nicotinamide adenine dinucleotide phosphate (NDP)", "NDP"),
-      ("S-adenosylhomocysteine (SAH)", "SAH"),
-      ("S-adenosylmethionine (SAM)", "SAM"),
-    ]),
-    ("Free amino acids", [
-      ("Alanine (ALA)", "ALA"),
-      ("Arginine (ARG)", "ARG"),
-      ("Asparagine (ASN)", "ASN"),
-      ("Aspartic acid (ASP)", "ASP"),
-      ("Cysteine (CYS)", "CYS"),
-      ("Glutamic acid (GLU)", "GLU"),
-      ("Glutamine (GLN)", "GLN"),
-      ("Glycine (GLY)", "GLY"),
-      ("Histidine (HIS)", "HIS"),
-      ("Isoleucine (ILE)", "ILE"),
-      ("Leucine (LEU)", "LEU"),
-      ("Lysine (LYS)", "LYS"),
-      ("Methionine (MET)", "MET"),
-      ("Phenylalanine (PHE)", "PHE"),
-      ("Proline (PRO)", "PRO"),
-      ("Serine (SER)", "SER"),
-      ("Threonine (THR)", "THR"),
-      ("Tryptophan (TRP)", "TRP"),
-      ("Tyrosine (TYR)", "TYR"),
-      ("Valine (VAL)", "VAL"),
-    ]),
-    ("Free sugars", [
-      ("Alpha-D-galactose (GLA)", "GLA"),
-      ("Alpha-D-glucose (GLC)", "GLC"),
-      ("Alpha-D-ribofuranose (RIB)", "RIB"),
-      ("Alpha-L-arabinose (ARA)", "ARA"),
-      ("Beta-D-galactose (GAL)", "GAL"),
-      ("Beta-D-glucose (BGC)", "BGC"),
-      ("Fructose (FRU)", "FRU"),
-      ("Fucose (FUC)", "FUC"),
-      ("Mannose (MAN)", "MAN"),
-      ("Xylose (XYS)", "XYS"),
-    ]),
-    ("Hemes / porphyrins", [
-      ("Ferrous tetravinylporphine complex (HEV)", "HEV"),
-      ("Heme A (HEA)", "HEA"),
-      ("Heme B (HEM)", "HEM"),
-      ("Heme C (HEC)", "HEC"),
-      ("Heme D (DHE)", "DHE"),
-      ("Heme D hydroxychlorin spirolactone (HDD)", "HDD"),
-      ("Heme O (HEO)", "HEO"),
-      ("Heme-AS (HAS)", "HAS"),
-    ]),
-    ("Immunosuppressants / macrocycles", [
-      ("Ascomycin analog (FK5)", "FK5"),
-      ("Rapamycin (RAP)", "RAP"),
-    ]),
-    ("Non-hydrolysable nucleotide analogs", [
-      ("AMP-CPP (APC)", "APC"),
-      ("AMP-PCP (ACP)", "ACP"),
-      ("AMP-PNP / AMPPNP (ANP)", "ANP"),
-      ("GMP-PCP (GCP)", "GCP"),
-      ("GMP-PNP / GppNHp (GNP)", "GNP"),
-      ("GTPgammaS (GSP)", "GSP"),
-    ]),
-    ("Nucleotides", [
-      ("Adenosine diphosphate (ADP)", "ADP"),
-      ("Adenosine monophosphate (AMP)", "AMP"),
-      ("Adenosine triphosphate (ATP)", "ATP"),
-      ("Cytidine diphosphate (CDP)", "CDP"),
-      ("Cytidine monophosphate (C5P)", "C5P"),
-      ("Cytidine triphosphate (CTP)", "CTP"),
-      ("Guanosine diphosphate (GDP)", "GDP"),
-      ("Guanosine monophosphate (5GP)", "5GP"),
-      ("Guanosine triphosphate (GTP)", "GTP"),
-      ("Uridine diphosphate (UDP)", "UDP"),
-      ("Uridine monophosphate (U)", "U"),
-      ("Uridine triphosphate (UTP)", "UTP"),
-    ]),
-    ("Phosphosugars / inositol phosphates", [
-      ("Fructose-1,6-bisphosphate (FBP)", "FBP"),
-      ("Fructose-6-phosphate (F6P)", "F6P"),
-      ("Glucosamine-6-phosphate (GLP)", "GLP"),
-      ("Glucose-1-phosphate (G1P)", "G1P"),
-      ("Glucose-6-phosphate (G6P)", "G6P"),
-      ("Inositol hexakisphosphate / phytate (IHP)", "IHP"),
-      ("Inositol pentakisphosphate (I5P)", "I5P"),
-      ("Inositol tetrakisphosphate (4IP)", "4IP"),
-      ("Inositol-1,4,5-trisphosphate (I3P)", "I3P"),
-      ("Inositol-1,4-bisphosphate (2IP)", "2IP"),
-      ("Inositol-1-phosphate (IPD)", "IPD"),
-      ("Inositol-2,4,5-trisphosphate (I2P)", "I2P"),
-      ("Inositol-4,5-bisphosphate (IP2)", "IP2"),
-      ("Inositol-4-phosphate (I4D)", "I4D"),
-      ("Mannose-1-phosphate (M1P)", "M1P"),
-      ("Mannose-6-phosphate (M6P)", "M6P"),
-      ("N-acetylglucosamine-6-phosphate (4QY)", "4QY"),
-      ("Ribose-5-phosphate (R5P)", "R5P"),
-    ]),
-    ("Polyamines", [
-      ("Cadaverine (N2P)", "N2P"),
-      ("Putrescine (PUT)", "PUT"),
-      ("Spermidine (SPD)", "SPD"),
-      ("Spermine (SPM)", "SPM"),
-    ]),
-    ("Protease inhibitors", [
-      ("AEBSF (AES)", "AES"),
-      ("Benzamidine (BEN)", "BEN"),
-      ("E-64 (E64)", "E64"),
-      ("PMSF (PMF)", "PMF"),
-      ("TLCK (TCK)", "TCK"),
-    ]),
-    ("Retinoids", [
-      ("9-cis-retinoic acid (9CR)", "9CR"),
-      ("All-trans retinoic acid (REA)", "REA"),
-      ("Retinal (RET)", "RET"),
-      ("Retinol (RTL)", "RTL"),
-    ]),
-    ("Tetrapyrroles / chlorophylls", [
-      ("Bacteriochlorophyll A (BCL)", "BCL"),
-      ("Bacteriochlorophyll B (BCB)", "BCB"),
-      ("Biliverdin (EL5)", "EL5"),
-      ("Chlorophyll A (CLA)", "CLA"),
-      ("Chlorophyll B (CHL)", "CHL"),
-      ("Chlorophyll D (CL7)", "CL7"),
-      ("Chlorophyll F (F6C)", "F6C"),
-      ("Pheophytin A (PHO)", "PHO"),
-      ("Phycocyanobilin (CYC)", "CYC"),
-      ("Protoporphyrin IX (PP9)", "PP9"),
-    ]),
-    ("Vitamin / coenzyme cofactors", [
-      ("5,10-Methenyltetrahydrofolate (GUE)", "GUE"),
-      ("Biotin (BTN)", "BTN"),
-      ("Pyridoxal 5'-phosphate (PLP)", "PLP"),
-      ("Tetrahydrofolate (THG)", "THG"),
-      ("Thiamine diphosphate (TPP)", "TPP"),
-    ]),
+  ("Cryoprotectants / solvents", [
+    ("Glycerol", "GOL"),
+    ("Ethylene glycol", "EDO"),
+    ("MPD", "MPD"),
+    ("PEG fragment", "PEG"),
+    ("DMSO", "DMS"),
+    ("Ethanol", "EOH"),
+    ("Isopropanol", "IPA"),
+    ("Acetonitrile", "ACN"),
   ]),
-  ("Solvents / additives", [
-    ("1,4-Butanediol (BU1)", "BU1"),
-    ("1-Butanol (1BO)", "1BO"),
-    ("Acetate (ACT)", "ACT"),
-    ("Acetonitrile (CCN)", "CCN"),
-    ("Ammonium (NH4)", "NH4"),
-    ("Azide (AZI)", "AZI"),
-    ("Carbonate (CO3)", "CO3"),
-    ("Chelators", [
-      ("EDTA (EDT)", "EDT"),
-      ("Nitrilotriacetic acid (NTA)", "NTA"),
-    ]),
-    ("DMSO (DMS)", "DMS"),
-    ("Ethanol (EOH)", "EOH"),
-    ("Ethylene glycol (EDO)", "EDO"),
-    ("Formic acid (FMT)", "FMT"),
-    ("Glycerol (GOL)", "GOL"),
-    ("Isopropanol (IPA)", "IPA"),
-    ("Methanol (MOH)", "MOH"),
-    ("MPD (MPD)", "MPD"),
-    ("n-Propanol (POL)", "POL"),
-    ("Nitrate (NO3)", "NO3"),
-    ("Organic acids", [
-      ("Citrate anion (FLC)", "FLC"),
-      ("Citric acid (CIT)", "CIT"),
-      ("Isocitric acid (ICT)", "ICT"),
-      ("Malate (MLT)", "MLT"),
-      ("Malonate (MLI)", "MLI"),
-      ("Oxalate (OXL)", "OXL"),
-      ("Oxaloacetate (OAA)", "OAA"),
-    ]),
-    ("Organic cations", [
-      ("Tetrabutylammonium (TBA)", "TBA"),
-      ("Tetramethylammonium (TMA)", "TMA"),
-      ("Triethylammonium (TEA)", "TEA"),
-    ]),
-    ("PEG (PEG)", "PEG"),
-    ("Propylene glycol / R-1,2-propanediol (PGR)", "PGR"),
-    ("Propylene glycol / S-1,2-propanediol (PGO)", "PGO"),
-    ("Reducing agents", [
-      ("Beta-mercaptoethanol (BME)", "BME"),
-      ("DTT / 2,3-dihydroxy-1,4-dithiobutane (DTT)", "DTT"),
-      ("TCEP / tris(2-carboxyethyl)phosphine (TCE)", "TCE"),
-    ]),
-    ("Tartaric acid", [
-      ("D(-)-Tartaric acid (TAR)", "TAR"),
-      ("L(+)-Tartaric acid (TLA)", "TLA"),
-    ]),
-    ("Taurine (TAU)", "TAU"),
-    ("Tetraethylene glycol (PG4)", "PG4"),
-    ("Thiocyanate (SCN)", "SCN"),
-    ("TMAO / trimethylamine oxide (TMO)", "TMO"),
-    ("Urea (URE)", "URE"),
+  ("Common ligands", [
+    ("Acetyl-CoA", "ACO"),
+    ("ATP", "ATP"),
+    ("ADP", "ADP"),
+    ("AMP", "AMP"),
+    ("GTP", "GTP"),
+    ("GDP", "GDP"),
+    ("NAD", "NAD"),
+    ("NADP", "NAP"),
+    ("FAD", "FAD"),
+    ("FMN", "FMN"),
+    ("HEM", "HEM"),
+    ("PLP", "PLP"),
+    ("CoA", "COA"),
   ]),
 ]
 
-# Some "monomers" are really better handled as typed atoms or built-in simple
-# groups. Those are placed at the pointer instead of going through get_monomer().
+
 COMMON_MONOMER_POINTER_TYPES = {
-  # Single-atom monomers are passed through using their CCP4 component code.
+  "H": "H",
+  "HE": "HE",
   "LI": "LI",
-  "MG": "MG",
-  "CA": "CA",
-  "NA": "NA",
-  "K": "K",
-  "RB": "RB",
-  "CS": "CS",
-  "SR": "SR",
-  "BA": "BA",
+  "BE": "BE",
+  "B": "B",
+  "C": "C",
+  "N": "N",
+  "O": "O",
   "F": "F",
   "CL": "CL",
   "BR": "BR",
@@ -10510,36 +10132,13 @@ COMMON_MONOMER_POINTER_TYPES = {
 }
 
 
-@lru_cache(maxsize=1)
-def _coot_trimmings_dir():
-  return os.path.dirname(_coot_trimmings_file_path())
 
-
-def _coot_trimmings_file_path():
-  candidates = []
-
-  runtime_file = globals().get("__file__", "")
-  module_file = getattr(sys.modules.get(__name__), "__file__", "")
-
-  for candidate in (
-    runtime_file,
-    module_file,
-    os.path.expanduser("~/.config/Coot/coot_trimmings.py"),
-    os.path.expanduser("~/Library/Application Support/Coot/coot_trimmings.py"),
-    os.path.join(os.getcwd(), "coot_trimmings.py"),
-  ):
-    if isinstance(candidate, str) and candidate:
-      normalized = os.path.abspath(candidate)
-      if normalized not in candidates:
-        candidates.append(normalized)
-
-  for candidate in candidates:
-    if os.path.isfile(candidate):
-      return candidate
-
-  if candidates:
-    return candidates[0]
-  return os.path.abspath("coot_trimmings.py")
+def _gio_module():
+  gio_module = globals().get("Gio")
+  if gio_module is None and "coot_gui" in globals() and hasattr(coot_gui, "Gio"):
+    gio_module = coot_gui.Gio
+    globals()["Gio"] = gio_module
+  return gio_module
 
 
 def _common_monomer_favorites_path():
@@ -10775,7 +10374,6 @@ def _normalize_common_monomer_favorite_cif(name, cif_path, comp_id=None):
 
 
 def _validate_custom_cif_dictionary(cif_path, comp_id):
-  """Check that a CIF dictionary can be read and can build its component."""
   normalized_path = _normalize_common_monomer_cif_path(cif_path)
   normalized_code = _sanitize_common_monomer_code(comp_id)
   if not normalized_path or not normalized_code:
@@ -10923,7 +10521,6 @@ def _clear_gio_menu(menu):
 
 
 def refresh_common_monomer_favorites_menu():
-  """Rebuild the Favorites submenu from the persistent JSON file."""
   global COMMON_MONOMER_FAVORITES_MENU
   menu = COMMON_MONOMER_FAVORITES_MENU
   if menu is None:
@@ -11013,7 +10610,6 @@ def _upsert_common_monomer_cif_favorite(name, cif_path):
 
 
 def prompt_add_common_monomer_code_favorite():
-  """Prompt for a persistent code-backed Common-monomers favorite."""
   generic_double_entry(
     "Add Common Monomer Favorite",
     "Favorite name",
@@ -11027,7 +10623,6 @@ def prompt_add_common_monomer_code_favorite():
 
 
 def prompt_add_common_monomer_cif_favorite():
-  """Prompt for a persistent custom-CIF Common-monomers favorite."""
   generic_double_entry_with_file_browse(
     "Add Common Monomer Favorite",
     "Favorite name",
@@ -11077,7 +10672,6 @@ def _remove_common_monomer_favorite(favorite_entry):
 
 
 def prompt_remove_common_monomer_favorite():
-  """Show the current favorites as removable buttons."""
   favorites = _load_common_monomer_favorites()
   if not favorites:
     info_dialog("No Common monomer favorites are currently saved.")
@@ -11098,7 +10692,6 @@ def prompt_remove_common_monomer_favorite():
 
 
 def place_common_monomer_favorite(favorite_entry):
-  """Place either a library monomer favorite or a custom-CIF favorite."""
   if favorite_entry.get("kind") == "cif":
     return place_custom_cif_monomer(favorite_entry["cif_path"], favorite_entry["comp_id"])
   return place_common_monomer(favorite_entry["code"])
@@ -11121,7 +10714,6 @@ def _common_monomer_target_molecule():
 
 
 def place_custom_cif_monomer(cif_path, comp_id=None):
-  """Load a custom CIF-backed monomer favorite and place it in Coot."""
   normalized_path = _normalize_common_monomer_cif_path(cif_path)
   normalized_code = _sanitize_common_monomer_code(comp_id or _extract_cif_component_id(cif_path) or "")
   if not normalized_path or not normalized_code:
@@ -11161,7 +10753,6 @@ def place_custom_cif_monomer(cif_path, comp_id=None):
 
 
 def place_common_monomer(monomer_code):
-  """Place a common monomer or simple ion at the pointer/current centre."""
   pointer_type = _pointer_type_for_monomer_code(monomer_code)
   if pointer_type:
     target_mol_id = _common_monomer_target_molecule()
@@ -11182,9 +10773,28 @@ def place_common_monomer(monomer_code):
       pass
     place_typed_atom_at_pointer(pointer_type)
     return target_mol_id
-  else:
-    get_monomer_no_H(monomer_code)
-    return molecule_number_list()[-1]
+  get_monomer_no_H(monomer_code)
+  return molecule_number_list()[-1]
+
+
+def add_common_monomer_menu_entries(menu, entries):
+  if menu is None:
+    return None
+  gio_module = _gio_module()
+  if gio_module is None:
+    return None
+  for label, value in entries:
+    if isinstance(value, list):
+      submenu = gio_module.Menu.new()
+      menu.append_submenu(label, submenu)
+      add_common_monomer_menu_entries(submenu, value)
+    else:
+      add_simple_coot_menu_menuitem(
+        menu,
+        label,
+        lambda func, monomer_code=value: place_common_monomer(monomer_code),
+      )
+  return None
 
 
 COORDINATION_LINK_MENU = [
@@ -11747,22 +11357,6 @@ def add_covalent_modification_menu_entries(menu):
     )
 
 
-def add_common_monomer_menu_entries(menu, entries):
-  """Recursively populate the Common monomers submenu from nested menu data."""
-  if menu is None:
-    return None
-  for label, value in entries:
-    if isinstance(value, list):
-      submenu = Gio.Menu.new()
-      menu.append_submenu(label, submenu)
-      add_common_monomer_menu_entries(submenu, value)
-    else:
-      add_simple_coot_menu_menuitem(
-        menu,
-        label,
-        lambda func, monomer_code=value: place_common_monomer(monomer_code),
-      )
-
 #Colors subset of protein residues red, provided by user as string of single-letter ids.
 def color_protein_residue_subset():
   residue = _active_residue_or_status()
@@ -11948,7 +11542,7 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
     dist = text_list[0]
     try:
       bl = float(dist)
-    except:
+    except (TypeError, ValueError):
       bl = False
       add_status_bar_text("Must define a number for the bond length")
     if bl:
@@ -12323,271 +11917,6 @@ def build_custom_menu():
   _build_custom_modify_menu(submenu_modify)
   _build_custom_maps_menu(submenu_maps)
   return menu
-
-# Preserve the older menu-building block as a clearly separated archive. The
-# main Coot 1.x menu layout should be edited in the live menu code above; this
-# archive is primarily here so legacy items can be compared or revived safely.
-GTK_UI_ARCHIVE = r'''
-#****Make and arrange menus****
-
-if GUI_PYTHON_AVAILABLE:
-  menu = attach_module_menu_button("Custom")
-  submenu_display = Gio.Menu.new()
-  submenu_colour = None
-  submenu_fit = Gio.Menu.new()
-  submenu_renumber = Gio.Menu.new()
-  submenu_settings = Gio.Menu.new()
-  submenu_build = Gio.Menu.new()
-  submenu_common_monomers = Gio.Menu.new()
-  submenu_common_monomer_favorites = Gio.Menu.new()
-  submenu_coordination_links = Gio.Menu.new()
-  submenu_covalent_modifications = Gio.Menu.new()
-  submenu_mutate = Gio.Menu.new()
-  submenu_modify = Gio.Menu.new()
-  submenu_maps = Gio.Menu.new()
-
-  menu.append_submenu("Display", submenu_display)
-  menu.append_submenu("Fit", submenu_fit)
-  menu.append_submenu("Renumber", submenu_renumber)
-  menu.append_submenu("Settings", submenu_settings)
-  menu.append_submenu("Build", submenu_build)
-  menu.append_submenu("Mutate", submenu_mutate)
-  menu.append_submenu("Modify", submenu_modify)
-  menu.append_submenu("Maps", submenu_maps)
-else:
-  menu = None
-  submenu_display = submenu_colour = submenu_fit = submenu_renumber = submenu_settings = None
-  submenu_build = submenu_common_monomers = submenu_common_monomer_favorites = submenu_coordination_links = submenu_covalent_modifications = submenu_mutate = submenu_modify = None
-  submenu_maps = None
-
-#**** Populate submenus ****
-#"Display..."
-
-add_simple_coot_menu_menuitem(submenu_display, "All Molecules use \"C-alpha\" Symmetry", lambda func: [valid_model_molecule_qm(imol) and symmetry_as_calphas(imol, 1) for imol in molecule_number_list()])
-
-add_simple_coot_menu_menuitem(submenu_display, "Toggle Symmetry", 
-lambda func: set_show_symmetry_master(not get_show_symmetry()))
-
-add_simple_coot_menu_menuitem(submenu_display, "Clear labels and distances", 
-lambda func: clear_distances_and_labels())
-
-add_simple_coot_menu_menuitem(submenu_display, "Toggle high-contrast model lighting",
-lambda func: toggle_high_contrast_mode())
-
-add_simple_coot_menu_menuitem(submenu_display, "Yellow-ify carbons",
-lambda func: yellowify_carbons_in_active_molecule())
-
-add_simple_coot_menu_menuitem(submenu_display,
-"Switch all mols to CA representation",lambda func: all_mols_to_ca())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by rotamer prob (outliers magenta) and missing atoms (blue)", lambda func: color_rotamer_outliers_and_missing_atoms_for_active_molecule())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by hydrophobics (orange), polars (blue), glys (magenta) and pros (green)", lambda func: color_polars_and_hphobs_for_active_molecule())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by charge (+ve blue, -ve red)", lambda func: color_by_charge_for_active_molecule())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Uncolor other chains in active mol", lambda func: uncolor_other_chains())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active chain", lambda func: color_active_chain())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active segment", lambda func: colour_active_segment())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color by protein/nucleic acid", lambda func: color_protein_na_for_active_molecule())
-
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color waters", lambda func: color_waters_for_active_molecule())
-
-add_simple_coot_menu_menuitem(submenu_colour, "Colour entered subset of protein residues for active mol", lambda func: color_protein_residue_subset())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by Ramachandran outliers", lambda func: color_by_rama_native_for_active_residue())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by density fit", lambda func: color_by_density_fit_native_for_active_residue())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by NCS difference", lambda func: color_by_ncs_difference_for_active_residue())
-
-add_simple_coot_menu_menuitem(submenu_colour,
-"Color active mol by clash score", lambda func: color_by_clash_score_for_active_molecule())
-
-add_simple_coot_menu_menuitem(submenu_colour, "Highlight chain breaks in active mol", lambda func: highlight_chain_breaks())
-
-add_simple_coot_menu_menuitem(submenu_colour, "Highlight chain breaks in all mols", lambda func: highlight_all_chain_breaks())
-
-add_simple_coot_menu_menuitem(submenu_display, "Find sequence in active chain", lambda func: find_sequence_with_entry())
-
-
-
-#"Fit..."
-add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", 
-lambda func: rigid_fit_all_chains())
-
-add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", 
-lambda func: rigid_fit_active_chain())
-
-add_simple_coot_menu_menuitem(submenu_fit, 
-"Jiggle-fit current chain to map (Slow!)", lambda func: jiggle_fit_active_chain())
-
-add_simple_coot_menu_menuitem(submenu_fit,
-"Jiggle-fit current chain to B-smoothed map (Slow!)", lambda func: jiggle_fit_active_chain_smooth())
-
-add_simple_coot_menu_menuitem(submenu_fit, "Jiggle-fit all chains to map (very slow!)",
-lambda func: jiggle_fit_all_chains())
-
-add_simple_coot_menu_menuitem(submenu_fit, 
-"Jiggle-fit current mol to map (Slow!)", lambda func: jiggle_fit_active_mol())
-
-add_simple_coot_menu_menuitem(submenu_fit, "Fit all segments", lambda func: rigid_body_fit_segments())
-
-add_simple_coot_menu_menuitem(submenu_fit, "Fit this segment", lambda func: fit_this_segment())
-
-add_simple_coot_menu_menuitem(submenu_fit,
-"Smart self restrain active mol...",lambda func: prompt_generate_smart_local_extra_restraints())
-
-#"Renumber..."
-
-add_simple_coot_menu_menuitem(submenu_renumber, "Renumber active chain by first res", 
-lambda func: renumber_by_first_res())
-
-add_simple_coot_menu_menuitem(submenu_renumber, 
-"Renumber active chain by last res", lambda func: renumber_by_last_res())
-
-add_simple_coot_menu_menuitem(submenu_renumber,
-"Renumber active chain by current res", lambda func: renumber_by_active_res())
-
-add_simple_coot_menu_menuitem(submenu_renumber,"Renumber from N-term to active residue",
-lambda func: renumber_n_term_segment())
-
-add_simple_coot_menu_menuitem(submenu_renumber,"Renumber from active residue to C-term",
-lambda func: renumber_c_term_segment())
-
-add_simple_coot_menu_menuitem(submenu_renumber, "Renumber segment by active res", lambda func: renumber_seg_by_active_res())
-
-
-#"Settings..."
-
-add_simple_coot_menu_menuitem(submenu_settings,
-"Auto-scale B-factor coloring for active mol",lambda func: autoscale_b_factor())
-
-add_simple_coot_menu_menuitem(submenu_settings,
-"Set Bfac for new atoms to mean B for active mol",lambda func: set_new_atom_b_fac_to_mean())
-
-
-#"Build..."
-add_simple_coot_menu_menuitem(submenu_build,
-"Forced addition of terminal residue (click terminus)", 
-lambda func: force_add_terminal_residue())
-
-add_simple_coot_menu_menuitem(submenu_build,
-"Grow helix (click terminus)",
-lambda func: grow_helix())
-
-add_simple_coot_menu_menuitem(submenu_build,
-"Grow strand (click terminus)",
-lambda func: grow_strand())
-
-add_simple_coot_menu_menuitem(submenu_build,
-"Grow parallel strand (click terminus)",
-lambda func: grow_parallel_strand())
-
-add_simple_coot_menu_menuitem(submenu_build,
-"Grow 3-10 helix (click terminus)",
-lambda func: grow_helix_3_10())
-
-add_simple_coot_menu_menuitem(submenu_build, 
-"Shorten loop by one residue", lambda func: shorten_loop())
-
-add_simple_coot_menu_menuitem(submenu_build, 
-"Lengthen loop by one residue", lambda func: lengthen_loop())
-
-add_simple_coot_menu_menuitem(submenu_build,
-"Get fractional coordinates of active atom",lambda func: get_fract_coords()) 
-
-submenu_build.append_submenu("Common monomers", submenu_common_monomers)
-submenu_common_monomers.append_submenu("Favorites", submenu_common_monomer_favorites)
-COMMON_MONOMER_FAVORITES_MENU = submenu_common_monomer_favorites
-refresh_common_monomer_favorites_menu()
-add_common_monomer_menu_entries(submenu_common_monomers, COMMON_MONOMER_MENU)
-
-submenu_build.append_submenu("Coordination links", submenu_coordination_links)
-add_coordination_link_menu_entries(submenu_coordination_links, COORDINATION_LINK_MENU)
-
-submenu_build.append_submenu("Covalent modifications", submenu_covalent_modifications)
-add_covalent_modification_menu_entries(submenu_covalent_modifications)
-
-add_simple_coot_menu_menuitem(submenu_build, "Make alpha helix of length n", lambda func: place_new_helix()) 
-
-add_simple_coot_menu_menuitem(submenu_build, "Make 3-10 helix of length n", lambda func: place_new_3_10_helix())
-
-add_simple_coot_menu_menuitem(submenu_build, "Build polyala loop (click start,end)", lambda func: fit_polyala_gui())
-
-
-
-
-
-#"Mutate...
-
-add_simple_coot_menu_menuitem(submenu_mutate,
-"Mutate range to UNK (click start and end)", lambda func: mutate_residue_range_by_click_a())
-
-add_simple_coot_menu_menuitem(submenu_mutate,
-"Mutate range to ALA (click start and end)", lambda func: mutate_residue_range_by_click_ala_a())
-
-add_simple_coot_menu_menuitem(submenu_mutate, "Mutate all Mets to MSE", lambda func: mutate_all_mets_to_mse())
-
-add_simple_coot_menu_menuitem(submenu_mutate, "Mutate all MSEs to Met", lambda func: mutate_all_mse_to_met())
-
-add_simple_coot_menu_menuitem(submenu_mutate,
-"Mutate active chain to template sequence (numbering must match sequence!)", lambda func: mutate_by_resnum())
-
-#"Modify..."
-add_simple_coot_menu_menuitem(submenu_modify, "Copy current chain", 
-lambda func: copy_active_chain())
-
-add_simple_coot_menu_menuitem(submenu_modify, "Cut current chain", 
-lambda func: cut_active_chain())
-
-add_simple_coot_menu_menuitem(submenu_modify, "Copy active segment", lambda func: copy_active_segment())
-
-add_simple_coot_menu_menuitem(submenu_modify, "Cut active segment", lambda func: cut_active_segment())
-
-add_simple_coot_menu_menuitem(submenu_modify,
-"Smart copy active non-polymer residue", lambda func: smart_copy_active_non_polymer_residue())
-
-add_simple_coot_menu_menuitem(submenu_modify,
-"Smart paste copied non-polymer residue", lambda func: smart_paste_copied_non_polymer_residue())
-
-add_simple_coot_menu_menuitem(submenu_modify,
-"Copy fragment (click start and end)", lambda func: copy_frag_by_click())
-
-add_simple_coot_menu_menuitem(submenu_modify,
-"Cut fragment (click start and end)", lambda func: cut_frag_by_click())
-
-add_simple_coot_menu_menuitem(submenu_modify,
-"Copy active chain to NCS equivs", lambda func: copy_ncs_chain_from_active())
-
-
-add_simple_coot_menu_menuitem(submenu_modify, "Delete active segment", lambda func: delete_active_segment())
-
-add_simple_coot_menu_menuitem(submenu_modify, "Merge chains (click two; 2nd into 1st)", lambda func: merge_chains())
-
-
-#"Maps..."
-add_simple_coot_menu_menuitem(submenu_maps,
-"Go to center of scrollable map",lambda func: goto_center_of_map())
-
-add_simple_coot_menu_menuitem(submenu_maps,
-"Set refinement map to scrollable map",lambda func: set_map_to_scrollable_map())
-'''
 
 if GUI_PYTHON_AVAILABLE:
   try:
