@@ -27,6 +27,15 @@ _Note: If you see an errror like <!DOCTYPE html> ^ SyntaxError: invalid syntax, 
 
 _Note 2: If you are using CCP4-bundled Coot 1, it should work out of the box; if you are using a version installed with homebrew, it may require some tweaking, see [here](https://github.com/pemsley/coot/issues/286#issuecomment-4131011003)._
 
+If you are using Coot1 installed with homebrew, add these two lines to your `coot` file, e.g. `/opt/homebrew/bin/coot`, at the second to last line:
+
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/glib/lib:/opt/homebrew/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}
+export GI_TYPELIB_PATH=/opt/homebrew/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}
+```
+
+In order to resolve a non-fatal startup error that was preventing the script running.
+
 ## Startup behavior
 
 The script changes a few defaults at startup, including:
