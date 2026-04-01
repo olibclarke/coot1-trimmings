@@ -334,7 +334,7 @@ def _coot_gui_repository_module(module_name):
   existing_module = globals().get(module_name)
   if existing_module is not None:
     return existing_module
-  coot_gui_module = globals().get("coot_gui")
+  coot_gui_module = _coot_gui_module()
   if coot_gui_module is not None and hasattr(coot_gui_module, module_name):
     return getattr(coot_gui_module, module_name)
   if module_name not in _GTK_REPOSITORY_WARNINGS_SHOWN:
@@ -892,7 +892,21 @@ def _optional_import(module_name):
     return None
 
 
-coot_gui = _optional_import("coot_gui")
+# Importing coot_gui eagerly at startup can trigger a second GTK/Rsvg stack in
+# some bundled Coot builds (notably the CCP4 macOS bundle), which then breaks
+# themed/icon rendering. Prefer the module Coot has already loaded, and only
+# treat GUI Python helpers as available when that preloaded module exists.
+def _coot_gui_module():
+  existing_module = globals().get("coot_gui")
+  if existing_module is not None:
+    return existing_module
+  existing_module = sys.modules.get("coot_gui")
+  if existing_module is not None:
+    globals()["coot_gui"] = existing_module
+  return existing_module
+
+
+coot_gui = _coot_gui_module()
 coot_fitting = _optional_import("coot_fitting")
 coot_ncs = _optional_import("coot_ncs")
 GUI_PYTHON_AVAILABLE = coot_gui is not None
@@ -1926,17 +1940,19 @@ if coot_fitting and hasattr(coot_fitting, "pepflip_active_residue"):
   pepflip_active_residue = coot_fitting.pepflip_active_residue
 
 
-if GUI_PYTHON_AVAILABLE:
-  coot_toolbar_button = coot_gui.coot_toolbar_button
-  attach_module_menu_button = coot_gui.attach_module_menu_button
-  generic_button_dialog = coot_gui.generic_button_dialog
+_preloaded_coot_gui = _coot_gui_module()
+
+if _preloaded_coot_gui is not None:
+  coot_toolbar_button = _preloaded_coot_gui.coot_toolbar_button
+  attach_module_menu_button = _preloaded_coot_gui.attach_module_menu_button
+  generic_button_dialog = _preloaded_coot_gui.generic_button_dialog
   generic_multiple_entries_with_check_button = (
-    coot_gui.generic_multiple_entries_with_check_button
+    _preloaded_coot_gui.generic_multiple_entries_with_check_button
   )
-  add_simple_action_to_menu = coot_gui.add_simple_action_to_menu
-  add_module_cryo_em_gui = coot_gui.add_module_cryo_em_gui
-  add_module_refine = coot_gui.add_module_refine
-  Gtk = coot_gui.Gtk
+  add_simple_action_to_menu = _preloaded_coot_gui.add_simple_action_to_menu
+  add_module_cryo_em_gui = _preloaded_coot_gui.add_module_cryo_em_gui
+  add_module_refine = _preloaded_coot_gui.add_module_refine
+  Gtk = _preloaded_coot_gui.Gtk
 
   _menu_action_counter = 0
 
@@ -10135,8 +10151,9 @@ COMMON_MONOMER_POINTER_TYPES = {
 
 def _gio_module():
   gio_module = globals().get("Gio")
-  if gio_module is None and "coot_gui" in globals() and hasattr(coot_gui, "Gio"):
-    gio_module = coot_gui.Gio
+  coot_gui_module = _coot_gui_module()
+  if gio_module is None and coot_gui_module is not None and hasattr(coot_gui_module, "Gio"):
+    gio_module = coot_gui_module.Gio
     globals()["Gio"] = gio_module
   return gio_module
 
@@ -11874,10 +11891,11 @@ def _build_custom_maps_menu(submenu_maps):
 
 def build_custom_menu():
   """Create the top-level Custom menu with direct Python submenu builders."""
-  if not GUI_PYTHON_AVAILABLE:
+  coot_gui_module = _coot_gui_module()
+  if coot_gui_module is None:
     return None
-  if "Gio" not in globals() and hasattr(coot_gui, "Gio"):
-    globals()["Gio"] = coot_gui.Gio
+  if "Gio" not in globals() and hasattr(coot_gui_module, "Gio"):
+    globals()["Gio"] = coot_gui_module.Gio
 
   menu = attach_module_menu_button("Custom")
   submenu_display = Gio.Menu.new()
@@ -11918,7 +11936,7 @@ def build_custom_menu():
   _build_custom_maps_menu(submenu_maps)
   return menu
 
-if GUI_PYTHON_AVAILABLE:
+if _coot_gui_module() is not None:
   try:
     build_custom_menu()
   except Exception:
