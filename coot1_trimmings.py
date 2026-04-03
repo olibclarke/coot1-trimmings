@@ -17,6 +17,7 @@ import sys
 import tempfile
 import traceback
 import warnings
+from bisect import bisect_left
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -434,6 +435,23 @@ EMRINGER_HELPER_MISFIT_MIN_PEAK_TO_CONTOUR_RATIO = 1.25
 EMRINGER_HELPER_MISFIT_MIN_GAIN_TO_CONTOUR_RATIO = 0.50
 EMRINGER_HELPER_MISFIT_MIN_PROMINENCE_TO_CONTOUR_RATIO = 0.25
 EMRINGER_HELPER_MISFIT_SUPPORT_STEP_DEGREES = 5.0
+
+# Thresholded Q-residue contour-optimization prototype defaults.
+THRESHOLDED_Q_GAUSSIAN_SIGMA = 0.60
+THRESHOLDED_Q_IDEAL_ENCLOSED_MASS_PERCENT = 70.0
+THRESHOLDED_Q_GRID_SPACING = 0.60
+THRESHOLDED_Q_SAMPLE_RADIUS_SIGMA = 4.0
+THRESHOLDED_Q_SAMPLE_SHELL_PADDING = 0.75
+THRESHOLDED_Q_CONTEXT_ATOM_INFLUENCE_SIGMA = 4.0
+THRESHOLDED_Q_LOCAL_RADIUS = 6.0
+THRESHOLDED_Q_CONTEXT_RADIUS_PADDING = 4.0
+THRESHOLDED_Q_LOCAL_MAX_RESIDUES = 12
+THRESHOLDED_Q_SWEEP_MIN_SIGMA = 0.5
+THRESHOLDED_Q_SWEEP_MAX_SIGMA = 12.0
+THRESHOLDED_Q_SWEEP_STEPS = 50
+
+_THRESHOLDED_Q_HYDROGEN_ELEMENTS = {"H", "D"}
+_THRESHOLDED_Q_BACKBONE_ATOM_NAMES = {"N", "CA", "C", "O", "P", "OP1", "OP2", "O1P", "O2P", "O3P"}
 
 # Model lighting presets used by the high-contrast toggle.
 MODEL_NORMAL_AMBIENT = (0.35, 0.35, 0.35, 1.0)
@@ -1137,6 +1155,24 @@ def _parse_int_entry(value, error_message, minimum_value=None):
   return parsed_value
 
 
+def _renumber_residue_range_or_dialog(mol_id, ch_id, start_res, last_res, offset, failure_message=None):
+  """Run residue renumbering and surface failures to the user."""
+  if failure_message is None:
+    failure_message = (
+      "Failed to renumber residues.\n\n"
+      "This usually means the requested renumbering would create overlapping sequence numbering."
+    )
+  try:
+    status = renumber_residue_range(mol_id, ch_id, start_res, last_res, int(offset))
+  except Exception:
+    info_dialog(failure_message)
+    return 0
+  if not status:
+    info_dialog(failure_message)
+    return 0
+  return status
+
+
 def _mask_map_by_all_atoms(map_id, mol_id, invert_flag):
   """Mask a map using an explicit all-atoms selection when possible."""
   # Some Coot masking paths appear to treat the convenience molecule-wide call
@@ -1213,17 +1249,64 @@ def _nearest_polymer_residue_to_rotation_centre(mol_id, chain_id=None, max_dista
   return best_residue
 
 
+def _navigation_residue_near_rotation_centre(reference_residue, max_distance=6.0, distance_tolerance=0.25):
+  """Prefer the polymer residue actually under the current rotation centre.
+
+  After renumbering, Coot can leave active_residue()/stored navigation state
+  pointing at the old residue number even though the view is still centred on
+  the correct residue. Re-resolve the residue from geometry when the current
+  view clearly favours a different residue in the same chain.
+  """
+  mol_id = reference_residue["mol_id"]
+  chain_id = reference_residue["chain_id"]
+  resno = reference_residue["resno"]
+  ins_code = reference_residue["ins_code"]
+  rotation_centre = _rotation_centre_xyz()
+  nearest_residue = _nearest_polymer_residue_to_rotation_centre(mol_id, chain_id, max_distance=max_distance)
+  if nearest_residue is None:
+    return reference_residue
+  if nearest_residue == (chain_id, resno, ins_code):
+    return reference_residue
+  reference_centre = residue_centre_py(mol_id, chain_id, resno, ins_code)
+  if not isinstance(reference_centre, (list, tuple)) or len(reference_centre) != 3:
+    reference_residue = dict(reference_residue)
+    reference_residue.update({
+      "chain_id": nearest_residue[0],
+      "resno": nearest_residue[1],
+      "ins_code": nearest_residue[2],
+      "source": "nearby",
+    })
+    reference_residue.pop("serial_number", None)
+    return reference_residue
+  reference_distance_sq = _distance_sq(rotation_centre, reference_centre)
+  nearest_centre = residue_centre_py(mol_id, nearest_residue[0], nearest_residue[1], nearest_residue[2])
+  if not isinstance(nearest_centre, (list, tuple)) or len(nearest_centre) != 3:
+    return reference_residue
+  nearest_distance_sq = _distance_sq(rotation_centre, nearest_centre)
+  if nearest_distance_sq + (distance_tolerance * distance_tolerance) >= reference_distance_sq:
+    return reference_residue
+  reference_residue = dict(reference_residue)
+  reference_residue.update({
+    "chain_id": nearest_residue[0],
+    "resno": nearest_residue[1],
+    "ins_code": nearest_residue[2],
+    "source": "nearby",
+  })
+  reference_residue.pop("serial_number", None)
+  return reference_residue
+
+
 def _navigation_reference_residue():
   """Resolve the residue that navigation should use as its starting point."""
   residue = active_residue()
   if residue and _residue_is_polymer(residue[0], residue[1], residue[2], residue[3]):
-    return {
+    return _navigation_residue_near_rotation_centre({
       "mol_id": residue[0],
       "chain_id": residue[1],
       "resno": residue[2],
       "ins_code": residue[3],
       "source": "active",
-    }
+    })
 
   global NAVIGATION_LAST_RESIDUE
   if NAVIGATION_LAST_RESIDUE:
@@ -1240,14 +1323,14 @@ def _navigation_reference_residue():
           serial_number = None
         elif insertion_code_from_serial_number(mol_id, chain_id, serial_number) != (ins_code or ""):
           serial_number = None
-      return {
+      return _navigation_residue_near_rotation_centre({
         "mol_id": mol_id,
         "chain_id": chain_id,
         "resno": resno,
         "ins_code": ins_code,
         "source": "stored",
         "serial_number": serial_number,
-      }
+      })
     NAVIGATION_LAST_RESIDUE = None
 
   mol_id = go_to_atom_molecule_number()
@@ -1297,6 +1380,100 @@ def _navigation_reference_residue():
   return None
 
 
+def _molecule_id_name_label(mol_id):
+  molecule_label = molecule_name_stub_py(mol_id, 0) or molecule_name(mol_id) or ""
+  molecule_label = os.path.basename(str(molecule_label).strip()) or f"molecule_{mol_id}"
+  return f"Molecule #{mol_id}, {molecule_label}"
+
+
+def _atom_b_factor_value(b_factor):
+  if isinstance(b_factor, (list, tuple)) and b_factor:
+    return _atom_b_factor_value(b_factor[0])
+  try:
+    return float(b_factor)
+  except Exception:
+    return None
+
+
+def _residue_representative_atom_metrics(mol_id, chain_id, resno, ins_code):
+  preferred_atom_names = ("CA", "P", "C1'", "C4'", "N", "C")
+  atom_info = residue_info_py(mol_id, chain_id, resno, ins_code)
+  if not atom_info:
+    return None
+
+  atom_records = []
+  for atom in atom_info:
+    try:
+      atom_name = str(atom[0][0]).strip()
+      alt_conf = str(atom[0][1]).strip()
+      atom_details = atom[1]
+      occupancy = float(atom_details[0])
+      b_factor = _atom_b_factor_value(atom_details[1])
+      element = str(atom_details[2]).strip().upper()
+    except Exception:
+      continue
+    if not atom_name:
+      continue
+    atom_records.append(
+      {
+        "name": atom_name,
+        "alt_conf": alt_conf,
+        "occupancy": occupancy,
+        "b_factor": b_factor,
+        "element": element,
+      }
+    )
+
+  if not atom_records:
+    return None
+
+  def choose_atom(predicate):
+    for atom_record in atom_records:
+      if predicate(atom_record):
+        return atom_record
+    return None
+
+  representative_atom = None
+  for preferred_atom_name in preferred_atom_names:
+    representative_atom = choose_atom(
+      lambda atom_record, preferred_atom_name=preferred_atom_name: (
+        atom_record["name"] == preferred_atom_name and not atom_record["alt_conf"]
+      )
+    )
+    if representative_atom:
+      break
+  if representative_atom is None:
+    for preferred_atom_name in preferred_atom_names:
+      representative_atom = choose_atom(
+        lambda atom_record, preferred_atom_name=preferred_atom_name: atom_record["name"] == preferred_atom_name
+      )
+      if representative_atom:
+        break
+  if representative_atom is None:
+    representative_atom = choose_atom(
+      lambda atom_record: atom_record["element"] not in ("H", "D") and not atom_record["alt_conf"]
+    )
+  if representative_atom is None:
+    representative_atom = choose_atom(lambda atom_record: atom_record["element"] not in ("H", "D"))
+  if representative_atom is None:
+    representative_atom = atom_records[0]
+  return representative_atom
+
+
+def _navigation_status_bar_label(mol_id, chain_id, resno, ins_code, residue_name_here=""):
+  residue_label = _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here)
+  status_label = f"Current residue: {residue_label} in {_molecule_id_name_label(mol_id)}"
+  representative_atom = _residue_representative_atom_metrics(mol_id, chain_id, resno, ins_code)
+  if representative_atom is None:
+    return status_label
+  atom_name = representative_atom["name"]
+  occupancy = representative_atom["occupancy"]
+  b_factor = representative_atom["b_factor"]
+  if b_factor is None:
+    return f"{status_label} [{atom_name} occ {occupancy:.2f}]"
+  return f"{status_label} [{atom_name} occ {occupancy:.2f}, B {b_factor:.1f}]"
+
+
 def _go_to_navigation_residue(mol_id, chain_id, resno, ins_code, serial_number=None):
   """Navigate quietly by orienting/centring without invoking Go To highlighting."""
   global NAVIGATION_LAST_RESIDUE
@@ -1317,6 +1494,9 @@ def _go_to_navigation_residue(mol_id, chain_id, resno, ins_code, serial_number=N
     "ins_code": ins_code,
     "serial_number": serial_number,
   }
+  add_status_bar_text(
+    _navigation_status_bar_label(mol_id, chain_id, resno, ins_code, residue_name_here)
+  )
   return 1
 
 
@@ -3433,6 +3613,9 @@ lambda: set_current_map_sigma(8))
 add_key_binding("Map to 9 sigma","(",
 lambda: set_current_map_sigma(9))
 
+add_key_binding("Optimize local contour by thresholded Q-residue",")",
+lambda: optimize_local_threshold_by_thresholded_q_current_view())
+
 add_key_binding("Map plus 0.1 sigma","+",
 lambda: step_current_map_coarse_up())
 
@@ -3612,9 +3795,7 @@ def _smart_paste_target_molecule():
 
 
 def _smart_paste_target_label(target_mol_id):
-  molecule_label = molecule_name_stub_py(target_mol_id, 0) or molecule_name(target_mol_id) or ""
-  molecule_label = os.path.basename(str(molecule_label).strip()) or f"molecule_{target_mol_id}"
-  return f"Molecule #{target_mol_id}, {molecule_label}"
+  return _molecule_id_name_label(target_mol_id)
 
 
 def _merge_molecules_explicitly_failed(merge_result):
@@ -6713,7 +6894,921 @@ def _post_map_level_status(map_id, prefix="set to"):
       contour_sigma,
     )
   )
-    
+
+
+def _tq_status(message):
+  print(message)
+  add_status_bar_text(message)
+
+
+def _tq_residue_info(imol, chain_id, resno, ins_code):
+  chain_id, resno, ins_code = _coot_residue_spec_tuple(chain_id, resno, ins_code)
+  if resno is None:
+    return []
+  return residue_info_py(imol, chain_id, resno, ins_code) or []
+
+
+def _tq_residue_name(imol, chain_id, resno, ins_code):
+  chain_id, resno, ins_code = _coot_residue_spec_tuple(chain_id, resno, ins_code)
+  if resno is None:
+    return ""
+  return residue_name(imol, chain_id, resno, ins_code) or ""
+
+
+def _tq_residue_centre(imol, chain_id, resno, ins_code):
+  chain_id, resno, ins_code = _coot_residue_spec_tuple(chain_id, resno, ins_code)
+  if resno is None:
+    return None
+  centre = residue_centre_py(imol, chain_id, resno, ins_code)
+  if isinstance(centre, (list, tuple)) and len(centre) == 3:
+    return [float(centre[0]), float(centre[1]), float(centre[2])]
+  return None
+
+
+def _tq_map_id_or_default(map_id=None):
+  if map_id is not None:
+    return map_id
+  return _scrollable_map_or_status()
+
+
+def _tq_map_sigma(map_id):
+  try:
+    sigma_value = float(map_sigma_py(map_id))
+    if math.isfinite(sigma_value) and sigma_value > 0.0:
+      return sigma_value
+  except Exception:
+    pass
+  try:
+    contour_absolute = float(get_contour_level_absolute(map_id))
+    contour_sigma = float(get_contour_level_in_sigma(map_id))
+    if math.isfinite(contour_absolute) and math.isfinite(contour_sigma) and abs(contour_sigma) > 1.0e-9:
+      sigma_value = abs(contour_absolute / contour_sigma)
+      if sigma_value > 0.0:
+        return sigma_value
+  except Exception:
+    pass
+  return None
+
+
+def _tq_valid_model_molecule(mol_id):
+  checker = globals().get("valid_model_molecule_qm")
+  if callable(checker):
+    try:
+      return checker(mol_id) == 1 or checker(mol_id) is True
+    except Exception:
+      pass
+  return mol_id in model_molecule_list()
+
+
+def _tq_valid_map_molecule(map_id):
+  checker = globals().get("valid_map_molecule_qm")
+  if callable(checker):
+    try:
+      return checker(map_id) == 1 or checker(map_id) is True
+    except Exception:
+      pass
+  return map_id in map_molecule_list()
+
+
+def _tq_chain_ids(mol_id):
+  getter = globals().get("chain_ids")
+  if callable(getter):
+    try:
+      return getter(mol_id) or []
+    except Exception:
+      pass
+  return []
+
+
+def _tq_post_map_level_status(map_id, prefix="set to"):
+  _post_map_level_status(map_id, prefix)
+
+
+def _tq_active_residue_target():
+  residue = _active_residue_or_status()
+  if not residue or len(residue) < 4:
+    return None
+  parsed = _coot_residue_spec_from_spec(residue[1:4])
+  if parsed is None:
+    _tq_status("Thresholded Q-residue: could not parse the active residue")
+    return None
+  return (residue[0], parsed[0], parsed[1], parsed[2])
+
+
+def _tq_is_heavy_atom(atom_name, element):
+  element = _coot_text_arg(element).strip().upper()
+  atom_name = _coot_text_arg(atom_name).strip().upper()
+  if element:
+    return element not in _THRESHOLDED_Q_HYDROGEN_ELEMENTS
+  return not atom_name.startswith("H")
+
+
+def _tq_residue_label(chain_id, resno, ins_code, residue_name_here=""):
+  residue_id = f"{chain_id}:{resno}{ins_code or ''}"
+  if residue_name_here:
+    return f"{residue_id} {_display_residue_name(residue_name_here)}"
+  return residue_id
+
+
+def _tq_gaussian_enclosed_mass_fraction(radius_over_sigma):
+  if radius_over_sigma <= 0.0:
+    return 0.0
+  scaled_radius = radius_over_sigma / math.sqrt(2.0)
+  return (
+    math.erf(scaled_radius)
+    - math.sqrt(2.0 / math.pi) * radius_over_sigma * math.exp(-(radius_over_sigma ** 2) / 2.0)
+  )
+
+
+@lru_cache(maxsize=64)
+def _tq_support_radius(sigma, enclosed_mass_percent):
+  target_fraction = max(0.0, min(0.999999, float(enclosed_mass_percent) / 100.0))
+  if target_fraction <= 0.0:
+    return 0.0
+  if target_fraction >= 0.999999:
+    return 5.0 * float(sigma)
+  low = 0.0
+  high = 8.0
+  for _ in range(60):
+    mid = 0.5 * (low + high)
+    if _tq_gaussian_enclosed_mass_fraction(mid) < target_fraction:
+      low = mid
+    else:
+      high = mid
+  return 0.5 * (low + high) * float(sigma)
+
+
+def _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True):
+  parsed = _coot_residue_spec_from_spec(residue_spec)
+  if parsed is None:
+    return []
+  chain_id, resno, ins_code = parsed
+  residue_name_here = _tq_residue_name(mol_id, chain_id, resno, ins_code)
+  atom_records = []
+  for atom in _tq_residue_info(mol_id, chain_id, resno, ins_code):
+    try:
+      atom_name = _coot_text_arg(atom[0][0]).strip()
+      alt_conf = _coot_text_arg(atom[0][1]).strip()
+      occupancy = float(atom[1][0])
+      b_factor = atom[1][1]
+      element = _coot_text_arg(atom[1][2]).strip().upper()
+      xyz = [float(atom[2][0]), float(atom[2][1]), float(atom[2][2])]
+    except Exception:
+      continue
+    if not atom_name:
+      continue
+    if heavy_atoms_only and not _tq_is_heavy_atom(atom_name, element):
+      continue
+    atom_records.append(
+      {
+        "residue_spec": parsed,
+        "residue_name": residue_name_here,
+        "name": atom_name,
+        "alt_conf": alt_conf,
+        "atom_key": (parsed, atom_name, alt_conf),
+        "occupancy": occupancy,
+        "b_factor": b_factor,
+        "element": element,
+        "xyz": xyz,
+      }
+    )
+  return atom_records
+
+
+def _tq_score_atom_records(atom_records, backbone_only=False):
+  if not backbone_only:
+    return list(atom_records)
+  return [atom for atom in atom_records if atom["name"] in _THRESHOLDED_Q_BACKBONE_ATOM_NAMES]
+
+
+def _tq_chain_residue_specs(mol_id, chain_id):
+  residue_specs = []
+  seen_specs = set()
+  try:
+    n_residues = chain_n_residues(chain_id, mol_id)
+  except Exception:
+    return residue_specs
+  for serial_number in range(n_residues):
+    try:
+      resno = seqnum_from_serial_number(mol_id, chain_id, serial_number)
+      ins_code = _coot_text_arg(insertion_code_from_serial_number(mol_id, chain_id, serial_number))
+    except Exception:
+      continue
+    residue_spec = _coot_residue_spec_tuple(chain_id, resno, ins_code)
+    if residue_spec[1] is None or residue_spec in seen_specs:
+      continue
+    residue_specs.append(residue_spec)
+    seen_specs.add(residue_spec)
+  return residue_specs
+
+
+def _tq_residue_specs_near_residue_centres(
+    mol_id,
+    seed_residue_specs,
+    radius=THRESHOLDED_Q_LOCAL_RADIUS,
+    max_residues=THRESHOLDED_Q_LOCAL_MAX_RESIDUES,
+):
+  seed_specs = []
+  seed_centres = []
+  for residue_spec in seed_residue_specs:
+    parsed = _coot_residue_spec_from_spec(residue_spec)
+    if parsed is None:
+      continue
+    seed_specs.append(parsed)
+    centre = _tq_residue_centre(mol_id, parsed[0], parsed[1], parsed[2])
+    if centre is not None:
+      seed_centres.append(centre)
+  if not seed_specs:
+    return []
+  if not seed_centres:
+    return list(seed_specs)
+
+  radius_sq = float(radius) * float(radius)
+  nearby_entries = []
+  seen_specs = set(seed_specs)
+  for seed_spec in seed_specs:
+    nearby_entries.append((0.0, seed_spec))
+
+  for chain_id in _tq_chain_ids(mol_id):
+    for residue_spec in _tq_chain_residue_specs(mol_id, chain_id):
+      if residue_spec in seen_specs:
+        continue
+      centre = _tq_residue_centre(mol_id, residue_spec[0], residue_spec[1], residue_spec[2])
+      if centre is None:
+        continue
+      nearest_seed_distance_sq = min(_distance_sq(centre, seed_centre) for seed_centre in seed_centres)
+      if nearest_seed_distance_sq > radius_sq:
+        continue
+      nearby_entries.append((nearest_seed_distance_sq, residue_spec))
+      seen_specs.add(residue_spec)
+
+  nearby_entries.sort(key=lambda item: (item[0], item[1][0], item[1][1], item[1][2]))
+  return [entry[1] for entry in nearby_entries[:int(max_residues)]]
+
+
+def _tq_context_atom_records(mol_id, score_residue_specs, context_radius):
+  context_residue_specs = _tq_residue_specs_near_residue_centres(
+    mol_id,
+    score_residue_specs,
+    radius=context_radius,
+    max_residues=max(THRESHOLDED_Q_LOCAL_MAX_RESIDUES * 2, len(score_residue_specs)),
+  )
+  atom_records = []
+  for residue_spec in context_residue_specs:
+    atom_records.extend(_tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True))
+  return atom_records
+
+
+def _tq_prune_context_atoms(score_atom_records, context_atom_records, sigma, sample_radius):
+  influence_radius_sq = (float(sample_radius) + float(sigma) * THRESHOLDED_Q_CONTEXT_ATOM_INFLUENCE_SIGMA) ** 2
+  score_atom_xyzs = [atom_record["xyz"] for atom_record in score_atom_records]
+  pruned_context_atoms = []
+  for context_atom in context_atom_records:
+    if min(_distance_sq(context_atom["xyz"], score_atom_xyz) for score_atom_xyz in score_atom_xyzs) <= influence_radius_sq:
+      pruned_context_atoms.append(context_atom)
+  return pruned_context_atoms or list(context_atom_records)
+
+
+def _tq_candidate_grid_indices(score_atom_records, sample_radius, grid_spacing):
+  sample_radius_sq = sample_radius * sample_radius
+  candidate_indices = set()
+  for atom_record in score_atom_records:
+    atom_x, atom_y, atom_z = atom_record["xyz"]
+    x_index_range = range(
+      int(math.floor((atom_x - sample_radius) / grid_spacing)),
+      int(math.ceil((atom_x + sample_radius) / grid_spacing)) + 1,
+    )
+    y_index_range = range(
+      int(math.floor((atom_y - sample_radius) / grid_spacing)),
+      int(math.ceil((atom_y + sample_radius) / grid_spacing)) + 1,
+    )
+    z_index_range = range(
+      int(math.floor((atom_z - sample_radius) / grid_spacing)),
+      int(math.ceil((atom_z + sample_radius) / grid_spacing)) + 1,
+    )
+    for ix in x_index_range:
+      x = ix * grid_spacing
+      dx_sq = (x - atom_x) * (x - atom_x)
+      if dx_sq > sample_radius_sq:
+        continue
+      for iy in y_index_range:
+        y = iy * grid_spacing
+        dxy_sq = dx_sq + (y - atom_y) * (y - atom_y)
+        if dxy_sq > sample_radius_sq:
+          continue
+        for iz in z_index_range:
+          z = iz * grid_spacing
+          distance_sq = dxy_sq + (z - atom_z) * (z - atom_z)
+          if distance_sq > sample_radius_sq:
+            continue
+          candidate_indices.add((ix, iy, iz))
+  return sorted(candidate_indices)
+
+
+def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, sigma, sample_radius, grid_spacing):
+  if not score_atom_records or not context_atom_records:
+    return []
+
+  sample_radius_sq = sample_radius * sample_radius
+  score_atom_keys = {atom_record["atom_key"] for atom_record in score_atom_records}
+  score_atom_xyzs = [atom_record["xyz"] for atom_record in score_atom_records]
+  context_atom_data = [
+    (context_atom["xyz"], context_atom["atom_key"], float(context_atom.get("occupancy", 1.0)))
+    for context_atom in context_atom_records
+  ]
+  exp = math.exp
+  point_records = []
+  candidate_indices = _tq_candidate_grid_indices(score_atom_records, sample_radius, grid_spacing)
+
+  for ix, iy, iz in candidate_indices:
+    x = ix * grid_spacing
+    y = iy * grid_spacing
+    z = iz * grid_spacing
+    point = [x, y, z]
+
+    min_score_distance_sq = min(_distance_sq(point, score_atom_xyz) for score_atom_xyz in score_atom_xyzs)
+    if min_score_distance_sq > sample_radius_sq:
+      continue
+
+    nearest_context_atom_key = None
+    nearest_context_distance_sq = None
+    ideal_density = 0.0
+    for context_atom_xyz, context_atom_key, occupancy in context_atom_data:
+      distance_sq = _distance_sq(point, context_atom_xyz)
+      if nearest_context_distance_sq is None or distance_sq < nearest_context_distance_sq:
+        nearest_context_distance_sq = distance_sq
+        nearest_context_atom_key = context_atom_key
+      ideal_density += occupancy * exp(-distance_sq / (2.0 * sigma * sigma))
+
+    if nearest_context_atom_key is None or nearest_context_atom_key not in score_atom_keys:
+      continue
+
+    try:
+      experimental_density = float(density_at_point(map_id, x, y, z))
+    except Exception:
+      experimental_density = 0.0
+
+    point_records.append(
+      {
+        "experimental_density": experimental_density,
+        "ideal_density": ideal_density,
+      }
+    )
+
+  return point_records
+
+
+def _tq_ideal_density_threshold(point_records, ideal_enclosed_mass_percent):
+  positive_densities = sorted(
+    (point_record["ideal_density"] for point_record in point_records if point_record["ideal_density"] > 0.0),
+    reverse=True,
+  )
+  if not positive_densities:
+    return 0.0
+  total_mass = sum(positive_densities)
+  target_mass = total_mass * max(0.0, min(100.0, float(ideal_enclosed_mass_percent))) / 100.0
+  if target_mass <= 0.0:
+    return positive_densities[0] + 1.0e-6
+  cumulative_mass = 0.0
+  threshold = positive_densities[-1]
+  for density_value in positive_densities:
+    cumulative_mass += density_value
+    threshold = density_value
+    if cumulative_mass >= target_mass:
+      break
+  return threshold
+
+
+def _tq_residue_region_score(point_records, contour_level, ideal_density_threshold):
+  ideal_points = 0
+  experimental_points = 0
+  overlap_points = 0
+  for point_record in point_records:
+    ideal_on = point_record["ideal_density"] >= ideal_density_threshold and point_record["ideal_density"] > 0.0
+    experimental_on = point_record["experimental_density"] >= contour_level
+    if ideal_on:
+      ideal_points += 1
+    if experimental_on:
+      experimental_points += 1
+    if ideal_on and experimental_on:
+      overlap_points += 1
+
+  denominator = ideal_points + experimental_points
+  score = 0.0 if denominator <= 0 else (2.0 * overlap_points) / float(denominator)
+  return {
+    "score": score,
+    "ideal_points": ideal_points,
+    "experimental_points": experimental_points,
+    "overlap_points": overlap_points,
+    "n_points": len(point_records),
+  }
+
+
+def _tq_residue_region_sweep_data(point_records, ideal_density_threshold):
+  ideal_flags = [
+    (point_record["ideal_density"] >= ideal_density_threshold and point_record["ideal_density"] > 0.0)
+    for point_record in point_records
+  ]
+  ideal_points = sum(1 for ideal_on in ideal_flags if ideal_on)
+  sorted_pairs = sorted(
+    zip((point_record["experimental_density"] for point_record in point_records), ideal_flags),
+    key=lambda pair: pair[0],
+  )
+  experimental_densities = [pair[0] for pair in sorted_pairs]
+  overlap_suffix = [0] * (len(sorted_pairs) + 1)
+  for index in range(len(sorted_pairs) - 1, -1, -1):
+    overlap_suffix[index] = overlap_suffix[index + 1] + (1 if sorted_pairs[index][1] else 0)
+  return {
+    "ideal_points": ideal_points,
+    "n_points": len(point_records),
+    "experimental_densities": experimental_densities,
+    "overlap_suffix": overlap_suffix,
+  }
+
+
+def _tq_residue_region_score_from_sweep_data(sweep_data, contour_level):
+  experimental_densities = sweep_data["experimental_densities"]
+  idx = bisect_left(experimental_densities, contour_level)
+  experimental_points = len(experimental_densities) - idx
+  overlap_points = sweep_data["overlap_suffix"][idx]
+  ideal_points = sweep_data["ideal_points"]
+  denominator = ideal_points + experimental_points
+  score = 0.0 if denominator <= 0 else (2.0 * overlap_points) / float(denominator)
+  return {
+    "score": score,
+    "ideal_points": ideal_points,
+    "experimental_points": experimental_points,
+    "overlap_points": overlap_points,
+    "n_points": sweep_data["n_points"],
+  }
+
+
+def _tq_prepare_scored_residues(
+    map_id,
+    mol_id,
+    residue_specs,
+    sigma=THRESHOLDED_Q_GAUSSIAN_SIGMA,
+    ideal_enclosed_mass_percent=THRESHOLDED_Q_IDEAL_ENCLOSED_MASS_PERCENT,
+    grid_spacing=THRESHOLDED_Q_GRID_SPACING,
+    sample_shell_padding=THRESHOLDED_Q_SAMPLE_SHELL_PADDING,
+    context_radius=None,
+    backbone_only=False,
+):
+  try:
+    sigma = float(sigma)
+    grid_spacing = float(grid_spacing)
+    sample_shell_padding = float(sample_shell_padding)
+  except Exception:
+    return None
+  if sigma <= 0.0 or grid_spacing <= 0.0 or sample_shell_padding < 0.0:
+    return None
+
+  score_residue_specs = []
+  for residue_spec in residue_specs:
+    parsed = _coot_residue_spec_from_spec(residue_spec)
+    if parsed is not None and parsed not in score_residue_specs:
+      score_residue_specs.append(parsed)
+  if not score_residue_specs:
+    return None
+
+  support_radius = _tq_support_radius(sigma, float(ideal_enclosed_mass_percent))
+  sample_radius = sigma * THRESHOLDED_Q_SAMPLE_RADIUS_SIGMA + sample_shell_padding
+  if context_radius is None:
+    context_radius = THRESHOLDED_Q_LOCAL_RADIUS
+  context_radius = max(float(context_radius), float(sample_radius))
+  context_atom_records = _tq_context_atom_records(mol_id, score_residue_specs, context_radius)
+  if not context_atom_records:
+    return None
+
+  prepared_residues = []
+  for residue_spec in score_residue_specs:
+    score_atom_records = _tq_score_atom_records(
+      _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True),
+      backbone_only=backbone_only,
+    )
+    if not score_atom_records:
+      continue
+    residue_context_atoms = _tq_prune_context_atoms(score_atom_records, context_atom_records, sigma, sample_radius)
+    point_records = _tq_residue_point_records(
+      map_id,
+      score_atom_records,
+      residue_context_atoms,
+      sigma,
+      sample_radius,
+      grid_spacing,
+    )
+    if not point_records:
+      continue
+    residue_name_here = score_atom_records[0]["residue_name"]
+    ideal_density_threshold = _tq_ideal_density_threshold(point_records, ideal_enclosed_mass_percent)
+    prepared_residues.append(
+      {
+        "residue_spec": residue_spec,
+        "residue_name": residue_name_here,
+        "label": _tq_residue_label(residue_spec[0], residue_spec[1], residue_spec[2], residue_name_here),
+        "n_atoms": len(score_atom_records),
+        "n_points": len(point_records),
+        "ideal_density_threshold": ideal_density_threshold,
+        "region_sweep_data": _tq_residue_region_sweep_data(point_records, ideal_density_threshold),
+        "point_records": point_records,
+      }
+    )
+
+  if not prepared_residues:
+    return None
+
+  return {
+    "map_id": map_id,
+    "mol_id": mol_id,
+    "score_residue_specs": score_residue_specs,
+    "support_radius": support_radius,
+    "sample_radius": sample_radius,
+    "sigma": float(sigma),
+    "ideal_enclosed_mass_percent": float(ideal_enclosed_mass_percent),
+    "prepared_residues": prepared_residues,
+  }
+
+
+def thresholded_q_residues(
+    map_id,
+    mol_id,
+    residue_specs,
+    contour_level=None,
+    sigma=THRESHOLDED_Q_GAUSSIAN_SIGMA,
+    ideal_enclosed_mass_percent=THRESHOLDED_Q_IDEAL_ENCLOSED_MASS_PERCENT,
+    grid_spacing=THRESHOLDED_Q_GRID_SPACING,
+    sample_shell_padding=THRESHOLDED_Q_SAMPLE_SHELL_PADDING,
+    context_radius=None,
+    backbone_only=False,
+    quiet=False,
+):
+  map_id = _tq_map_id_or_default(map_id)
+  try:
+    sigma = float(sigma)
+    grid_spacing = float(grid_spacing)
+    sample_shell_padding = float(sample_shell_padding)
+    if context_radius is not None:
+      context_radius = float(context_radius)
+  except Exception:
+    message = "Thresholded Q-residue: invalid numeric parameter"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if sigma <= 0.0 or grid_spacing <= 0.0 or sample_shell_padding < 0.0:
+    message = "Thresholded Q-residue: sigma/grid spacing must be > 0 and shell padding must be >= 0"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if not _tq_valid_map_molecule(map_id):
+    message = f"Thresholded Q-residue: invalid map #{map_id}"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if not _tq_valid_model_molecule(mol_id):
+    message = f"Thresholded Q-residue: invalid model molecule #{mol_id}"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if contour_level is None:
+    try:
+      contour_level = float(get_contour_level_absolute(map_id))
+    except Exception:
+      contour_level = None
+  if contour_level is None:
+    contour_level = 0.0
+
+  prepared = _tq_prepare_scored_residues(
+    map_id,
+    mol_id,
+    residue_specs,
+    sigma=sigma,
+    ideal_enclosed_mass_percent=ideal_enclosed_mass_percent,
+    grid_spacing=grid_spacing,
+    sample_shell_padding=sample_shell_padding,
+    context_radius=context_radius,
+    backbone_only=backbone_only,
+  )
+  if prepared is None:
+    message = f"Thresholded Q-residue: no scorable atoms for {_molecule_id_name_label(mol_id)}"
+    if not quiet:
+      _tq_status(message)
+    return {
+      "map_id": map_id,
+      "mol_id": mol_id,
+      "contour_level": contour_level,
+      "score": 0.0,
+      "residue_scores": [],
+      "message": message,
+    }
+
+  residue_scores = []
+  for prepared_residue in prepared["prepared_residues"]:
+    region_score = _tq_residue_region_score_from_sweep_data(
+      prepared_residue["region_sweep_data"],
+      contour_level,
+    )
+    residue_scores.append(
+      {
+        "residue_spec": prepared_residue["residue_spec"],
+        "residue_name": prepared_residue["residue_name"],
+        "label": prepared_residue["label"],
+        "score": region_score["score"],
+        "n_atoms": prepared_residue["n_atoms"],
+        "n_points": region_score["n_points"],
+        "ideal_points": region_score["ideal_points"],
+        "experimental_points": region_score["experimental_points"],
+        "overlap_points": region_score["overlap_points"],
+        "ideal_density_threshold": prepared_residue["ideal_density_threshold"],
+      }
+    )
+
+  overall_score = 0.0
+  if residue_scores:
+    overall_score = sum(residue_score["score"] for residue_score in residue_scores) / float(len(residue_scores))
+
+  result = {
+    "map_id": map_id,
+    "mol_id": mol_id,
+    "contour_level": contour_level,
+    "score": overall_score,
+    "residue_scores": residue_scores,
+    "support_radius": prepared["support_radius"],
+    "sample_radius": prepared["sample_radius"],
+    "sigma": prepared["sigma"],
+    "ideal_enclosed_mass_percent": prepared["ideal_enclosed_mass_percent"],
+  }
+
+  if not quiet:
+    labels = ", ".join(residue_score["label"] for residue_score in residue_scores[:4])
+    if len(residue_scores) > 4:
+      labels += ", ..."
+    _tq_status(
+      "Thresholded Q-residue at level {0:.4f}: score {1:.3f} for {2} residue(s) in {3} [{4}]".format(
+        contour_level,
+        overall_score,
+        len(residue_scores),
+        _molecule_id_name_label(mol_id),
+        labels or "no labels",
+      )
+    )
+  return result
+
+
+def thresholded_q_residue(map_id, mol_id, residue_spec, **kwargs):
+  result = thresholded_q_residues(map_id, mol_id, [residue_spec], **kwargs)
+  if result["residue_scores"]:
+    result["residue_score"] = result["residue_scores"][0]
+  else:
+    result["residue_score"] = None
+  return result
+
+
+def thresholded_q_active_residue(
+    map_id=None,
+    ideal_enclosed_mass_percent=THRESHOLDED_Q_IDEAL_ENCLOSED_MASS_PERCENT,
+    **kwargs,
+):
+  target = _tq_active_residue_target()
+  if target is None:
+    message = "Thresholded Q-residue: no active residue"
+    _tq_status(message)
+    return None
+  mol_id, chain_id, resno, ins_code = target
+  return thresholded_q_residue(
+    _tq_map_id_or_default(map_id),
+    mol_id,
+    (chain_id, resno, ins_code),
+    ideal_enclosed_mass_percent=ideal_enclosed_mass_percent,
+    **kwargs,
+  )
+
+
+def optimize_local_threshold_by_thresholded_q(
+    map_id,
+    mol_id,
+    residue_specs,
+    contour_min=None,
+    contour_max=None,
+    contour_min_sigma=None,
+    contour_max_sigma=None,
+    n_steps=THRESHOLDED_Q_SWEEP_STEPS,
+    sigma=THRESHOLDED_Q_GAUSSIAN_SIGMA,
+    ideal_enclosed_mass_percent=THRESHOLDED_Q_IDEAL_ENCLOSED_MASS_PERCENT,
+    grid_spacing=THRESHOLDED_Q_GRID_SPACING,
+    sample_shell_padding=THRESHOLDED_Q_SAMPLE_SHELL_PADDING,
+    context_radius=None,
+    backbone_only=False,
+    apply_contour=False,
+    quiet=False,
+):
+  map_id = _tq_map_id_or_default(map_id)
+  try:
+    sigma = float(sigma)
+    grid_spacing = float(grid_spacing)
+    sample_shell_padding = float(sample_shell_padding)
+    n_steps = int(n_steps)
+    if context_radius is not None:
+      context_radius = float(context_radius)
+  except Exception:
+    message = "Thresholded Q-residue optimizer: invalid numeric parameter"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if sigma <= 0.0 or grid_spacing <= 0.0 or sample_shell_padding < 0.0:
+    message = "Thresholded Q-residue optimizer: sigma/grid spacing must be > 0 and shell padding must be >= 0"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if not _tq_valid_map_molecule(map_id):
+    message = f"Thresholded Q-residue optimizer: invalid map #{map_id}"
+    if not quiet:
+      _tq_status(message)
+    return None
+  if not _tq_valid_model_molecule(mol_id):
+    message = f"Thresholded Q-residue optimizer: invalid model molecule #{mol_id}"
+    if not quiet:
+      _tq_status(message)
+    return None
+  try:
+    current_contour = float(get_contour_level_absolute(map_id))
+  except Exception:
+    current_contour = 0.0
+  try:
+    current_contour_sigma = float(get_contour_level_in_sigma(map_id))
+  except Exception:
+    current_contour_sigma = None
+  map_sigma = _tq_map_sigma(map_id)
+
+  if contour_min is None and contour_max is None and map_sigma is not None:
+    if contour_min_sigma is None:
+      contour_min_sigma = THRESHOLDED_Q_SWEEP_MIN_SIGMA
+    if contour_max_sigma is None:
+      contour_max_sigma = THRESHOLDED_Q_SWEEP_MAX_SIGMA
+    contour_min = float(contour_min_sigma) * map_sigma
+    contour_max = float(contour_max_sigma) * map_sigma
+  else:
+    if contour_min is None:
+      contour_min = float(contour_min_sigma) * map_sigma if contour_min_sigma is not None and map_sigma is not None else current_contour
+    if contour_max is None:
+      contour_max = float(contour_max_sigma) * map_sigma if contour_max_sigma is not None and map_sigma is not None else current_contour
+  contour_min = float(contour_min)
+  contour_max = float(contour_max)
+  if contour_max < contour_min:
+    contour_min, contour_max = contour_max, contour_min
+  n_steps = max(2, n_steps)
+
+  prepared = _tq_prepare_scored_residues(
+    map_id,
+    mol_id,
+    residue_specs,
+    sigma=sigma,
+    ideal_enclosed_mass_percent=ideal_enclosed_mass_percent,
+    grid_spacing=grid_spacing,
+    sample_shell_padding=sample_shell_padding,
+    context_radius=context_radius,
+    backbone_only=backbone_only,
+  )
+  if prepared is None:
+    message = f"Thresholded Q-residue optimizer: no scorable atoms for {_molecule_id_name_label(mol_id)}"
+    if not quiet:
+      _tq_status(message)
+    return None
+
+  contour_levels = [contour_min] if contour_max == contour_min else [
+    contour_min + (contour_max - contour_min) * (index / float(n_steps - 1))
+    for index in range(n_steps)
+  ]
+
+  sweep_results = []
+  best_result = None
+  for contour_level in contour_levels:
+    residue_scores = []
+    for prepared_residue in prepared["prepared_residues"]:
+      region_score = _tq_residue_region_score_from_sweep_data(
+        prepared_residue["region_sweep_data"],
+        contour_level,
+      )
+      residue_scores.append(region_score["score"])
+    mean_score = sum(residue_scores) / float(len(residue_scores)) if residue_scores else 0.0
+    sweep_result = {
+      "contour_level": contour_level,
+      "score": mean_score,
+      "n_residues": len(residue_scores),
+    }
+    if map_sigma is not None and map_sigma > 0.0:
+      sweep_result["contour_sigma"] = contour_level / map_sigma
+    sweep_results.append(sweep_result)
+    if best_result is None:
+      best_result = sweep_result
+    elif mean_score > best_result["score"] + 1.0e-9:
+      best_result = sweep_result
+    elif abs(mean_score - best_result["score"]) <= 1.0e-9 and contour_level > best_result["contour_level"]:
+      best_result = sweep_result
+
+  result = {
+    "map_id": map_id,
+    "mol_id": mol_id,
+    "current_contour": current_contour,
+    "current_contour_sigma": current_contour_sigma,
+    "map_sigma": map_sigma,
+    "best_contour_level": best_result["contour_level"],
+    "best_score": best_result["score"],
+    "sweep_results": sweep_results,
+    "residue_specs": prepared["score_residue_specs"],
+    "support_radius": prepared["support_radius"],
+    "sample_radius": prepared["sample_radius"],
+    "ideal_enclosed_mass_percent": prepared["ideal_enclosed_mass_percent"],
+  }
+  if map_sigma is not None and map_sigma > 0.0:
+    result["best_contour_sigma"] = result["best_contour_level"] / map_sigma
+
+  if not quiet:
+    if "best_contour_sigma" in result:
+      _tq_status(
+        "Thresholded Q-residue local optimum: level {0:.4f}, {1:.2f} sigma (score {2:.3f}) for {3} residue(s) in {4}".format(
+          result["best_contour_level"],
+          result["best_contour_sigma"],
+          result["best_score"],
+          len(result["residue_specs"]),
+          _molecule_id_name_label(mol_id),
+        )
+      )
+    else:
+      _tq_status(
+        "Thresholded Q-residue local optimum: level {0:.4f} (score {1:.3f}) for {2} residue(s) in {3}".format(
+          result["best_contour_level"],
+          result["best_score"],
+          len(result["residue_specs"]),
+          _molecule_id_name_label(mol_id),
+        )
+      )
+
+  if apply_contour:
+    try:
+      set_contour_level_absolute(map_id, result["best_contour_level"])
+      _tq_post_map_level_status(map_id, "set to")
+    except Exception as error:
+      _tq_status(f"Thresholded Q-residue optimizer: failed to apply contour ({error!r})")
+  return result
+
+
+def optimize_local_threshold_by_thresholded_q_current_view(
+    map_id=None,
+    mol_id=None,
+    residue_specs=None,
+    radius=THRESHOLDED_Q_LOCAL_RADIUS,
+    max_residues=THRESHOLDED_Q_LOCAL_MAX_RESIDUES,
+    apply_contour=True,
+    **kwargs,
+):
+  map_id = _tq_map_id_or_default(map_id)
+  try:
+    radius = float(radius)
+    max_residues = int(max_residues)
+  except Exception:
+    _tq_status("Thresholded Q-residue optimizer: invalid radius/max_residues")
+    return None
+  if radius <= 0.0:
+    _tq_status("Thresholded Q-residue optimizer: radius must be > 0")
+    return None
+  if max_residues <= 0:
+    _tq_status("Thresholded Q-residue optimizer: max_residues must be > 0")
+    return None
+  if residue_specs is None:
+    target = _tq_active_residue_target()
+    if target is None:
+      _tq_status("Thresholded Q-residue optimizer: no active residue")
+      return None
+    mol_id = target[0]
+    residue_specs = [(target[1], target[2], target[3])]
+  elif mol_id is None:
+    target = _tq_active_residue_target()
+    if target is not None:
+      mol_id = target[0]
+  if mol_id is None:
+    _tq_status("Thresholded Q-residue optimizer: no target molecule")
+    return None
+
+  score_residue_specs = _tq_residue_specs_near_residue_centres(
+    mol_id,
+    residue_specs,
+    radius=radius,
+    max_residues=max_residues,
+  )
+  if not score_residue_specs:
+    _tq_status("Thresholded Q-residue optimizer: no local residues to score")
+    return None
+  context_radius = kwargs.pop("context_radius", radius + THRESHOLDED_Q_CONTEXT_RADIUS_PADDING)
+  return optimize_local_threshold_by_thresholded_q(
+    map_id,
+    mol_id,
+    score_residue_specs,
+    context_radius=max(radius, context_radius),
+    apply_contour=apply_contour,
+    **kwargs,
+  )
+
+
 def _step_map_sigma(mol_id, delta):
   """Adjust contour sigma in coarse 0.1 steps within the usual trimmings range."""
   current_level = get_contour_level_in_sigma(mol_id)
@@ -8944,7 +10039,16 @@ def shorten_loop():
   ins_code=active_atom[3]
   delete_residue(mol_id,ch_id,resn,ins_code)
   first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
-  renumber_residue_range(mol_id,ch_id,first_res,resn,1)
+  if not _renumber_residue_range_or_dialog(
+    mol_id,
+    ch_id,
+    first_res,
+    resn,
+    1,
+    "Failed to shorten the loop because the renumbering step was not possible.\n\n"
+    "This usually means the requested change would create overlapping sequence numbering.",
+  ):
+    return None
   _refresh_extra_restraints_display(mol_id)
   r1=resn-1
   r2=resn+2
@@ -8962,7 +10066,16 @@ def lengthen_loop():
   ch_id=active_atom[1]
   resn=active_atom[2]
   first_res=seqnum_from_serial_number(mol_id,"%s"%(ch_id),0)
-  renumber_residue_range(mol_id,ch_id,first_res,resn,-1)
+  if not _renumber_residue_range_or_dialog(
+    mol_id,
+    ch_id,
+    first_res,
+    resn,
+    -1,
+    "Failed to lengthen the loop because the renumbering step was not possible.\n\n"
+    "This usually means the requested change would create overlapping sequence numbering.",
+  ):
+    return None
   sort_residues(mol_id)
   _refresh_extra_restraints_display(mol_id)
   r1=resn-1
@@ -9893,7 +11006,8 @@ def renumber_by_first_res():
     if new_num is None:
       return 0
     offset=new_num-first_res
-    renumber_residue_range(mol_id,ch_id,first_res,last_res,int(offset))
+    if not _renumber_residue_range_or_dialog(mol_id, ch_id, first_res, last_res, offset):
+      return 0
     _refresh_extra_restraints_display(mol_id)
     return 1
   generic_single_entry("New number for first residue in this chain?",
@@ -9913,7 +11027,8 @@ def renumber_by_last_res():
     if new_num is None:
       return 0
     offset=new_num-last_res
-    renumber_residue_range(mol_id,ch_id,first_res,last_res,int(offset))
+    if not _renumber_residue_range_or_dialog(mol_id, ch_id, first_res, last_res, offset):
+      return 0
     _refresh_extra_restraints_display(mol_id)
     return 1
   generic_single_entry("New number for last residue in this chain?",
@@ -9934,7 +11049,8 @@ def renumber_by_active_res():
     if new_num is None:
       return 0
     offset=new_num-current_num
-    renumber_residue_range(mol_id,ch_id,first_res,last_res,int(offset))
+    if not _renumber_residue_range_or_dialog(mol_id, ch_id, first_res, last_res, offset):
+      return 0
     _refresh_extra_restraints_display(mol_id)
     return 1
   generic_single_entry("New number for this residue?",
@@ -9954,7 +11070,8 @@ def renumber_n_term_segment():
     if new_resn is None:
       return 0
     offset=new_resn-resn
-    renumber_residue_range(mol_id,ch_id,first_res,resn,offset)
+    if not _renumber_residue_range_or_dialog(mol_id, ch_id, first_res, resn, offset):
+      return 0
     _refresh_extra_restraints_display(mol_id)
     return 1
   generic_single_entry("New residue number?",
@@ -9974,7 +11091,8 @@ def renumber_c_term_segment():
     if new_resn is None:
       return 0
     offset=new_resn-resn
-    renumber_residue_range(mol_id,ch_id,resn,last_res,offset)
+    if not _renumber_residue_range_or_dialog(mol_id, ch_id, resn, last_res, offset):
+      return 0
     _refresh_extra_restraints_display(mol_id)
     return 1
   generic_single_entry("New residue number?",
@@ -11813,7 +12931,16 @@ def renumber_seg_by_active_res():
           seg_prev=new_seg_list[seg_count-2]
         offset=new_num-current_num
         if ((((res_start==first_res) or (res_start+offset)>seg_prev[3])) and (((res_end==last_res) or (res_end+offset)<seg_next[2]))):
-          renumber_residue_range(mol_id,ch_id,res_start,res_end,int(offset))
+          if not _renumber_residue_range_or_dialog(
+            mol_id,
+            ch_id,
+            res_start,
+            res_end,
+            offset,
+            "Failed to renumber the active segment.\n\n"
+            "This usually means the requested renumbering would create overlapping sequence numbering.",
+          ):
+            return 0
         else:
           info_dialog("No can do, this would result in overlapping sequence numbering!")
         _refresh_extra_restraints_display(mol_id)
