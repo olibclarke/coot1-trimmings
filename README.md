@@ -34,7 +34,7 @@ export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/glib/lib:/opt/homebrew/lib${
 export GI_TYPELIB_PATH=/opt/homebrew/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}
 ```
 
-In order to resolve a non-fatal startup error that was preventing the script running.
+In order to resolve a non-fatal startup error that was preventing the script running. _Note: this may be fixed in the latest homebrew recipe; if so ignore!_
 
 ## Startup behavior
 
