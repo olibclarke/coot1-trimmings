@@ -409,6 +409,9 @@ RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
   or os.environ.get("USERNAME")
   or ""
 )
+RESIDUE_ANNOTATION_SCHEMA_VERSION = "2"
+RESIDUE_ANNOTATION_NEARBY_RADIUS = 6.0
+RESIDUE_ANNOTATION_POLL_INTERVAL_MS = 300
 
 # Map restyling defaults for the EM helper.
 EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
@@ -2768,23 +2771,26 @@ if _preloaded_coot_gui is not None:
     window.present()
     entry.grab_focus()
 
-  def generic_author_note_entry(
+  def generic_title_author_note_entry(
     function_label,
     residue_label,
+    title_default_text,
     author_default_text,
     note_default_text,
     go_button_label,
     handle_go_function,
   ):
-    """Small GTK4 prompt for adding an authored multiline residue note."""
+    """Small GTK4 prompt for adding a titled/authored multiline residue note."""
     window = Gtk.Window()
     window.set_title("Coot")
-    window.set_default_size(520, 360)
+    window.set_default_size(520, 400)
 
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     hbox_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     title_label = Gtk.Label(label=function_label)
     residue_info_label = Gtk.Label(label=residue_label)
+    note_title_label = Gtk.Label(label="Title")
+    note_title_entry = Gtk.Entry()
     author_label = Gtk.Label(label="Author")
     author_entry = Gtk.Entry()
     note_label = Gtk.Label(label="Note")
@@ -2803,6 +2809,10 @@ if _preloaded_coot_gui is not None:
     residue_info_label.set_margin_end(12)
     residue_info_label.set_margin_bottom(4)
     residue_info_label.set_xalign(0.0)
+    note_title_label.set_margin_start(12)
+    note_title_label.set_margin_end(12)
+    note_title_entry.set_margin_start(12)
+    note_title_entry.set_margin_end(12)
     author_label.set_margin_start(12)
     author_label.set_margin_end(12)
     author_entry.set_margin_start(12)
@@ -2815,10 +2825,16 @@ if _preloaded_coot_gui is not None:
     note_scrolled.set_margin_bottom(8)
     note_scrolled.set_hexpand(True)
     note_scrolled.set_vexpand(True)
+    try:
+      note_scrolled.set_has_frame(True)
+    except Exception:
+      pass
     hbox_buttons.set_margin_start(12)
     hbox_buttons.set_margin_end(12)
     hbox_buttons.set_margin_bottom(12)
 
+    if isinstance(title_default_text, str):
+      note_title_entry.set_text(title_default_text)
     if isinstance(author_default_text, str):
       author_entry.set_text(author_default_text)
     if isinstance(note_default_text, str):
@@ -2835,6 +2851,7 @@ if _preloaded_coot_gui is not None:
       start_iter = note_buffer.get_start_iter()
       end_iter = note_buffer.get_end_iter()
       status = handle_go_function(
+        note_title_entry.get_text(),
         author_entry.get_text(),
         note_buffer.get_text(start_iter, end_iter, False),
       )
@@ -2844,10 +2861,13 @@ if _preloaded_coot_gui is not None:
 
     cancel_button.connect("clicked", close_window)
     go_button.connect("clicked", submit)
+    note_title_entry.connect("activate", lambda *_args: author_entry.grab_focus())
     author_entry.connect("activate", lambda *_args: note_view.grab_focus())
 
     vbox.append(title_label)
     vbox.append(residue_info_label)
+    vbox.append(note_title_label)
+    vbox.append(note_title_entry)
     vbox.append(author_label)
     vbox.append(author_entry)
     vbox.append(note_label)
@@ -2857,10 +2877,32 @@ if _preloaded_coot_gui is not None:
     vbox.append(hbox_buttons)
     window.set_child(vbox)
     window.present()
-    if author_entry.get_text().strip():
+    if not note_title_entry.get_text().strip():
+      note_title_entry.grab_focus()
+    elif not author_entry.get_text().strip():
+      author_entry.grab_focus()
+    elif author_entry.get_text().strip():
       note_view.grab_focus()
     else:
-      author_entry.grab_focus()
+      note_title_entry.grab_focus()
+
+  def generic_author_note_entry(
+    function_label,
+    residue_label,
+    author_default_text,
+    note_default_text,
+    go_button_label,
+    handle_go_function,
+  ):
+    return generic_title_author_note_entry(
+      function_label,
+      residue_label,
+      "",
+      author_default_text,
+      note_default_text,
+      go_button_label,
+      lambda title_text, author_text, note_text: handle_go_function(author_text, note_text),
+    )
 
   def interesting_things_gui(dialog_name, thing_list):
     """Show a simple GTK4 list of jump targets as labeled buttons."""
@@ -3334,6 +3376,17 @@ else:
     function_label,
     _entry_1_default_text,
     _entry_1_browse_title,
+    _go_button_label,
+    _handle_go_function,
+  ):
+    info_dialog(_gui_unavailable_message(function_label))
+
+  def generic_title_author_note_entry(
+    function_label,
+    _residue_label,
+    _title_default_text,
+    _author_default_text,
+    _note_default_text,
     _go_button_label,
     _handle_go_function,
   ):
@@ -5003,13 +5056,14 @@ def _annotation_next_id(mol_id):
   return max_id + 1
 
 
-def _annotation_prepare_note_fields(author_text, note_text):
+def _annotation_prepare_note_fields(title_text, author_text, note_text):
+  normalized_title = _annotation_text_or_empty(title_text).strip()
   normalized_author = _annotation_text_or_empty(author_text).strip() or _annotation_default_author()
   normalized_note = _annotation_text_or_empty(note_text).strip()
   if not normalized_note:
     info_dialog("Please enter a note before saving the residue annotation.")
     return None
-  return normalized_author, normalized_note
+  return normalized_title, normalized_author, normalized_note
 
 
 def _annotation_target_for_active_residue(expected_mol_id=None):
@@ -5036,6 +5090,20 @@ def _annotation_target_for_active_residue(expected_mol_id=None):
   }
 
 
+def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
+  return {
+    "id": int(entry_id),
+    "auth_asym_id": target["chain_id"],
+    "auth_seq_id": int(target["resno"]),
+    "pdbx_PDB_ins_code": str(target["ins_code"] or ""),
+    "label_comp_id": target["residue_name"],
+    "title": _annotation_text_or_empty(title_text).strip(),
+    "author": _annotation_text_or_empty(author_text).strip() or _annotation_default_author(),
+    "modified_utc": _annotation_now_utc(),
+    "note": _annotation_text_or_empty(note_text).strip(),
+  }
+
+
 def _annotation_normalize_entry(raw_entry, fallback_id=None):
   auth_asym_id = _annotation_text_or_empty(raw_entry.get("auth_asym_id")).strip()
   auth_seq_id = _annotation_safe_int(raw_entry.get("auth_seq_id"), default=None)
@@ -5050,6 +5118,7 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
     "auth_seq_id": auth_seq_id,
     "pdbx_PDB_ins_code": _annotation_text_or_empty(raw_entry.get("pdbx_PDB_ins_code")).strip(),
     "label_comp_id": _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip() or "?",
+    "title": _annotation_text_or_empty(raw_entry.get("title")).strip(),
     "author": _annotation_text_or_empty(raw_entry.get("author")).strip() or _annotation_default_author(),
     "modified_utc": _annotation_text_or_empty(raw_entry.get("modified_utc")).strip() or _annotation_now_utc(),
     "note": _annotation_text_or_empty(raw_entry.get("note")).strip(),
@@ -5057,6 +5126,18 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
   if not normalized_entry["note"]:
     return None
   return normalized_entry
+
+
+def _annotation_entry_display_title(entry, fallback_from_note=True, max_length=None):
+  title_text = _annotation_text_or_empty(entry.get("title")).replace("\r\n", "\n").replace("\r", "\n").strip()
+  if title_text:
+    title_text = title_text.splitlines()[0].strip()
+  elif fallback_from_note:
+    note_lines = _annotation_text_or_empty(entry.get("note")).splitlines()
+    title_text = note_lines[0].strip() if note_lines else ""
+  if max_length is not None and len(title_text) > max_length:
+    title_text = title_text[:max_length - 1].rstrip() + "..."
+  return title_text
 
 
 def _annotation_group_sort_key(group):
@@ -5105,6 +5186,9 @@ def _annotation_group_detail_text(group):
   lines = [group["dialog_label"], ""]
   for entry_index, entry in enumerate(group["entries"], start=1):
     lines.append(f"Note {entry_index}")
+    explicit_title = _annotation_entry_display_title(entry, fallback_from_note=False)
+    if explicit_title:
+      lines.append(f"Title: {explicit_title}")
     lines.append(f"Author: {_annotation_text_or_empty(entry.get('author')) or 'Unknown'}")
     lines.append(f"Timestamp: {_annotation_text_or_empty(entry.get('modified_utc')) or 'Unknown'}")
     lines.append("")
@@ -5115,15 +5199,120 @@ def _annotation_group_detail_text(group):
 
 
 def _annotation_group_preview_text(group, max_length=56):
-  latest_note = _annotation_text_or_empty(group["entries"][-1].get("note")).splitlines()
-  preview_text = latest_note[0].strip() if latest_note else ""
-  if len(preview_text) > max_length:
-    preview_text = preview_text[:max_length - 1].rstrip() + "..."
+  preview_text = _annotation_entry_display_title(group["entries"][-1], fallback_from_note=True, max_length=max_length)
   note_count = len(group["entries"])
   suffix = "note" if note_count == 1 else "notes"
   if preview_text:
     return f"{group['dialog_label']} ({note_count} {suffix}) - {preview_text}"
   return f"{group['dialog_label']} ({note_count} {suffix})"
+
+
+def _annotation_group_nearby_preview_text(group, max_length=48):
+  preview_text = _annotation_group_preview_text(group, max_length=max_length)
+  distance = group.get("distance")
+  if distance is None:
+    return preview_text
+  return f"[{distance:.1f} A] {preview_text}"
+
+
+def _annotation_clear_box_children(box):
+  child = box.get_first_child()
+  while child is not None:
+    next_child = child.get_next_sibling()
+    box.remove(child)
+    child = next_child
+
+
+def _annotation_detail_label(text, selectable=False, margin_bottom=0):
+  label = Gtk.Label(label=text)
+  label.set_xalign(0.0)
+  label.set_wrap(True)
+  try:
+    label.set_selectable(bool(selectable))
+  except Exception:
+    pass
+  label.set_margin_start(12)
+  label.set_margin_end(12)
+  if margin_bottom:
+    label.set_margin_bottom(margin_bottom)
+  return label
+
+
+def _annotation_set_detail_placeholder(detail_box, placeholder_text):
+  _annotation_clear_box_children(detail_box)
+  placeholder_label = _annotation_detail_label(placeholder_text, selectable=False)
+  placeholder_label.set_margin_top(8)
+  detail_box.append(placeholder_label)
+  return None
+
+
+def _annotation_note_expander_label(entry, entry_index, total_entries, max_length=56):
+  preview_title = _annotation_entry_display_title(entry, fallback_from_note=True, max_length=max_length)
+  if preview_title:
+    return f"Note {entry_index} of {total_entries}: {preview_title}"
+  return f"Note {entry_index} of {total_entries}"
+
+
+def _annotation_render_group_detail_widgets(detail_box, group):
+  _annotation_clear_box_children(detail_box)
+  if not group:
+    return _annotation_set_detail_placeholder(detail_box, "Select a residue annotation thread to view its notes.")
+  if not hasattr(Gtk, "Expander"):
+    fallback_label = _annotation_detail_label(_annotation_group_detail_text(group), selectable=True)
+    fallback_label.set_margin_top(8)
+    detail_box.append(fallback_label)
+    return None
+
+  note_count = len(group["entries"])
+  summary_label = _annotation_detail_label(
+    f"{group['dialog_label']}\n{note_count} {'note' if note_count == 1 else 'notes'}",
+    selectable=False,
+    margin_bottom=6,
+  )
+  summary_label.set_margin_top(6)
+  detail_box.append(summary_label)
+
+  separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+  separator.set_margin_start(12)
+  separator.set_margin_end(12)
+  separator.set_margin_bottom(8)
+  detail_box.append(separator)
+
+  for entry_index, entry in enumerate(group["entries"], start=1):
+    expander = Gtk.Expander(label=_annotation_note_expander_label(entry, entry_index, note_count))
+    expander.set_margin_start(12)
+    expander.set_margin_end(12)
+    expander.set_margin_bottom(8)
+    expander.set_expanded(entry_index == note_count)
+
+    note_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    note_box.set_margin_top(6)
+    note_box.set_margin_bottom(6)
+
+    explicit_title = _annotation_entry_display_title(entry, fallback_from_note=False)
+    if explicit_title:
+      note_box.append(_annotation_detail_label(f"Title: {explicit_title}", selectable=True))
+    note_box.append(
+      _annotation_detail_label(
+        f"Author: {_annotation_text_or_empty(entry.get('author')) or 'Unknown'}",
+        selectable=True,
+      )
+    )
+    note_box.append(
+      _annotation_detail_label(
+        f"Timestamp: {_annotation_text_or_empty(entry.get('modified_utc')) or 'Unknown'}",
+        selectable=True,
+        margin_bottom=4,
+      )
+    )
+    note_box.append(_annotation_detail_label("Note:", selectable=False))
+    note_text_label = _annotation_detail_label(_annotation_text_or_empty(entry.get("note")) or "", selectable=True)
+    note_text_label.set_margin_start(24)
+    note_box.append(note_text_label)
+
+    expander.set_child(note_box)
+    detail_box.append(expander)
+  return None
 
 
 def _annotation_mmcif_rows(mol_id):
@@ -5136,6 +5325,7 @@ def _annotation_mmcif_rows(mol_id):
         str(entry.get("auth_seq_id", "")),
         _annotation_text_or_empty(entry.get("pdbx_PDB_ins_code")) or "?",
         _annotation_text_or_empty(entry.get("label_comp_id")) or "?",
+        _annotation_encode_text(entry.get("title")),
         _annotation_encode_text(entry.get("author")),
         _annotation_text_or_empty(entry.get("modified_utc")) or "?",
         _annotation_encode_text(entry.get("note")),
@@ -5165,15 +5355,16 @@ def _annotation_markdown_table_text(mol_id):
     "",
     f"Source: `{source_display_name}`",
     "",
-    "| Residue | Author | Timestamp | Note |",
-    "| --- | --- | --- | --- |",
+    "| Residue | Title | Author | Timestamp | Note |",
+    "| --- | --- | --- | --- | --- |",
   ]
   for group in _annotation_groups_for_molecule(mol_id):
     residue_label = _annotation_markdown_cell(group["dialog_label"])
     for entry in group["entries"]:
       lines.append(
-        "| {0} | {1} | {2} | {3} |".format(
+        "| {0} | {1} | {2} | {3} | {4} |".format(
           residue_label,
+          _annotation_markdown_cell(entry.get("title")) or "",
           _annotation_markdown_cell(entry.get("author")) or "Unknown",
           _annotation_markdown_cell(entry.get("modified_utc")) or "",
           _annotation_markdown_cell(entry.get("note")) or "",
@@ -5225,6 +5416,14 @@ def _load_annotations_from_mmcif_file(file_path):
     if candidate_tag in tag_indices:
       author_tag = candidate_tag
       break
+  title_tag = None
+  for candidate_tag in (
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title_b64",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title",
+  ):
+    if candidate_tag in tag_indices:
+      title_tag = candidate_tag
+      break
   note_tag = None
   for candidate_tag in (
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note_b64",
@@ -5245,6 +5444,7 @@ def _load_annotations_from_mmcif_file(file_path):
         "auth_seq_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_seq_id"]]),
         "pdbx_PDB_ins_code": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "pdbx_PDB_ins_code"]]),
         "label_comp_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id"]]),
+        "title": _annotation_decode_text(loop[row_index, tag_indices[title_tag]]) if title_tag is not None else "",
         "author": _annotation_decode_text(loop[row_index, tag_indices[author_tag]]),
         "modified_utc": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "modified_utc"]]),
         "note": _annotation_decode_text(loop[row_index, tag_indices[note_tag]]),
@@ -5260,7 +5460,7 @@ def _load_annotations_from_mmcif_file(file_path):
 
 def _annotation_write_entries_to_mmcif_block(block, entries):
   _annotation_clear_existing_mmcif_items(block)
-  block.set_pair(RESIDUE_ANNOTATION_META_VERSION_TAG, "1")
+  block.set_pair(RESIDUE_ANNOTATION_META_VERSION_TAG, RESIDUE_ANNOTATION_SCHEMA_VERSION)
   block.set_pair(RESIDUE_ANNOTATION_META_PROGRAM_TAG, "coot-trimmings")
   if entries:
     loop = block.init_loop(
@@ -5271,6 +5471,7 @@ def _annotation_write_entries_to_mmcif_block(block, entries):
         "auth_seq_id",
         "pdbx_PDB_ins_code",
         "label_comp_id",
+        "title_b64",
         "author_b64",
         "modified_utc",
         "note_b64",
@@ -5760,19 +5961,20 @@ def _annotation_active_molecule_or_status():
   return None
 
 
-def _append_annotation_for_target(target, author_text, note_text, refresh_function=None):
+def _append_annotation_for_target(target, title_text, author_text, note_text, refresh_function=None):
   global RESIDUE_ANNOTATION_LAST_AUTHOR
   if not target:
     return 0
-  note_fields = _annotation_prepare_note_fields(author_text, note_text)
+  note_fields = _annotation_prepare_note_fields(title_text, author_text, note_text)
   if note_fields is None:
     return 0
-  normalized_author, normalized_note = note_fields
+  normalized_title, normalized_author, normalized_note = note_fields
   RESIDUE_ANNOTATION_LAST_AUTHOR = normalized_author
 
   mol_id = target["mol_id"]
   annotation_entry = _new_annotation_entry(
     target,
+    normalized_title,
     normalized_author,
     normalized_note,
     _annotation_next_id(mol_id),
@@ -5807,14 +6009,16 @@ def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None)
     target["ins_code"],
     target["residue_name"],
   )
-  generic_author_note_entry(
+  generic_title_author_note_entry(
     "Add residue annotation",
     residue_label,
+    "",
     _annotation_default_author(),
     "",
     "Add note",
-    lambda author_text, note_text: _append_annotation_for_target(
+    lambda title_text, author_text, note_text: _append_annotation_for_target(
       target,
+      title_text,
       author_text,
       note_text,
       refresh_function,
@@ -5826,22 +6030,20 @@ def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None)
 def _annotation_note_choice_label(entry, entry_index, max_length=48):
   author_text = _annotation_text_or_empty(entry.get("author")) or "Unknown author"
   modified_text = _annotation_text_or_empty(entry.get("modified_utc")) or "Unknown time"
-  preview_lines = _annotation_text_or_empty(entry.get("note")).splitlines()
-  preview_text = preview_lines[0].strip() if preview_lines else ""
-  if len(preview_text) > max_length:
-    preview_text = preview_text[:max_length - 1].rstrip() + "..."
+  preview_text = _annotation_entry_display_title(entry, fallback_from_note=True, max_length=max_length)
   if preview_text:
     return f"{entry_index}. {author_text} - {modified_text} - {preview_text}"
   return f"{entry_index}. {author_text} - {modified_text}"
 
 
-def _update_annotation_entry(annotation_entry, author_text, note_text, refresh_function=None):
+def _update_annotation_entry(annotation_entry, title_text, author_text, note_text, refresh_function=None):
   global RESIDUE_ANNOTATION_LAST_AUTHOR
-  note_fields = _annotation_prepare_note_fields(author_text, note_text)
+  note_fields = _annotation_prepare_note_fields(title_text, author_text, note_text)
   if note_fields is None:
     return 0
-  normalized_author, normalized_note = note_fields
+  normalized_title, normalized_author, normalized_note = note_fields
   RESIDUE_ANNOTATION_LAST_AUTHOR = normalized_author
+  annotation_entry["title"] = normalized_title
   annotation_entry["author"] = normalized_author
   annotation_entry["note"] = normalized_note
   annotation_entry["modified_utc"] = _annotation_now_utc()
@@ -5865,14 +6067,16 @@ def _delete_annotation_entry(mol_id, annotation_entry, refresh_function=None):
 
 
 def _prompt_edit_annotation_entry(group, annotation_entry, refresh_function=None):
-  generic_author_note_entry(
+  generic_title_author_note_entry(
     "Edit residue annotation",
     group["dialog_label"],
+    _annotation_text_or_empty(annotation_entry.get("title")),
     _annotation_text_or_empty(annotation_entry.get("author")) or _annotation_default_author(),
     _annotation_text_or_empty(annotation_entry.get("note")),
     "Save changes",
-    lambda author_text, note_text: _update_annotation_entry(
+    lambda title_text, author_text, note_text: _update_annotation_entry(
       annotation_entry,
+      title_text,
       author_text,
       note_text,
       refresh_function,
@@ -5930,6 +6134,39 @@ def _annotation_jump_to_group(mol_id, group):
   return 1
 
 
+def _annotation_groups_near_point(mol_id, point_xyz, radius):
+  nearby_groups = []
+  try:
+    radius_sq = float(radius) * float(radius)
+  except Exception:
+    return nearby_groups
+  for group in _annotation_groups_for_molecule(mol_id):
+    chain_id, resno, ins_code, _residue_name_here = group["key"]
+    residue_point = residue_centre_py(mol_id, chain_id, resno, ins_code)
+    if not isinstance(residue_point, (list, tuple)) or len(residue_point) != 3:
+      continue
+    distance_sq = _distance_sq(point_xyz, residue_point)
+    if distance_sq > radius_sq:
+      continue
+    nearby_group = dict(group)
+    nearby_group["distance"] = math.sqrt(distance_sq)
+    nearby_groups.append(nearby_group)
+  nearby_groups.sort(key=lambda group: (group.get("distance", float("inf")), _annotation_group_sort_key(group)))
+  return nearby_groups
+
+
+def _annotation_groups_signature(groups):
+  return tuple(
+    (
+      group["key"],
+      len(group.get("entries") or []),
+      _annotation_text_or_empty(group["entries"][-1].get("modified_utc")) if group.get("entries") else "",
+      round(float(group.get("distance", -1.0)), 2),
+    )
+    for group in groups
+  )
+
+
 def _annotation_browser_title(mol_id):
   source_display_name = _annotation_source_display_name(mol_id)
   if source_display_name:
@@ -5938,6 +6175,20 @@ def _annotation_browser_title(mol_id):
       f"Source: {source_display_name}; use the widget to export an annotated mmCIF"
     )
   return f"Residue annotations for molecule #{mol_id}\n(No accessible source file path)"
+
+
+def _annotation_nearby_browser_title(mol_id, radius):
+  source_display_name = _annotation_source_display_name(mol_id)
+  radius_text = f"{float(radius):.1f} A"
+  if source_display_name:
+    return (
+      f"Nearby residue annotations within {radius_text} of the rotation centre for molecule #{mol_id}\n"
+      f"Source: {source_display_name}"
+    )
+  return (
+    f"Nearby residue annotations within {radius_text} of the rotation centre for molecule #{mol_id}\n"
+    "(No accessible source file path)"
+  )
 
 
 def _annotation_active_residue_header_text(mol_id):
@@ -5983,8 +6234,7 @@ def residue_annotations_gui():
   active_residue_label = Gtk.Label(label=_annotation_active_residue_header_text(initial_mol_id))
   detail_header = Gtk.Label(label="Selected notes: none")
   detail_scrolled = Gtk.ScrolledWindow()
-  detail_view = Gtk.TextView()
-  detail_buffer = detail_view.get_buffer()
+  detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
   add_button = Gtk.Button(label="Add note for active residue")
   edit_button = Gtk.Button(label="Edit selected note...")
   delete_button = Gtk.Button(label="Delete selected note...")
@@ -6007,6 +6257,10 @@ def residue_annotations_gui():
   list_scrolled.set_margin_bottom(8)
   list_scrolled.set_hexpand(True)
   list_scrolled.set_vexpand(True)
+  try:
+    list_scrolled.set_has_frame(True)
+  except Exception:
+    pass
   list_box.set_valign(Gtk.Align.START)
   list_scrolled.set_child(list_box)
   active_residue_label.set_margin_start(12)
@@ -6022,10 +6276,12 @@ def residue_annotations_gui():
   detail_scrolled.set_margin_bottom(8)
   detail_scrolled.set_hexpand(True)
   detail_scrolled.set_vexpand(True)
-  detail_view.set_editable(False)
-  detail_view.set_cursor_visible(False)
-  detail_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-  detail_scrolled.set_child(detail_view)
+  try:
+    detail_scrolled.set_has_frame(True)
+  except Exception:
+    pass
+  detail_box.set_valign(Gtk.Align.START)
+  detail_scrolled.set_child(detail_box)
   action_row_top.set_halign(Gtk.Align.CENTER)
   action_row_top.set_margin_start(12)
   action_row_top.set_margin_end(12)
@@ -6082,7 +6338,10 @@ def residue_annotations_gui():
     def start_polling(self):
       if glib_module is not None:
         try:
-          self.active_residue_timer_id = glib_module.timeout_add(300, self.poll_active_residue_header)
+          self.active_residue_timer_id = glib_module.timeout_add(
+            RESIDUE_ANNOTATION_POLL_INTERVAL_MS,
+            self.poll_active_residue_header,
+          )
         except Exception:
           self.active_residue_timer_id = None
       return None
@@ -6122,11 +6381,7 @@ def residue_annotations_gui():
           pass
 
     def clear_list_box_children(self):
-      child = list_box.get_first_child()
-      while child is not None:
-        next_child = child.get_next_sibling()
-        list_box.remove(child)
-        child = next_child
+      _annotation_clear_box_children(list_box)
 
     def update_selection_button_state(self):
       has_selection = self.current_index is not None
@@ -6147,7 +6402,7 @@ def residue_annotations_gui():
       self.current_index = None
       self.selected_group_key = None
       detail_header.set_text("Selected notes: none")
-      detail_buffer.set_text("")
+      _annotation_set_detail_placeholder(detail_box, "Select a residue annotation thread to view its notes.")
       self.set_selected_button(None)
       self.update_selection_button_state()
 
@@ -6159,7 +6414,7 @@ def residue_annotations_gui():
       self.current_index = entry_index
       self.selected_group_key = group["key"]
       detail_header.set_text(f"Selected notes: {group['dialog_label']}")
-      detail_buffer.set_text(_annotation_group_detail_text(group))
+      _annotation_render_group_detail_widgets(detail_box, group)
       button = self.row_buttons[entry_index] if entry_index < len(self.row_buttons) else None
       self.set_selected_button(button)
       self.update_selection_button_state()
@@ -6374,6 +6629,327 @@ def residue_annotations_gui():
   outer_vbox.append(navigation_row)
   outer_vbox.append(close_button)
   window.set_child(outer_vbox)
+  window.present()
+  return len(browser.grouped_annotations)
+
+
+def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
+  initial_mol_id = _annotation_active_molecule_or_status()
+  if initial_mol_id is None:
+    return 0
+
+  try:
+    nearby_radius = float(radius)
+  except Exception:
+    nearby_radius = float(RESIDUE_ANNOTATION_NEARBY_RADIUS)
+  if nearby_radius <= 0.0:
+    nearby_radius = float(RESIDUE_ANNOTATION_NEARBY_RADIUS)
+
+  _ensure_residue_annotations_loaded(initial_mol_id)
+
+  if "Gtk" not in globals():
+    groups = _annotation_groups_near_point(initial_mol_id, _rotation_centre_xyz(), nearby_radius)
+    labels = [_annotation_group_nearby_preview_text(group) for group in groups]
+    message = _annotation_nearby_browser_title(initial_mol_id, nearby_radius)
+    if labels:
+      message += "\n\n" + "\n".join(labels)
+    else:
+      message += "\n\nNo residue annotations are currently near the rotation centre."
+    info_dialog(message)
+    return len(groups)
+
+  window = Gtk.Window()
+  window.set_title("Coot")
+  window.set_default_size(620, 560)
+
+  outer_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  navigation_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  title_label = Gtk.Label(label=_annotation_nearby_browser_title(initial_mol_id, nearby_radius))
+  context_label = Gtk.Label(label="")
+  list_scrolled = Gtk.ScrolledWindow()
+  list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  detail_header = Gtk.Label(label="Nearby notes: none")
+  detail_scrolled = Gtk.ScrolledWindow()
+  detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+  refresh_button = Gtk.Button(label="Refresh nearby notes")
+  prev_button = Gtk.Button(label="<--Prev")
+  next_button = Gtk.Button(label="Next-->")
+  close_button = Gtk.Button(label="Close")
+
+  title_label.set_margin_start(12)
+  title_label.set_margin_end(12)
+  title_label.set_margin_top(12)
+  title_label.set_margin_bottom(4)
+  title_label.set_wrap(True)
+  title_label.set_xalign(0.0)
+  context_label.set_margin_start(12)
+  context_label.set_margin_end(12)
+  context_label.set_margin_bottom(4)
+  context_label.set_wrap(True)
+  context_label.set_xalign(0.0)
+  list_scrolled.set_margin_start(12)
+  list_scrolled.set_margin_end(12)
+  list_scrolled.set_margin_bottom(8)
+  list_scrolled.set_hexpand(True)
+  list_scrolled.set_vexpand(True)
+  try:
+    list_scrolled.set_has_frame(True)
+  except Exception:
+    pass
+  list_box.set_valign(Gtk.Align.START)
+  list_scrolled.set_child(list_box)
+  detail_header.set_margin_start(12)
+  detail_header.set_margin_end(12)
+  detail_header.set_margin_bottom(2)
+  detail_header.set_xalign(0.0)
+  detail_scrolled.set_margin_start(12)
+  detail_scrolled.set_margin_end(12)
+  detail_scrolled.set_margin_bottom(8)
+  detail_scrolled.set_hexpand(True)
+  detail_scrolled.set_vexpand(True)
+  try:
+    detail_scrolled.set_has_frame(True)
+  except Exception:
+    pass
+  detail_box.set_valign(Gtk.Align.START)
+  detail_scrolled.set_child(detail_box)
+  action_row.set_halign(Gtk.Align.CENTER)
+  action_row.set_margin_start(12)
+  action_row.set_margin_end(12)
+  action_row.set_margin_bottom(4)
+  navigation_row.set_halign(Gtk.Align.CENTER)
+  navigation_row.set_margin_start(12)
+  navigation_row.set_margin_end(12)
+  navigation_row.set_margin_bottom(4)
+  close_button.set_margin_start(12)
+  close_button.set_margin_end(12)
+  close_button.set_margin_bottom(12)
+  close_button.set_halign(Gtk.Align.CENTER)
+
+  glib_module = None
+  try:
+    glib_module = _coot_gui_repository_module("GLib")
+  except Exception:
+    glib_module = None
+
+  class NearbyAnnotationBrowserState:
+    def __init__(self, mol_id, nearby_radius):
+      self.current_mol_id = mol_id
+      self.radius = float(nearby_radius)
+      self.grouped_annotations = []
+      self.group_index_by_key = {}
+      self.selected_group_key = None
+      self.current_index = None
+      self.selected_button = None
+      self.row_buttons = []
+      self.timer_id = None
+      self.last_signature = None
+      self.last_rotation_centre = None
+
+    def mol_id(self):
+      return self.current_mol_id
+
+    def stop_polling(self):
+      if glib_module is not None and self.timer_id is not None:
+        try:
+          glib_module.source_remove(self.timer_id)
+        except Exception:
+          pass
+        self.timer_id = None
+      return None
+
+    def close_window(self, *_args):
+      self.stop_polling()
+      window.destroy()
+      return False
+
+    def start_polling(self):
+      if glib_module is not None:
+        try:
+          self.timer_id = glib_module.timeout_add(
+            RESIDUE_ANNOTATION_POLL_INTERVAL_MS,
+            self.poll_nearby_groups,
+          )
+        except Exception:
+          self.timer_id = None
+      return None
+
+    def clear_list_box_children(self):
+      _annotation_clear_box_children(list_box)
+
+    def set_selected_button(self, button):
+      if self.selected_button is not None:
+        try:
+          self.selected_button.remove_css_class("suggested-action")
+        except Exception:
+          pass
+      self.selected_button = button
+      if button is not None:
+        try:
+          button.add_css_class("suggested-action")
+        except Exception:
+          pass
+
+    def selected_group(self):
+      if self.selected_group_key is None:
+        return None
+      group_index = self.group_index_by_key.get(self.selected_group_key)
+      if group_index is None or group_index >= len(self.grouped_annotations):
+        return None
+      return self.grouped_annotations[group_index]
+
+    def clear_selected_group(self):
+      self.current_index = None
+      self.selected_group_key = None
+      detail_header.set_text("Nearby notes: none")
+      _annotation_set_detail_placeholder(detail_box, "No nearby residue annotation thread is selected.")
+      self.set_selected_button(None)
+
+    def update_context_text(self):
+      count = len(self.grouped_annotations)
+      if count == 0:
+        context_label.set_text(
+          f"No residue annotation threads are currently within {self.radius:.1f} A of the rotation centre."
+        )
+      else:
+        context_label.set_text(
+          f"{count} residue annotation {'thread' if count == 1 else 'threads'} within "
+          f"{self.radius:.1f} A of the rotation centre."
+        )
+      return None
+
+    def show_group(self, entry_index):
+      if not self.grouped_annotations:
+        return None
+      entry_index = entry_index % len(self.grouped_annotations)
+      group = self.grouped_annotations[entry_index]
+      self.current_index = entry_index
+      self.selected_group_key = group["key"]
+      detail_header.set_text(f"Nearby notes: {group['dialog_label']}")
+      _annotation_render_group_detail_widgets(detail_box, group)
+      button = self.row_buttons[entry_index] if entry_index < len(self.row_buttons) else None
+      self.set_selected_button(button)
+      return group
+
+    def activate_prev(self, *_args):
+      if not self.grouped_annotations:
+        return None
+      if self.current_index is None:
+        return self.show_group(len(self.grouped_annotations) - 1)
+      return self.show_group(self.current_index - 1)
+
+    def activate_next(self, *_args):
+      if not self.grouped_annotations:
+        return None
+      if self.current_index is None:
+        return self.show_group(0)
+      return self.show_group(self.current_index + 1)
+
+    def render_groups(self, groups, preferred_key=None):
+      self.grouped_annotations[:] = list(groups or [])
+      self.group_index_by_key = {}
+      title_label.set_text(_annotation_nearby_browser_title(self.mol_id(), self.radius))
+      self.clear_selected_group()
+      self.row_buttons.clear()
+      self.clear_list_box_children()
+
+      if not self.grouped_annotations:
+        empty_label = Gtk.Label(label="No residue annotations are currently near the rotation centre.")
+        empty_label.set_xalign(0.0)
+        list_box.append(empty_label)
+        prev_button.set_sensitive(False)
+        next_button.set_sensitive(False)
+        self.update_context_text()
+        return None
+
+      selected_index = None
+      for entry_index, group in enumerate(self.grouped_annotations):
+        self.group_index_by_key[group["key"]] = entry_index
+        button = Gtk.Button(label=_annotation_group_nearby_preview_text(group))
+        button.connect("clicked", lambda _button, idx=entry_index: self.show_group(idx))
+        self.row_buttons.append(button)
+        list_box.append(button)
+        if preferred_key is not None and group["key"] == preferred_key:
+          selected_index = entry_index
+
+      prev_button.set_sensitive(True)
+      next_button.set_sensitive(True)
+      self.update_context_text()
+      if selected_index is None:
+        selected_index = 0
+      self.show_group(selected_index)
+      return None
+
+    def refresh_nearby_groups(self, force=False):
+      model_molecules = model_molecule_list()
+      active_mol_id = _annotation_active_molecule()
+      target_mol_id = active_mol_id
+      if target_mol_id is None and self.mol_id() in model_molecules:
+        target_mol_id = self.mol_id()
+      if target_mol_id is None:
+        self.grouped_annotations[:] = []
+        self.last_signature = None
+        self.last_rotation_centre = None
+        self.clear_selected_group()
+        self.clear_list_box_children()
+        empty_label = Gtk.Label(label="No active model molecule is available for nearby notes.")
+        empty_label.set_xalign(0.0)
+        list_box.append(empty_label)
+        prev_button.set_sensitive(False)
+        next_button.set_sensitive(False)
+        context_label.set_text("No active model molecule is available for nearby residue annotations.")
+        return None
+
+      if target_mol_id != self.mol_id():
+        self.current_mol_id = target_mol_id
+        _ensure_residue_annotations_loaded(target_mol_id)
+        force = True
+
+      rotation_centre = _rotation_centre_xyz()
+      groups = _annotation_groups_near_point(target_mol_id, rotation_centre, self.radius)
+      signature = _annotation_groups_signature(groups)
+      moved = (
+        self.last_rotation_centre is None
+        or _distance_sq(rotation_centre, self.last_rotation_centre) > 0.25 * 0.25
+      )
+      if force or moved or signature != self.last_signature:
+        self.last_signature = signature
+        self.last_rotation_centre = list(rotation_centre)
+        self.render_groups(groups, preferred_key=self.selected_group_key)
+      else:
+        self.grouped_annotations[:] = list(groups or [])
+        self.update_context_text()
+      return None
+
+    def poll_nearby_groups(self):
+      self.refresh_nearby_groups(force=False)
+      return True
+
+  browser = NearbyAnnotationBrowserState(initial_mol_id, nearby_radius)
+
+  refresh_button.connect("clicked", lambda *_args: browser.refresh_nearby_groups(force=True))
+  prev_button.connect("clicked", browser.activate_prev)
+  next_button.connect("clicked", browser.activate_next)
+  close_button.connect("clicked", browser.close_window)
+  window.connect("close-request", lambda *_args: browser.stop_polling() or False)
+
+  action_row.append(refresh_button)
+  navigation_row.append(prev_button)
+  navigation_row.append(next_button)
+
+  outer_vbox.append(title_label)
+  outer_vbox.append(context_label)
+  outer_vbox.append(action_row)
+  outer_vbox.append(list_scrolled)
+  outer_vbox.append(detail_header)
+  outer_vbox.append(detail_scrolled)
+  outer_vbox.append(navigation_row)
+  outer_vbox.append(close_button)
+  window.set_child(outer_vbox)
+
+  browser.refresh_nearby_groups(force=True)
+  browser.start_polling()
   window.present()
   return len(browser.grouped_annotations)
 
@@ -13042,6 +13618,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Residue annotations...",
     lambda func: residue_annotations_gui(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Nearby residue annotations...",
+    lambda func: nearby_residue_annotations_gui(),
   )
 
 
