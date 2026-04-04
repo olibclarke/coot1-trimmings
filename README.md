@@ -153,7 +153,7 @@ Protein and nucleic-acid residues use torsion-based virtual-atom sampling (a la 
 Results are shown as a clickable categorized list with Previous/Next navigation buttons; diagnostics are printed to the log.
 
 #### Residue Annotations
-`Residue annotations` lets you attach plain text notes to residues in the active model, browse annotated residues in a simple navigable list, and export the structure as an annotated mmCIF with the notes embedded. Notes are grouped by residue, can be edited or deleted individually, store author and timestamp information, and are reloaded automatically when the widget is opened on a structure that already contains embedded annotations.
+`Residue annotations` lets you attach plain text notes to residues in the active model, browse annotated residues in a simple navigable list, and export the structure as an annotated mmCIF with the notes embedded. Notes are grouped by residue, can be edited or deleted individually, store author and timestamp information, and are reloaded automatically when the widget is opened on a structure that already contains embedded annotations. Residue notes can also be viewed/edited in ChimeraX with the [`chimerax-resnotes` extension](https://github.com/olibclarke/chimerax-resnotes); Nearby notes (near the center of rotation) can be viewed in the "Nearby Residue Annotations" pane.
 
 ### Fit
 
