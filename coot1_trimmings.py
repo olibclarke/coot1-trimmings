@@ -401,6 +401,7 @@ STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
 # User-facing helper defaults.
 DEFAULT_NEW_HELIX_CHAIN_ID = "A"
 HIGH_CONTRAST_BOND_THICKNESS = 2
+PROPORTIONAL_EDITING_RADIUS = 1.0
 COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
 COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 WATER_REFINE_MAX_DISPLACEMENT = 1.0
@@ -409,7 +410,7 @@ RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
   or os.environ.get("USERNAME")
   or ""
 )
-RESIDUE_ANNOTATION_SCHEMA_VERSION = "2"
+RESIDUE_ANNOTATION_SCHEMA_VERSION = "3"
 RESIDUE_ANNOTATION_NEARBY_RADIUS = 6.0
 RESIDUE_ANNOTATION_POLL_INTERVAL_MS = 300
 
@@ -2835,6 +2836,13 @@ if _preloaded_coot_gui is not None:
 
     if isinstance(title_default_text, str):
       note_title_entry.set_text(title_default_text)
+    if not _annotation_text_or_empty(title_default_text).strip():
+      try:
+        placeholder_text = _annotation_note_title_placeholder(note_default_text)
+        if placeholder_text:
+          note_title_entry.set_placeholder_text(placeholder_text)
+      except Exception:
+        pass
     if isinstance(author_default_text, str):
       author_entry.set_text(author_default_text)
     if isinstance(note_default_text, str):
@@ -2877,11 +2885,9 @@ if _preloaded_coot_gui is not None:
     vbox.append(hbox_buttons)
     window.set_child(vbox)
     window.present()
-    if not note_title_entry.get_text().strip():
-      note_title_entry.grab_focus()
-    elif not author_entry.get_text().strip():
+    if not author_entry.get_text().strip():
       author_entry.grab_focus()
-    elif author_entry.get_text().strip():
+    elif note_buffer.get_char_count() > 0:
       note_view.grab_focus()
     else:
       note_title_entry.grab_focus()
@@ -4974,11 +4980,22 @@ def _annotation_text_or_empty(value):
   return str(value)
 
 
+def _annotation_optional_text(value):
+  text = _annotation_text_or_empty(value).strip()
+  if text in ("''", '""'):
+    return ""
+  return text
+
+
 def _annotation_safe_int(value, default=None):
   try:
     return int(str(value).strip())
   except Exception:
     return default
+
+
+def _annotation_label_seq_text(value):
+  return _annotation_text_or_empty(value).strip()
 
 
 def _annotation_encode_text(value):
@@ -5057,13 +5074,25 @@ def _annotation_next_id(mol_id):
 
 
 def _annotation_prepare_note_fields(title_text, author_text, note_text):
-  normalized_title = _annotation_text_or_empty(title_text).strip()
+  normalized_title = _annotation_optional_text(title_text)
   normalized_author = _annotation_text_or_empty(author_text).strip() or _annotation_default_author()
   normalized_note = _annotation_text_or_empty(note_text).strip()
   if not normalized_note:
     info_dialog("Please enter a note before saving the residue annotation.")
     return None
   return normalized_title, normalized_author, normalized_note
+
+
+def _annotation_note_title_placeholder(note_text, max_length=48):
+  preview_entry = {"title": "", "note": _annotation_text_or_empty(note_text)}
+  placeholder_text = _annotation_entry_display_title(
+    preview_entry,
+    fallback_from_note=True,
+    max_length=max_length,
+  )
+  if placeholder_text == "Untitled note":
+    return ""
+  return placeholder_text
 
 
 def _annotation_target_for_active_residue(expected_mol_id=None):
@@ -5093,11 +5122,13 @@ def _annotation_target_for_active_residue(expected_mol_id=None):
 def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
   return {
     "id": int(entry_id),
+    "label_comp_id": target["residue_name"],
+    "label_asym_id": _annotation_text_or_empty(target.get("label_asym_id")).strip(),
+    "label_seq_id": _annotation_label_seq_text(target.get("label_seq_id")),
     "auth_asym_id": target["chain_id"],
     "auth_seq_id": int(target["resno"]),
     "pdbx_PDB_ins_code": str(target["ins_code"] or ""),
-    "label_comp_id": target["residue_name"],
-    "title": _annotation_text_or_empty(title_text).strip(),
+    "title": _annotation_optional_text(title_text),
     "author": _annotation_text_or_empty(author_text).strip() or _annotation_default_author(),
     "modified_utc": _annotation_now_utc(),
     "note": _annotation_text_or_empty(note_text).strip(),
@@ -5105,6 +5136,7 @@ def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
 
 
 def _annotation_normalize_entry(raw_entry, fallback_id=None):
+  label_comp_id = _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip() or "?"
   auth_asym_id = _annotation_text_or_empty(raw_entry.get("auth_asym_id")).strip()
   auth_seq_id = _annotation_safe_int(raw_entry.get("auth_seq_id"), default=None)
   if not auth_asym_id or auth_seq_id is None:
@@ -5114,11 +5146,13 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
     return None
   normalized_entry = {
     "id": entry_id,
+    "label_comp_id": label_comp_id,
+    "label_asym_id": _annotation_text_or_empty(raw_entry.get("label_asym_id")).strip(),
+    "label_seq_id": _annotation_label_seq_text(raw_entry.get("label_seq_id")),
     "auth_asym_id": auth_asym_id,
     "auth_seq_id": auth_seq_id,
     "pdbx_PDB_ins_code": _annotation_text_or_empty(raw_entry.get("pdbx_PDB_ins_code")).strip(),
-    "label_comp_id": _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip() or "?",
-    "title": _annotation_text_or_empty(raw_entry.get("title")).strip(),
+    "title": _annotation_optional_text(raw_entry.get("title")),
     "author": _annotation_text_or_empty(raw_entry.get("author")).strip() or _annotation_default_author(),
     "modified_utc": _annotation_text_or_empty(raw_entry.get("modified_utc")).strip() or _annotation_now_utc(),
     "note": _annotation_text_or_empty(raw_entry.get("note")).strip(),
@@ -5129,7 +5163,7 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
 
 
 def _annotation_entry_display_title(entry, fallback_from_note=True, max_length=None):
-  title_text = _annotation_text_or_empty(entry.get("title")).replace("\r\n", "\n").replace("\r", "\n").strip()
+  title_text = _annotation_optional_text(entry.get("title")).replace("\r\n", "\n").replace("\r", "\n").strip()
   if title_text:
     title_text = title_text.splitlines()[0].strip()
   elif fallback_from_note:
@@ -5315,20 +5349,64 @@ def _annotation_render_group_detail_widgets(detail_box, group):
   return None
 
 
-def _annotation_mmcif_rows(mol_id):
+def _annotation_export_entry_maps(entity_records):
+  polymer_residue_map = {}
+  nonpoly_residue_map = {}
+  for record in entity_records or []:
+    if record["kind"] == "polymer":
+      polymer_residue_map[record["chain_id"]] = record
+    elif record["kind"] == "nonpolymer":
+      nonpoly_residue_map[record["residue_key"]] = record
+  return polymer_residue_map, nonpoly_residue_map
+
+
+def _annotation_export_label_fields(entry, polymer_residue_map=None, nonpoly_residue_map=None):
+  label_comp_id = _annotation_text_or_empty(entry.get("label_comp_id")).strip() or "?"
+  label_asym_id = _annotation_text_or_empty(entry.get("label_asym_id")).strip()
+  label_seq_id = _annotation_label_seq_text(entry.get("label_seq_id"))
+  if polymer_residue_map is None or nonpoly_residue_map is None:
+    return label_comp_id, label_asym_id, label_seq_id
+  residue_key = (
+    _annotation_text_or_empty(entry.get("auth_asym_id")).strip(),
+    str(entry.get("auth_seq_id", "")),
+    _annotation_text_or_empty(entry.get("pdbx_PDB_ins_code")).strip(),
+    label_comp_id,
+  )
+  nonpoly_record = nonpoly_residue_map.get(residue_key)
+  if nonpoly_record is not None:
+    return label_comp_id, nonpoly_record["asym_id"], "."
+
+  polymer_record = polymer_residue_map.get(residue_key[0])
+  if polymer_record is not None:
+    exported_label_seq_id = polymer_record["residue_key_to_label_seq"].get(residue_key)
+    if exported_label_seq_id is not None:
+      return label_comp_id, polymer_record["asym_id"], str(exported_label_seq_id)
+
+  return label_comp_id, label_asym_id, label_seq_id
+
+
+def _annotation_mmcif_rows(mol_id, entity_records=None):
   rows = []
+  polymer_residue_map, nonpoly_residue_map = _annotation_export_entry_maps(entity_records)
   for entry in sorted(_annotation_entries_for_molecule(mol_id), key=_annotation_entry_sort_key):
+    label_comp_id, label_asym_id, label_seq_id = _annotation_export_label_fields(
+      entry,
+      polymer_residue_map=polymer_residue_map,
+      nonpoly_residue_map=nonpoly_residue_map,
+    )
     rows.append(
       [
         _annotation_text_or_empty(entry.get("id")) or "?",
+        label_comp_id or "?",
+        label_asym_id or (_annotation_text_or_empty(entry.get("auth_asym_id")) or "?"),
+        label_seq_id or ".",
         _annotation_text_or_empty(entry.get("auth_asym_id")) or "?",
         str(entry.get("auth_seq_id", "")),
         _annotation_text_or_empty(entry.get("pdbx_PDB_ins_code")) or "?",
-        _annotation_text_or_empty(entry.get("label_comp_id")) or "?",
-        _annotation_encode_text(entry.get("title")),
-        _annotation_encode_text(entry.get("author")),
+        _annotation_text_or_empty(entry.get("title")),
+        _annotation_text_or_empty(entry.get("author")),
         _annotation_text_or_empty(entry.get("modified_utc")) or "?",
-        _annotation_encode_text(entry.get("note")),
+        _annotation_text_or_empty(entry.get("note")),
       ]
     )
   return rows
@@ -5398,36 +5476,43 @@ def _load_annotations_from_mmcif_file(file_path):
   tag_indices = {tag: index for index, tag in enumerate(loop.tags)}
   required_tags = [
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_asym_id",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_seq_id",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "pdbx_PDB_ins_code",
-    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "modified_utc",
   ]
   for required_tag in required_tags:
     if required_tag not in tag_indices:
       raise RuntimeError(f"Embedded annotation loop is missing required tag {required_tag}.")
 
+  def loop_text_field(row_index, plain_tag_name, legacy_b64_tag_name=None):
+    if plain_tag_name in tag_indices:
+      return _annotation_text_or_empty(loop[row_index, tag_indices[plain_tag_name]])
+    if legacy_b64_tag_name is not None and legacy_b64_tag_name in tag_indices:
+      return _annotation_decode_text(loop[row_index, tag_indices[legacy_b64_tag_name]])
+    return ""
+
   author_tag = None
   for candidate_tag in (
-    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author_b64",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author_b64",
   ):
     if candidate_tag in tag_indices:
       author_tag = candidate_tag
       break
   title_tag = None
   for candidate_tag in (
-    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title_b64",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title_b64",
   ):
     if candidate_tag in tag_indices:
       title_tag = candidate_tag
       break
   note_tag = None
   for candidate_tag in (
-    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note_b64",
     RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note",
+    RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note_b64",
   ):
     if candidate_tag in tag_indices:
       note_tag = candidate_tag
@@ -5440,14 +5525,28 @@ def _load_annotations_from_mmcif_file(file_path):
     normalized_entry = _annotation_normalize_entry(
       {
         "id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id"]]),
+        "label_comp_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id"]]),
+        "label_asym_id": _annotation_text_or_empty(loop[row_index, tag_indices.get(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_asym_id", -1)]) if RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_asym_id" in tag_indices else "",
+        "label_seq_id": _annotation_text_or_empty(loop[row_index, tag_indices.get(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_seq_id", -1)]) if RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_seq_id" in tag_indices else "",
         "auth_asym_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_asym_id"]]),
         "auth_seq_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_seq_id"]]),
         "pdbx_PDB_ins_code": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "pdbx_PDB_ins_code"]]),
-        "label_comp_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id"]]),
-        "title": _annotation_decode_text(loop[row_index, tag_indices[title_tag]]) if title_tag is not None else "",
-        "author": _annotation_decode_text(loop[row_index, tag_indices[author_tag]]),
+        "title": loop_text_field(
+          row_index,
+          RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title",
+          RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title_b64",
+        ) if title_tag is not None else "",
+        "author": loop_text_field(
+          row_index,
+          RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author",
+          RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author_b64",
+        ),
         "modified_utc": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "modified_utc"]]),
-        "note": _annotation_decode_text(loop[row_index, tag_indices[note_tag]]),
+        "note": loop_text_field(
+          row_index,
+          RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note",
+          RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note_b64",
+        ),
       },
       fallback_id=row_index + 1,
     )
@@ -5467,14 +5566,16 @@ def _annotation_write_entries_to_mmcif_block(block, entries):
       RESIDUE_ANNOTATION_CATEGORY_PREFIX,
       [
         "id",
+        "label_comp_id",
+        "label_asym_id",
+        "label_seq_id",
         "auth_asym_id",
         "auth_seq_id",
         "pdbx_PDB_ins_code",
-        "label_comp_id",
-        "title_b64",
-        "author_b64",
+        "title",
+        "author",
         "modified_utc",
-        "note_b64",
+        "note",
       ],
     )
     for row in entries:
@@ -5757,7 +5858,7 @@ def _annotation_export_document_from_coot_cif(file_path):
   block = document.sole_block()
   entity_records = _annotation_apply_export_entity_metadata(block, structure)
   _annotation_apply_export_atom_site_metadata(block, entity_records)
-  return document
+  return document, entity_records
 
 
 def _load_residue_annotations_for_molecule(mol_id, file_path=None, show_status=True):
@@ -5795,8 +5896,8 @@ def _write_model_with_embedded_annotations(mol_id, file_path):
     write_cif_file(mol_id, source_path)
     if not os.path.isfile(source_path) or os.path.getsize(source_path) == 0:
       raise RuntimeError("Coot failed to write a temporary mmCIF file.")
-    export_document = _annotation_export_document_from_coot_cif(source_path)
-    _annotation_write_entries_to_mmcif_block(export_document.sole_block(), _annotation_mmcif_rows(mol_id))
+    export_document, entity_records = _annotation_export_document_from_coot_cif(source_path)
+    _annotation_write_entries_to_mmcif_block(export_document.sole_block(), _annotation_mmcif_rows(mol_id, entity_records))
     export_handle, export_path = tempfile.mkstemp(suffix=".cif", dir=output_directory)
     os.close(export_handle)
     export_handle = None
@@ -7339,6 +7440,106 @@ def decrease_map_radius():
   current_radius = get_map_radius()
   new_radius = max(2.0, current_radius - 2.0)
   _set_map_radius_both(new_radius)
+
+
+def _proportional_editing_radius_supported():
+  return (
+    hasattr(coot, "increase_proportional_editing_radius")
+    and hasattr(coot, "decrease_proportional_editing_radius")
+  )
+
+
+def _show_proportional_editing_radius_unavailable():
+  info_dialog(
+    "This Coot build does not expose proportional editing radius controls yet."
+  )
+  return None
+
+
+def _apply_proportional_editing_radius_step(direction):
+  global PROPORTIONAL_EDITING_RADIUS
+  if not _proportional_editing_radius_supported():
+    return _show_proportional_editing_radius_unavailable()
+  step_size = 1.0
+  minimum_radius = 1.0
+  maximum_radius = 1000.0
+  direction = 1.0 if direction >= 0 else -1.0
+  current_radius = float(PROPORTIONAL_EDITING_RADIUS)
+  target_radius = min(maximum_radius, max(minimum_radius, current_radius + direction * step_size))
+  if abs(target_radius - current_radius) < 0.001:
+    add_status_bar_text("Proportional editing radius: %.1f A" % current_radius)
+    return current_radius
+  try:
+    if direction > 0:
+      increase_proportional_editing_radius()
+    else:
+      decrease_proportional_editing_radius()
+  except Exception as error:
+    info_dialog(
+      "Unable to change the proportional editing radius in this Coot build.\n\n"
+      "Original error: %r" % (error,)
+    )
+    return None
+  PROPORTIONAL_EDITING_RADIUS = target_radius
+  add_status_bar_text("Proportional editing radius: %.1f A" % PROPORTIONAL_EDITING_RADIUS)
+  return PROPORTIONAL_EDITING_RADIUS
+
+
+def increase_proportional_editing_radius_with_status():
+  return _apply_proportional_editing_radius_step(+1.0)
+
+
+def decrease_proportional_editing_radius_with_status():
+  return _apply_proportional_editing_radius_step(-1.0)
+
+
+def set_proportional_editing_radius():
+  if not _proportional_editing_radius_supported():
+    return _show_proportional_editing_radius_unavailable()
+  current_radius_string = "%.1f" % float(PROPORTIONAL_EDITING_RADIUS)
+  def set_proportional_editing_radius_from_text(text):
+    global PROPORTIONAL_EDITING_RADIUS
+    try:
+      requested_radius = float(str(text).strip())
+    except ValueError:
+      info_dialog("Radius must be a number")
+      return 0
+    if requested_radius < 1.0 or requested_radius > 1000.0:
+      info_dialog("Proportional editing radius must be between 1 and 1000 A")
+      return 0
+    target_radius = float(int(round(requested_radius)))
+    current_radius = float(PROPORTIONAL_EDITING_RADIUS)
+    if abs(target_radius - current_radius) < 0.001:
+      add_status_bar_text("Proportional editing radius set to %.1f A" % PROPORTIONAL_EDITING_RADIUS)
+      return 1
+    try:
+      while current_radius < target_radius - 0.001:
+        increase_proportional_editing_radius()
+        current_radius = min(target_radius, current_radius + 1.0)
+      while current_radius > target_radius + 0.001:
+        decrease_proportional_editing_radius()
+        current_radius = max(target_radius, current_radius - 1.0)
+    except Exception as error:
+      info_dialog(
+        "Unable to change the proportional editing radius in this Coot build.\n\n"
+        "Original error: %r" % (error,)
+      )
+      return 0
+    PROPORTIONAL_EDITING_RADIUS = current_radius
+    if abs(target_radius - requested_radius) > 0.001:
+      add_status_bar_text(
+        "Proportional editing radius set to %.1f A (rounded to 1 A steps)"
+        % PROPORTIONAL_EDITING_RADIUS
+      )
+    else:
+      add_status_bar_text("Proportional editing radius set to %.1f A" % PROPORTIONAL_EDITING_RADIUS)
+    return 1
+  generic_single_entry(
+    "New proportional editing radius (1 A steps)",
+    current_radius_string,
+    "Set proportional editing radius",
+    set_proportional_editing_radius_from_text,
+  )
 
 
 def active_map_surface_displayed():
@@ -11421,25 +11622,23 @@ def find_sequence_in_current_chain(subseq):
       index=index+pattern_length
     else:
       index=index+1
-  if len(sn_list)==1:
-    sn_start=sn_list[0]
-    interesting_entry=_sequence_match_list_entry(mol_id,ch_id,seq,sn_start,pattern_length)
-    if not interesting_entry:
-      info_dialog("Found the sequence match, but could not locate a CA/P atom to center on.")
-      return None
-    return _activate_interesting_entry(interesting_entry)
-  elif len(sn_list)==0:
+  if len(sn_list)==0:
     info_dialog("Sequence not found!")
-  elif len(sn_list)>1:
-    for sn in sn_list:
-      list_entry=_sequence_match_list_entry(mol_id,ch_id,seq,sn,pattern_length)
-      if not list_entry:
-        continue
-      interesting_list.append(list_entry)
-    if not interesting_list:
+    return None
+  for sn in sn_list:
+    list_entry=_sequence_match_list_entry(mol_id,ch_id,seq,sn,pattern_length)
+    if not list_entry:
+      continue
+    interesting_list.append(list_entry)
+  if not interesting_list:
+    if len(sn_list)==1:
+      info_dialog("Found the sequence match, but could not locate a CA/P atom to center on.")
+    else:
       info_dialog("Found matching sequence positions, but could not locate jump atoms for them.")
-      return None
-    navigable_interesting_things_gui("Matches to entered sequence",interesting_list)
+    return None
+  result_label = "Match to entered sequence" if len(interesting_list) == 1 else "Matches to entered sequence"
+  navigable_interesting_things_gui(result_label, interesting_list)
+  return None
 
 # ---------------------------------------------------------------------------
 # Legacy Gtk archive
@@ -13701,6 +13900,11 @@ def _build_custom_settings_menu(submenu_settings):
     submenu_settings,
     "Set Bfac for new atoms to mean B for active mol",
     lambda func: set_new_atom_b_fac_to_mean(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_settings,
+    "Set proportional editing radius",
+    lambda func: set_proportional_editing_radius(),
   )
 
 
