@@ -395,6 +395,7 @@ STARTUP_MUTATE_AUTO_FIT_POST_REFINE = 1
 STARTUP_SYMMETRY_SIZE = 30
 STARTUP_NOMENCLATURE_ERRORS_MODE = "ignore"
 STARTUP_REORIENTING_NEXT_RESIDUE_MODE = 1
+STARTUP_CURMUDGEON_MODE = 1
 STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE = 0.15
 STARTUP_ROTATION_CENTRE_CROSSHAIRS_COLOUR = (1.0, 1.0, 1.0, 1.0)
 
@@ -1018,6 +1019,8 @@ def _apply_startup_settings():
   set_symmetry_size(STARTUP_SYMMETRY_SIZE)
   set_nomenclature_errors_on_read(STARTUP_NOMENCLATURE_ERRORS_MODE)
   set_reorienting_next_residue_mode(STARTUP_REORIENTING_NEXT_RESIDUE_MODE)
+  if STARTUP_CURMUDGEON_MODE:
+    _call_optional_coot_api("curmudgeon_mode")
   _call_optional_coot_api(
     "set_user_defined_rotation_centre_crosshairs_size_scale_factor",
     STARTUP_ROTATION_CENTRE_CROSSHAIRS_SCALE
@@ -7055,14 +7058,21 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
   return len(browser.grouped_annotations)
 
 
-def _generate_smart_local_extra_restraints_for_mol(mol_id, show_start_message=True):
+def _generate_smart_local_extra_restraints_for_mol(
+  mol_id,
+  distance_cutoff=3.7,
+  show_start_message=True,
+):
   if mol_id not in model_molecule_list():
     add_status_bar_text("No active model")
     return None
   if show_start_message:
     add_status_bar_text("Generating smart local restraints...")
     graphics_draw()
-  distance_cutoff = 3.7
+  try:
+    distance_cutoff = float(distance_cutoff)
+  except (TypeError, ValueError):
+    distance_cutoff = 3.7
   max_sequence_separation = 10
   restraint_esd = 0.05
   backbone_donor_names = {"N"}
