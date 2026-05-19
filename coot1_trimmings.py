@@ -648,23 +648,14 @@ def _residue_spec_to_cid_compat(residue_spec):
   return "//{chain_id}/{res_no}".format(chain_id=chain_id, res_no=res_no)
 
 
-# ============================================================================
-# Legacy / disabled custom-colouring support
-# ============================================================================
-#
-# The Colour menu is currently disabled in Coot 1.1 because the user-defined
-# colouring APIs remain awkward and fragile. The code below is kept for
-# reference and for a few programmatic helpers, but it is intentionally kept
-# away from the main startup settings and general utility code.
-#
-
 USER_DEFINED_COLOUR_TABLE_SIZE = 60
 USER_DEFINED_COLOUR_TABLE_BASE = 60
 USER_DEFINED_COLOUR_TABLE_READY = False
+USER_DEFINED_DIRECT_COLOUR_MIN_REVISION_COUNT = 19935
+USER_DEFINED_DIRECT_COLOUR_MIN_COMMIT_PREFIX = "bcc3af8"
 
 
 def _make_default_user_defined_colours():
-  base_colours = [[0.72, 0.72, 0.72] for _ in range(USER_DEFINED_COLOUR_TABLE_SIZE)]
   explicit_colours = {
     0:  [0.72, 0.72, 0.72],
     1:  [0.92, 0.92, 0.92],
@@ -681,10 +672,49 @@ def _make_default_user_defined_colours():
     31: [0.92, 0.12, 0.12],
     34: [0.90, 0.20, 0.85],
     39: [0.55, 0.28, 0.90],
+    # Density-fit palette: ordered from poor (red) to good (blue), avoiding
+    # magenta so the meaning stays visually obvious.
+    48: [0.78, 0.00, 0.12],
+    49: [0.90, 0.24, 0.08],
+    50: [0.98, 0.50, 0.06],
+    51: [1.00, 0.74, 0.10],
+    52: [0.96, 0.90, 0.20],
+    53: [0.72, 0.88, 0.18],
+    54: [0.34, 0.86, 0.22],
+    55: [0.10, 0.78, 0.42],
+    56: [0.06, 0.78, 0.68],
+    57: [0.08, 0.70, 0.90],
+    58: [0.12, 0.52, 0.98],
+    59: [0.18, 0.36, 0.98],
   }
-  for colour_index, colour in explicit_colours.items():
-    if 0 <= colour_index < USER_DEFINED_COLOUR_TABLE_SIZE:
-      base_colours[colour_index] = colour
+
+  def interpolated_colour(colour_index):
+    if colour_index in explicit_colours:
+      return list(explicit_colours[colour_index])
+
+    lower_indices = [idx for idx in explicit_colours if idx < colour_index]
+    upper_indices = [idx for idx in explicit_colours if idx > colour_index]
+
+    if not lower_indices and not upper_indices:
+      return [0.72, 0.72, 0.72]
+    if not lower_indices:
+      return list(explicit_colours[min(upper_indices)])
+    if not upper_indices:
+      return list(explicit_colours[max(lower_indices)])
+
+    lower_index = max(lower_indices)
+    upper_index = min(upper_indices)
+    lower_colour = explicit_colours[lower_index]
+    upper_colour = explicit_colours[upper_index]
+    blend = float(colour_index - lower_index) / float(upper_index - lower_index)
+    return [
+      lower_colour[i] + blend * (upper_colour[i] - lower_colour[i])
+      for i in range(3)
+    ]
+
+  base_colours = []
+  for colour_index in range(USER_DEFINED_COLOUR_TABLE_SIZE):
+    base_colours.append(interpolated_colour(colour_index))
 
   colours = []
   for i in range(USER_DEFINED_COLOUR_TABLE_SIZE):
@@ -702,16 +732,99 @@ def _legacy_user_colour_index_to_coot_index(colour_index):
   return USER_DEFINED_COLOUR_TABLE_BASE + colour_index
 
 
+DENSITY_FIT_COLOUR_INDICES = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
+DENSITY_FIT_COLOUR_BAND_NAMES = ["red", "orange", "yellow", "green", "cyan", "blue"]
+
+
+def _density_fit_score_to_colour_index(score):
+  """Map CC score 0..1 to an ordered bad->good colour ramp."""
+  if score < 0.0:
+    score = 0.0
+  if score > 1.0:
+    score = 1.0
+  palette_size = len(DENSITY_FIT_COLOUR_INDICES)
+  palette_index = int(score * palette_size)
+  if palette_index >= palette_size:
+    palette_index = palette_size - 1
+  return DENSITY_FIT_COLOUR_INDICES[palette_index]
+
+
+def _colour_band_legend_text(metric_label, min_value, max_value, reverse=False):
+  band_count = len(DENSITY_FIT_COLOUR_BAND_NAMES)
+  span = float(max_value) - float(min_value)
+  lines = []
+  for band_index, colour_name in enumerate(DENSITY_FIT_COLOUR_BAND_NAMES):
+    if reverse:
+      low = min_value + span * float(band_count - band_index - 1) / float(band_count)
+      high = min_value + span * float(band_count - band_index) / float(band_count)
+    else:
+      low = min_value + span * float(band_index) / float(band_count)
+      high = min_value + span * float(band_index + 1) / float(band_count)
+    if band_index == band_count - 1 and not reverse:
+      high_text = "{:.2f}".format(max_value)
+    elif band_index == 0 and reverse:
+      high_text = "{:.2f}".format(max_value)
+    else:
+      high_text = "{:.2f}".format(high)
+    lines.append(
+      "{colour}: {metric} {low:.2f}-{high}".format(
+        colour=colour_name,
+        metric=metric_label,
+        low=low,
+        high=high_text,
+      )
+    )
+  return "\n".join(lines)
+
+
 def ensure_user_defined_colour_table():
   global USER_DEFINED_COLOUR_TABLE_READY
-  if USER_DEFINED_COLOUR_TABLE_READY:
-    return
-  if "make_alphafold_colours" in globals():
-    colours = make_alphafold_colours()
-  else:
-    colours = _make_default_user_defined_colours()
+  # Always re-apply our legacy palette here. Other helpers (for example
+  # Alphafold colouring utilities shipped with Coot) can mutate the global
+  # user-defined colour table, so a one-time initialization is not reliable.
+  colours = _make_default_user_defined_colours()
   coot.set_user_defined_colours_py(colours)
   USER_DEFINED_COLOUR_TABLE_READY = True
+
+
+def _coot_git_commit_string():
+  git_commit_function = globals().get("git_commit", getattr(coot, "git_commit", None))
+  if not callable(git_commit_function):
+    return ""
+  try:
+    return str(git_commit_function() or "").strip()
+  except Exception:
+    return ""
+
+
+def _coot_revision_count():
+  version_extra_function = globals().get(
+    "coot_version_extra_info",
+    getattr(coot, "coot_version_extra_info", None),
+  )
+  if not callable(version_extra_function):
+    return None
+  try:
+    version_extra = str(version_extra_function() or "")
+  except Exception:
+    return None
+  match = re.search(r"revision-count\s+(\d+)", version_extra)
+  if not match:
+    return None
+  try:
+    return int(match.group(1))
+  except Exception:
+    return None
+
+
+def _supports_direct_user_defined_colouring():
+  revision_count = _coot_revision_count()
+  if revision_count is not None and revision_count >= USER_DEFINED_DIRECT_COLOUR_MIN_REVISION_COUNT:
+    return True
+  git_commit_string = _coot_git_commit_string().lower()
+  if git_commit_string.startswith(USER_DEFINED_DIRECT_COLOUR_MIN_COMMIT_PREFIX):
+    return True
+  return False
 
 
 if "set_user_defined_atom_colour_by_residue_py" not in globals():
@@ -728,6 +841,28 @@ if "set_user_defined_atom_colour_by_residue_py" not in globals():
         continue
       selection_colour_list.append((cid, _legacy_user_colour_index_to_coot_index(colour_index)))
     return coot.set_user_defined_atom_colour_by_selection_py(mol_id, selection_colour_list)
+
+
+def _set_user_defined_atom_colour_by_residue_rows_py(mol_id, residue_specs_colour_index_tuple_list_py):
+  ensure_user_defined_colour_table()
+  selection_colour_list = []
+  for item in residue_specs_colour_index_tuple_list_py or []:
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+      continue
+    residue_spec = item[0]
+    colour_index = item[1]
+    cid = _residue_spec_to_cid_compat(residue_spec)
+    if cid is None:
+      continue
+    selection_colour_list.append((cid, _legacy_user_colour_index_to_coot_index(colour_index)))
+  if not selection_colour_list:
+    return 0
+  try:
+    coot.set_user_defined_atom_colour_by_selection_py(mol_id, selection_colour_list)
+  except Exception:
+    traceback.print_exc()
+    return 0
+  return len(selection_colour_list)
 
 
 if "clear_user_defined_atom_colours" not in globals():
@@ -756,42 +891,79 @@ _coot_graphics_to_ca_plus_ligands_and_sidechains_representation = (
 _coot_graphics_to_ca_plus_ligands_sec_struct_representation = (
   graphics_to_ca_plus_ligands_sec_struct_representation
 )
+LAST_STANDARD_REPRESENTATION_BY_MOL = {}
 
 
 def _clear_user_defined_colours_for_standard_representation(mol_id):
   if mol_id is None or mol_id < 0:
     return
+  if _supports_direct_user_defined_colouring():
+    return
   clear_user_defined_atom_colours(mol_id)
+
+
+def _remember_standard_representation(mol_id, representation_function):
+  if mol_id is None or mol_id < 0:
+    return
+  LAST_STANDARD_REPRESENTATION_BY_MOL[mol_id] = representation_function
+
+
+def _last_standard_representation_function(mol_id):
+  return LAST_STANDARD_REPRESENTATION_BY_MOL.get(
+    mol_id,
+    graphics_to_bonds_representation,
+  )
+
+
+def _restore_last_standard_representation(mol_id, representation_function=None):
+  if representation_function is None:
+    representation_function = _last_standard_representation_function(mol_id)
+  try:
+    return representation_function(mol_id)
+  except Exception:
+    return _coot_graphics_to_bonds_representation(mol_id)
 
 
 def graphics_to_bonds_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
-  return _coot_graphics_to_bonds_representation(mol_id)
+  result = _coot_graphics_to_bonds_representation(mol_id)
+  _remember_standard_representation(mol_id, graphics_to_bonds_representation)
+  return result
 
 
 def graphics_to_rainbow_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
-  return _coot_graphics_to_rainbow_representation(mol_id)
+  result = _coot_graphics_to_rainbow_representation(mol_id)
+  _remember_standard_representation(mol_id, graphics_to_rainbow_representation)
+  return result
 
 
 def graphics_to_b_factor_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
-  return _coot_graphics_to_b_factor_representation(mol_id)
+  result = _coot_graphics_to_b_factor_representation(mol_id)
+  _remember_standard_representation(mol_id, graphics_to_b_factor_representation)
+  return result
 
 
 def graphics_to_ca_plus_ligands_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
-  return _coot_graphics_to_ca_plus_ligands_representation(mol_id)
+  result = _coot_graphics_to_ca_plus_ligands_representation(mol_id)
+  _remember_standard_representation(mol_id, graphics_to_ca_plus_ligands_representation)
+  return result
 
 
 def graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
-  return _coot_graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
+  result = _coot_graphics_to_ca_plus_ligands_and_sidechains_representation(mol_id)
+  _remember_standard_representation(mol_id, graphics_to_ca_plus_ligands_and_sidechains_representation)
+  return result
 
 
 def graphics_to_ca_plus_ligands_sec_struct_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
-  return _coot_graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
+  result = _coot_graphics_to_ca_plus_ligands_sec_struct_representation(mol_id)
+  _remember_standard_representation(mol_id, graphics_to_ca_plus_ligands_sec_struct_representation)
+  return result
 
 
 coot.graphics_to_bonds_representation = graphics_to_bonds_representation
@@ -9267,17 +9439,54 @@ def _active_polymer_molecule_for_colouring(action_name):
   return residue[0]
 
 
-def _clear_custom_colour_additional_representations(mol_id):
+def _iter_chain_serial_numbers(mol_id, ch_id):
+  try:
+    n_residues = int(chain_n_residues(ch_id, mol_id))
+  except Exception:
+    return
+  for serial_number in range(max(0, n_residues)):
+    yield serial_number
+
+
+def _clear_custom_colour_additional_representations(mol_id, clear_user_colours=True):
   handles = CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS.pop(mol_id, [])
   for handle in handles:
     try:
       delete_additional_representation(mol_id, handle)
     except Exception:
       pass
-  try:
-    clear_user_defined_atom_colours(mol_id)
-  except Exception:
-    pass
+  if clear_user_colours:
+    try:
+      clear_user_defined_atom_colours(mol_id)
+    except Exception:
+      pass
+
+
+def _direct_user_defined_blank_rows_for_molecule(mol_id, blank_colour=0):
+  blank_rows = []
+  for residue_spec in _all_residue_specs_for_colouring(mol_id):
+    blank_rows.append((residue_spec, blank_colour))
+  return blank_rows
+
+
+def _graphics_to_legacy_user_defined_representation(mol_id, colour_rows):
+  if _supports_direct_user_defined_colouring():
+    graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
+    return
+  for item in colour_rows or []:
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+      continue
+    residue_spec = item[0]
+    if not isinstance(residue_spec, (list, tuple)) or len(residue_spec) < 3:
+      continue
+    chain_id = residue_spec[0]
+    res_no = residue_spec[1]
+    ins_code = residue_spec[2] or ""
+    residue_name_here = residue_name(mol_id, chain_id, res_no, ins_code)
+    if str(residue_name_here or "").upper() in WATER_RESIDUE_NAMES:
+      graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
+      return
+  graphics_to_user_defined_atom_colours_representation(mol_id)
 
 
 def _set_user_defined_atom_colour_by_residue_atoms_py(mol_id, residue_specs_colour_index_tuple_list_py):
@@ -9307,7 +9516,14 @@ def _set_user_defined_atom_colour_by_residue_atoms_py(mol_id, residue_specs_colo
       atom_colour_list.append(
         (atom_spec, _legacy_user_colour_index_to_coot_index(colour_index))
       )
-  return coot.set_user_defined_atom_colour_py(mol_id, atom_colour_list)
+  if not atom_colour_list:
+    return 0
+  try:
+    coot.set_user_defined_atom_colour_py(mol_id, atom_colour_list)
+  except Exception:
+    traceback.print_exc()
+    return 0
+  return len(atom_colour_list)
 
 
 def _make_custom_colour_additional_representation(mol_id, residue_spec):
@@ -9342,11 +9558,48 @@ def clear_custom_colour_representations_for_active_molecule():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  _clear_custom_colour_additional_representations(mol_id)
+  if _supports_direct_user_defined_colouring():
+    restore_representation = _last_standard_representation_function(mol_id)
+    # On fixed direct-colouring builds, clearing the colour rules while the
+    # user-defined all-atoms representation is still active can trigger a crash
+    # during redraw. Move back to the last remembered standard representation
+    # first, then tear down the user-defined state.
+    _restore_last_standard_representation(mol_id, restore_representation)
+    _clear_custom_colour_additional_representations(mol_id, clear_user_colours=False)
+    blank_rows = _direct_user_defined_blank_rows_for_molecule(mol_id)
+    if blank_rows:
+      _set_user_defined_atom_colour_by_residue_rows_py(mol_id, blank_rows)
+  else:
+    _clear_custom_colour_additional_representations(mol_id)
+  if _supports_direct_user_defined_colouring():
+    # Rebuild the same standard representation once the neutral overwrite has
+    # happened. Avoiding clear_user_defined_atom_colours() on the fixed direct
+    # path prevents Coot from regenerating with internal -1 colour indices.
+    _restore_last_standard_representation(mol_id, restore_representation)
   add_status_bar_text("Cleared custom colour representations")
 
 
-def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+def _apply_direct_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  ensure_user_defined_colour_table()
+  _clear_custom_colour_additional_representations(mol_id, clear_user_colours=False)
+  full_colour_list = list(blank_res_list or []) + list(colour_list or [])
+  if not full_colour_list:
+    if info_message:
+      info_dialog(info_message)
+    return None
+  neutral_rows = _direct_user_defined_blank_rows_for_molecule(mol_id)
+  overwrite_rows = neutral_rows + list(colour_list or [])
+  colour_count = _set_user_defined_atom_colour_by_residue_rows_py(mol_id, overwrite_rows)
+  if not colour_count:
+    info_dialog("Failed to set user-defined atom colours for the requested residues.")
+    return None
+  _graphics_to_legacy_user_defined_representation(mol_id, overwrite_rows)
+  if info_message:
+    info_dialog(info_message)
+  return colour_count
+
+
+def _apply_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
   del blank_res_list
   ensure_user_defined_colour_table()
   _clear_custom_colour_additional_representations(mol_id)
@@ -9377,6 +9630,23 @@ def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, inf
     return None
   if info_message:
     info_dialog(info_message)
+  return handles
+
+
+def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  if _supports_direct_user_defined_colouring():
+    return _apply_direct_user_defined_residue_colours(
+      mol_id,
+      blank_res_list,
+      colour_list,
+      info_message=info_message,
+    )
+  return _apply_overlay_user_defined_residue_colours(
+    mol_id,
+    blank_res_list,
+    colour_list,
+    info_message=info_message,
+  )
 
 
 def color_by_rama_native(mol_id):
@@ -9434,23 +9704,26 @@ def color_by_density_fit_native(mol_id):
   for residue_spec in _all_residue_specs_for_colouring(mol_id):
     blank_res_list.append((residue_spec, blank_colour))
   for item in correlation_results:
-    if not isinstance(item, list) or len(item) < 2:
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
       continue
     residue_spec = _coot_residue_spec_from_spec(item[0])
     score=item[1]
     if residue_spec is None:
       continue
-    if score < 0.0:
-      score=0.0
-    if score > 1.0:
-      score=1.0
-    colour_index=int((1.0-score)*31+2)
+    try:
+      score=float(score)
+    except Exception:
+      continue
+    if math.isnan(score):
+      continue
+    colour_index=_density_fit_score_to_colour_index(score)
     density_colour_list.append((list(residue_spec), colour_index))
   _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
     density_colour_list,
-    "Active molecule colored by model/map correlation, in spectral coloring (blue=CC 1.0, red=CC 0.0)",
+    "Active molecule colored by model/map correlation.\n\n"
+    + _colour_band_legend_text("CC", 0.0, 1.0),
   )
 
 
@@ -9603,14 +9876,15 @@ def color_by_clash_score(mol_id):
       normalized_score=0.0
     if normalized_score > 1.0:
       normalized_score=1.0
-    colour_index=int(normalized_score*31+2)
+    colour_index=_density_fit_score_to_colour_index(1.0-normalized_score)
     clash_colour_list.append(([residue_spec[0], residue_spec[1], residue_spec[2]], colour_index))
 
   _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
     clash_colour_list,
-    "Active molecule colored by per-residue maximum clash overlap, in spectral coloring (blue=low clash, red=high clash)",
+    "Active molecule colored by per-residue maximum clash overlap.\n\n"
+    + _colour_band_legend_text("overlap", 0.0, 2.0, reverse=True),
   )
 
 
@@ -9655,7 +9929,7 @@ def toggle_mol_display():
     mol_disp_flag_cycle=0
 
 #Cycle representation mode forward/back
-REPRESENTATION_SEQUENCE = [
+BASE_REPRESENTATION_SEQUENCE = [
   graphics_to_ca_plus_ligands_representation,
   graphics_to_ca_plus_ligands_and_sidechains_representation,
   graphics_to_ca_plus_ligands_sec_struct_representation,
@@ -9666,28 +9940,41 @@ REPRESENTATION_SEQUENCE = [
 DEFAULT_REPRESENTATION_INDEX = 4
 cycle_rep_flag = {}
 
+
+def _representation_sequence():
+  sequence = list(BASE_REPRESENTATION_SEQUENCE)
+  if _supports_direct_user_defined_colouring():
+    sequence.extend([
+      graphics_to_user_defined_atom_colours_representation,
+      graphics_to_user_defined_atom_colours_all_atoms_representation,
+    ])
+  return sequence
+
 def _cycle_rep_flag_or_default(mol_id):
+  representation_sequence = _representation_sequence()
   flag = cycle_rep_flag.get(mol_id, DEFAULT_REPRESENTATION_INDEX)
-  if flag not in range(len(REPRESENTATION_SEQUENCE)):
+  if flag not in range(len(representation_sequence)):
     flag = DEFAULT_REPRESENTATION_INDEX
   cycle_rep_flag[mol_id] = flag
   return flag
 
 def _apply_representation_index(mol_id, flag):
-  REPRESENTATION_SEQUENCE[flag](mol_id)
+  _representation_sequence()[flag](mol_id)
   cycle_rep_flag[mol_id] = flag
   return flag
 
 def cycle_rep_up(mol_id,flag=None):
+  representation_sequence = _representation_sequence()
   current_flag = _cycle_rep_flag_or_default(mol_id) if flag is None else flag
-  next_flag = (current_flag + 1) % len(REPRESENTATION_SEQUENCE)
+  next_flag = (current_flag + 1) % len(representation_sequence)
   return _apply_representation_index(mol_id, next_flag)
 
 
     
 def cycle_rep_down(mol_id,flag=None):
+  representation_sequence = _representation_sequence()
   current_flag = _cycle_rep_flag_or_default(mol_id) if flag is None else flag
-  next_flag = (current_flag - 1) % len(REPRESENTATION_SEQUENCE)
+  next_flag = (current_flag - 1) % len(representation_sequence)
   return _apply_representation_index(mol_id, next_flag)
 
 
@@ -10031,7 +10318,7 @@ def sn_of_active_res():
   mol_id = chain_context["mol_id"]
   ch_id = chain_context["chain_id"]
   resn_to_match = chain_context["resno"]
-  for sn in range(chain_n_residues(ch_id, mol_id) + 1):
+  for sn in _iter_chain_serial_numbers(mol_id, ch_id):
     if seqnum_from_serial_number(mol_id, "%s" % ch_id, sn) == resn_to_match:
       return sn
   return None
@@ -10973,8 +11260,7 @@ def color_polars_and_hphobs(mol_id):
   pro_res_list=[]
   blank_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
-    for sn in range(0,sn_max+1):
+    for sn in _iter_chain_serial_numbers(mol_id, ch_id):
       resname_here=resname_from_serial_number(mol_id,ch_id,sn)
       if resname_here in polar_list:
         resn=seqnum_from_serial_number(mol_id,ch_id,sn)
@@ -11014,8 +11300,7 @@ def color_by_charge(mol_id):
   neg_res_list=[]
   blank_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
-    for sn in range(0,sn_max+1):
+    for sn in _iter_chain_serial_numbers(mol_id, ch_id):
       resname_here=resname_from_serial_number(mol_id,ch_id,sn)
       if resname_here in pos_list:
         resn=seqnum_from_serial_number(mol_id,ch_id,sn)
@@ -11037,8 +11322,7 @@ def color_by_charge(mol_id):
 
 
 def _append_chain_residue_colours(colour_rows, mol_id, ch_id, colour_index):
-  sn_max = chain_n_residues(ch_id, mol_id)
-  for sn in range(0, sn_max+1):
+  for sn in _iter_chain_serial_numbers(mol_id, ch_id):
     resn = seqnum_from_serial_number(mol_id, ch_id, sn)
     ins_id = str(insertion_code_from_serial_number(mol_id, ch_id, sn))
     colour_rows.append(([ch_id, resn, ins_id], colour_index))
@@ -11114,8 +11398,7 @@ def color_waters(mol_id):
   water_list=[]
   blank_res_list=[]
   for ch_id in chain_ids(mol_id):
-    sn_max=chain_n_residues(ch_id,mol_id)
-    for sn in range(0,sn_max+1):
+    for sn in _iter_chain_serial_numbers(mol_id, ch_id):
       resname_here=resname_from_serial_number(mol_id,ch_id,sn)
       resn=seqnum_from_serial_number(mol_id,ch_id,sn)
       ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
@@ -13568,8 +13851,7 @@ def color_protein_residue_subset():
       if (aa_dic.get(char,0)!=0): #make a list of 3-letter resnames from user supplied string by checking aa_dic
         resname_list.append(aa_dic.get(char,0))
     for ch_id in chain_ids(mol_id):
-      sn_max=chain_n_residues(ch_id,mol_id)
-      for sn in  range(0,sn_max+1):
+      for sn in _iter_chain_serial_numbers(mol_id, ch_id):
         resname_here=resname_from_serial_number(mol_id,ch_id,sn)
         for resname in resname_list:
           if resname==resname_here:
@@ -13835,6 +14117,79 @@ def _build_custom_display_menu(submenu_display):
   )
 
 
+def _build_custom_user_colour_menu(submenu_colour):
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by rotamer prob (outliers magenta) and missing atoms (blue)",
+    lambda func: color_rotamer_outliers_and_missing_atoms_for_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by hydrophobics (orange), polars (blue), glys (magenta) and pros (green)",
+    lambda func: color_polars_and_hphobs_for_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by charge (+ve blue, -ve red)",
+    lambda func: color_by_charge_for_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Uncolor other chains in active mol",
+    lambda func: uncolor_other_chains(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active chain",
+    lambda func: color_active_chain(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active segment",
+    lambda func: colour_active_segment(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color by protein/nucleic acid",
+    lambda func: color_protein_na_for_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color waters",
+    lambda func: color_waters_for_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Colour entered subset of protein residues for active mol",
+    lambda func: color_protein_residue_subset(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by Ramachandran outliers",
+    lambda func: color_by_rama_native_for_active_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by density fit",
+    lambda func: color_by_density_fit_native_for_active_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by NCS difference",
+    lambda func: color_by_ncs_difference_for_active_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Color active mol by clash score",
+    lambda func: color_by_clash_score_for_active_molecule(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
+    "Clear custom colours",
+    lambda func: clear_custom_colour_representations_for_active_molecule(),
+  )
+
+
 def _build_custom_fit_menu(submenu_fit):
   add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", lambda func: rigid_fit_all_chains())
   add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", lambda func: rigid_fit_active_chain())
@@ -14095,6 +14450,7 @@ def build_custom_menu():
 
   menu = attach_module_menu_button("Custom")
   submenu_display = Gio.Menu.new()
+  submenu_colour = Gio.Menu.new()
   submenu_fit = Gio.Menu.new()
   submenu_renumber = Gio.Menu.new()
   submenu_settings = Gio.Menu.new()
@@ -14108,6 +14464,8 @@ def build_custom_menu():
   submenu_maps = Gio.Menu.new()
 
   menu.append_submenu("Display", submenu_display)
+  if _supports_direct_user_defined_colouring():
+    menu.append_submenu("User-defined colouring", submenu_colour)
   menu.append_submenu("Fit", submenu_fit)
   menu.append_submenu("Renumber", submenu_renumber)
   menu.append_submenu("Settings", submenu_settings)
@@ -14117,6 +14475,8 @@ def build_custom_menu():
   menu.append_submenu("Maps", submenu_maps)
 
   _build_custom_display_menu(submenu_display)
+  if _supports_direct_user_defined_colouring():
+    _build_custom_user_colour_menu(submenu_colour)
   _build_custom_fit_menu(submenu_fit)
   _build_custom_renumber_menu(submenu_renumber)
   _build_custom_settings_menu(submenu_settings)
