@@ -143,7 +143,7 @@ If the active residue is not of the correct type, the helper stops and tells you
 
 ### Display
 
-The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes. Also added a "High contrast toggle" which makes the view higher contrast by changing to ambient lighting for the model. Recently added the "Odd residues" validation helper, and the "residue annotation" tool for addind/browsing notes.
+The `Display` menu collects GUI-accessible versions of common viewing and analysis helpers, including symmetry-display toggles, probe-dot generation, sequence searching, clearing labels/distances, Chimera export, and whole-model display-mode changes. Also added a "High contrast toggle" which makes the view higher contrast by changing to ambient lighting for the model. Recently added the "Odd residues" validation helper, and the "residue annotation" tool for adding/browsing notes.
 
 #### Odd residues
 "Odd residues" scans the active model against the current scrollable map contour and groups suspicious features into _Possible Misfits_, _Weak Sidechains_, _Weak Backbone_, _Weak Waters_, and _Weak Ligands_. 
@@ -154,6 +154,24 @@ Results are shown as a clickable categorized list with Previous/Next navigation 
 
 #### Residue Annotations
 `Residue annotations` lets you attach plain text notes to residues in the active model, browse annotated residues in a simple navigable list, and export the structure as an annotated mmCIF with the notes embedded. Notes are grouped by residue, can be edited or deleted individually, store author and timestamp information, and are reloaded automatically when the widget is opened on a structure that already contains embedded annotations. Residue notes can also be viewed/edited in ChimeraX with the [`chimerax-resnotes` extension](https://github.com/olibclarke/chimerax-resnotes); Nearby notes (near the center of rotation) can be viewed in the "Nearby Residue Annotations" pane.
+
+#### User-defined colouring
+In Coot 1 builds after 1.3.1, `coot-trimmings` adds several user-defined colouring modes for quick visual inspection of model quality and composition.
+
+- **Rotamer probability / missing atoms**: highlights rotamer outliers in magenta and residues with missing atoms in blue.
+- **Hydrophobic / polar / Gly / Pro**: colours hydrophobics orange, polars blue, glycines magenta, and prolines green.
+- **Charge**: colours positively charged residues blue and negatively charged residues red.
+- **Uncolor other chains**: greys out all chains except the active one.
+- **Color active chain**: highlights the active chain against a neutral background.
+- **Color active segment**: highlights the currently defined segment.
+- **Protein / nucleic acid**: colours protein and nucleic-acid components differently for fast compositional overview.
+- **Waters**: highlights water molecules separately from the rest of the model.
+- **Entered residue subset**: colours a user-specified subset of residues.
+- **Ramachandran outliers**: marks residues by Ramachandran quality.
+- **Density fit**: colours residues by per-residue model/map correlation (`red = poor fit`, `blue = good fit`).
+- **NCS difference**: colours residues by the magnitude of local NCS disagreement.
+- **Clash score**: colours residues by per-residue maximum clash overlap (`red = worse clashes`, `blue = cleaner geometry`).
+- **Clear custom colours**: removes the custom colouring and returns to the normal representation.
 
 ### Fit
 
