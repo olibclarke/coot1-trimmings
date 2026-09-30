@@ -335,9 +335,36 @@ def _coot_gui_repository_module(module_name):
   existing_module = globals().get(module_name)
   if existing_module is not None:
     return existing_module
+
+  # PyGObject repository modules are normally already loaded by Coot/GTK even
+  # when coot_gui does not re-export them as attributes.  Prefer those exact
+  # module objects so we stay on Coot's existing GI/GTK stack.
+  for module_key in (f"gi.repository.{module_name}", module_name):
+    existing_module = sys.modules.get(module_key)
+    if existing_module is not None:
+      globals()[module_name] = existing_module
+      return existing_module
+
   coot_gui_module = _coot_gui_module()
   if coot_gui_module is not None and hasattr(coot_gui_module, module_name):
-    return getattr(coot_gui_module, module_name)
+    existing_module = getattr(coot_gui_module, module_name)
+    globals()[module_name] = existing_module
+    return existing_module
+
+  # If GTK is already running under PyGObject, importing another repository
+  # namespace (not another GTK version) is safe and is the normal way to obtain
+  # GLib.  This fixes builds where coot_gui exposes Gtk/Gio but not GLib.
+  if "gi" in sys.modules:
+    try:
+      repository = __import__(f"gi.repository.{module_name}", fromlist=[module_name])
+      globals()[module_name] = repository
+      return repository
+    except Exception as error:
+      _record_startup_diagnostic(
+        "warning",
+        f"Could not obtain gi.repository.{module_name}: {error}",
+      )
+
   if module_name not in _GTK_REPOSITORY_WARNINGS_SHOWN:
     _GTK_REPOSITORY_WARNINGS_SHOWN.add(module_name)
     _record_startup_diagnostic(
@@ -387,7 +414,6 @@ STARTUP_MAP_RADIUS = 20
 STARTUP_MAP_RADIUS_EM = 20
 STARTUP_DEFAULT_BOND_THICKNESS = 3
 STARTUP_USE_VARIABLE_BOND_THICKNESS = 1
-STARTUP_VARIABLE_BOND_THICKNESS = 7
 STARTUP_DEFAULT_NEW_ATOM_B = 50.0
 STARTUP_ADD_TERMINAL_POST_REFINE = 1
 STARTUP_TERMINAL_RIGID_BODY_REFINE = 0
@@ -404,6 +430,7 @@ DEFAULT_NEW_HELIX_CHAIN_ID = "A"
 HIGH_CONTRAST_BOND_THICKNESS = 2
 PROPORTIONAL_EDITING_RADIUS = 1.0
 COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
+DISPLAY_PREFERENCES_FILENAME = "coot_trimmings_preferences.py"
 COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 WATER_REFINE_MAX_DISPLACEMENT = 1.0
 RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
@@ -416,7 +443,11 @@ RESIDUE_ANNOTATION_NEARBY_RADIUS = 6.0
 RESIDUE_ANNOTATION_POLL_INTERVAL_MS = 300
 
 # Map restyling defaults for the EM helper.
-EM_REFINED_MAP_COLOUR = (0.10, 0.57, 0.95)
+EM_REFINED_MAP_COLOUR = (26 / 255.0, 95 / 255.0, 180 / 255.0)  # Ambient-map dark blue: #1a5fb4.
+EM_MAP_AMBIENT = (1.0, 1.0, 1.0, 1.0)
+EM_MAP_DIFFUSE = (0.0, 0.0, 0.0, 1.0)
+EM_MAP_SPECULAR = (0.0, 64.0)
+EM_MAP_FRESNEL = (0, 0.0, 0.3, 3.0)
 EM_REFINED_MAP_CONTOUR_SIGMA = 2.3
 EM_TARGET_PIXEL_SIZE = 0.5
 EM_RESAMPLE_CONFIRM_MAX_GRID_DIMENSION = 512
@@ -1179,9 +1210,10 @@ def _apply_startup_settings():
   set_map_radius_em(STARTUP_MAP_RADIUS_EM)
   set_default_bond_thickness(STARTUP_DEFAULT_BOND_THICKNESS)
   try:
-    # Older Coot builds may not expose the variable-thickness API at all.
+    # Variable bond thickness is an on/off mode.  Do not feed a separate
+    # "variable thickness" value to set_default_bond_thickness(): that API
+    # changes the ordinary default bond thickness.
     set_use_variable_bond_thickness(STARTUP_USE_VARIABLE_BOND_THICKNESS)
-    set_default_bond_thickness(STARTUP_VARIABLE_BOND_THICKNESS)
   except NameError:
     print("Your coot is a bit old... consider upgrading...")
   set_default_temperature_factor_for_new_atoms(STARTUP_DEFAULT_NEW_ATOM_B)
@@ -2382,6 +2414,7 @@ if _preloaded_coot_gui is not None:
     handle_cancel_function,
     confirm_button_label,
     handle_confirm_function,
+    handle_close_function=None,
   ):
     """Small GTK4-safe two-option dialog for potentially expensive actions."""
     window = Gtk.Window()
@@ -2431,6 +2464,11 @@ if _preloaded_coot_gui is not None:
 
     cancel_button.connect("clicked", cancel)
     confirm_button.connect("clicked", submit)
+    if handle_close_function is not None:
+      def on_close(*_args):
+        handle_close_function()
+        return False
+      window.connect("close-request", on_close)
 
     vbox.append(title_label)
     vbox.append(label)
@@ -2513,7 +2551,8 @@ if _preloaded_coot_gui is not None:
     window.present()
     entry_1.grab_focus()
 
-  def _populate_entry_from_file_chooser(parent_window, target_entry, chooser_title):
+  def _populate_entry_from_file_chooser(parent_window, target_entry, chooser_title,
+                                      initial_directory=None, all_files=False):
     """Open a GTK file chooser and copy the selected path into an entry."""
     def _gtk_gio_module():
       gio_module = globals().get("Gio")
@@ -2537,14 +2576,14 @@ if _preloaded_coot_gui is not None:
       return None
 
     def _apply_file_chooser_initial_folder(chooser, gio_module=None):
-      initial_directory = COMMON_MONOMER_LAST_BROWSED_DIRECTORY
-      if not initial_directory or not os.path.isdir(initial_directory):
+      directory = initial_directory or COMMON_MONOMER_LAST_BROWSED_DIRECTORY
+      if not directory or not os.path.isdir(directory):
         return None
       if gio_module is None:
         gio_module = _gtk_gio_module()
       if gio_module is None or not hasattr(gio_module, "File"):
         return None
-      initial_folder = gio_module.File.new_for_path(initial_directory)
+      initial_folder = gio_module.File.new_for_path(directory)
       if hasattr(chooser, "set_initial_folder"):
         try:
           chooser.set_initial_folder(initial_folder)
@@ -2581,7 +2620,7 @@ if _preloaded_coot_gui is not None:
         filters.append(cif_filter)
         filters.append(all_filter)
         chooser.set_filters(filters)
-        chooser.set_default_filter(cif_filter)
+        chooser.set_default_filter(all_filter if all_files else cif_filter)
 
       def on_open_finished(dialog, result):
         try:
@@ -2612,6 +2651,7 @@ if _preloaded_coot_gui is not None:
         )
         chooser.add_filter(cif_filter)
         chooser.add_filter(all_filter)
+        chooser.set_filter(all_filter if all_files else cif_filter)
       _apply_file_chooser_initial_folder(chooser)
 
       def on_response(dialog, response_id):
@@ -2639,6 +2679,7 @@ if _preloaded_coot_gui is not None:
         chooser.add_button("Open", Gtk.ResponseType.ACCEPT)
         chooser.add_filter(cif_filter)
         chooser.add_filter(all_filter)
+        chooser.set_filter(all_filter if all_files else cif_filter)
       _apply_file_chooser_initial_folder(chooser)
 
       def on_response(dialog, response_id):
@@ -2654,7 +2695,7 @@ if _preloaded_coot_gui is not None:
       chooser.present()
       return None
 
-    info_dialog("Browse is unavailable in this Gtk build; please paste the CIF path manually.")
+    info_dialog("Browse is unavailable in this Gtk build; please paste the file path manually.")
     return None
 
   def _populate_entry_from_save_file_chooser(parent_window, target_entry, chooser_title):
@@ -2887,8 +2928,11 @@ if _preloaded_coot_gui is not None:
     entry_1_browse_title,
     go_button_label,
     handle_go_function,
+    save_file=True,
+    initial_directory=None,
+    all_files=False,
   ):
-    """GTK4-safe one-entry prompt with a Browse button for save/export paths."""
+    """GTK4-safe one-entry prompt with a Browse button for open/save paths."""
     window = Gtk.Window()
     window.set_title("Coot")
 
@@ -2930,7 +2974,9 @@ if _preloaded_coot_gui is not None:
     cancel_button.connect("clicked", close_window)
     browse_button.connect(
       "clicked",
-      lambda *_args: _populate_entry_from_save_file_chooser(window, entry, entry_1_browse_title),
+      lambda *_args: _populate_entry_from_save_file_chooser(window, entry, entry_1_browse_title)
+      if save_file else _populate_entry_from_file_chooser(
+        window, entry, entry_1_browse_title, initial_directory, all_files),
     )
     go_button.connect("clicked", submit)
     entry.connect("activate", submit)
@@ -3527,7 +3573,10 @@ else:
     _handle_cancel_function,
     _confirm_button_label,
     _handle_confirm_function,
+    handle_close_function=None,
   ):
+    if handle_close_function is not None:
+      handle_close_function()
     info_dialog(_gui_unavailable_message(function_label))
 
   def generic_double_entry(
@@ -3559,6 +3608,9 @@ else:
     _entry_1_browse_title,
     _go_button_label,
     _handle_go_function,
+    save_file=True,
+    initial_directory=None,
+    all_files=False,
   ):
     info_dialog(_gui_unavailable_message(function_label))
 
@@ -3928,11 +3980,7 @@ def toggle_high_contrast_mode():
     use_variable_bonds = STARTUP_USE_VARIABLE_BOND_THICKNESS
     default_bond_thickness = MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS
     if default_bond_thickness is None:
-      default_bond_thickness = (
-        STARTUP_VARIABLE_BOND_THICKNESS
-        if STARTUP_USE_VARIABLE_BOND_THICKNESS
-        else STARTUP_DEFAULT_BOND_THICKNESS
-      )
+      default_bond_thickness = STARTUP_DEFAULT_BOND_THICKNESS
     set_do_GL_lighting(1 if MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE else 0)
     status_message = "Set all models to normal lighting"
     MODEL_HIGH_CONTRAST_MOLECULES = set()
@@ -3966,6 +4014,223 @@ def toggle_high_contrast_mode():
       MODEL_HIGH_CONTRAST_MOLECULES = set(current_model_molecules)
   add_status_bar_text(status_message)
 
+
+def _display_preferences_path():
+  """Return the companion preferences file beside this startup script."""
+  return os.path.join(_coot_trimmings_dir(), DISPLAY_PREFERENCES_FILENAME)
+
+
+def _load_display_defaults():
+  """Load display-default booleans from the companion Python preferences file."""
+  defaults = {"high_contrast_models": False, "ambient_maps": False}
+  path = _display_preferences_path()
+  namespace = {}
+  try:
+    with open(path, "r", encoding="utf-8") as handle:
+      source = handle.read()
+    exec(compile(source, path, "exec"), {"__builtins__": {}}, namespace)
+    defaults["high_contrast_models"] = bool(namespace.get("DEFAULT_HIGH_CONTRAST_MODELS", False))
+    defaults["ambient_maps"] = bool(namespace.get("DEFAULT_AMBIENT_MAPS", False))
+  except FileNotFoundError:
+    pass
+  except Exception as error:
+    print(f"WARNING:: could not read display preferences from {path}: {error}")
+  return defaults
+
+
+def _save_display_default(name, enabled=True):
+  """Persist display defaults as simple Python beside coot_trimmings.py."""
+  defaults = _load_display_defaults()
+  defaults[name] = bool(enabled)
+  path = _display_preferences_path()
+  source = (
+    '# Auto-generated by coot_trimmings.py. You may edit these values manually.\n'
+    f'DEFAULT_HIGH_CONTRAST_MODELS = {defaults["high_contrast_models"]!r}\n'
+    f'DEFAULT_AMBIENT_MAPS = {defaults["ambient_maps"]!r}\n'
+  )
+  try:
+    # Atomic replacement avoids leaving a partial preferences file if writing fails.
+    directory = os.path.dirname(path) or "."
+    fd, temporary_path = tempfile.mkstemp(prefix=".coot_trimmings_preferences_", suffix=".py", dir=directory)
+    try:
+      with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(source)
+      os.replace(temporary_path, path)
+    except Exception:
+      try:
+        os.unlink(temporary_path)
+      except Exception:
+        pass
+      raise
+  except Exception as error:
+    info_dialog(
+      "Could not save the display default for future sessions.\n\n"
+      f"Preferences file: {path}\n\n{error}"
+    )
+    return False
+  return True
+
+
+def reset_map_model_defaults():
+  """Remove persisted map/model display defaults; Coot defaults return after restart."""
+  path = _display_preferences_path()
+  try:
+    os.unlink(path)
+  except FileNotFoundError:
+    add_status_bar_text("Map/model defaults are already reset; restart Coot to use Coot defaults")
+    return True
+  except Exception as error:
+    info_dialog(
+      "Could not reset the persisted map/model defaults.\n\n"
+      f"Preferences file: {path}\n\n{error}"
+    )
+    return False
+  add_status_bar_text("Map/model defaults reset; restart Coot to restore Coot defaults")
+  return True
+
+
+def _set_native_high_contrast_model_defaults(show_dialog=True):
+  """Apply Coot's native defaults for subsequently created models."""
+  names = ("set_default_model_material_ambient", "set_default_model_material_diffuse",
+           "set_default_model_material_specular", "set_default_bond_thickness",
+           "set_use_variable_bond_thickness", "set_do_GL_lighting")
+  missing = [name for name in names if not callable(getattr(coot, name, None))]
+  if missing:
+    if show_dialog:
+      info_dialog("This Coot build cannot set the high-contrast model defaults.\\n\\n"
+                  "Missing API: " + ", ".join(missing))
+    return False
+  try:
+    coot.set_default_model_material_ambient(*MODEL_AMBIENT_ONLY_AMBIENT)
+    coot.set_default_model_material_diffuse(*MODEL_AMBIENT_ONLY_DIFFUSE)
+    # Coot 1.3.4's default-material API takes the molecule-type flag first.
+    coot.set_default_model_material_specular(0, *MODEL_AMBIENT_ONLY_SPECULAR)
+    coot.set_default_bond_thickness(HIGH_CONTRAST_BOND_THICKNESS)
+    coot.set_use_variable_bond_thickness(0)
+    coot.set_do_GL_lighting(1)
+  except Exception as error:
+    if show_dialog:
+      info_dialog(f"Could not finish setting model defaults; some settings may have changed.\\n\\n{error}")
+    else:
+      print(f"WARNING:: could not restore high-contrast model defaults: {error}")
+    return False
+  return True
+
+
+def default_models_to_high_contrast_display():
+  """Persist and apply high-contrast defaults for subsequently created models."""
+  if not _set_native_high_contrast_model_defaults(show_dialog=True):
+    return False
+  if not _save_display_default("high_contrast_models", True):
+    return False
+  message = "New models will default to high-contrast display, including future Coot sessions."
+  add_status_bar_text(message)
+  info_dialog(message + "\\n\\nExisting model materials are unchanged. "
+              "Global lighting is enabled and variable bond thickness is disabled.")
+  return True
+
+
+def _set_native_ambient_map_defaults(show_dialog=True):
+  """Apply the ambient-map defaults natively exposed by Coot 1.3.4."""
+  # The uploaded Coot 1.3.4 coot.py exposes exactly these two map-default
+  # material setters.  Specular, Fresnel, and colour remain per-map settings.
+  required = (
+    "set_default_map_material_ambient",
+    "set_default_map_material_diffuse",
+  )
+  missing = [name for name in required if not callable(getattr(coot, name, None))]
+  if missing:
+    if show_dialog:
+      info_dialog("This Coot build cannot set the ambient map material defaults.\n\n"
+                  "Missing API: " + ", ".join(missing) +
+                  "\nThese native default-material functions require Coot 1.3.4 or newer.")
+    return False
+  try:
+    coot.set_default_map_material_ambient(*EM_MAP_AMBIENT)
+    coot.set_default_map_material_diffuse(*EM_MAP_DIFFUSE)
+  except Exception as error:
+    if show_dialog:
+      info_dialog(f"Could not finish setting map defaults; some settings may have changed.\n\n{error}")
+    else:
+      print(f"WARNING:: could not restore ambient map defaults: {error}")
+    return False
+  return True
+
+
+def default_maps_to_ambient_display():
+  """Persist and apply ambient defaults for subsequently created maps."""
+  if not _set_native_ambient_map_defaults(show_dialog=True):
+    return False
+  if not _save_display_default("ambient_maps", True):
+    return False
+  message = "New maps will default to ambient material display, including future Coot sessions."
+  add_status_bar_text(message)
+  info_dialog(
+    message +
+    "\n\nCoot 1.3.4 exposes native map defaults for ambient and diffuse material only. "
+    "Specular = 0, Fresnel off, and dark blue (#1a5fb4) are therefore still applied "
+    "by the Restyle/resample map command rather than as native defaults for every new map."
+    "\n\nExisting maps are unchanged."
+  )
+  return True
+
+
+def _apply_persistent_display_defaults():
+  """Restore startup values that Coot may overwrite during initialization.
+
+  Coot can restore parts of its own display state after startup scripts have
+  been evaluated, so this function is also scheduled once on the GTK event
+  loop below.  Map radius is reapplied unconditionally because it is a normal
+  startup preference, not part of either optional display-style preset.
+  Returning False makes it suitable as a GLib timeout callback.
+  """
+  # Coot's later state/startup restoration can reset these to its built-in
+  # radius (commonly 10 or 20 A depending on context).  Reassert both here.
+  set_map_radius(STARTUP_MAP_RADIUS)
+  set_map_radius_em(STARTUP_MAP_RADIUS_EM)
+
+  defaults = _load_display_defaults()
+  if defaults.get("high_contrast_models"):
+    _set_native_high_contrast_model_defaults(show_dialog=False)
+    # Models supplied on Coot's command line can be instantiated before this
+    # startup script runs, so they may already have copied Coot's built-in
+    # bond thickness (typically 5) even though the global default is now 2.
+    # This callback is one-shot: correct models that already exist at startup
+    # without installing a recurring molecule watcher.
+    try:
+      for imol in model_molecule_list():
+        set_bond_thickness(imol, HIGH_CONTRAST_BOND_THICKNESS)
+    except Exception as error:
+      print(f"WARNING:: could not apply startup bond thickness to existing models: {error}")
+  if defaults.get("ambient_maps"):
+    _set_native_ambient_map_defaults(show_dialog=False)
+  return False
+
+
+def _schedule_persistent_display_defaults_reapply():
+  """Reapply saved defaults after Coot's own startup/state restoration."""
+  glib_module = _coot_gui_repository_module("GLib")
+  if glib_module is None:
+    print("WARNING:: GLib unavailable; delayed coot_trimmings defaults were not scheduled")
+    return False
+  try:
+    # Reassert at more than one point because state restoration timing varies
+    # between Coot builds.  Each callback runs once (it returns False).
+    source_ids = [
+      glib_module.timeout_add(250, _apply_persistent_display_defaults),
+      glib_module.timeout_add(1000, _apply_persistent_display_defaults),
+      glib_module.timeout_add(3000, _apply_persistent_display_defaults),
+    ]
+    print("coot_trimmings: scheduled deferred defaults via GLib:", source_ids)
+    return True
+  except Exception as error:
+    print(f"WARNING:: could not schedule display-default restoration: {error}")
+    traceback.print_exc()
+    return False
+
+
+_apply_persistent_display_defaults()
+_schedule_persistent_display_defaults_reapply()
 
 def jiggle_fit_active_non_polymer_residue():
   residue = _active_residue_or_status()
@@ -8961,25 +9226,115 @@ def _resample_plan_for_target_pixel_size(map_id, target_pixel_size):
 
 
 def style_resampled_em_map(map_id):
+  """Apply the standard ambient EM-map appearance used by the restyle shortcut."""
   set_draw_map_standard_lines(map_id, 1)
   set_draw_solid_density_surface(map_id, 0)
   if not map_is_difference_map(map_id):
-    set_map_colour(
-      map_id,
-      EM_REFINED_MAP_COLOUR[0],
-      EM_REFINED_MAP_COLOUR[1],
-      EM_REFINED_MAP_COLOUR[2],
-    )
-  set_map_material_specular(map_id, 0.5, 64.0)
-  set_map_fresnel_settings(map_id, 1, 0.0, 0.3, 3.0)
+    set_map_colour(map_id, *EM_REFINED_MAP_COLOUR)
+  set_map_material_ambient(map_id, *EM_MAP_AMBIENT)
+  set_map_material_diffuse(map_id, *EM_MAP_DIFFUSE)
+  set_map_material_specular(map_id, *EM_MAP_SPECULAR)
+  set_map_fresnel_settings(map_id, *EM_MAP_FRESNEL)
   set_solid_density_surface_opacity(map_id, 1.0)
   MAP_LOCAL_APPEARANCE_STATE[map_id] = {
     "map_colour": list(map_colour_components_py(map_id)),
-    "specular_strength": 0.5,
-    "shininess": 64.0,
-    "fresnel": (1, 0.0, 0.3, 3.0),
+    "ambient": EM_MAP_AMBIENT,
+    "diffuse": EM_MAP_DIFFUSE,
+    "specular_strength": EM_MAP_SPECULAR[0],
+    "shininess": EM_MAP_SPECULAR[1],
+    "fresnel": EM_MAP_FRESNEL,
     "opacity": 1.0,
   }
+
+
+def show_active_map_brightness_slider():
+  """Open a non-modal slider that live-updates the current active map's ambient brightness."""
+  initial_map = _scrollable_map_or_status()
+  if initial_map is None:
+    return None
+
+  window = Gtk.Window()
+  window.set_title("Map brightness")
+  window.set_default_size(420, -1)
+
+  vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  vbox.set_margin_top(12)
+  vbox.set_margin_bottom(12)
+  vbox.set_margin_start(12)
+  vbox.set_margin_end(12)
+
+  map_label = Gtk.Label(label="")
+  map_label.set_halign(Gtk.Align.START)
+  value_label = Gtk.Label(label="100%")
+  value_label.set_width_chars(5)
+
+  slider_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+  adjustment = Gtk.Adjustment(value=100.0, lower=0.0, upper=200.0, step_increment=1.0, page_increment=10.0)
+  slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
+  slider.set_hexpand(True)
+  slider.set_draw_value(False)
+  slider.set_digits(0)
+
+  button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  button_row.set_halign(Gtk.Align.END)
+  reset_button = Gtk.Button(label="Reset to 100%")
+  close_button = Gtk.Button(label="Close")
+
+  def current_map():
+    # Resolve this afresh for every update so changing the scroll-wheel/refinement
+    # map while the window is open redirects the control to that map.
+    map_id = scroll_wheel_map()
+    if map_id != -1 and map_id in map_molecule_list():
+      return map_id
+    map_id = imol_refinement_map()
+    if map_id != -1 and map_id in map_molecule_list():
+      return map_id
+    displayed = [imol for imol in map_molecule_list() if map_is_displayed(imol)]
+    return displayed[0] if displayed else None
+
+  def update_map_label(map_id):
+    if map_id is None:
+      map_label.set_text("No active map")
+      return
+    try:
+      name = molecule_name(map_id)
+    except Exception:
+      name = "map"
+    map_label.set_text("Active map: {} ({})".format(name, map_id))
+
+  def apply_brightness(scale):
+    percent = float(scale.get_value())
+    value_label.set_text("{:.0f}%".format(percent))
+    map_id = current_map()
+    update_map_label(map_id)
+    if map_id is None:
+      return
+    brightness = percent / 100.0
+    try:
+      set_map_material_ambient(map_id, brightness, brightness, brightness, 1.0)
+      state = MAP_LOCAL_APPEARANCE_STATE.setdefault(map_id, {})
+      state["ambient"] = (brightness, brightness, brightness, 1.0)
+    except Exception as error:
+      print("WARNING:: could not set map brightness: {}".format(error))
+
+  def reset_brightness(button):
+    slider.set_value(100.0)
+
+  slider.connect("value-changed", apply_brightness)
+  reset_button.connect("clicked", reset_brightness)
+  close_button.connect("clicked", lambda button: window.close())
+
+  slider_row.append(slider)
+  slider_row.append(value_label)
+  button_row.append(reset_button)
+  button_row.append(close_button)
+  vbox.append(map_label)
+  vbox.append(slider_row)
+  vbox.append(button_row)
+  window.set_child(vbox)
+  update_map_label(initial_map)
+  window.present()
+  return window
 
 
 def _restyle_active_map_without_resampling(map_id, contour_level_sigma, status_message):
@@ -13294,6 +13649,503 @@ COORDINATION_LINK_MENU = [
 ]
 
 
+# Reference fallbacks, NOT oxidation-state/geometry-specific PDB ideal distances.
+# Distances: https://github.com/pemsley/coot/tree/main/data/metal
+# Counts and donor-element restrictions: cctbx/mmtbx/ions/ion_parameters.cif
+# https://github.com/cctbx/cctbx_project/blob/master/mmtbx/ions/ion_parameters.cif
+# That file cites Dokmanic et al. (2008), Zheng et al. (2008), Harding (2001),
+# and Rulisek & Vondrasek (1998). Its bond-valence parameters are NOT lengths.
+# Embedded so neither Phenix nor a network connection is needed at runtime.
+METAL_LINK_REFERENCE_PROFILES = {
+  "MN": ((4, 6), {"O": 1.9159, "N": 1.9329}, "Mn(II)"),
+  "CO": ((5, 6), {"O": 1.9221, "N": 1.8284}, "Co(II)"),
+  "NI": ((4, 6), {"O": 2.0544, "N": 2.1043, "S": 2.1638}, "Ni(II)"),
+  "CU": ((3, 4), {"O": 1.9888, "N": 2.5317, "S": 2.1835}, "Cu(II)"),
+  "CD": ((3, 7), {"O": 2.3494, "N": 2.3164, "S": 2.9976}, "Cd(II)"),
+}
+
+
+# BEGIN GENERATED METALPDB PROFILES
+# Generated by tools/build_metalpdb_profiles.py; provenance: tools/metalpdb_reference/profiles.json.
+# Observed medians, NOT ideal restraints. No resolution/oxidation-state filter.
+# MetalPDB truncates contacts at 3 A; p90 >=2.9 A excluded. Counts are not chemical limits.
+# Per donor class: most-supported geometry/CN stratum, not inferred geometry of this site.
+# Values: distance, geometry, CN, PDB count, p10, p90 (per-PDB median distances).
+METALPDB_LINK_PROFILES = {
+  'LI': ((4, 4), {
+    'carboxylate-O': (1.919, 'tetrahedron (regular)', 4, 5, 1.822, 1.988),
+    'water-O': (1.957, 'tetrahedron (regular)', 4, 5, 1.877, 1.973),
+  }),
+  'SR': ((4, 8), {
+    'carboxylate-O': (2.64, 'trigonal prism, square-face bicapped (distorted)', 8, 5, 2.6, 2.731),
+    'water-O': (2.742, 'irregular (n/a)', 4, 7, 2.634, 2.763),
+  }),
+  'HG': ((2, 4), {
+    'backbone-O': (2.755, 'irregular (n/a)', 4, 6, 2.663, 2.896),
+    'carboxylate-O': (2.637, 'irregular (n/a)', 3, 6, 2.443, 2.77),
+    'cysteine-S': (2.397, 'linear (regular)', 2, 45, 2.298, 2.614),
+  }),
+  'PR': ((3, 5), {
+    'carboxylate-O': (2.729, 'irregular (n/a)', 3, 8, 2.545, 2.828),
+    'water-O': (2.615, 'irregular (n/a)', 3, 5, 2.504, 2.892),
+  }),
+  'SM': ((4, 7), {
+    'carboxylate-O': (2.503, 'irregular (n/a)', 4, 7, 2.337, 2.675),
+    'water-O': (2.524, 'square antiprism with a vacancy (distorted)', 7, 5, 2.23, 2.664),
+  }),
+  'GD': ((2, 9), {
+    'carboxylate-O': (2.641, 'irregular (n/a)', 2, 5, 2.503, 2.727),
+    'water-O': (2.452, 'irregular (n/a)', 9, 6, 2.322, 2.625),
+  }),
+  'YB': ((3, 5), {
+    'carboxylate-O': (2.405, 'irregular (n/a)', 5, 7, 2.304, 2.612),
+    'water-O': (2.506, 'irregular (n/a)', 3, 5, 2.22, 2.65),
+  }),
+  'MN': ((2, 8), {
+    'amide-O': (2.177, 'octahedron (regular)', 6, 24, 2.046, 2.348),
+    'backbone-O': (2.195, 'octahedron (regular)', 6, 49, 2.101, 2.317),
+    'carboxylate-O': (2.171, 'octahedron (regular)', 6, 173, 2.082, 2.305),
+    'histidine-N': (2.254, 'octahedron (regular)', 6, 71, 2.18, 2.371),
+    'hydroxyl-O': (2.227, 'octahedron (regular)', 6, 20, 2.131, 2.372),
+    'water-O': (2.233, 'octahedron (regular)', 6, 200, 2.109, 2.367),
+  }),
+  'CO': ((2, 6), {
+    'backbone-O': (2.122, 'octahedron (regular)', 6, 8, 2.026, 2.206),
+    'carboxylate-O': (2.11, 'octahedron (regular)', 6, 41, 1.978, 2.222),
+    'cysteine-S': (2.294, 'tetrahedron (regular)', 4, 5, 2.138, 2.44),
+    'histidine-N': (2.171, 'octahedron (regular)', 6, 43, 2.047, 2.266),
+    'hydroxyl-O': (2.19, 'octahedron (regular)', 6, 7, 2.005, 2.421),
+    'water-O': (2.187, 'octahedron (regular)', 6, 51, 2.053, 2.343),
+  }),
+  'NI': ((2, 7), {
+    'amide-O': (2.291, 'octahedron (regular)', 6, 8, 2.053, 2.481),
+    'backbone-O': (2.12, 'octahedron (regular)', 6, 16, 2.051, 2.295),
+    'carboxylate-O': (2.125, 'octahedron (regular)', 6, 34, 2.027, 2.239),
+    'cysteine-S': (2.23, 'square plane (regular)', 4, 7, 2.077, 2.338),
+    'histidine-N': (2.133, 'octahedron (regular)', 6, 74, 2.046, 2.258),
+    'water-O': (2.176, 'octahedron (regular)', 6, 67, 2.031, 2.388),
+  }),
+  'CU': ((2, 6), {
+    'carboxylate-O': (2.401, 'irregular (n/a)', 3, 14, 2.113, 2.513),
+    'cysteine-S': (2.222, 'trigonal plane (regular)', 3, 13, 2.186, 2.27),
+    'histidine-N': (2.037, 'irregular (n/a)', 5, 32, 1.941, 2.21),
+    'methionine-S': (2.304, 'tetrahedron (regular)', 4, 7, 2.214, 2.43),
+    'water-O': (1.838, 'linear (regular)', 2, 6, 1.797, 2.041),
+  }),
+  'CD': ((2, 7), {
+    'amide-O': (2.362, 'octahedron (distorted)', 6, 6, 2.244, 2.482),
+    'backbone-O': (2.626, 'irregular (n/a)', 3, 17, 2.383, 2.828),
+    'carboxylate-O': (2.466, 'irregular (n/a)', 3, 150, 2.302, 2.726),
+    'cysteine-S': (2.544, 'tetrahedron (regular)', 4, 22, 2.455, 2.6),
+    'histidine-N': (2.326, 'irregular (n/a)', 5, 54, 2.191, 2.554),
+    'hydroxyl-O': (2.443, 'octahedron (regular)', 6, 5, 2.37, 2.565),
+    'water-O': (2.378, 'octahedron (regular)', 6, 40, 2.25, 2.514),
+  }),
+}
+# END GENERATED METALPDB PROFILES
+
+def _metal_donor_class(residue, atom, element):
+  """Match the donor classes used by the offline MetalPDB profile builder."""
+  if element == "O":
+    if residue in {"HOH", "WAT", "DOD"}:
+      return "water-O"
+    if (residue == "ASP" and atom in {"OD1", "OD2"}) or (residue == "GLU" and atom in {"OE1", "OE2"}):
+      return "carboxylate-O"
+    if (residue == "ASN" and atom == "OD1") or (residue == "GLN" and atom == "OE1"):
+      return "amide-O"
+    if (residue, atom) in {("SER", "OG"), ("THR", "OG1"), ("TYR", "OH")}:
+      return "hydroxyl-O"
+    if residue in set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split()) and atom == "O":
+      return "backbone-O"
+  if residue == "HIS" and atom in {"ND1", "NE2"} and element == "N":
+    return "histidine-N"
+  if residue == "CYS" and atom == "SG" and element == "S":
+    return "cysteine-S"
+  if residue == "MET" and atom == "SD" and element == "S":
+    return "methionine-S"
+  return None
+
+
+# Shannon (1976), Acta Cryst. A32, 751-767, doi:10.1107/S0567739476001551.
+# Ionic radii verified against pymatgen v2024.5.1/core/periodic_table.json.
+# CN VIII except Ag(I), CN IV. Ligand offsets below are deliberately rough
+# size-based heuristics, not tabulated neutral-ligand bond lengths.
+METAL_LINK_ESTIMATE_RADII = {
+  "RB": (1.61, "Rb(I), radius CN VIII"), "CS": (1.74, "Cs(I), radius CN VIII"),
+  "BA": (1.42, "Ba(II), radius CN VIII"), "AG": (1.00, "Ag(I), radius CN IV"),
+  "LA": (1.160, "La(III), radius CN VIII"), "CE": (1.143, "Ce(III), radius CN VIII"),
+  "ND": (1.109, "Nd(III), radius CN VIII"), "PM": (1.093, "Pm(III), radius CN VIII"),
+  "EU": (1.066, "Eu(III), radius CN VIII"), "TB": (1.040, "Tb(III), radius CN VIII"),
+  "DY": (1.027, "Dy(III), radius CN VIII"), "HO": (1.015, "Ho(III), radius CN VIII"),
+  "ER": (1.004, "Er(III), radius CN VIII"), "TM": (0.994, "Tm(III), radius CN VIII"),
+  "LU": (0.977, "Lu(III), radius CN VIII"),
+}
+
+
+def _metal_link_candidates(imol, metal_spec, radius, estimate=None):
+  """Return chemistry-filtered candidates; observed distances only rank the search."""
+  profiles = {"MG": (6, 6), "NA": (4, 8), "K": (6, 9),
+              "CA": (6, 8), "ZN": (4, 6), "FE": (4, 6)}
+  profiles.update({metal: values[0] for metal, values in METAL_LINK_REFERENCE_PROFILES.items()})
+  for metal, values in METALPDB_LINK_PROFILES.items():
+    profiles.setdefault(metal, values[0])
+  atoms = residue_info_py(imol, *metal_spec[:3]) or []
+  ion = [a for a in atoms if list(a[0][:2]) == metal_spec[3:]]
+  if len(ion) != 1:
+    raise ValueError("Select a single metal atom in the active residue.")
+  element = str(ion[0][1][2]).strip().upper()
+  if estimate is not None:
+    if element not in METAL_LINK_ESTIMATE_RADII or estimate.get("element") != element:
+      raise ValueError("The estimate does not match the active metal.")
+    if any(not math.isfinite(estimate[key]) or not 1 <= estimate[key] <= 4.5 for key in ("O", "N")):
+      raise ValueError("Estimated distances must be between 1 and 4.5 A.")
+    profiles[element] = (0, 0)  # No inferred coordination-count limits.
+  if element not in profiles:
+    raise ValueError("Supported metals: " + ", ".join(sorted(profiles)) + ".")
+  targets = {}
+  for _, entries in COORDINATION_LINK_MENU:
+    for _, entry in entries:
+      if element in entry["metal_codes"]:
+        targets.update({donor: entry["distance"] for donor in entry["donor_elements"]})
+  if element in METAL_LINK_REFERENCE_PROFILES:
+    targets = METAL_LINK_REFERENCE_PROFILES[element][1]
+  empirical = METALPDB_LINK_PROFILES.get(element)
+  if empirical:
+    targets = {role.rsplit("-", 1)[1]: None for role in empirical[1]}
+  if estimate is not None:
+    targets = {key: estimate[key] for key in ("O", "N")}
+    empirical = None
+  if not callable(getattr(coot, "link_info_py", None)):
+    raise ValueError("This Coot build cannot inspect existing links safely.")
+  existing = set()
+  for link in coot.link_info_py(imol) or []:
+    a, b = tuple(link[1][-5:]), tuple(link[2][-5:])
+    if a == tuple(metal_spec):
+      existing.add(b)
+    elif b == tuple(metal_spec):
+      existing.add(a)
+  protein = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split())
+  candidates = []
+  for spec in _all_residue_specs_for_colouring(imol):
+    if list(spec) == metal_spec[:3]:
+      continue
+    resname = residue_name(imol, *spec).strip().upper()
+    ligand = resname not in protein and resname not in ("HOH", "WAT", "DOD")
+    for atom in residue_info_py(imol, *spec) or []:
+      name, alt = atom[0][:2]
+      donor = str(atom[1][2]).strip().upper()
+      if donor not in targets or atom[1][0] <= 0:
+        continue
+      # Do not mix alternate conformers, or choose one silently for a blank ion.
+      if alt and alt != metal_spec[4]:
+        continue
+      atom_name = name.strip()
+      reference = None
+      proxy_role = None
+      if empirical:
+        role = _metal_donor_class(resname, atom_name, donor)
+        reference = empirical[1].get(role)
+        if reference is None and ligand:
+          # A donor-element proxy permits manual ligand review without claiming
+          # that protein/water statistics describe this ligand's chemistry.
+          alternatives = [(key, value) for key, value in empirical[1].items()
+                          if key.rsplit("-", 1)[1] == donor]
+          if alternatives:
+            proxy_role, reference = max(alternatives, key=lambda item: item[1][3])
+        if reference is None:
+          continue
+      unlikely_n = False
+      if donor == "N":
+        plausible_n = ligand or (resname == "HIS" and atom_name in ("ND1", "NE2"))
+        if estimate is not None:
+          plausible_n = plausible_n or resname not in protein
+          unlikely_n = not plausible_n
+          if unlikely_n and not estimate.get("unlikely_n", False):
+            continue
+        elif not plausible_n:
+          continue
+      if donor == "S" and not (ligand or (resname == "CYS" and atom_name == "SG") or
+                               (resname == "MET" and atom_name == "SD")):
+        continue
+      observed = math.sqrt(sum((float(x) - float(y)) ** 2
+                               for x, y in zip(atom[2], ion[0][2])))
+      donor_spec = list(spec) + [name, alt]
+      if not math.isfinite(observed) or observed > radius or tuple(donor_spec) in existing:
+        continue
+      chemistry = "oxygen donor" if donor == "O" else "check protonation/oxidation state"
+      if resname not in protein and resname not in ("HOH", "WAT", "DOD"):
+        chemistry = "nonstandard residue: verify donor chemistry manually"
+      target = targets[donor]
+      if reference:
+        target, geometry, cn, count, low, high = reference
+        chemistry = (f"MetalPDB {proxy_role or role}; reference: {geometry}, CN {cn}. "
+                     f"{count} PDB entries; central observed range {low:.3f}-{high:.3f} A. "
+                     "Reference geometry is not inferred for the current site.")
+        if count < 10:
+          chemistry += " Limited evidence (fewer than 10 PDB entries)."
+        if proxy_role:
+          chemistry = "LOW CONFIDENCE: donor-element proxy, NOT ligand-specific data. " + chemistry
+      if estimate is not None:
+        chemistry = "LOW CONFIDENCE: editable size-based estimate; verify charge, donor chemistry and geometry."
+        if unlikely_n:
+          chemistry += " UNLIKELY N DONOR: amide/protonated nitrogen generally does not coordinate."
+        elif donor == "N" and resname not in protein:
+          chemistry += " Unclassified ligand N: bonding and protonation have not been checked."
+      if ligand:
+        chemistry += (" Ligand donor: verify bonding, protonation and chelation geometry; "
+                      "nearby atoms are candidates, not an automatic chemical assignment.")
+      candidates.append((donor_spec, target, observed, resname, chemistry))
+  candidates.sort(key=lambda item: item[2])
+  return element, profiles[element], len(existing), candidates
+
+
+def _preview_metal_link(imol, metal_spec, donor_spec):
+  """Own only this preview's drawing/text handles; leave atom labels untouched."""
+  required = ("new_generic_object_number", "to_generic_object_add_dashed_line",
+              "set_display_generic_object", "close_generic_object", "place_text", "remove_text")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    raise ValueError("This Coot build lacks the temporary link preview APIs.")
+  positions = []
+  for spec in (metal_spec, donor_spec):
+    atoms = [a for a in residue_info_py(imol, *spec[:3]) or [] if list(a[0][:2]) == spec[3:]]
+    if len(atoms) != 1:
+      raise ValueError("A preview atom is no longer uniquely available.")
+    positions.append(atoms[0][2])
+  obj = coot.new_generic_object_number("Proposed metal coordination")
+  labels = []
+  closed = False
+  def show_labels(enabled):
+    for handle in reversed(labels):
+      coot.remove_text(handle)
+    labels.clear()
+    if enabled and not closed:
+      for spec, position in zip((metal_spec, donor_spec), positions):
+        label = f"{spec[0]}:{spec[1]}{spec[2]} {spec[3].strip()}" + (f" alt {spec[4]}" if spec[4] else "")
+        labels.append(coot.place_text(label, position[0] + 0.3, position[1] + 0.3, position[2], 14))
+  def cleanup():
+    nonlocal closed
+    if closed:
+      return
+    closed = True
+    for handle in reversed(labels):
+      try:
+        coot.remove_text(handle)
+      except Exception as error:
+        print(f"Could not remove preview label: {error}")
+    coot.close_generic_object(obj)
+  try:
+    coot.to_generic_object_add_dashed_line(obj, "orange", 1, 5.0,
+                                          *(list(positions[0]) + list(positions[1])))
+    coot.set_display_generic_object(obj, 1)
+    show_labels(True)
+  except Exception:
+    cleanup()
+    raise
+  return cleanup, show_labels
+
+
+def _metal_link_review_panel(title, message, discard, keep, preview, state):
+  """Non-modal review: the main Coot canvas remains interactive."""
+  cleanup, show_labels = preview
+  state.update(cleanup=cleanup, show_labels=show_labels, discard=discard, keep=keep)
+  if "window" in state:
+    state["window"].set_title(title)
+    state["label"].set_text(message)
+    show_labels(state["labels_button"].get_active())
+    return
+  window = Gtk.Window()
+  window.set_title(title)
+  window.set_modal(False)
+  window.set_default_size(420, -1)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + side)(12)
+  label = Gtk.Label(label=message)
+  label.set_wrap(True)
+  label.set_xalign(0)
+  box.append(label)
+  labels_button = Gtk.CheckButton(label="Show atom labels")
+  labels_button.set_active(True)
+  labels_button.connect("toggled", lambda button: state["show_labels"](button.get_active()))
+  box.append(labels_button)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  state.update(window=window, label=label, labels_button=labels_button, busy=False, closed=False)
+  def finish(action=None):
+    if state["closed"] or state["busy"]:
+      return False
+    state["busy"] = True
+    try:
+      state["cleanup"]()
+      if action is None:
+        state["closed"] = True
+        window.destroy()
+      else:
+        state[action]()
+    finally:
+      state["busy"] = False
+    return False
+  for text, action in (("Finish", "finish_review"), ("Discard", "discard"), ("Keep link", "keep")):
+    button = Gtk.Button(label=text)
+    button.connect("clicked", lambda *_, action=action: finish(action))
+    buttons.append(button)
+  box.append(buttons)
+  window.set_child(box)
+  window.connect("close-request", lambda *_: finish())
+  window.present()
+
+
+def _metal_link_estimate_dialog(element, search):
+  radius, assumption = METAL_LINK_ESTIMATE_RADII[element]
+  window = Gtk.Window()
+  window.set_title("Estimated metal coordination")
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + side)(12)
+  note = Gtk.Label(label=f"LOW CONFIDENCE: {assumption}.\n"
+                   "Starting estimates: Shannon metal radius + 1.40 A (O) / 1.50 A (N).\n"
+                   "Ligand offsets are heuristics, not measured bond lengths. Edit for your chemistry.\n"
+                   "No coordination-number limits are inferred. All links require review.")
+  note.set_wrap(True)
+  box.append(note)
+  entries = []
+  for label, default in (("Search radius (A)", 5.0), ("Estimated metal-O (A)", radius + 1.4),
+                         ("Estimated metal-N (A)", radius + 1.5)):
+    box.append(Gtk.Label(label=label))
+    entry = Gtk.Entry()
+    entry.set_text(f"{default:.3f}")
+    entries.append(entry)
+    box.append(entry)
+  unlikely = Gtk.CheckButton(label="Show unlikely N donors (amide/protonated nitrogens)")
+  box.append(unlikely)
+  def submit(*_args):
+    try:
+      estimate = {"element": element, "O": float(entries[1].get_text()),
+                  "N": float(entries[2].get_text()), "unlikely_n": unlikely.get_active()}
+      result = search(entries[0].get_text(), estimate)
+    except ValueError:
+      info_dialog("Please enter numeric distances.")
+      return
+    if result != 0:
+      window.destroy()
+  button = Gtk.Button(label="Review candidates")
+  button.connect("clicked", submit)
+  box.append(button)
+  window.set_child(box)
+  window.present()
+
+
+def auto_metal_links_current_residue():
+  active = _active_residue_or_status()
+  if not active:
+    return
+  imol = active[0]
+  metal_spec = list(active[1:6])
+
+  def search(text, estimate=None):
+    try:
+      radius = float(text)
+      if not math.isfinite(radius) or not 0 < radius <= 10:
+        raise ValueError("Search radius must be greater than 0 and at most 10 A.")
+      element, limits, existing_count, candidates = _metal_link_candidates(imol, metal_spec, radius, estimate)
+    except (ValueError, TypeError, IndexError) as error:
+      info_dialog(str(error))
+      return 0
+    if not candidates:
+      info_dialog("No new compatible donors found. Existing links and incompatible alternate conformers are excluded.")
+      return 0
+    if estimate is not None:
+      target_label = "editable estimate"
+      source_note = f"LOW CONFIDENCE: {METAL_LINK_ESTIMATE_RADII[element][1]}. No expected coordination count inferred. "
+    elif element in METALPDB_LINK_PROFILES:
+      target_label = "MetalPDB observed median"
+      source_note = ("Observed reference, not an ideal restraint. MetalPDB omits contacts beyond 3 A. No resolution or oxidation-state filter; "
+                     "PDB entries may be homologous or restrained. Ligand proxies are explicitly flagged; "
+                     "donor elements without reference data are omitted. ")
+      if element in METAL_LINK_REFERENCE_PROFILES:
+        source_note += f"Count guidance assumes {METAL_LINK_REFERENCE_PROFILES[element][2]}. "
+      else:
+        source_note += "Count range is observed in the retained reference strata, not a chemical limit. "
+    elif element in METAL_LINK_REFERENCE_PROFILES:
+      assumed_state = METAL_LINK_REFERENCE_PROFILES[element][2]
+      target_label = "Coot reference distance"
+      source_note = (f"Count guidance assumes {assumed_state}; oxidation state is not inferred. "
+                     "Coot table distances are generic fallbacks, not validated PDB ideals; "
+                     "verify the chemistry before keeping links. ")
+    else:
+      target_label = "chemistry target"
+      source_note = ""
+    selected = []
+    empirical_counts_only = estimate is not None or (element in METALPDB_LINK_PROFILES and element not in METAL_LINK_REFERENCE_PROFILES)
+    count_label = "Reference contact counts (not full coordination)" if empirical_counts_only else "Typical coordination"
+    count_text = "Expected coordination: not inferred" if estimate is not None else f"{count_label}: {limits[0]}-{limits[1]}"
+    panel_state = {}
+    def close_panel():
+      if "window" in panel_state and not panel_state.get("closed"):
+        panel_state["closed"] = True
+        panel_state["cleanup"]()
+        panel_state["window"].destroy()
+
+    def review(index):
+      if index < len(candidates):
+        spec, target, observed, resname, chemistry = candidates[index]
+        try:
+          preview = _preview_metal_link(imol, metal_spec, spec)
+          cleanup = preview[0]
+        except Exception as error:
+          close_panel()
+          info_dialog(f"Preview stopped; previously kept links remain.\n{error}")
+          return
+        def discard():
+          cleanup()
+          review(index + 1)
+        def keep():
+          cleanup()
+          try:
+            if not valid_model_molecule_qm(imol):
+              raise ValueError("Target model is no longer available.")
+            _, _, _, fresh = _metal_link_candidates(imol, metal_spec, radius, estimate)
+            if tuple(spec) not in {tuple(item[0]) for item in fresh}:
+              raise ValueError("The candidate changed or is already linked. Please restart the search.")
+            coot.make_link_py(imol, metal_spec, spec, "dummy", target)
+          except Exception as error:
+            close_panel()
+            info_dialog(f"Link creation stopped; previously kept links remain.\n{error}")
+            return
+          selected.append((spec, target))
+          review(index + 1)
+        warning = "\nWARNING: keeping this donor exceeds the typical coordination range." if not empirical_counts_only and existing_count + len(selected) + 1 > limits[1] else ""
+        _metal_link_review_panel(
+          f"{element} coordination candidate {index + 1}/{len(candidates)}",
+          f"{element} {metal_spec[0]}:{metal_spec[1]}{metal_spec[2]} {metal_spec[3].strip()}\n"
+          f"Donor: {resname} {spec[0]}:{spec[1]}{spec[2]} {spec[3].strip()}\n"
+          f"Observed: {observed:.2f} A; {target_label}: {target:.3f} A\n{chemistry}\n{source_note}\n"
+          f"Existing links: {existing_count}; kept: {len(selected)}. {count_text}.{warning}\n"
+          "Dashed orange line is a temporary preview. You can rotate and zoom in Coot. Keep creates the real link immediately. "
+          "Finish skips the remaining candidates and keeps accepted links, without accepting the current preview. "
+          "Coot may use built-in refinement distances.",
+          discard, keep, preview, panel_state)
+        return
+      close_panel()
+      if not selected:
+        info_dialog("No donors selected; no links added.")
+        return
+      total = existing_count + len(selected)
+      warning = "\nWARNING: outside the typical coordination range." if not empirical_counts_only and not limits[0] <= total <= limits[1] else ""
+      message = f"Submitted {len(selected)} {element} links; total coordination {total} ({count_text}).{warning}"
+      print(message)
+      add_status_bar_text(message)
+      info_dialog(message)
+    panel_state["finish_review"] = lambda: review(len(candidates))
+    review(0)
+    return None
+  atoms = [a for a in residue_info_py(imol, *metal_spec[:3]) or [] if list(a[0][:2]) == metal_spec[3:]]
+  element = str(atoms[0][1][2]).strip().upper() if len(atoms) == 1 else ""
+  if element in METAL_LINK_ESTIMATE_RADII:
+    _metal_link_estimate_dialog(element, search)
+  else:
+    generic_single_entry("Search radius around active metal (A)", "5.0", "Find donors", search)
+
+
 def _atom_name_element(atom_name):
   atom_name = str(atom_name).strip().upper()
   if not atom_name:
@@ -13420,6 +14272,223 @@ def _make_coordination_link(label, metal_codes, metal_label, donor_elements, don
     submit_distance,
   )
   return 1
+
+
+def _parse_phenix_metal_edits(text):
+  """Read the explicit bond-add subset of PHIL without a Phenix dependency."""
+  import shlex
+  scopes, bonds, current = [], [], None
+  allowed = {"action", "atom_selection_1", "atom_selection_2", "distance_ideal", "sigma"}
+  for line_number, raw in enumerate(text.splitlines(), 1):
+    lexer = shlex.shlex(raw, posix=True)
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    if not tokens:
+      continue
+    line = raw.strip()
+    if len(tokens) == 2 and tokens[1] == "{":
+      scope = tokens[0]
+      if scope not in ("refinement.geometry_restraints.edits", "refinement", "geometry_restraints", "edits", "bond"):
+        raise ValueError(f"Line {line_number}: unsupported scope {scope!r}.")
+      if current is not None:
+        raise ValueError(f"Line {line_number}: nested bond block.")
+      scopes.append(scope)
+      if scope == "bond":
+        current = {}
+    elif tokens == ["}"]:
+      if not scopes:
+        raise ValueError(f"Line {line_number}: unmatched closing brace.")
+      if scopes.pop() == "bond":
+        required = allowed - {"action"}
+        if not required.issubset(current):
+          raise ValueError(f"Bond ending at line {line_number}: missing {sorted(required - current.keys())}.")
+        if current.get("action", "add") not in ("add", "*add"):
+          raise ValueError(f"Line {line_number}: only action=add is supported.")
+        for field in ("distance_ideal", "sigma"):
+          value = float(current[field])
+          if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Line {line_number}: {field} must be finite and positive.")
+          current[field] = value
+        bonds.append(current)
+        current = None
+    else:
+      if current is None or "=" not in line:
+        raise ValueError(f"Line {line_number}: expected a bond property or scope.")
+      key, value = line.split("=", 1)
+      key = key.strip()
+      if key not in allowed or key in current:
+        raise ValueError(f"Line {line_number}: unsupported or repeated property {key!r}.")
+      # Preserve quotes in selections (e.g. chain ' ' or name ' CA ').
+      current[key] = value.strip()
+      if not key.startswith("atom_selection"):
+        current[key] = " ".join(shlex.split(value, comments=True))
+  if scopes or not bonds:
+    raise ValueError("Unclosed scope or no bond edits found.")
+  return bonds
+
+
+def _phenix_metal_atom_spec(imol, selection):
+  """Resolve a restricted Phenix selection to exactly one Coot atom."""
+  import shlex
+  tokens = shlex.split(selection, comments=True)
+  if len(tokens) == 1:
+    tokens = shlex.split(tokens[0])
+  fields = {}
+  while tokens:
+    if len(tokens) < 2:
+      raise ValueError(f"Incomplete atom selection: {selection}")
+    key, value = tokens[:2]
+    tokens = tokens[2:]
+    if key not in ("name", "chain", "resname", "resseq", "icode", "altloc") or key in fields:
+      raise ValueError(f"Unsupported selection term {key!r}: {selection}")
+    if any(char in value for char in "*?()"):
+      raise ValueError(f"Only explicit atom selections are supported: {selection}")
+    fields[key] = value
+    if tokens:
+      if tokens.pop(0).lower() != "and" or not tokens:
+        raise ValueError(f"Only AND selections are supported: {selection}")
+  if not {"name", "chain", "resseq"}.issubset(fields):
+    raise ValueError(f"Selection requires name, chain and resseq: {selection}")
+  chain, resno = fields["chain"], int(fields["resseq"])
+  matches = []
+  for spec in _all_residue_specs_for_colouring(imol):
+    ch, rn, ins = spec
+    if ch != chain or rn != resno or ("icode" in fields and ins != fields["icode"].strip()):
+      continue
+    if "resname" in fields and residue_name(imol, ch, rn, ins).strip() != fields["resname"].strip():
+      continue
+    for atom in residue_info_py(imol, ch, rn, ins) or []:
+      name, alt = atom[0][:2]
+      if name.strip() == fields["name"].strip() and ("altloc" not in fields or alt.strip() == fields["altloc"].strip()):
+        matches.append([ch, rn, ins, name, alt])
+  if len(matches) != 1:
+    raise ValueError(f"Selection matched {len(matches)} atoms (expected 1): {selection}")
+  return matches[0]
+
+
+def _phenix_link_warning(imol, a, b):
+  """Conservative coordination heuristic, not a full chemical validation."""
+  metals = set("LI NA K RB CS FR BE MG CA SR BA RA SC TI V CR MN FE CO NI CU ZN "
+               "Y ZR NB MO TC RU RH PD AG CD HF TA W RE OS IR PT AU HG AL GA IN TL "
+               "SN PB BI LA CE PR ND PM SM EU GD TB DY HO ER TM YB LU AC TH PA U NP PU AM CM BK CF ES FM MD NO LR".split())
+  elements = []
+  for spec in (a, b):
+    matches = [atom for atom in residue_info_py(imol, *spec[:3]) or []
+               if list(atom[0][:2]) == spec[3:]]
+    if len(matches) != 1:
+      raise ValueError(f"Atom is no longer uniquely available: {spec}")
+    elements.append(str(matches[0][1][2]).strip().upper())
+  first, second = elements
+  if first in metals and second in metals:
+    return f"Metal-metal link ({first}-{second})"
+  if ((first in metals and second in {"N", "O", "S"}) or
+      (second in metals and first in {"N", "O", "S"})):
+    return None
+  return f"Not a usual metal-N/O/S coordination pair ({first or '?'}-{second or '?'})"
+
+
+def _apply_phenix_metal_links(imol, prepared):
+  if not valid_model_molecule_qm(imol):
+    info_dialog("Import cancelled: the target model is no longer available.")
+    return 0
+  # Revalidate after the asynchronous review, before making any changes.
+  try:
+    for a, b, distance in prepared:
+      _phenix_link_warning(imol, a, b)
+  except (ValueError, TypeError, IndexError) as error:
+    info_dialog(f"Import cancelled; no links added.\n\n{error}")
+    return 0
+  added = 0
+  try:
+    for a, b, distance in prepared:
+      coot.make_link_py(imol, a, b, "dummy", distance)
+      added += 1
+  except Exception as error:
+    info_dialog(f"Import stopped after {added} link calls; earlier changes remain in the model.\n\n{error}")
+    return added
+  message = f"Submitted {added} Phenix links to Coot for molecule #{imol}."
+  print(message)
+  add_status_bar_text(message)
+  info_dialog(message + "\n\nAtom specifications and ideal distances were passed to make_link. "
+              "Sigmas are not imported, and no extra restraints were added. "
+              "Coot may use its built-in metal-link distances during refinement.")
+  return added
+
+
+def _review_phenix_metal_links(imol, prepared, warnings_to_review, discarded=None):
+  discarded = set() if discarded is None else discarded
+  if not warnings_to_review:
+    return _apply_phenix_metal_links(
+      imol, [link for index, link in enumerate(prepared) if index not in discarded])
+  index, warning = warnings_to_review[0]
+  a, b, distance = prepared[index]
+  def describe(spec):
+    chain, number, ins, name, alt = spec
+    return f"{chain}:{number}{ins} {name.strip()}" + (f" (alt {alt})" if alt else "")
+  def proceed(discard):
+    remaining_discarded = discarded | {index} if discard else discarded
+    _review_phenix_metal_links(imol, prepared, warnings_to_review[1:], remaining_discarded)
+  generic_confirm_dialog(
+    "Review unusual Phenix link",
+    f"Molecule #{imol}: {warning}\n\n{describe(a)} -- {describe(b)}\n"
+    f"Ideal distance: {distance:g} A\n\n"
+    "Keep this link or discard it? No links are created until review finishes. "
+    "Close this window to cancel the entire import.",
+    "Discard link", lambda: proceed(True), "Keep link", lambda: proceed(False))
+  return None
+
+
+def import_phenix_metal_edits(imol, file_name):
+  """Create Coot links from Phenix atom selections and ideal distances."""
+  try:
+    imol = int(imol)
+    if not valid_model_molecule_qm(imol):
+      raise ValueError("Choose a valid model molecule number.")
+    with open(os.path.expanduser(file_name.strip()), encoding="utf-8") as handle:
+      bonds = _parse_phenix_metal_edits(handle.read())
+    prepared, seen = [], {}
+    for bond in bonds:
+      a = _phenix_metal_atom_spec(imol, bond["atom_selection_1"])
+      b = _phenix_metal_atom_spec(imol, bond["atom_selection_2"])
+      if a == b:
+        raise ValueError("A bond cannot join an atom to itself.")
+      pair = tuple(sorted((tuple(a), tuple(b))))
+      values = bond["distance_ideal"]
+      if pair in seen:
+        if seen[pair] != values:
+          raise ValueError(f"Conflicting edits for atom pair {pair}.")
+        continue
+      seen[pair] = values
+      prepared.append((a, b, values))
+    warnings_to_review = []
+    for index, (a, b, distance) in enumerate(prepared):
+      warning = _phenix_link_warning(imol, a, b)
+      if warning:
+        warnings_to_review.append((index, warning))
+  except (OSError, ValueError, TypeError, IndexError) as error:
+    info_dialog(f"Phenix metal edits import cancelled; no links added.\n\n{error}")
+    return 0
+  return _review_phenix_metal_links(imol, prepared, warnings_to_review)
+
+
+def import_phenix_metal_edits_dialog():
+  imol = _active_molecule_or_status()
+  if imol is None:
+    return
+  initial_directory = None
+  model_path = molecule_name(imol)
+  if isinstance(model_path, str) and model_path:
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(model_path)))
+    if os.path.isdir(directory):
+      initial_directory = directory
+  generic_single_entry_with_file_browse(
+    f"Import Phenix metal edits into active molecule #{imol}", "",
+    "Choose Phenix metal edits", "Import",
+    lambda file_name: import_phenix_metal_edits(imol, file_name),
+    save_file=False,
+    initial_directory=initial_directory,
+    all_files=True,
+  )
 
 
 def add_coordination_link_menu_entries(menu, entries):
@@ -14057,6 +15126,21 @@ def _build_custom_display_menu(submenu_display):
   """Populate the Display submenu in normal Python rather than exec'd text."""
   add_simple_coot_menu_menuitem(
     submenu_display,
+    "Default model to high contrast display",
+    lambda func: default_models_to_high_contrast_display(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Default to ambient maps",
+    lambda func: default_maps_to_ambient_display(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Reset map/model defaults (restart required)",
+    lambda func: reset_map_model_defaults(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
     "All Molecules use \"C-alpha\" Symmetry",
     lambda func: [valid_model_molecule_qm(imol) and symmetry_as_calphas(imol, 1) for imol in molecule_number_list()],
   )
@@ -14089,6 +15173,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Resample/restyle current map",
     lambda func: resample_active_map_for_em_half_angstrom(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Map brightness...",
+    lambda func: show_active_map_brightness_slider(),
   )
   add_simple_coot_menu_menuitem(
     submenu_display,
@@ -14331,6 +15420,14 @@ def _build_custom_build_menu(
 
   submenu_build.append_submenu("Coordination links", submenu_coordination_links)
   add_coordination_link_menu_entries(submenu_coordination_links, COORDINATION_LINK_MENU)
+  add_simple_coot_menu_menuitem(
+    submenu_coordination_links, "Propose metal links for current residue...",
+    lambda func: auto_metal_links_current_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_coordination_links, "Import Phenix metal edits...",
+    lambda *_args: import_phenix_metal_edits_dialog(),
+  )
 
   submenu_build.append_submenu("Covalent modifications", submenu_covalent_modifications)
   add_covalent_modification_menu_entries(submenu_covalent_modifications)
@@ -14498,3 +15595,8 @@ if _coot_gui_module() is not None:
   except Exception:
     print("coot_trimmings direct menu build failed")
     traceback.print_exc()
+
+# Keep this as the final startup action in the file.  It covers settings Coot
+# may have changed while the rest of this startup script was being evaluated;
+# the GLib callbacks above then cover state restoration after script completion.
+_apply_persistent_display_defaults()
