@@ -9337,6 +9337,140 @@ def show_active_map_brightness_slider():
   return window
 
 
+def show_active_map_colour_slider():
+  """Open a non-modal hue slider that live-updates the current active map colour."""
+  import colorsys
+
+  initial_map = _scrollable_map_or_status()
+  if initial_map is None:
+    return None
+
+  window = Gtk.Window()
+  window.set_title("Map colour")
+  window.set_default_size(420, -1)
+
+  vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  vbox.set_margin_top(12)
+  vbox.set_margin_bottom(12)
+  vbox.set_margin_start(12)
+  vbox.set_margin_end(12)
+
+  map_label = Gtk.Label(label="")
+  map_label.set_halign(Gtk.Align.START)
+  value_label = Gtk.Label(label="")
+  value_label.set_width_chars(5)
+
+  slider_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+  adjustment = Gtk.Adjustment(value=0.0, lower=0.0, upper=360.0, step_increment=1.0, page_increment=15.0)
+  slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
+  slider.set_hexpand(True)
+  slider.set_draw_value(False)
+  slider.set_digits(0)
+
+  button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  button_row.set_halign(Gtk.Align.END)
+  reset_button = Gtk.Button(label="Reset colour")
+  close_button = Gtk.Button(label="Close")
+
+  state = {"map_id": None, "saturation": 1.0, "value": 1.0, "reset_colour": None, "updating": False}
+
+  def current_map():
+    map_id = scroll_wheel_map()
+    if map_id != -1 and map_id in map_molecule_list():
+      return map_id
+    map_id = imol_refinement_map()
+    if map_id != -1 and map_id in map_molecule_list():
+      return map_id
+    displayed = [imol for imol in map_molecule_list() if map_is_displayed(imol)]
+    return displayed[0] if displayed else None
+
+  def update_map_label(map_id):
+    if map_id is None:
+      map_label.set_text("No active map")
+      return
+    try:
+      name = molecule_name(map_id)
+    except Exception:
+      name = "map"
+    map_label.set_text("Active map: {} ({})".format(name, map_id))
+
+  def sync_to_map(map_id):
+    if map_id is None or map_id == state["map_id"]:
+      return
+    try:
+      colour = tuple(float(x) for x in map_colour_components_py(map_id)[:3])
+      hue, saturation, value = colorsys.rgb_to_hsv(*colour)
+    except Exception as error:
+      print("WARNING:: could not read map colour: {}".format(error))
+      return
+    state["map_id"] = map_id
+    state["saturation"] = saturation
+    state["value"] = value
+    state["reset_colour"] = colour
+    state["updating"] = True
+    slider.set_value(hue * 360.0)
+    state["updating"] = False
+    value_label.set_text("{:.0f} deg".format(hue * 360.0))
+
+  def apply_colour(scale):
+    if state["updating"]:
+      return
+    map_id = current_map()
+    update_map_label(map_id)
+    if map_id is None:
+      return
+    sync_to_map(map_id)
+    degrees = float(scale.get_value())
+    value_label.set_text("{:.0f} deg".format(degrees))
+    red, green, blue = colorsys.hsv_to_rgb(degrees / 360.0, state["saturation"], state["value"])
+    try:
+      set_map_colour(map_id, red, green, blue)
+      local_state = MAP_LOCAL_APPEARANCE_STATE.setdefault(map_id, {})
+      local_state["map_colour"] = [red, green, blue]
+    except Exception as error:
+      print("WARNING:: could not set map colour: {}".format(error))
+
+  def reset_colour(button):
+    map_id = current_map()
+    update_map_label(map_id)
+    if map_id is None:
+      return
+    sync_to_map(map_id)
+    colour = state["reset_colour"]
+    if colour is None:
+      return
+    try:
+      set_map_colour(map_id, *colour)
+      hue, saturation, value = colorsys.rgb_to_hsv(*colour)
+      state["saturation"] = saturation
+      state["value"] = value
+      state["updating"] = True
+      slider.set_value(hue * 360.0)
+      state["updating"] = False
+      value_label.set_text("{:.0f} deg".format(hue * 360.0))
+      local_state = MAP_LOCAL_APPEARANCE_STATE.setdefault(map_id, {})
+      local_state["map_colour"] = list(colour)
+    except Exception as error:
+      print("WARNING:: could not reset map colour: {}".format(error))
+
+  slider.connect("value-changed", apply_colour)
+  reset_button.connect("clicked", reset_colour)
+  close_button.connect("clicked", lambda button: window.close())
+
+  slider_row.append(slider)
+  slider_row.append(value_label)
+  button_row.append(reset_button)
+  button_row.append(close_button)
+  vbox.append(map_label)
+  vbox.append(slider_row)
+  vbox.append(button_row)
+  window.set_child(vbox)
+  update_map_label(initial_map)
+  sync_to_map(initial_map)
+  window.present()
+  return window
+
+
 def _restyle_active_map_without_resampling(map_id, contour_level_sigma, status_message):
   style_resampled_em_map(map_id)
   if isinstance(contour_level_sigma, (int, float)):
@@ -15178,6 +15312,11 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Map brightness...",
     lambda func: show_active_map_brightness_slider(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Map colour...",
+    lambda func: show_active_map_colour_slider(),
   )
   add_simple_coot_menu_menuitem(
     submenu_display,
