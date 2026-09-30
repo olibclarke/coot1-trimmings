@@ -14379,6 +14379,62 @@ def _start_coordination_link_clicks(label, metal_codes, metal_label, donor_eleme
   return 1
 
 
+def make_custom_link():
+  """Pick any two atoms in one model, then enter the target link distance."""
+  add_status_bar_text("Make custom link: click two atoms")
+
+  def picked(*args):
+    if len(args) < 2:
+      info_dialog("Make custom link did not receive two atom picks.")
+      return 0
+
+    click_1, click_2 = args[0], args[1]
+    imol_1 = _click_spec_imol(click_1)
+    imol_2 = _click_spec_imol(click_2)
+    if imol_1 == -1 or imol_2 == -1 or imol_1 != imol_2:
+      info_dialog("Make custom link requires two atoms in the same model molecule.")
+      return 0
+
+    atom_1 = _click_spec_to_link_spec(click_1)
+    atom_2 = _click_spec_to_link_spec(click_2)
+    summary_1 = _click_spec_summary(click_1)
+    summary_2 = _click_spec_summary(click_2)
+
+    def submit_distance(value):
+      try:
+        distance = float(str(value).strip())
+      except Exception:
+        info_dialog("Custom link distance must be numeric.")
+        return 0
+      if distance <= 0:
+        info_dialog("Custom link distance must be positive.")
+        return 0
+      try:
+        coot.make_link_py(imol_1, atom_1, atom_2, "dummy", distance)
+      except Exception as error:
+        info_dialog(f"Could not create custom link.\n\n{error}")
+        return 0
+      add_status_bar_text(
+        f"Custom link: {_click_spec_summary(click_1)} - {_click_spec_summary(click_2)} ({distance:.3f} A)"
+      )
+      return 1
+
+    generic_single_entry(
+      f"Custom link target distance (A)\n{summary_1}  -  {summary_2}",
+      "2.000",
+      "Make link",
+      submit_distance,
+    )
+    return 1
+
+  try:
+    coot.user_defined_click_py(2, picked)
+  except Exception as error:
+    info_dialog(f"Could not start custom-link atom picking.\n\n{error}")
+    return 0
+  return 1
+
+
 def _make_coordination_link(label, metal_codes, metal_label, donor_elements, donor_label, distance, range_text=""):
   """Prompt for a target distance, then start the two-click link helper."""
   def submit_distance(value):
@@ -15559,6 +15615,10 @@ def _build_custom_build_menu(
 
   submenu_build.append_submenu("Coordination links", submenu_coordination_links)
   add_coordination_link_menu_entries(submenu_coordination_links, COORDINATION_LINK_MENU)
+  add_simple_coot_menu_menuitem(
+    submenu_coordination_links, "Make custom link...",
+    lambda *_args: make_custom_link(),
+  )
   add_simple_coot_menu_menuitem(
     submenu_coordination_links, "Propose metal links for current residue...",
     lambda func: auto_metal_links_current_residue(),
