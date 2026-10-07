@@ -11864,21 +11864,26 @@ def shift_register_clicked_range():
   coot.user_defined_click_py(1, first_clicked)
 
 
-def _register_comparison_targets(records, centre, sequence, origin, shift_window=5):
+def _register_comparison_targets(records, centre, sequence, origin, shift_window=5, fragment_size=9):
   sequence = _register_clean_sequence(sequence)
   origin = int(origin)
   shift_window = int(shift_window)
   if shift_window < 0:
     raise ValueError("Shift window must be a non-negative integer.")
-  start, end = centre-4, centre+4
+  fragment_size = int(fragment_size)
+  if fragment_size < 1:
+    raise ValueError("Fragment size must be a positive integer.")
+  # Even lengths place the extra residue on the C-terminal side.
+  start = centre-(fragment_size-1)//2
+  end = start+fragment_size-1
   selected = [r for r in records if start <= r["number"] <= end]
   if [r["number"] for r in selected] != list(range(start, end+1)):
-    raise ValueError("The centre needs four consecutive residues on either side, without insertion codes.")
+    raise ValueError(f"The fragment needs consecutive residues {start}-{end}, without insertion codes.")
   if any(r["ins"] or r["name"] not in _REGISTER_PROTEIN_NAMES or
          set(r["backbone"]) != {"N", "CA", "C", "O"} for r in selected):
-    raise ValueError("The nine-residue region must have complete protein backbone atoms and no insertion codes.")
+    raise ValueError("The fragment must have complete protein backbone atoms and no insertion codes.")
   if any(not _register_connected(a, b) for a, b in zip(selected, selected[1:])):
-    raise ValueError("The nine-residue region crosses a backbone break.")
+    raise ValueError("The fragment crosses a backbone break.")
   if start-shift_window < origin or end+shift_window >= origin+len(sequence):
     raise ValueError(f"The reference sequence must cover residues {start-shift_window}-{end+shift_window}.")
   targets = []
@@ -12004,8 +12009,8 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
       score = float(item[1])
       if math.isfinite(score) and list(spec) in specs:
         scores[tuple(spec)] = score
-    if len(scores) != 9:
-      raise RuntimeError(f"Only {len(scores)}/9 residues could be scored; candidate excluded.")
+    if len(scores) != len(specs):
+      raise RuntimeError(f"Only {len(scores)}/{len(specs)} residues could be scored; candidate excluded.")
     try:
       sidechain = _register_sidechain_correlation(fragment, specs, target, map_id)
     except Exception as error:
@@ -12016,7 +12021,7 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
       rows = [(list(spec), _density_fit_score_to_colour_index(score)) for spec, score in scores.items()]
       coloured = bool(_apply_direct_user_defined_residue_colours(fragment, [], rows))
     return {"model": fragment, "offset": offset, "sequence": target,
-            "mean": sum(scores.values())/9, "minimum": min(scores.values()), "coloured": coloured,
+            "mean": sum(scores.values())/len(scores), "minimum": min(scores.values()), "coloured": coloured,
             "sidechain": sidechain}
   except Exception:
     coot.close_molecule(fragment)
@@ -12061,6 +12066,12 @@ def compare_local_sequence_registers():
     info_dialog(str(error))
     return
   centre_name = next((r["name"] for r in records if r["number"] == centre and r["ins"] == ins), "")
+  needs_sequence_input = not sequence or origin is None or message.startswith("Model-derived")
+  if not needs_sequence_input:
+    try:
+      _register_comparison_targets(records, centre, sequence, origin, 5, 9)
+    except (ValueError, TypeError):
+      needs_sequence_input = True
   centre_label = f"{chain}:{centre} {centre_name}".strip()
   window = Gtk.Window(title=f"Compare registers: #{source} | Centre {centre_label}")
   window.set_default_size(650, 480)
@@ -12072,12 +12083,13 @@ def compare_local_sequence_registers():
   label.set_xalign(0)
   box.append(label)
   row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-  row.append(Gtk.Label(label="Sequence start"))
+  origin_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  origin_row.append(Gtk.Label(label="Sequence start"))
   origin_entry = Gtk.Entry()
   origin_entry.set_width_chars(7)
   origin_entry.set_max_width_chars(9)
   origin_entry.set_text(str(origin) if origin is not None else "")
-  row.append(origin_entry)
+  origin_row.append(origin_entry)
   row.append(Gtk.Label(label="Shift +/-"))
   shift_entry = Gtk.Entry()
   shift_entry.set_width_chars(3)
@@ -12088,8 +12100,18 @@ def compare_local_sequence_registers():
   generate = Gtk.Button(label="Generate")
   row.append(generate)
   box.append(row)
-  reference = Gtk.Expander(label="Reference sequence (verify/edit)")
-  reference.set_expanded(not bool(sequence))
+  size_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  size_row.append(Gtk.Label(label="Fragment size"))
+  size_entry = Gtk.Entry()
+  size_entry.set_width_chars(3)
+  size_entry.set_max_width_chars(5)
+  size_entry.set_text("9")
+  size_entry.set_tooltip_text("Consecutive residues centred on the active residue. Even lengths extend one extra residue towards the C terminus.")
+  size_row.append(size_entry)
+  box.append(size_row)
+  reference = Gtk.Expander(label="Reference sequence needs verification")
+  reference.set_visible(needs_sequence_input)
+  reference.set_expanded(needs_sequence_input)
   sequence_view = Gtk.TextView()
   sequence_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
   sequence_view.get_buffer().set_text(sequence)
@@ -12097,7 +12119,10 @@ def compare_local_sequence_registers():
   sequence_scroll = Gtk.ScrolledWindow()
   sequence_scroll.set_min_content_height(70)
   sequence_scroll.set_child(sequence_view)
-  reference.set_child(sequence_scroll)
+  sequence_controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  sequence_controls.append(origin_row)
+  sequence_controls.append(sequence_scroll)
+  reference.set_child(sequence_controls)
   box.append(reference)
   rigid_fit_option = Gtk.CheckButton(label="Rigid fit before refinement")
   rigid_fit_available = callable(getattr(coot, "rigid_body_refine_by_atom_selection", None))
@@ -12239,7 +12264,9 @@ def compare_local_sequence_registers():
       return False
     progress.set_text(f"Built {state['index']}/{total}; next shift {state['targets'][state['index']][0]:+d}")
     return True
-  def begin(*_args):
+  def begin(*_args, confirmed_size=None):
+    if state["closed"] or state["idle"] is not None:
+      return
     try:
       if map_id not in map_molecule_list():
         raise ValueError("The selected refinement map is no longer available.")
@@ -12249,10 +12276,33 @@ def compare_local_sequence_registers():
       buffer = sequence_view.get_buffer()
       reference_sequence = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
       snapshot = _register_chain_snapshot(source, chain)
-      start, end, targets = _register_comparison_targets(
-        snapshot, centre, reference_sequence, origin_entry.get_text(), shift_entry.get_text())
+      try:
+        start, end, targets = _register_comparison_targets(
+          snapshot, centre, reference_sequence, origin_entry.get_text(), shift_entry.get_text(), size_entry.get_text())
+      except (ValueError, TypeError):
+        reference.set_visible(True)
+        reference.set_expanded(True)
+        raise
     except (ValueError, TypeError) as error:
       progress.set_text(str(error))
+      return
+    fragment_size = end-start+1
+    if fragment_size > 12 and confirmed_size != fragment_size:
+      generate.set_sensitive(False)
+      def cancel_generation():
+        if not state["closed"]:
+          generate.set_sensitive(True)
+      def confirm_generation():
+        if not state["closed"]:
+          generate.set_sensitive(True)
+          begin(confirmed_size=fragment_size)
+      generic_confirm_dialog(
+        "Generate large register fragments?",
+        f"Fit {len(targets)} fragments of {fragment_size} residues each?\n"
+        "Fragments longer than 12 residues may take a while to fit and refine.",
+        "Cancel", cancel_generation, "Generate", confirm_generation,
+        handle_close_function=cancel_generation,
+      )
       return
     state.update(start=start, end=end, targets=targets, snapshot=snapshot,
                  rigid_fit=rigid_fit_available and bool(rigid_fit_option.get_active()))
@@ -12262,6 +12312,8 @@ def compare_local_sequence_registers():
     generate.set_sensitive(False)
     origin_entry.set_sensitive(False)
     shift_entry.set_sensitive(False)
+    size_entry.set_sensitive(False)
+    label.set_text(f"Centre: {centre_label} | Model #{source}\nRegion {chain}:{start}-{end} | Map #{map_id}")
     sequence_view.set_editable(False)
     rigid_fit_option.set_sensitive(False)
     progress.set_text(f"Building register {targets[0][0]:+d}...")
