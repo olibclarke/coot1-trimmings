@@ -11400,6 +11400,464 @@ def delete_sidechain_range(mol_id, ch_id, res_start, res_end):
   for resno in range(res_start, res_end + 1):
     coot.delete_residue_sidechain(mol_id, ch_id, resno, "", 0)
 
+# Sequence-register editing groups native backups and preserves rotamer settings.
+_REGISTER_AA = dict(zip("ARNDCQEGHILKMFPSTWYV", (
+  "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+  "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL")))
+_REGISTER_PROTEIN_NAMES = set(_REGISTER_AA.values()) | {"MSE", "UNK"}
+
+
+def _register_clean_sequence(text):
+  lines = str(text).strip().splitlines()
+  if sum(line.lstrip().startswith(">") for line in lines) > 1:
+    raise ValueError("Supply one sequence, not multiple FASTA records.")
+  sequence = "".join("".join(line.split()) for line in lines if not line.lstrip().startswith(">")).upper()
+  if not sequence or set(sequence) - (set(_REGISTER_AA) | {"X"}):
+    raise ValueError("Use a protein sequence or single FASTA record. Gaps, stop symbols and nonstandard letters are unsupported; X is allowed outside the target region.")
+  return sequence
+
+
+def _register_chain_snapshot(mol_id, chain_id):
+  if not valid_model_molecule_qm(mol_id):
+    raise ValueError("The target model is no longer available.")
+  if coot.n_models(mol_id) != 1:
+    raise ValueError("Register shifting currently requires a single-model molecule.")
+  records = []
+  for ch, number, ins in _all_residue_specs_for_colouring(mol_id):
+    if ch != chain_id:
+      continue
+    atoms = coot.residue_info_py(mol_id, ch, number, ins) or []
+    signature = tuple(sorted((a[0][0], a[0][1], tuple(float(x) for x in a[2]), repr(a[1])) for a in atoms))
+    alternatives = sorted({a[0][1] for a in atoms if a[0][1]})
+    preferred = max(alternatives, key=lambda alt: sum(float(a[1][0]) for a in atoms if a[0][1] == alt) /
+                    sum(a[0][1] == alt for a in atoms)) if alternatives else ""
+    shared = {a[0][0] for a in atoms if not a[0][1]}
+    backbone = {a[0][0].strip(): tuple(float(x) for x in a[2]) for a in atoms
+                if a[0][0].strip() in {"N", "CA", "C", "O"} and
+                (not a[0][1] or (a[0][1] == preferred and a[0][0] not in shared))}
+    records.append({"number": number, "ins": ins, "name": residue_name(mol_id, ch, number, ins).strip(),
+                    "alt": any(bool(a[0][1]) for a in atoms), "backbone": backbone, "atoms": signature})
+  return sorted(records, key=lambda r: (r["number"], r["ins"]))
+
+
+def _register_connected(left, right):
+  if (left["name"] not in _REGISTER_PROTEIN_NAMES or right["name"] not in _REGISTER_PROTEIN_NAMES
+      or left["ins"] or right["ins"] or right["number"] != left["number"] + 1):
+    return False
+  carbon, nitrogen = left["backbone"].get("C"), right["backbone"].get("N")
+  return carbon is not None and nitrogen is not None and sum((a-b)**2 for a, b in zip(carbon, nitrogen)) <= 2.2**2
+
+
+def _register_plan(records, start, end, offset, sequence, sequence_start):
+  """Pure preflight: trim only the nearest neighbour's overlapping terminus."""
+  start, end = sorted((int(start), int(end)))
+  offset, sequence_start = int(offset), int(sequence_start)
+  if not offset:
+    raise ValueError("Enter a nonzero register shift; +2 means residue 100 becomes 102.")
+  sequence = _register_clean_sequence(sequence)
+  selected = [r for r in records if start <= r["number"] <= end]
+  if [r["number"] for r in selected] != list(range(start, end+1)):
+    raise ValueError("The selected range must have unique consecutive residue numbers, with no missing residues or insertion codes.")
+  for r in selected:
+    if r["ins"] or r["name"] not in _REGISTER_PROTEIN_NAMES or set(r["backbone"]) != {"N", "CA", "C", "O"}:
+      raise ValueError("The selected range requires protein residues with complete N/CA/C/O atoms and no insertion codes.")
+  if any(not _register_connected(a, b) for a, b in zip(selected, selected[1:])):
+    raise ValueError("The selected range crosses a backbone break. Select a single connected region.")
+  first, last = start+offset, end+offset
+  if first < sequence_start or last >= sequence_start+len(sequence):
+    raise ValueError("The shifted region is outside the supplied sequence numbering. Check the sequence's first residue number.")
+  target = sequence[first-sequence_start:last-sequence_start+1]
+  if set(target) - set(_REGISTER_AA):
+    raise ValueError("The target region contains X; specify those residue identities before shifting.")
+  outsiders = [r for r in records if not start <= r["number"] <= end]
+  trim = [r for r in outsiders if first <= r["number"] <= last]
+  if trim:
+    side = [r for r in records if r["number"] > end] if offset > 0 else [r for r in records if r["number"] < start]
+    if offset < 0:
+      side = list(reversed(side))
+    neighbour = []
+    for r in side:
+      if neighbour:
+        a, b = (neighbour[-1], r) if offset > 0 else (r, neighbour[-1])
+        if not _register_connected(a, b):
+          break
+      neighbour.append(r)
+    trimmed_numbers = {(r["number"], r["ins"]) for r in trim}
+    prefix = neighbour[:len(trim)]
+    if trimmed_numbers != {(r["number"], r["ins"]) for r in prefix}:
+      raise ValueError("The shift collides with more than the adjacent region's terminus.")
+    if len(trim) >= len(neighbour):
+      raise ValueError("The shift would delete the entire neighbouring region. Use a smaller shift or handle that region separately.")
+    if any(r["ins"] or r["name"] not in _REGISTER_PROTEIN_NAMES for r in trim):
+      raise ValueError("Overlaps involving ligands or insertion codes cannot be trimmed automatically.")
+  remaining = [r for r in outsiders if r not in trim]
+  if any((r["number"] < start and r["number"] >= first) or
+         (r["number"] > end and r["number"] <= last) for r in remaining):
+    raise ValueError("The shift would move the region past another residue or fragment.")
+  changes = []
+  for r, letter in zip(selected, target):
+    new_name = _REGISTER_AA[letter]
+    equivalent = r["name"] == new_name or (r["name"] == "MSE" and new_name == "MET")
+    changes.append((r["number"], r["number"]+offset, r["name"], r["name"] if equivalent else new_name, not equivalent or r["alt"]))
+  return {"start": start, "end": end, "offset": offset, "target": target,
+          "sequence": sequence, "sequence_start": sequence_start, "trim": trim, "changes": changes,
+          "snapshot": records, "selected": selected}
+
+
+def _register_preview_text(plan, map_id):
+  reverse = {value: key for key, value in _REGISTER_AA.items()}
+  old = "".join(reverse.get(r["name"], "M" if r["name"] == "MSE" else "X") for r in plan["selected"])
+  first, last = plan["start"]+plan["offset"], plan["end"]+plan["offset"]
+  changed = sum(c[4] for c in plan["changes"])
+  text = [f"{plan['start']}-{plan['end']}  ->  {first}-{last}    ({plan['offset']:+d})", "",
+          f"Before  {old}",
+          f"After   {plan['target']}", "",
+          f"Rebuild/fit: {changed} of {len(plan['selected'])} residues | Map #{map_id}",
+          "Delete: " + (", ".join(f"{r['number']} {r['name']}" for r in plan["trim"]) or "none"),
+          "", "Current rotamer/backrub settings apply.",
+          "Vacated positions stay gaps. One Undo restores the whole shift."]
+  collapsed = [str(r["number"]) for r in plan["selected"] if r["alt"]]
+  if collapsed:
+    text.insert(7, "Altlocs -> single rotamer: " + ", ".join(collapsed))
+  return "\n".join(text)
+
+
+def _register_collapse_alternates(mol_id, chain_id, number):
+  atoms = coot.residue_info_py(mol_id, chain_id, number, "") or []
+  alternatives = sorted({a[0][1] for a in atoms if a[0][1]})
+  if not alternatives:
+    return
+  preferred = max(alternatives, key=lambda alt: sum(float(a[1][0]) for a in atoms if a[0][1] == alt) /
+                  sum(a[0][1] == alt for a in atoms))
+  shared = {a[0][0] for a in atoms if not a[0][1]}
+  occupancy = {}
+  for atom in atoms:
+    occupancy[atom[0][0]] = occupancy.get(atom[0][0], 0.0) + float(atom[1][0])
+  for atom in atoms:
+    name, alt = atom[0]
+    if alt and (alt != preferred or name in shared):
+      coot.delete_atom(mol_id, chain_id, number, "", name, alt)
+  for atom in atoms:
+    name, alt = atom[0]
+    if alt == preferred and name not in shared:
+      # Native implementations can return 0 even after successfully editing.
+      coot.set_atom_string_attribute(mol_id, chain_id, number, "", name, alt, "alt-conf", "")
+      updated = coot.residue_info_py(mol_id, chain_id, number, "") or []
+      if not any(a[0][0] == name and not a[0][1] for a in updated) or any(
+          a[0][0] == name and a[0][1] == alt for a in updated):
+        raise RuntimeError(f"Could not clear alternate identifier for {number}:{name}.")
+      coot.set_atom_attribute(mol_id, chain_id, number, "", name, "", "occ", min(1.0, occupancy[name]))
+  remaining = coot.residue_info_py(mol_id, chain_id, number, "") or []
+  if any(a[0][1] for a in remaining) or len({a[0][0] for a in remaining}) != len(remaining):
+    raise RuntimeError(f"Could not safely collapse alternate conformers for residue {number}.")
+
+
+def _apply_register_shift(mol_id, chain_id, plan, map_id, anchor_number=None):
+  global NAVIGATION_LAST_RESIDUE
+  try:
+    if _register_chain_snapshot(mol_id, chain_id) != plan["snapshot"]:
+      raise ValueError("The chain changed after preview. Preview again before applying.")
+    if map_id not in map_molecule_list():
+      raise ValueError("The selected refinement map is no longer available.")
+    if coot.backup_state(mol_id) != 1:
+      raise ValueError("Enable Coot backups for this molecule before shifting its register.")
+  except (ValueError, TypeError) as error:
+    info_dialog(str(error))
+    return False
+  failed_fits = []
+  stage = "backup preparation"
+  try:
+    # One native history entry covers trimming, renumbering and sidechain edits.
+    coot.make_backup(mol_id)
+    coot.turn_off_backup(mol_id)
+    stage = "trimming"
+    for r in plan["trim"]:
+      coot.delete_residue(mol_id, chain_id, r["number"], r["ins"])
+      if coot.residue_info_py(mol_id, chain_id, r["number"], r["ins"]):
+        raise RuntimeError(f"Coot could not delete overlapping residue {r['number']}.")
+    stage = "renumbering"
+    if not coot.renumber_residue_range(mol_id, chain_id, plan["start"], plan["end"], plan["offset"]):
+      raise RuntimeError("Coot rejected renumbering.")
+    stage = "mutation/autofitting"
+    for old_no, new_no, old_name, new_name, changed in plan["changes"]:
+      if changed:
+        _register_collapse_alternates(mol_id, chain_id, new_no)
+        if not coot.mutate(mol_id, chain_id, new_no, "", new_name):
+          raise RuntimeError(f"Coot could not mutate residue {new_no} to {new_name}.")
+        if new_name not in {"ALA", "GLY"}:
+          score = coot.auto_fit_best_rotamer(mol_id, chain_id, new_no, "", "", map_id, 1, 0.3)
+          if not isinstance(score, (int, float)) or not math.isfinite(score) or score <= -999:
+            failed_fits.append(new_no)
+  except Exception as error:
+    NAVIGATION_LAST_RESIDUE = None
+    info_dialog(f"Register shift stopped during {stage}. Earlier edits remain; use Coot Undo to recover.\n\n{error}")
+    return False
+  finally:
+    coot.turn_on_backup(mol_id)
+  NAVIGATION_LAST_RESIDUE = None
+  destination = (anchor_number if anchor_number is not None and plan["start"] <= anchor_number <= plan["end"] else plan["start"]) + plan["offset"]
+  coot.set_go_to_atom_molecule(mol_id)
+  coot.set_go_to_atom_chain_residue_atom_name_full(chain_id, destination, "", " CA ", "")
+  message = f"Shifted {chain_id}:{plan['start']}-{plan['end']} by {plan['offset']:+d}; trimmed {len(plan['trim'])}, mutated {sum(c[4] for c in plan['changes'])}."
+  print(message)
+  add_status_bar_text(_navigation_status_bar_label(mol_id, chain_id, destination, "") + " | " + message)
+  if failed_fits:
+    info_dialog(message + "\n\nRotamer fitting could not complete for: " + ", ".join(map(str, failed_fits)))
+  return True
+
+
+def _register_sequence_origin(records, sequence):
+  """Infer a numbering offset only from a strong, unique identity match."""
+  sequence = _register_clean_sequence(sequence)
+  reverse = {value: key for key, value in _REGISTER_AA.items()}
+  reverse["MSE"] = "M"
+  known = [(r["number"], reverse[r["name"]]) for r in records
+           if not r["ins"] and r["name"] in reverse]
+  if len(known) < 3:
+    return None
+  candidates = set()
+  for triple in zip(known, known[1:], known[2:]):
+    if triple[2][0] != triple[0][0] + 2 or triple[1][0] != triple[0][0] + 1:
+      continue
+    motif = "".join(letter for _, letter in triple)
+    position = sequence.find(motif)
+    while position >= 0:
+      candidates.add(triple[0][0] - position)
+      position = sequence.find(motif, position + 1)
+  scores = [(sum(0 <= number-origin < len(sequence) and sequence[number-origin] == letter
+                 for number, letter in known), origin) for origin in candidates]
+  scores.sort(reverse=True)
+  if not scores or scores[0][0] < max(3, 0.8 * len(known)):
+    return None
+  if len(scores) > 1 and scores[0][0] == scores[1][0]:
+    return None
+  return scores[0][1]
+
+
+def _register_reference_sequence(mol_id, chain_id, records):
+  """Prefer reference sequence; coordinates are a last-resort, numbered fallback."""
+  getter = getattr(coot, "sequence_info_py", None)
+  if callable(getter):
+    associated = [item[1] for item in getter(mol_id) or [] if len(item) == 2 and item[0] == chain_id]
+    if len(associated) == 1 and associated[0]:
+      return _register_clean_sequence(associated[0]), "Chain-associated reference sequence loaded."
+  path = _annotation_source_path(mol_id)
+  if path:
+    names = []
+    with open(path, encoding="utf-8", errors="replace") as handle:
+      for line in handle:
+        if line.startswith("SEQRES") and line[11:12].strip() == chain_id:
+          names.extend(line[19:70].split())
+    if names:
+      reverse = {value: key for key, value in _REGISTER_AA.items()}
+      reverse["MSE"] = "M"
+      return "".join(reverse.get(name, "X") for name in names), "PDB SEQRES reference sequence loaded."
+  reverse = {value: key for key, value in _REGISTER_AA.items()}
+  reverse["MSE"] = "M"
+  numbered = {r["number"]: reverse[r["name"]] for r in records
+              if not r["ins"] and r["name"] in reverse}
+  if numbered and max(numbered)-min(numbered) < 100000:
+    return "".join(numbered.get(i, "X") for i in range(min(numbered), max(numbered)+1)), (
+      "Model-derived sequence loaded (not an independent reference). Missing positions are X; paste a reference if existing identities are wrong.")
+  return "", "Paste the reference sequence or a single FASTA record."
+
+
+def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, selection_cleanup=None):
+  required = ("n_models", "residue_info_py", "renumber_residue_range", "delete_residue", "mutate",
+              "auto_fit_best_rotamer", "backup_state", "make_backup", "turn_off_backup", "turn_on_backup",
+              "delete_atom", "set_atom_string_attribute",
+              "set_atom_attribute", "set_go_to_atom_molecule",
+              "set_go_to_atom_chain_residue_atom_name_full")
+  missing = [name for name in required if not callable(getattr(coot, name, None))]
+  if missing or globals().get("Gtk") is None:
+    if selection_cleanup:
+      selection_cleanup()
+    info_dialog("Register shift is unavailable in this build. " + ", ".join(missing))
+    return
+  records = _register_chain_snapshot(mol_id, chain_id)
+  default_sequence, sequence_message = _register_reference_sequence(mol_id, chain_id, records)
+  origin = None
+  if default_sequence:
+    try:
+      origin = _register_sequence_origin(records, default_sequence)
+      if sequence_message.startswith("Model-derived"):
+        origin = min(r["number"] for r in records if not r["ins"] and r["name"] in _REGISTER_PROTEIN_NAMES - {"UNK"})
+    except (ValueError, TypeError):
+      pass
+  window = Gtk.Window()
+  def close_dialog(*_args):
+    if selection_cleanup:
+      selection_cleanup()
+    window.destroy()
+  def closing(*_args):
+    if selection_cleanup:
+      selection_cleanup()
+    return False
+  window.connect("close-request", closing)
+  window.set_title(f"Shift register: molecule #{mol_id}, {chain_id}:{start}-{end}")
+  window.set_default_size(620, 440)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + side)(12)
+  source = ("PDB SEQRES" if sequence_message.startswith("PDB") else
+            "Model-derived (verify identities)" if sequence_message.startswith("Model-derived") else
+            "Associated sequence" if default_sequence else "Reference sequence required")
+  note = Gtk.Label(label=source + (" | Start inferred: verify" if origin is not None else " | Enter sequence start"))
+  note.set_tooltip_text(sequence_message + "\nPositive shift: 100 + 2 becomes 102.")
+  note.set_wrap(True)
+  note.set_xalign(0)
+  box.append(note)
+  entries = []
+  for label, value in (("Shift (+/-)", "1"), ("Sequence starts at", str(origin) if origin is not None else "")):
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.append(Gtk.Label(label=label))
+    entry = Gtk.Entry()
+    entry.set_text(value)
+    row.append(entry)
+    entries.append(entry)
+    box.append(row)
+  sequence_view = Gtk.TextView()
+  sequence_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+  sequence_view.get_buffer().set_text(default_sequence)
+  sequence_scroll = Gtk.ScrolledWindow()
+  sequence_scroll.set_min_content_height(110)
+  sequence_scroll.set_child(sequence_view)
+  reference = Gtk.Expander(label="Reference sequence (edit)")
+  reference.set_expanded(not bool(default_sequence))
+  reference.set_child(sequence_scroll)
+  box.append(reference)
+  detail = Gtk.TextView()
+  detail.set_editable(False)
+  detail.set_monospace(True)
+  detail.set_wrap_mode(Gtk.WrapMode.NONE)
+  detail_scroll = Gtk.ScrolledWindow()
+  detail_scroll.set_vexpand(True)
+  detail_scroll.set_child(detail)
+  box.append(detail_scroll)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  apply_button = Gtk.Button(label="Apply register shift")
+  apply_button.set_sensitive(False)
+  state = {}
+  def invalidate(*_args):
+    state.clear()
+    apply_button.set_sensitive(False)
+    detail.get_buffer().set_text("Preview required after changing sequence or numbering.")
+  for entry in entries:
+    entry.connect("changed", invalidate)
+  sequence_view.get_buffer().connect("changed", invalidate)
+  def preview(*_args):
+    invalidate()
+    try:
+      buffer = sequence_view.get_buffer()
+      sequence = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+      plan = _register_plan(_register_chain_snapshot(mol_id, chain_id), start, end,
+                            int(entries[0].get_text()), sequence, int(entries[1].get_text()))
+      map_id = imol_refinement_map()
+      if map_id not in map_molecule_list():
+        raise ValueError("Select a refinement map in Coot before previewing.")
+      state.update(plan=plan, map_id=map_id)
+      detail.get_buffer().set_text(_register_preview_text(plan, map_id))
+      apply_button.set_sensitive(True)
+    except (ValueError, TypeError) as error:
+      detail.get_buffer().set_text(str(error))
+  def apply(*_args):
+    if state and _apply_register_shift(mol_id, chain_id, state["plan"], state["map_id"], anchor_number):
+      close_dialog()
+    else:
+      invalidate()
+  for label, action in (("Cancel", close_dialog), ("Preview", preview)):
+    button = Gtk.Button(label=label)
+    button.connect("clicked", action)
+    buttons.append(button)
+  apply_button.connect("clicked", apply)
+  buttons.append(apply_button)
+  box.append(buttons)
+  window.set_child(box)
+  window.present()
+
+
+def shift_register_active_segment():
+  active = _active_residue_or_status()
+  if not active:
+    return
+  mol_id, chain_id, number, ins = active[:4]
+  try:
+    records = _register_chain_snapshot(mol_id, chain_id)
+    index = next(i for i, r in enumerate(records) if r["number"] == number and r["ins"] == ins)
+    left = right = index
+    while left > 0 and _register_connected(records[left-1], records[left]):
+      left -= 1
+    while right+1 < len(records) and _register_connected(records[right], records[right+1]):
+      right += 1
+    _register_shift_dialog(mol_id, chain_id, records[left]["number"], records[right]["number"], number)
+  except (ValueError, StopIteration) as error:
+    info_dialog(f"Cannot select the active segment.\n\n{error}")
+
+
+_REGISTER_SELECTION_MARKERS = []
+
+
+def _clear_register_selection_markers():
+  while _REGISTER_SELECTION_MARKERS:
+    obj = _REGISTER_SELECTION_MARKERS.pop()
+    try:
+      coot.close_generic_object(obj)
+    except Exception as error:
+      print("Could not clear register endpoint marker:", error)
+
+
+def _mark_register_endpoint(spec, colour):
+  required = ("new_generic_object_number", "to_generic_object_add_point",
+              "set_display_generic_object", "close_generic_object")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    return
+  atoms = coot.residue_info_py(_click_spec_imol(spec), _click_spec_chain_id(spec),
+                               _click_spec_res_no(spec), _click_spec_ins_code(spec)) or []
+  candidates = [a for a in atoms if a[0][0].strip() == "CA"]
+  if not candidates:
+    return
+  atom = max(candidates, key=lambda a: (not bool(a[0][1]), float(a[1][0])))
+  obj = coot.new_generic_object_number("Register range endpoint")
+  _REGISTER_SELECTION_MARKERS.append(obj)
+  try:
+    coot.to_generic_object_add_point(obj, colour, 8, *atom[2])
+    coot.set_display_generic_object(obj, 1)
+  except Exception as error:
+    print("Could not draw register endpoint marker:", error)
+    _clear_register_selection_markers()
+
+
+def shift_register_clicked_range():
+  _clear_register_selection_markers()
+  def show_click(spec, prompt):
+    add_status_bar_text(_navigation_status_bar_label(
+      _click_spec_imol(spec), _click_spec_chain_id(spec),
+      _click_spec_res_no(spec), _click_spec_ins_code(spec)).replace("Current residue:", "Clicked residue:", 1) + " | " + prompt)
+  def clicked(first, last):
+    show_click(last, "Range selected")
+    _mark_register_endpoint(last, "orange")
+    if _click_spec_ins_code(first) or _click_spec_ins_code(last):
+      _clear_register_selection_markers()
+      info_dialog("Insertion-code endpoints are unsupported for register shifting.")
+      return
+    region = _clicked_same_chain_residue_range(first, last)
+    if region:
+      try:
+        _register_shift_dialog(*region, anchor_number=_click_spec_res_no(first),
+                               selection_cleanup=_clear_register_selection_markers)
+      except Exception:
+        _clear_register_selection_markers()
+        raise
+    else:
+      _clear_register_selection_markers()
+  def first_clicked(first):
+    show_click(first, "Start selected; click the end residue")
+    _mark_register_endpoint(first, "cyan")
+    coot.user_defined_click_py(1, lambda last: clicked(first, last))
+  add_status_bar_text("Shift register: click the start residue.")
+  coot.user_defined_click_py(1, first_clicked)
+
+
 #Mutate range to poly-unk
 def mutate_residue_range_by_click_a():
   def mutate_residue_range_by_click_b(res1,res2):
@@ -15649,6 +16107,14 @@ def _build_custom_build_menu(
 
 
 def _build_custom_mutate_menu(submenu_mutate):
+  add_simple_coot_menu_menuitem(
+    submenu_mutate, "Shift sequence register of active segment...",
+    lambda func: shift_register_active_segment(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_mutate, "Shift sequence register (click start and end)...",
+    lambda func: shift_register_clicked_range(),
+  )
   add_simple_coot_menu_menuitem(
     submenu_mutate,
     "Mutate range to UNK (click start and end)",
