@@ -6692,15 +6692,16 @@ def _annotation_jump_to_group(mol_id, group):
   return 1
 
 
-def _annotation_groups_near_point(mol_id, point_xyz, radius):
+def _annotation_groups_near_point(mol_id, point_xyz, radius, groups=None, positions=None):
   nearby_groups = []
   try:
     radius_sq = float(radius) * float(radius)
   except Exception:
     return nearby_groups
-  for group in _annotation_groups_for_molecule(mol_id):
+  for group in (_annotation_groups_for_molecule(mol_id) if groups is None else groups):
     chain_id, resno, ins_code, _residue_name_here = group["key"]
-    residue_point = residue_centre_py(mol_id, chain_id, resno, ins_code)
+    residue_point = (residue_centre_py(mol_id, chain_id, resno, ins_code) if positions is None
+                     else positions.get((chain_id, resno, ins_code)))
     if not isinstance(residue_point, (list, tuple)) or len(residue_point) != 3:
       continue
     distance_sq = _distance_sq(point_xyz, residue_point)
@@ -7304,6 +7305,9 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       self.timer_id = None
       self.last_signature = None
       self.last_rotation_centre = None
+      self.cached_annotation_entries = None
+      self.cached_annotation_groups = []
+      self.last_nearby_query = None
 
     def mol_id(self):
       return self.current_mol_id
@@ -7449,6 +7453,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
         self.grouped_annotations[:] = []
         self.last_signature = None
         self.last_rotation_centre = None
+        self.last_nearby_query = None
         self.clear_selected_group()
         self.clear_list_box_children()
         empty_label = Gtk.Label(label="No active model molecule is available for nearby notes.")
@@ -7465,7 +7470,25 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
         force = True
 
       rotation_centre = _rotation_centre_xyz()
-      groups = _annotation_groups_near_point(target_mol_id, rotation_centre, self.radius)
+      entries = _annotation_entries_for_molecule(target_mol_id)
+      if force or entries != self.cached_annotation_entries:
+        self.cached_annotation_entries = [dict(entry) for entry in entries]
+        self.cached_annotation_groups = _annotation_groups_for_molecule(target_mol_id)
+        force = True
+      positions = {}
+      for group in self.cached_annotation_groups:
+        key = group["key"][:3]
+        if key not in positions:
+          position = residue_centre_py(target_mol_id, *key)
+          positions[key] = tuple(position) if isinstance(position, (list, tuple)) and len(position) == 3 else None
+      # Native edits have no portable revision counter. Read centres each poll,
+      # but reuse grouping and avoid all filtering/rendering for unchanged input.
+      query = (target_mol_id, tuple(rotation_centre), self.radius, tuple(positions.items()))
+      if not force and query == self.last_nearby_query:
+        return None
+      self.last_nearby_query = query
+      groups = _annotation_groups_near_point(target_mol_id, rotation_centre, self.radius,
+                                             groups=self.cached_annotation_groups, positions=positions)
       signature = _annotation_groups_signature(groups)
       moved = (
         self.last_rotation_centre is None
@@ -8450,14 +8473,16 @@ def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, 
   if not score_atom_records or not context_atom_records:
     return []
 
-  sample_radius_sq = sample_radius * sample_radius
   score_atom_keys = {atom_record["atom_key"] for atom_record in score_atom_records}
-  score_atom_xyzs = [atom_record["xyz"] for atom_record in score_atom_records]
   context_atom_data = [
-    (context_atom["xyz"], context_atom["atom_key"], float(context_atom.get("occupancy", 1.0)))
+    (*context_atom["xyz"], context_atom["atom_key"])
     for context_atom in context_atom_records
   ]
+  occupancies = [float(atom.get("occupancy", 1.0)) for atom in context_atom_records]
+  distances = [0.0] * len(context_atom_data)
+  gaussian_denominator = 2.0 * sigma * sigma
   exp = math.exp
+  sample_density = density_at_point
   point_records = []
   candidate_indices = _tq_candidate_grid_indices(score_atom_records, sample_radius, grid_spacing)
 
@@ -8465,29 +8490,32 @@ def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, 
     x = ix * grid_spacing
     y = iy * grid_spacing
     z = iz * grid_spacing
-    point = [x, y, z]
-
-    min_score_distance_sq = min(_distance_sq(point, score_atom_xyz) for score_atom_xyz in score_atom_xyzs)
-    if min_score_distance_sq > sample_radius_sq:
-      continue
-
+    # Every candidate is already inside a scoring atom's sampling sphere.
     nearest_context_atom_key = None
     nearest_context_distance_sq = None
-    ideal_density = 0.0
-    for context_atom_xyz, context_atom_key, occupancy in context_atom_data:
-      distance_sq = _distance_sq(point, context_atom_xyz)
+    for index, (atom_x, atom_y, atom_z, context_atom_key) in enumerate(context_atom_data):
+      dx, dy, dz = x-atom_x, y-atom_y, z-atom_z
+      distance_sq = dx*dx + dy*dy + dz*dz
+      distances[index] = distance_sq
       if nearest_context_distance_sq is None or distance_sq < nearest_context_distance_sq:
         nearest_context_distance_sq = distance_sq
         nearest_context_atom_key = context_atom_key
-      ideal_density += occupancy * exp(-distance_sq / (2.0 * sigma * sigma))
 
     if nearest_context_atom_key is None or nearest_context_atom_key not in score_atom_keys:
       continue
 
+    ideal_density = 0.0
+    for distance_sq, occupancy in zip(distances, occupancies):
+      ideal_density += occupancy * exp(-distance_sq / gaussian_denominator)
+
     try:
-      experimental_density = float(density_at_point(map_id, x, y, z))
-    except Exception:
-      experimental_density = 0.0
+      experimental_density = float(sample_density(map_id, x, y, z))
+      if not math.isfinite(experimental_density):
+        raise ValueError("non-finite density")
+    except Exception as error:
+      raise RuntimeError(
+        f"Map #{map_id} density sampling failed at ({x:.3f}, {y:.3f}, {z:.3f}): {error}"
+      ) from error
 
     point_records.append(
       {
@@ -8670,6 +8698,19 @@ def _tq_prepare_scored_residues(
   }
 
 
+def _tq_prepare_scored_residues_or_status(*args, quiet=False, **kwargs):
+  try:
+    prepared = _tq_prepare_scored_residues(*args, **kwargs)
+    if prepared is None and not quiet:
+      _tq_status("Thresholded Q-residue: no scorable atoms or invalid sampling parameters")
+    return prepared
+  except RuntimeError as error:
+    # Never optimize against a partially sampled map or fabricated zero density.
+    if not quiet:
+      _tq_status(f"Thresholded Q-residue: calculation aborted. {error}")
+    return None
+
+
 def thresholded_q_residues(
     map_id,
     mol_id,
@@ -8718,7 +8759,7 @@ def thresholded_q_residues(
   if contour_level is None:
     contour_level = 0.0
 
-  prepared = _tq_prepare_scored_residues(
+  prepared = _tq_prepare_scored_residues_or_status(
     map_id,
     mol_id,
     residue_specs,
@@ -8728,19 +8769,10 @@ def thresholded_q_residues(
     sample_shell_padding=sample_shell_padding,
     context_radius=context_radius,
     backbone_only=backbone_only,
+    quiet=quiet,
   )
   if prepared is None:
-    message = f"Thresholded Q-residue: no scorable atoms for {_molecule_id_name_label(mol_id)}"
-    if not quiet:
-      _tq_status(message)
-    return {
-      "map_id": map_id,
-      "mol_id": mol_id,
-      "contour_level": contour_level,
-      "score": 0.0,
-      "residue_scores": [],
-      "message": message,
-    }
+    return None
 
   residue_scores = []
   for prepared_residue in prepared["prepared_residues"]:
@@ -8797,6 +8829,8 @@ def thresholded_q_residues(
 
 def thresholded_q_residue(map_id, mol_id, residue_spec, **kwargs):
   result = thresholded_q_residues(map_id, mol_id, [residue_spec], **kwargs)
+  if result is None:
+    return None
   if result["residue_scores"]:
     result["residue_score"] = result["residue_scores"][0]
   else:
@@ -8898,7 +8932,7 @@ def optimize_local_threshold_by_thresholded_q(
     contour_min, contour_max = contour_max, contour_min
   n_steps = max(2, n_steps)
 
-  prepared = _tq_prepare_scored_residues(
+  prepared = _tq_prepare_scored_residues_or_status(
     map_id,
     mol_id,
     residue_specs,
@@ -8908,11 +8942,9 @@ def optimize_local_threshold_by_thresholded_q(
     sample_shell_padding=sample_shell_padding,
     context_radius=context_radius,
     backbone_only=backbone_only,
+    quiet=quiet,
   )
   if prepared is None:
-    message = f"Thresholded Q-residue optimizer: no scorable atoms for {_molecule_id_name_label(mol_id)}"
-    if not quiet:
-      _tq_status(message)
     return None
 
   contour_levels = [contour_min] if contour_max == contour_min else [
@@ -11023,31 +11055,82 @@ def cut_active_chain():
       last_res = last_residue(mol_id, ch_id)
       delete_residue_range(mol_id, ch_id, first_res, last_res)
 
-#Faster rigid body fit (not relevant for smaller ranges, but much faster for larger ranges)
-def fast_rigid_fit(res_start,res_end,ch_id,mol_id):
-  if (mol_id in model_molecule_number_list()) and (ch_id in chain_ids(mol_id)):
+def _rigid_fit_atom_snapshot(mol_id, chain=None, start=None, end=None):
+  """Index coordinates by full atom identity, not transient serial indices."""
+  if coot.n_models(mol_id) != 1:
+    raise ValueError("Fast rigid fitting requires a single-model molecule.")
+  snapshot = {}
+  for ch, number, ins in _all_residue_specs_for_colouring(mol_id):
+    if chain is not None and (ch != chain or not start <= number <= end):
+      continue
+    name = residue_name(mol_id, ch, number, ins)
+    for atom in coot.residue_info_py(mol_id, ch, number, ins) or []:
+      key = (ch, number, ins, name, atom[0][0], atom[0][1], repr(atom[1]))
+      xyz = tuple(float(v) for v in atom[2])
+      if key in snapshot or len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+        raise ValueError("Fragment has ambiguous atom identities or invalid coordinates.")
+      snapshot[key] = xyz
+  if not snapshot:
+    raise ValueError("No atoms found in the requested range.")
+  return snapshot
+
+
+def fast_rigid_fit(res_start, res_end, ch_id, mol_id):
+  """Fit a disposable copy, then update matching coordinates without deleting residues."""
+  fragment = None
+  previous_replacement = None
+  updating_source = False
+  try:
+    if mol_id not in model_molecule_number_list() or ch_id not in chain_ids(mol_id):
+      raise ValueError("The specified chain or molecule does not exist.")
+    if coot.imol_refinement_map() not in map_molecule_list():
+      raise ValueError("Select a refinement map before rigid fitting.")
+    if coot.backup_state(mol_id) != 1:
+      raise ValueError("Enable Coot backups for this model before fast rigid fitting.")
+    pending = getattr(coot, "get_continue_updating_refinement_atoms_state", None)
+    if callable(pending) and pending():
+      raise ValueError("Accept or cancel the current refinement before rigid fitting.")
+    start, end = sorted((int(res_start), int(res_end)))
+    original = _rigid_fit_atom_snapshot(mol_id, ch_id, start, end)
+    selection = _atom_selection_for_residue_range(ch_id, start, end)
+    existing = set(model_molecule_number_list())
+    copied = coot.new_molecule_by_atom_selection(mol_id, selection)
+    if copied in existing or not valid_model_molecule_qm(copied):
+      raise RuntimeError("Coot could not create an independent fitting fragment.")
+    fragment = copied
+    coot.set_mol_displayed(fragment, 0)
+    if _rigid_fit_atom_snapshot(fragment) != original:
+      raise RuntimeError("The copied fragment does not match the requested atoms.")
+    previous_replacement = coot.refinement_immediate_replacement_state()
+    coot.set_refinement_immediate_replacement(1)
+    coot.rigid_body_refine_by_atom_selection(fragment, "//")
+    coot.accept_regularizement()
+    fitted = _rigid_fit_atom_snapshot(fragment)
+    if fitted.keys() != original.keys():
+      raise RuntimeError("Rigid fitting changed fragment atom identities.")
+    if _rigid_fit_atom_snapshot(mol_id, ch_id, start, end) != original:
+      raise RuntimeError("The original region changed during fitting; no replacement applied.")
     with _grouped_model_edit(mol_id):
-      ins_code=""
-      sn_max=chain_n_residues(ch_id,mol_id)-1
-      res_min=seqnum_from_serial_number(mol_id,ch_id,0)
-      res_max=seqnum_from_serial_number(mol_id,ch_id,sn_max)
-      if res_start>res_end:
-        res_start,res_end=res_end,res_start
-      while not residue_exists_qm(mol_id,ch_id,res_start,ins_code) and res_start<=res_max:
-       res_start=res_start+1
-      while not residue_exists_qm(mol_id,ch_id,res_end,ins_code) and res_end>=res_min:
-       res_end=res_end-1
-      if res_start<=res_end:
-        new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id,res_start=res_start,res_end=res_end))
-        mol_id_new=model_molecule_number_list()[-1]
-        rigid_body_refine_by_atom_selection(mol_id_new,"/ /")
-        accept_regularizement()
-        delete_residue_range(mol_id,ch_id,res_start,res_end) #delete copied range from original mol
-        merge_molecules([mol_id_new],mol_id) #Merge fit segment back into original mol
-        change_chain_id_with_result(mol_id,chain_ids(mol_id)[-1],ch_id,1,res_start,res_end) #Merge chains
-        close_molecule(mol_id_new)
-  else:
-    info_dialog("The specified chain or molecule does not exist!")
+      updating_source = True
+      if not coot.replace_fragment(mol_id, fragment, selection):
+        raise RuntimeError("Coot rejected the fragment update.")
+      updated = _rigid_fit_atom_snapshot(mol_id, ch_id, start, end)
+      if updated.keys() != fitted.keys() or any(
+          sum((a-b)**2 for a, b in zip(updated[key], xyz)) > 1e-8 for key, xyz in fitted.items()):
+        raise RuntimeError("The updated coordinates do not match the fitted fragment.")
+    add_status_bar_text(f"Rigid fitted {ch_id}:{start}-{end}; one Undo restores the original coordinates.")
+    return True
+  except Exception as error:
+    recovery = "\nThe original may have been updated; use Coot Undo to recover." if updating_source else "\nOriginal coordinates were not replaced."
+    info_dialog(f"Fast rigid fit failed: {error}{recovery}")
+    return False
+  finally:
+    try:
+      if previous_replacement is not None:
+        coot.set_refinement_immediate_replacement(previous_replacement)
+    finally:
+      if fragment is not None and valid_model_molecule_qm(fragment):
+        coot.close_molecule(fragment)
 
 #Copy active segment
 def copy_active_segment():
@@ -11781,9 +11864,12 @@ def shift_register_clicked_range():
   coot.user_defined_click_py(1, first_clicked)
 
 
-def _register_comparison_targets(records, centre, sequence, origin):
+def _register_comparison_targets(records, centre, sequence, origin, shift_window=5):
   sequence = _register_clean_sequence(sequence)
   origin = int(origin)
+  shift_window = int(shift_window)
+  if shift_window < 0:
+    raise ValueError("Shift window must be a non-negative integer.")
   start, end = centre-4, centre+4
   selected = [r for r in records if start <= r["number"] <= end]
   if [r["number"] for r in selected] != list(range(start, end+1)):
@@ -11793,10 +11879,10 @@ def _register_comparison_targets(records, centre, sequence, origin):
     raise ValueError("The nine-residue region must have complete protein backbone atoms and no insertion codes.")
   if any(not _register_connected(a, b) for a, b in zip(selected, selected[1:])):
     raise ValueError("The nine-residue region crosses a backbone break.")
-  if start-5 < origin or end+5 >= origin+len(sequence):
-    raise ValueError("The reference sequence must cover all eleven shifts (centre -9 through centre +9).")
+  if start-shift_window < origin or end+shift_window >= origin+len(sequence):
+    raise ValueError(f"The reference sequence must cover residues {start-shift_window}-{end+shift_window}.")
   targets = []
-  for offset in range(-5, 6):
+  for offset in range(-shift_window, shift_window+1):
     target = sequence[start+offset-origin:end+offset-origin+1]
     if set(target) - set(_REGISTER_AA):
       raise ValueError("All candidate identities must be known; replace X in the reference sequence.")
@@ -11804,7 +11890,64 @@ def _register_comparison_targets(records, centre, sequence, origin):
   return start, end, targets
 
 
-def _build_register_comparison_fragment(source, chain, start, end, offset, target, map_id):
+def _register_fit_fixed_backbone_rotamer(fragment, chain, number, map_id):
+  """Score library conformers without the residue translations used by autofit."""
+  rows = coot.score_rotamers_py(fragment, chain, number, "", "", map_id, 1, 0.3) or []
+  candidates = []
+  clash_acceptable = []
+  for row in rows:
+    if not isinstance(row, (list, tuple)) or len(row) < 5:
+      raise RuntimeError("Unexpected rotamer scoring result.")
+    density, clash = float(row[2]), float(row[4])
+    if math.isfinite(density) and math.isfinite(clash) and clash >= 0:
+      candidate = (density, row[0])
+      candidates.append(candidate)
+      if clash < 20:
+        clash_acceptable.append(candidate)
+  if not candidates:
+    raise RuntimeError(f"No scorable fixed-backbone rotamer for {chain}:{number}.")
+  # Unfitted neighbours can clash with every conformer; do not reject a register
+  # before joint refinement has had a chance to resolve those contacts.
+  best = max(clash_acceptable or candidates, key=lambda candidate: candidate[0])
+  if not clash_acceptable:
+    print(f"Register comparison {chain}:{number}: all rotamers clash; using best density fit.")
+  def backbone_coordinates():
+    return {tuple(atom[0]): tuple(float(value) for value in atom[2])
+            for atom in coot.residue_info_py(fragment, chain, number, "") or []
+            if atom[0][0].strip() in {"N", "CA", "C", "O"}}
+  before = backbone_coordinates()
+  if len(before) != 4:
+    raise RuntimeError(f"Incomplete backbone at {chain}:{number}.")
+  if not coot.set_residue_to_rotamer_name(fragment, chain, number, "", "", best[1]):
+    raise RuntimeError(f"Could not set rotamer at {chain}:{number}.")
+  after = backbone_coordinates()
+  if before.keys() != after.keys() or any(
+      not all(math.isfinite(value) for value in after[key]) or
+      _distance_sq(before[key], after[key]) > 1e-10 for key in before):
+    raise RuntimeError(f"Rotamer selection moved backbone atoms at {chain}:{number}; candidate excluded.")
+
+
+def _register_sidechain_correlation(fragment, specs, target, map_id):
+  """Mean residue CC beyond C-beta; Gly/Ala have no informative atoms here."""
+  eligible = {tuple(spec) for spec, letter in zip(specs, target) if letter not in {"G", "A"}}
+  scores = {}
+  if eligible:
+    # Mask 3 excludes main-chain atoms and CB in both CCP4 and Homebrew Coot.
+    results = coot.map_to_model_correlation_per_residue_py(fragment, specs, 3, map_id) or []
+    for item in results:
+      if not isinstance(item, (list, tuple)) or len(item) < 2:
+        continue
+      spec = _coot_residue_spec_from_spec(item[0])
+      if spec is None or tuple(spec) not in eligible:
+        continue
+      value = float(item[1])
+      if math.isfinite(value) and -1 <= value <= 1:
+        scores[tuple(spec)] = value
+  return {"mean": sum(scores.values())/len(scores) if scores else None,
+          "count": len(scores), "eligible": len(eligible)}
+
+
+def _build_register_comparison_fragment(source, chain, start, end, offset, target, map_id, rigid_fit=False):
   """Build on a disposable copy; restore global refinement settings on every path."""
   fragment = coot.new_molecule_by_atom_selection(source, _atom_selection_for_residue_range(chain, start, end))
   if fragment == source or not valid_model_molecule_qm(fragment):
@@ -11818,6 +11961,11 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
     coot.set_mol_displayed(fragment, 0)
     coot.set_molecule_name(fragment, f"Register {offset:+d}: {chain}:{start+offset}-{end+offset}")
     specs = [[chain, number+offset, ""] for number in range(start, end+1)]
+    def fit_rotamers():
+      for spec, letter in zip(specs, target):
+        if _REGISTER_AA[letter] not in {"ALA", "GLY"}:
+          _register_fit_fixed_backbone_rotamer(fragment, chain, spec[1], map_id)
+
     with _grouped_model_edit(fragment):
       if offset and not coot.renumber_residue_range(fragment, chain, start, end, offset):
         raise RuntimeError("Fragment renumbering failed.")
@@ -11826,13 +11974,24 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
         name = _REGISTER_AA[letter]
         if not coot.mutate(fragment, *spec, name):
           raise RuntimeError(f"Mutation failed at {chain}:{spec[1]}.")
-        if name not in {"ALA", "GLY"}:
-          fit = coot.auto_fit_best_rotamer(fragment, chain, spec[1], "", "", map_id, 1, 0.3)
-          if not isinstance(fit, (int, float)) or not math.isfinite(fit) or fit <= -999:
-            raise RuntimeError(f"Rotamer fitting failed at {chain}:{spec[1]}.")
+      if rigid_fit:
+        fit_function = getattr(coot, "rigid_body_refine_by_atom_selection", None)
+        if not callable(fit_function):
+          raise RuntimeError("Rigid-body fitting is unavailable in this Coot build.")
+        before_fit = _rigid_fit_atom_snapshot(fragment)
+        fit_function(fragment, "//")
+        coot.accept_regularizement()
+        if _rigid_fit_atom_snapshot(fragment).keys() != before_fit.keys():
+          raise RuntimeError("Rigid fitting changed fragment atom identities.")
+      fit_rotamers()
       refinement = coot.refine_residues_py(fragment, specs)
       if refinement is False:
         raise RuntimeError("Coot could not refine this fragment.")
+      coot.accept_regularizement()
+      fit_rotamers()
+      final_refinement = coot.refine_residues_py(fragment, specs)
+      if final_refinement is False:
+        raise RuntimeError("Coot could not perform the final fragment refinement.")
       coot.accept_regularizement()
     results = coot.map_to_model_correlation_per_residue_py(fragment, specs, 0, map_id) or []
     scores = {}
@@ -11847,12 +12006,18 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
         scores[tuple(spec)] = score
     if len(scores) != 9:
       raise RuntimeError(f"Only {len(scores)}/9 residues could be scored; candidate excluded.")
+    try:
+      sidechain = _register_sidechain_correlation(fragment, specs, target, map_id)
+    except Exception as error:
+      print(f"Register {offset:+d}: sidechain CC unavailable: {error}")
+      sidechain = {"mean": None, "count": 0, "eligible": sum(letter not in {"G", "A"} for letter in target)}
     coloured = False
     if _supports_direct_user_defined_colouring():
       rows = [(list(spec), _density_fit_score_to_colour_index(score)) for spec, score in scores.items()]
       coloured = bool(_apply_direct_user_defined_residue_colours(fragment, [], rows))
     return {"model": fragment, "offset": offset, "sequence": target,
-            "mean": sum(scores.values())/9, "minimum": min(scores.values()), "coloured": coloured}
+            "mean": sum(scores.values())/9, "minimum": min(scores.values()), "coloured": coloured,
+            "sidechain": sidechain}
   except Exception:
     coot.close_molecule(fragment)
     raise
@@ -11867,7 +12032,7 @@ def compare_local_sequence_registers():
     return
   source, chain, centre, ins = active[:4]
   required = ("new_molecule_by_atom_selection", "renumber_residue_range", "mutate",
-              "auto_fit_best_rotamer", "refine_residues_py", "accept_regularizement",
+              "score_rotamers_py", "set_residue_to_rotamer_name", "refine_residues_py", "accept_regularizement",
               "map_to_model_correlation_per_residue_py", "set_imol_refinement_map",
               "refinement_immediate_replacement_state", "set_refinement_immediate_replacement",
               "set_mol_displayed", "mol_is_displayed", "close_molecule", "set_molecule_name")
@@ -11895,20 +12060,32 @@ def compare_local_sequence_registers():
   except (ValueError, TypeError) as error:
     info_dialog(str(error))
     return
-  window = Gtk.Window(title=f"Compare registers: #{source} {chain}:{centre-4}-{centre+4}")
-  window.set_default_size(660, 580)
-  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  centre_name = next((r["name"] for r in records if r["number"] == centre and r["ins"] == ins), "")
+  centre_label = f"{chain}:{centre} {centre_name}".strip()
+  window = Gtk.Window(title=f"Compare registers: #{source} | Centre {centre_label}")
+  window.set_default_size(650, 480)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
   for side in ("start", "end", "top", "bottom"):
-    getattr(box, "set_margin_"+side)(12)
-  label = Gtk.Label(label="11 registers (-5 to +5) | 9 residues | Refinement map #" + str(map_id))
+    getattr(box, "set_margin_"+side)(8)
+  label = Gtk.Label(label=f"Centre: {centre_label} | Model #{source}\n"
+                         f"Region {chain}:{centre-4}-{centre+4} | Map #{map_id}")
   label.set_xalign(0)
   box.append(label)
   row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-  row.append(Gtk.Label(label="Sequence starts at"))
+  row.append(Gtk.Label(label="Sequence start"))
   origin_entry = Gtk.Entry()
+  origin_entry.set_width_chars(7)
+  origin_entry.set_max_width_chars(9)
   origin_entry.set_text(str(origin) if origin is not None else "")
   row.append(origin_entry)
-  generate = Gtk.Button(label="Generate candidates")
+  row.append(Gtk.Label(label="Shift +/-"))
+  shift_entry = Gtk.Entry()
+  shift_entry.set_width_chars(3)
+  shift_entry.set_max_width_chars(5)
+  shift_entry.set_text("5")
+  shift_entry.set_tooltip_text("Test every integer shift from -N to +N; 0 tests the original register only.")
+  row.append(shift_entry)
+  generate = Gtk.Button(label="Generate")
   row.append(generate)
   box.append(row)
   reference = Gtk.Expander(label="Reference sequence (verify/edit)")
@@ -11918,15 +12095,28 @@ def compare_local_sequence_registers():
   sequence_view.get_buffer().set_text(sequence)
   sequence_view.set_tooltip_text(message)
   sequence_scroll = Gtk.ScrolledWindow()
-  sequence_scroll.set_min_content_height(90)
+  sequence_scroll.set_min_content_height(70)
   sequence_scroll.set_child(sequence_view)
   reference.set_child(sequence_scroll)
   box.append(reference)
-  progress = Gtk.Label(label="Isolated fragments: scores guide comparison, not proof of the correct register.")
+  rigid_fit_option = Gtk.CheckButton(label="Rigid fit before refinement")
+  rigid_fit_available = callable(getattr(coot, "rigid_body_refine_by_atom_selection", None))
+  rigid_fit_option.set_active(False)
+  rigid_fit_option.set_sensitive(rigid_fit_available)
+  rigid_fit_option.set_tooltip_text(
+    "Mutate, rigid fit, select fixed-backbone rotamers, refine, select rotamers again, then final refine."
+    if rigid_fit_available else "Rigid-body fitting is unavailable in this Coot build.")
+  box.append(rigid_fit_option)
+  progress = Gtk.Label(label="Isolated fragments; CC guides comparison, not certainty.")
   progress.set_wrap(True)
   progress.set_xalign(0)
   box.append(progress)
-  rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+  headings = Gtk.Label(label="Shift   Sequence     Mean CC   Min CC   SC CC (n)")
+  headings.set_xalign(0)
+  headings.set_tooltip_text("SC CC: mean per-residue correlation beyond C-beta; coverage is scored/eligible residues. Gly/Ala excluded. Independent of contour.")
+  headings.add_css_class("monospace")
+  box.append(headings)
+  rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
   scroll = Gtk.ScrolledWindow()
   scroll.set_vexpand(True)
   scroll.set_child(rows)
@@ -11935,7 +12125,9 @@ def compare_local_sequence_registers():
                      else "Density-fit colouring unavailable in this build; scores still available.")
   legend.set_wrap(True)
   legend.set_xalign(0)
-  box.append(legend)
+  legend_expander = Gtk.Expander(label="Density-fit colour scale")
+  legend_expander.set_child(legend)
+  box.append(legend_expander)
   buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
   previous = Gtk.Button(label="Previous")
   next_button = Gtk.Button(label="Next")
@@ -11943,14 +12135,16 @@ def compare_local_sequence_registers():
   next_button.set_sensitive(False)
   buttons.append(previous)
   buttons.append(next_button)
-  keep = Gtk.Button(label="Keep selected fragment")
+  keep = Gtk.Button(label="Keep selected")
+  keep.set_tooltip_text("Keep this fragment as a separate model; discard the other candidates.")
   keep.set_sensitive(False)
   discard = Gtk.Button(label="Discard all")
   buttons.append(keep)
   buttons.append(discard)
   box.append(buttons)
   state = {"closed": False, "candidates": [], "selected": None, "idle": None,
-           "hidden_original": False, "index": 0, "targets": [], "snapshot": None, "buttons": []}
+           "hidden_original": False, "index": 0, "targets": [], "snapshot": None, "buttons": [],
+           "rigid_fit": False}
   def choose(candidate):
     if state["closed"] or not valid_model_molecule_qm(candidate["model"]):
       return
@@ -11996,13 +12190,23 @@ def compare_local_sequence_registers():
     try:
       if map_id not in map_molecule_list() or _register_chain_snapshot(source, chain) != state["snapshot"]:
         raise ValueError("Source model or map changed; discard and restart the comparison.")
-      candidate = _build_register_comparison_fragment(source, chain, state["start"], state["end"], offset, target, map_id)
+      candidate = _build_register_comparison_fragment(
+        source, chain, state["start"], state["end"], offset, target, map_id,
+        rigid_fit=state["rigid_fit"])
       if state["closed"]:
         coot.close_molecule(candidate["model"])
         return False
       state["candidates"].append(candidate)
-      button = Gtk.Button(label=f"{offset:+d}   {target}   mean CC {candidate['mean']:.3f}   min {candidate['minimum']:.3f}" +
-                          ("" if candidate["coloured"] else "   [not coloured]"))
+      button = Gtk.Button()
+      sidechain = candidate["sidechain"]
+      sidechain_text = f"{sidechain['mean']:.3f}" if sidechain["mean"] is not None else "n/a"
+      candidate_label = Gtk.Label(label=f"{offset:+3d}     {target}    {candidate['mean']:.3f}    {candidate['minimum']:.3f}"
+                                       f"    {sidechain_text} ({sidechain['count']}/{sidechain['eligible']})")
+      candidate_label.set_xalign(0)
+      candidate_label.add_css_class("monospace")
+      button.set_child(candidate_label)
+      button.set_tooltip_text(f"Centre {chain}:{centre+offset} | " +
+                              ("Coloured by density fit" if candidate["coloured"] else "Density-fit colouring unavailable"))
       button.connect("clicked", lambda *_args, candidate=candidate: choose(candidate))
       rows.append(button)
       state["buttons"].append((button, candidate))
@@ -12017,14 +12221,23 @@ def compare_local_sequence_registers():
       rows.append(error_label)
       print(f"Register comparison {offset:+d}: {error}")
     state["index"] += 1
-    if state["index"] == 11:
+    total = len(state["targets"])
+    if state["index"] == total:
       state["idle"] = None
       keep.set_sensitive(state["selected"] is not None)
-      best = max(state["candidates"], key=lambda c: c["mean"], default=None)
-      progress.set_text(f"{len(state['candidates'])}/11 built. Highest mean CC: {best['offset']:+d} ({best['mean']:.3f})." if best
+      available = [c for c in state["candidates"] if valid_model_molecule_qm(c["model"])]
+      sidechain_available = [c for c in available if c["sidechain"]["mean"] is not None]
+      best = max(sidechain_available or available,
+                 key=lambda c: (c["sidechain"]["mean"], c["mean"]) if sidechain_available else (c["mean"],),
+                 default=None)
+      if best is not None:
+        choose(best)
+      metric_label = "SC CC" if sidechain_available else "mean CC (SC CC unavailable)"
+      best_score = best["sidechain"]["mean"] if sidechain_available else (best["mean"] if best else None)
+      progress.set_text(f"{len(state['candidates'])}/{total} built. Highest {metric_label}: {best['offset']:+d} ({best_score:.3f})." if best
                         else "No candidates succeeded; inspect the failed rows.")
       return False
-    progress.set_text(f"Built {state['index']}/11; next shift {state['targets'][state['index']][0]:+d}")
+    progress.set_text(f"Built {state['index']}/{total}; next shift {state['targets'][state['index']][0]:+d}")
     return True
   def begin(*_args):
     try:
@@ -12036,18 +12249,22 @@ def compare_local_sequence_registers():
       buffer = sequence_view.get_buffer()
       reference_sequence = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
       snapshot = _register_chain_snapshot(source, chain)
-      start, end, targets = _register_comparison_targets(snapshot, centre, reference_sequence, origin_entry.get_text())
+      start, end, targets = _register_comparison_targets(
+        snapshot, centre, reference_sequence, origin_entry.get_text(), shift_entry.get_text())
     except (ValueError, TypeError) as error:
       progress.set_text(str(error))
       return
-    state.update(start=start, end=end, targets=targets, snapshot=snapshot)
+    state.update(start=start, end=end, targets=targets, snapshot=snapshot,
+                 rigid_fit=rigid_fit_available and bool(rigid_fit_option.get_active()))
     state["hidden_original"] = bool(coot.mol_is_displayed(source))
     if state["hidden_original"]:
       coot.set_mol_displayed(source, 0)
     generate.set_sensitive(False)
     origin_entry.set_sensitive(False)
+    shift_entry.set_sensitive(False)
     sequence_view.set_editable(False)
-    progress.set_text("Building register -5...")
+    rigid_fit_option.set_sensitive(False)
+    progress.set_text(f"Building register {targets[0][0]:+d}...")
     state["idle"] = glib.idle_add(step)
   generate.connect("clicked", begin)
   keep.connect("clicked", lambda *_: finish(True))
@@ -16287,7 +16504,7 @@ def _build_custom_build_menu(
 
 def _build_custom_mutate_menu(submenu_mutate):
   add_simple_coot_menu_menuitem(
-    submenu_mutate, "Compare local sequence registers (-5 to +5)...",
+    submenu_mutate, "Compare local sequence registers...",
     lambda func: compare_local_sequence_registers(),
   )
   add_simple_coot_menu_menuitem(
