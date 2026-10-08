@@ -11864,6 +11864,42 @@ def shift_register_clicked_range():
   coot.user_defined_click_py(1, first_clicked)
 
 
+_REGISTER_REFERENCE_ORIGINS = {}
+
+
+def _register_associate_reference(fragment, chain, sequence, origin):
+  sequence = _register_clean_sequence(sequence)
+  coot.delete_sequence_by_chain_id(fragment, chain)
+  coot.assign_sequence_from_string(fragment, chain, sequence)
+  associated = coot.sequence_info_py(fragment) or []
+  if not any(item[0] == chain and _register_clean_sequence(item[1]) == sequence
+             for item in associated if isinstance(item, (list, tuple)) and len(item) == 2):
+    raise RuntimeError("Coot did not associate the reference sequence with the fragment.")
+  _REGISTER_REFERENCE_ORIGINS[(fragment, chain)] = (sequence, int(origin))
+
+
+def _register_terminal_residue_type(mol_id, chain, destination):
+  cached = _REGISTER_REFERENCE_ORIGINS.get((mol_id, chain))
+  if cached is not None:
+    sequence, origin = cached
+    associated = coot.sequence_info_py(mol_id) or []
+    matches = [item[1] for item in associated if isinstance(item, (list, tuple))
+               and len(item) == 2 and item[0] == chain]
+    if len(matches) == 1 and _register_clean_sequence(matches[0]) == sequence:
+      index = destination-origin
+      if 0 <= index < len(sequence) and sequence[index] in _REGISTER_AA:
+        return _REGISTER_AA[sequence[index]]
+      add_status_bar_text("Reference sequence has no known residue at this position; using Coot's automatic type.")
+    else:
+      _REGISTER_REFERENCE_ORIGINS.pop((mol_id, chain), None)
+  lookup = getattr(coot, "find_terminal_residue_type_py", None)
+  if callable(lookup):
+    residue_type = lookup(mol_id, chain, destination)
+    if isinstance(residue_type, str) and residue_type in set(_REGISTER_AA.values()):
+      return residue_type
+  return "auto"
+
+
 def _register_comparison_targets(records, centre, sequence, origin, shift_window=5, fragment_size=9):
   sequence = _register_clean_sequence(sequence)
   origin = int(origin)
@@ -12040,7 +12076,8 @@ def compare_local_sequence_registers():
               "score_rotamers_py", "set_residue_to_rotamer_name", "refine_residues_py", "accept_regularizement",
               "map_to_model_correlation_per_residue_py", "set_imol_refinement_map",
               "refinement_immediate_replacement_state", "set_refinement_immediate_replacement",
-              "set_mol_displayed", "mol_is_displayed", "close_molecule", "set_molecule_name")
+              "set_mol_displayed", "mol_is_displayed", "close_molecule", "set_molecule_name",
+              "delete_sequence_by_chain_id", "assign_sequence_from_string", "sequence_info_py")
   missing = [name for name in required if not callable(getattr(coot, name, None))]
   try:
     glib = _coot_gui_repository_module("GLib")
@@ -12203,6 +12240,7 @@ def compare_local_sequence_registers():
     chosen = state["selected"] if keep_selected else None
     for candidate in state["candidates"]:
       if candidate is not chosen and valid_model_molecule_qm(candidate["model"]):
+        _REGISTER_REFERENCE_ORIGINS.pop((candidate["model"], chain), None)
         coot.close_molecule(candidate["model"])
     if state["hidden_original"] and valid_model_molecule_qm(source):
       coot.set_mol_displayed(source, 1)
@@ -12218,6 +12256,12 @@ def compare_local_sequence_registers():
       candidate = _build_register_comparison_fragment(
         source, chain, state["start"], state["end"], offset, target, map_id,
         rigid_fit=state["rigid_fit"])
+      try:
+        _register_associate_reference(candidate["model"], chain, state["reference_sequence"], state["reference_origin"])
+      except Exception:
+        _REGISTER_REFERENCE_ORIGINS.pop((candidate["model"], chain), None)
+        coot.close_molecule(candidate["model"])
+        raise
       if state["closed"]:
         coot.close_molecule(candidate["model"])
         return False
@@ -12305,6 +12349,7 @@ def compare_local_sequence_registers():
       )
       return
     state.update(start=start, end=end, targets=targets, snapshot=snapshot,
+                 reference_sequence=_register_clean_sequence(reference_sequence), reference_origin=int(origin_entry.get_text()),
                  rigid_fit=rigid_fit_available and bool(rigid_fit_option.get_active()))
     state["hidden_original"] = bool(coot.mol_is_displayed(source))
     if state["hidden_original"]:
@@ -13112,7 +13157,9 @@ def add_term_shortcut():
       growth_context["mol_id"],
       growth_context["chain_id"],
       anchor_resno,
-      "auto",
+      _register_terminal_residue_type(
+        growth_context["mol_id"], growth_context["chain_id"],
+        anchor_resno + (-1 if growth_context["grow_from_n_term"] else 1)),
       1,
     )
   )
