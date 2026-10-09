@@ -766,7 +766,14 @@ def _make_default_user_defined_colours():
   for colour_index in range(USER_DEFINED_COLOUR_TABLE_SIZE):
     base_colours.append(interpolated_colour(colour_index))
 
-  colours = []
+  # CA user-colour rendering indexes this list by bond colour number, whereas
+  # all-atom rendering looks up the explicit key. Pad to align positions with
+  # our 60..119 keys, repeating the neutral key so standard 0..59 colours are
+  # never overridden. Coot retains these duplicate entries in order.
+  colours = [
+    (USER_DEFINED_COLOUR_TABLE_BASE, list(base_colours[0]))
+    for _ in range(USER_DEFINED_COLOUR_TABLE_BASE)
+  ]
   for i in range(USER_DEFINED_COLOUR_TABLE_SIZE):
     colours.append((USER_DEFINED_COLOUR_TABLE_BASE + i, base_colours[i]))
   return colours
@@ -901,7 +908,7 @@ def _set_user_defined_atom_colour_by_residue_rows_py(mol_id, residue_specs_colou
       continue
     residue_spec = item[0]
     colour_index = item[1]
-    cid = _residue_spec_to_cid_compat(residue_spec)
+    cid = residue_spec if isinstance(residue_spec, str) else _residue_spec_to_cid_compat(residue_spec)
     if cid is None:
       continue
     selection_colour_list.append((cid, _legacy_user_colour_index_to_coot_index(colour_index)))
@@ -956,6 +963,11 @@ def _remember_standard_representation(mol_id, representation_function):
   if mol_id is None or mol_id < 0:
     return
   LAST_STANDARD_REPRESENTATION_BY_MOL[mol_id] = representation_function
+  sequence_function = globals().get("_representation_sequence")
+  if callable(sequence_function):
+    sequence = sequence_function()
+    if representation_function in sequence:
+      cycle_rep_flag[mol_id] = sequence.index(representation_function)
 
 
 def _last_standard_representation_function(mol_id):
@@ -976,6 +988,11 @@ def _restore_last_standard_representation(mol_id, representation_function=None):
 
 def graphics_to_bonds_representation(mol_id):
   _clear_user_defined_colours_for_standard_representation(mol_id)
+  if _supports_direct_user_defined_colouring():
+    get_bond_type = getattr(coot, "get_graphics_molecule_bond_type", None)
+    if callable(get_bond_type) and get_bond_type(mol_id) in (12, 13):
+      # Leave the custom bond mode before rebuilding normal element colours.
+      _coot_graphics_to_ca_plus_ligands_representation(mol_id)
   result = _coot_graphics_to_bonds_representation(mol_id)
   _remember_standard_representation(mol_id, graphics_to_bonds_representation)
   return result
@@ -1123,8 +1140,11 @@ EMRINGER_HELPER_LATE_STAGE_DEFINITIONS = {
 WATER_RESIDUE_NAMES = {"HOH", "WAT", "DOD", "OH2", "H2O"}
 ODD_RESIDUE_CATEGORY_ORDER = (
   "Possible Misfits",
+  "Unusual phi/psi in context",
+  "Helical features",
   "Weak Sidechains",
   "Weak Backbone",
+  "Weak regions",
   "Weak Waters/Ions",
   "Weak Ligands",
 )
@@ -3246,6 +3266,8 @@ if _preloaded_coot_gui is not None:
     flat_entry_specs = []
     current_index = {"value": None}
     selected_button = {"value": None}
+    category_expanded = {}
+    category_widgets = {}
 
     def set_selected_button(button):
       previous_button = selected_button["value"]
@@ -3316,7 +3338,7 @@ if _preloaded_coot_gui is not None:
     window.set_child(vbox)
     window.present()
 
-  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None):
+  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None, chain_choices=None):
     """Show grouped clickable jump targets in a single scrollable dialog."""
     window = Gtk.Window()
     window.set_title("Coot")
@@ -3357,6 +3379,7 @@ if _preloaded_coot_gui is not None:
     scrolled.set_child(inside_vbox)
 
     def close_window(*_args):
+      _clear_odd_helical_feature_highlights()
       window.destroy()
 
     def jump_to_entry(entry, category_name=None):
@@ -3367,6 +3390,27 @@ if _preloaded_coot_gui is not None:
     flat_entry_specs = []
     current_index = {"value": None}
     selected_button = {"value": None}
+    category_expanded = {}
+    category_widgets = {}
+    filter_state = {"choices": [(None, "All chains")] + list(chain_choices or []),
+                    "chain": None, "updating": False, "title": dialog_name,
+                    "categories": categorized_thing_lists}
+    chain_dropdown = None
+    if chain_choices is not None:
+      chain_dropdown = Gtk.DropDown.new_from_strings([text for _chain, text in filter_state["choices"]])
+      chain_dropdown.set_selected(0)
+
+    def update_chain_choices(choices):
+      filter_state["updating"] = True
+      try:
+        filter_state["choices"] = [(None, "All chains")] + list(choices)
+        index = next((i for i, (chain, _text) in enumerate(filter_state["choices"])
+                      if chain == filter_state["chain"]), 0)
+        filter_state["chain"] = filter_state["choices"][index][0]
+        chain_dropdown.set_model(Gtk.StringList.new([text for _chain, text in filter_state["choices"]]))
+        chain_dropdown.set_selected(index)
+      finally:
+        filter_state["updating"] = False
 
     def set_selected_button(button):
       previous_button = selected_button["value"]
@@ -3383,10 +3427,16 @@ if _preloaded_coot_gui is not None:
           pass
 
     def render_categories(current_dialog_name, current_categorized_thing_lists):
+      if chain_dropdown is not None:
+        filter_state["title"] = current_dialog_name
+        filter_state["categories"] = current_categorized_thing_lists
+        current_categorized_thing_lists = _odd_residue_filter_categories(
+          current_categorized_thing_lists, filter_state["chain"])
       label.set_text(current_dialog_name)
       current_index["value"] = None
       set_selected_button(None)
       flat_entry_specs.clear()
+      category_widgets.clear()
 
       child = inside_vbox.get_first_child()
       while child is not None:
@@ -3400,11 +3450,14 @@ if _preloaded_coot_gui is not None:
           continue
         shown_any_category = True
 
-        header = Gtk.Label(label=f"{category_name} ({len(thing_list)})")
-        header.set_xalign(0.0)
-        header.set_margin_top(6)
-        header.set_margin_bottom(2)
-        inside_vbox.append(header)
+        expander = Gtk.Expander(label=f"{category_name} ({len(thing_list)})")
+        expander.set_expanded(category_expanded.get(category_name, False))
+        expander.connect("notify::expanded", lambda widget, _param, name=category_name:
+                         category_expanded.__setitem__(name, widget.get_expanded()))
+        category_widgets[category_name] = expander
+        category_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        expander.set_child(category_box)
+        inside_vbox.append(expander)
 
         for entry in thing_list:
           if len(entry) < 4:
@@ -3416,7 +3469,7 @@ if _preloaded_coot_gui is not None:
             "clicked",
             lambda _button, idx=entry_index: activate_entry(idx),
           )
-          inside_vbox.append(button)
+          category_box.append(button)
 
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         separator.set_margin_top(4)
@@ -3437,6 +3490,7 @@ if _preloaded_coot_gui is not None:
       entry_index = entry_index % len(flat_entry_specs)
       current_index["value"] = entry_index
       category_name, entry, button = flat_entry_specs[entry_index]
+      category_widgets[category_name].set_expanded(True)
       jump_to_entry(entry, category_name)
       set_selected_button(button)
       try:
@@ -3464,8 +3518,18 @@ if _preloaded_coot_gui is not None:
       refreshed_payload = refresh_function()
       if not refreshed_payload:
         return None
-      refreshed_dialog_name, refreshed_categorized_thing_lists = refreshed_payload
+      refreshed_dialog_name, refreshed_categorized_thing_lists = refreshed_payload[:2]
+      if chain_dropdown is not None and len(refreshed_payload) > 2:
+        update_chain_choices(refreshed_payload[2])
       render_categories(refreshed_dialog_name, refreshed_categorized_thing_lists)
+
+    def chain_changed(*_args):
+      if filter_state["updating"]:
+        return
+      index = chain_dropdown.get_selected()
+      if index < len(filter_state["choices"]):
+        filter_state["chain"] = filter_state["choices"][index][0]
+        render_categories(filter_state["title"], filter_state["categories"])
 
     prev_button.connect("clicked", lambda *_args: activate_prev())
     next_button.connect("clicked", lambda *_args: activate_next())
@@ -3476,6 +3540,15 @@ if _preloaded_coot_gui is not None:
     render_categories(dialog_name, categorized_thing_lists)
 
     vbox.append(label)
+    if chain_dropdown is not None:
+      filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+      filter_row.set_margin_start(12)
+      filter_row.set_margin_end(12)
+      filter_row.append(Gtk.Label(label="Chain"))
+      chain_dropdown.set_hexpand(True)
+      filter_row.append(chain_dropdown)
+      chain_dropdown.connect("notify::selected", chain_changed)
+      vbox.append(filter_row)
     vbox.append(scrolled)
     navigation_row.append(prev_button)
     navigation_row.append(next_button)
@@ -3497,6 +3570,14 @@ if _preloaded_coot_gui is not None:
     status_message = _interesting_entry_status_text(entry, category_name)
     if len(entry) >= 5 and isinstance(entry[4], dict):
       navigation = entry[4]
+      if navigation.get("type") == "polymer_range":
+        _highlight_odd_helical_range(navigation)
+        if status_message:
+          add_status_bar_text(status_message)
+        return _go_to_navigation_residue(
+          navigation["mol_id"], navigation["chain_id"], navigation["resno"],
+          navigation.get("ins_code", ""), navigation.get("serial_number"))
+      _clear_odd_helical_feature_highlights()
       if navigation.get("type") == "polymer_residue":
         if status_message:
           add_status_bar_text(status_message)
@@ -3507,6 +3588,8 @@ if _preloaded_coot_gui is not None:
           navigation.get("ins_code", ""),
           navigation.get("serial_number"),
         )
+    else:
+      _clear_odd_helical_feature_highlights()
     if status_message:
       add_status_bar_text(status_message)
     set_rotation_centre(entry[1], entry[2], entry[3])
@@ -3662,7 +3745,7 @@ else:
   def navigable_interesting_things_gui(dialog_name, thing_list):
     interesting_things_gui(dialog_name, thing_list)
 
-  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None):
+  def categorized_interesting_things_gui(dialog_name, categorized_thing_lists, refresh_function=None, chain_choices=None):
     labels = []
     for category_name, thing_list in categorized_thing_lists:
       if not thing_list:
@@ -5011,6 +5094,14 @@ def _sorted_categorized_outputs(categorized_entries, category_order=None):
   return gui_categories, detail_categories
 
 
+def _odd_residue_filter_categories(gui_categories, chain_id=None):
+  filtered = [(category, [entry for entry in entries
+              if chain_id is None or (len(entry) > 4 and isinstance(entry[4], dict)
+                                      and entry[4].get("chain_id") == chain_id)])
+              for category, entries in gui_categories]
+  return _numbered_gui_categories(filtered)
+
+
 def _numbered_gui_categories(gui_categories):
   """Prefix categorized hit labels with per-category numbers for easier navigation."""
   numbered_categories = []
@@ -5212,6 +5303,312 @@ def _scan_polymer_stages(map_id, residue_id, residue_name_here, stage_specs, pea
   }
 
 
+def _odd_dihedral_degrees(a, b, c, d):
+  axis = _normalize_vector(_vector_subtract(c, b))
+  if axis is None:
+    return None
+  v = _project_vector_perpendicular(_vector_subtract(a, b), axis)
+  w = _project_vector_perpendicular(_vector_subtract(d, c), axis)
+  if v is None or w is None:
+    return None
+  return math.degrees(math.atan2(_vector_dot(_vector_cross(axis, v), w), _vector_dot(v, w)))
+
+
+def _odd_phi_psi_context_hits(angles, links):
+  """Flag clear helix/strand switches inside a consistent two-residue context."""
+  def region(pair):
+    phi, psi = pair
+    if -100 <= phi <= -30 and -80 <= psi <= -5:
+      return "helix"
+    if -180 <= phi <= -70 and (psi >= 70 or psi <= -150):
+      return "strand"
+    return None
+
+  def clearly_opposite(pair, context):
+    phi, psi = pair
+    if context == "helix":
+      return -180 <= phi <= -90 and (psi >= 90 or psi <= -160)
+    return -95 <= phi <= -35 and -75 <= psi <= -5
+
+  hits = []
+  for index in range(3, len(angles)-3):
+    local = angles[index-2:index+3]
+    if any(pair is None or not all(math.isfinite(value) for value in pair) for pair in local):
+      continue
+    if not all(links[index-3:index+3]):
+      continue
+    neighbours = [region(local[i]) for i in (0, 1, 3, 4)]
+    context = neighbours[0]
+    if context is not None and all(value == context for value in neighbours) and clearly_opposite(local[2], context):
+      hits.append((index, context, *local[2]))
+  return hits
+
+
+def _odd_backbone_geometry(records):
+  usable = []
+  for record in records:
+    xyz = record["xyz"]
+    usable.append(record["name"] in _REGISTER_PROTEIN_NAMES and
+                  all(name in xyz for name in ("N", "CA", "C", "O")) and record["unambiguous"])
+  links = [usable[i] and usable[i+1] and
+           1.0**2 <= _distance_sq(records[i]["xyz"]["C"], records[i+1]["xyz"]["N"]) <= 1.8**2
+           for i in range(len(records)-1)]
+  angles = [None] * len(records)
+  for i in range(1, len(records)-1):
+    if not (links[i-1] and links[i]):
+      continue
+    xyz = records[i]["xyz"]
+    phi = _odd_dihedral_degrees(records[i-1]["xyz"]["C"], xyz["N"], xyz["CA"], xyz["C"])
+    psi = _odd_dihedral_degrees(xyz["N"], xyz["CA"], xyz["C"], records[i+1]["xyz"]["N"])
+    if phi is not None and psi is not None:
+      angles[i] = (phi, psi)
+  return angles, links
+
+
+def _odd_backbone_context_hits(records):
+  angles, links = _odd_backbone_geometry(records)
+  return _odd_phi_psi_context_hits(angles, links)
+
+
+def _odd_backbone_hbond(records, acceptor, donor):
+  """Approximate a peptide N-H direction from the preceding carbonyl."""
+  if donor < 1 or records[donor]["name"] == "PRO":
+    return False
+  acceptor_xyz, donor_xyz, previous_xyz = (records[index]["xyz"] for index in (acceptor, donor, donor-1))
+  direction = _normalize_vector(_vector_subtract(previous_xyz["C"], previous_xyz["O"]))
+  if direction is None:
+    return False
+  hydrogen = tuple(donor_xyz["N"][axis] + direction[axis] for axis in range(3))
+  def distance(a, b):
+    return math.sqrt(_distance_sq(a, b))
+  on, ch, oh, cn = (distance(a, b) for a, b in (
+    (acceptor_xyz["O"], donor_xyz["N"]), (acceptor_xyz["C"], hydrogen),
+    (acceptor_xyz["O"], hydrogen), (acceptor_xyz["C"], donor_xyz["N"])))
+  if not all(math.isfinite(value) and value > 0.5 for value in (on, ch, oh, cn)) or not 2.3 <= on <= 3.5:
+    return False
+  energy = 27.888 * (1/on + 1/ch - 1/oh - 1/cn)
+  return energy < -0.5 and oh < on
+
+
+def _odd_ca_window_kind(ca, start):
+  """Classify a C-alpha distance fingerprint over five consecutive residues."""
+  def distance(offset):
+    return math.sqrt(_distance_sq(ca[start], ca[start+offset]))
+  d3, d4 = distance(3), distance(4)
+  ca_torsion = _odd_dihedral_degrees(ca[start], ca[start+1], ca[start+2], ca[start+3])
+  if ca_torsion is None:
+    return None
+  # RyR 3_10 segments can have a contracted i->i+3 distance while retaining
+  # the characteristic i->i+4 span and torsion.
+  if 5.35 <= d3 <= 6.35 and 7.5 <= d4 <= 9.2 and 63 <= ca_torsion <= 103:
+    return "310"
+  if 4.7 <= d3 <= 5.55 and 5.8 <= d4 <= 6.7 and 35 <= ca_torsion <= 65:
+    return "alpha"
+  if 5.5 <= d3 <= 6.2 and 4.6 <= d4 <= 5.2 and 15 <= ca_torsion <= 42:
+    return "pi"
+  return None
+
+
+def _odd_helical_patterns(ca, links):
+  """Infer tentative helical motifs from consecutive C-alpha distance fingerprints."""
+  count = len(ca)
+  kinds = [None] * max(0, count-4)
+  for start in range(len(kinds)):
+    if all(links[start:start+4]):
+      kinds[start] = _odd_ca_window_kind(ca, start)
+  features = []
+  for motif, label in (("310", "Possible 3_10 helix"), ("pi", "Possible pi-bulge")):
+    starts = [i for i, kind in enumerate(kinds)
+              if kind == motif and (motif != "pi" or i+5 < count)]
+    runs = []
+    for start in starts:
+      if runs and start == runs[-1][-1] + 1:
+        runs[-1].append(start)
+      else:
+        runs.append([start])
+    for run in runs:
+      first, last = run[0], run[-1]
+      flank_start = max(0, first-2)
+      flank_end = min(len(kinds), last+3)
+      left_flanks = kinds[flank_start:first]
+      right_flanks = kinds[last+1:flank_end]
+      alpha_flanks = (len(left_flanks) == 2 and len(right_flanks) == 2 and
+                      all(kind == "alpha" for kind in left_flanks + right_flanks))
+      if motif == "pi" and len(run) <= 2 and alpha_flanks:
+        label_here = "Possible pi-bulge"
+      elif motif == "310" and len(run) >= 2:
+        label_here = label
+      else:
+        continue
+      span = 3 if motif == "310" else 5
+      features.append((first, last+max(4, span), label_here, len(run), span, tuple(run)))
+  return sorted(features)
+
+
+def _odd_helical_feature_hits(records):
+  ca = [record["xyz"].get("CA") for record in records]
+  usable = [record["name"] in _REGISTER_PROTEIN_NAMES and record["unambiguous"] and
+            point is not None and len(point) == 3 and all(math.isfinite(v) for v in point)
+            for record, point in zip(records, ca)]
+  links = [usable[i] and usable[i+1] and 3.4**2 <= _distance_sq(ca[i], ca[i+1]) <= 4.1**2
+           for i in range(len(records)-1)]
+  safe_ca = [point if valid else (float("nan"),)*3 for point, valid in zip(ca, usable)]
+  features = _odd_helical_patterns(safe_ca, links)
+  supported_features = []
+  for first, last, label, pattern_count, step, starts in features:
+    hbond_flags = []
+    for start in starts:
+      acceptor, donor = start, start + step
+      required = all(atom in records[acceptor]["xyz"] for atom in ("C", "O")) and all(
+        atom in records[index]["xyz"] for index in (donor-1, donor) for atom in ("C", "O", "N"))
+      peptide_path_ok = all(
+        1.0**2 <= _distance_sq(records[index]["xyz"]["C"], records[index+1]["xyz"]["N"]) <= 1.8**2
+        for index in range(acceptor, donor)
+        if "C" in records[index]["xyz"] and "N" in records[index+1]["xyz"])
+      peptide_path_ok = peptide_path_ok and all(
+        "C" in records[index]["xyz"] and "N" in records[index+1]["xyz"]
+        for index in range(acceptor, donor))
+      if (not required or not peptide_path_ok or not records[acceptor]["unambiguous"] or
+          not records[donor-1]["unambiguous"] or not records[donor]["unambiguous"]):
+        hbond_flags.append(False)
+      else:
+        hbond_flags.append(_odd_backbone_hbond(records, acceptor, donor))
+    all_supported = bool(hbond_flags) and all(hbond_flags)
+    if all_supported:
+      label += " (H-bond supported)"
+    supported_features.append((first, last, label, pattern_count, all_supported))
+  return supported_features
+
+
+ODD_HELICAL_FEATURE_COLOUR_INDEX = 28
+ODD_HELICAL_HIGHLIGHT_STATE = {}
+
+
+def _clear_odd_helical_feature_highlights():
+  for mol_id, state in list(ODD_HELICAL_HIGHLIGHT_STATE.items()):
+    try:
+      if state.get("handles"):
+        for handle in state["handles"]:
+          try:
+            delete_additional_representation(mol_id, handle)
+          except Exception:
+            pass
+        current_handles = CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS.get(mol_id, [])
+        CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS[mol_id] = [
+          handle for handle in current_handles if handle not in state["handles"]]
+      elif _supports_direct_user_defined_colouring():
+        representation = state.get("representation")
+        _restore_last_standard_representation(mol_id, representation)
+        blank_rows = state.get("blank_rows")
+        if blank_rows is None:
+          blank_rows = _direct_user_defined_blank_rows_for_molecule(mol_id)
+        if blank_rows:
+          _set_user_defined_atom_colour_by_residue_rows_py(mol_id, blank_rows)
+        _restore_last_standard_representation(mol_id, representation)
+    except Exception:
+      traceback.print_exc()
+    ODD_HELICAL_HIGHLIGHT_STATE.pop(mol_id, None)
+
+
+def _highlight_odd_helical_range(navigation):
+  mol_id = navigation.get("mol_id")
+  residue_specs = navigation.get("residue_specs") or []
+  if mol_id is None or not residue_specs:
+    return False
+  existing = ODD_HELICAL_HIGHLIGHT_STATE.get(mol_id)
+  if existing and _supports_direct_user_defined_colouring():
+    previous_specs = existing.get("residue_specs", [])
+    previous_keys = {tuple(spec[:3]) for spec in previous_specs}
+    next_keys = {tuple(spec[:3]) for spec in residue_specs}
+    changed_rows = [
+      (spec, 0) for spec in previous_specs if tuple(spec[:3]) not in next_keys
+    ] + [
+      (spec, ODD_HELICAL_FEATURE_COLOUR_INDEX)
+      for spec in residue_specs if tuple(spec[:3]) not in previous_keys
+    ]
+    if changed_rows and not _set_user_defined_atom_colour_by_residue_rows_py(mol_id, changed_rows):
+      return False
+    if changed_rows:
+      _graphics_to_legacy_user_defined_representation(mol_id, changed_rows)
+    existing["residue_specs"] = list(residue_specs)
+    return True
+  if existing:
+    _clear_odd_helical_feature_highlights()
+  rows = [(spec, ODD_HELICAL_FEATURE_COLOUR_INDEX) for spec in residue_specs]
+  try:
+    representation = _last_standard_representation_function(mol_id)
+    if _supports_direct_user_defined_colouring():
+      ensure_user_defined_colour_table()
+      _clear_custom_colour_additional_representations(mol_id, clear_user_colours=False)
+      blank_rows = _direct_user_defined_blank_rows_for_molecule(mol_id)
+      result = _set_user_defined_atom_colour_by_residue_rows_py(
+        mol_id, blank_rows + rows)
+      if result:
+        _graphics_to_legacy_user_defined_representation(mol_id, blank_rows + rows)
+    else:
+      blank_rows = None
+      result = _apply_user_defined_residue_colours(mol_id, [], rows)
+    if not result:
+      return False
+    handles = list(CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS.get(mol_id, [])) \
+      if not _supports_direct_user_defined_colouring() else []
+    ODD_HELICAL_HIGHLIGHT_STATE[mol_id] = {
+      "representation": representation,
+      "handles": handles,
+      "residue_specs": list(residue_specs),
+      "blank_rows": blank_rows,
+    }
+    return True
+  except Exception:
+    traceback.print_exc()
+    return False
+
+
+def _odd_weak_region_hits(records):
+  """Group existing backbone support scores within connected protein stretches."""
+  regions = []
+  chunks = []
+  for index, record in enumerate(records):
+    usable = (record.get("backbone_support") is not None and
+              record["name"] in _REGISTER_PROTEIN_NAMES and "CA" in record["xyz"])
+    if not usable:
+      continue
+    connected = False
+    if chunks and chunks[-1][-1] == index - 1:
+      previous = records[index - 1]["xyz"]
+      current = record["xyz"]
+      connected = ("C" in previous and "N" in current and
+                   1.0**2 <= _distance_sq(previous["C"], current["N"]) <= 1.8**2)
+    if connected:
+      chunks[-1].append(index)
+    else:
+      chunks.append([index])
+  for chunk in chunks:
+    weak = [records[index]["backbone_support"] < EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION
+            for index in chunk]
+    spans = []
+    for start in range(len(chunk) - 4):
+      if sum(weak[start:start + 5]) < 3:
+        continue
+      end = start + 4
+      # Trim stronger window edges instead of inflating region boundaries.
+      while not weak[start]:
+        start += 1
+      while not weak[end]:
+        end -= 1
+      if spans and start <= spans[-1][1] + 2:
+        spans[-1][1] = max(spans[-1][1], end)
+      else:
+        spans.append([start, end])
+    for start, end in spans:
+      if end - start + 1 < 5:
+        continue
+      support = [records[index]["backbone_support"] for index in chunk[start:end + 1]]
+      regions.append((chunk[start], chunk[end], sum(weak[start:end + 1]),
+                      sum(support) / len(support)))
+  return regions
+
+
 def _collect_odd_residue_dialog_data():
   """Build the current Odd residues dialog payload from the active model/map."""
   map_id = _active_analysis_map_or_status()
@@ -5233,12 +5630,18 @@ def _collect_odd_residue_dialog_data():
   missing_atom_residue_keys = _missing_atom_residue_keys(mol_id)
 
   for chain_index, chain_id in enumerate(chain_ids(mol_id)):
+    backbone_records = []
     for serial_number in range(chain_n_residues(chain_id, mol_id)):
       residue_name_here = resname_from_serial_number(mol_id, chain_id, serial_number)
       resno = seqnum_from_serial_number(mol_id, chain_id, serial_number)
       ins_code = insertion_code_from_serial_number(mol_id, chain_id, serial_number)
 
       atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code)
+      backbone_records.append({"name": residue_name_here, "xyz": atom_xyz, "resno": resno,
+                               "ins": ins_code, "serial": serial_number,
+                               "backbone_support": None,
+                               "unambiguous": all(sum(atom["name"] == name for atom in atom_records) == 1
+                                                  for name in ("N", "CA", "C", "O"))})
       if not atom_xyz:
         continue
       residue_id = _format_residue_id(chain_id, resno, ins_code)
@@ -5256,7 +5659,7 @@ def _collect_odd_residue_dialog_data():
           dialog_label,
           point if point is not None else residue_point,
           detail_label,
-          navigation_metadata if use_navigation else None,
+          navigation_metadata if use_navigation else {"chain_id": chain_id},
         )
 
       if residue_name_here not in POLYMER_RESIDUE_NAMES:
@@ -5285,10 +5688,28 @@ def _collect_odd_residue_dialog_data():
           )
         continue
 
-      if residue_name_here == "GLY":
-        continue
+      if residue_name_here == "GLY" and backbone_records[-1]["unambiguous"]:
+        # Keep the L-amino-acid handedness; the carbonyl oxygen should not
+        # choose which of glycine's two alpha-hydrogen sites is tested.
+        cb_direction = _pseudo_cb_direction_from_backbone(
+          {name: atom_xyz[name] for name in ("N", "CA", "C")})
+        if cb_direction is not None:
+          cb_point = [atom_xyz["CA"][axis] + 1.53 * cb_direction[axis] for axis in range(3)]
+          cb_density = density_at_point(map_id, *cb_point)
+          if math.isfinite(cb_density) and cb_density >= peak_threshold:
+            _append_odd_residue_entry(
+              categorized_entries, "Possible Misfits",
+              (0.0, -cb_density, chain_index, serial_number, -1),
+              f"{dialog_label}: unexpected C-beta density", residue_point,
+              f"{residue_id} GLY: unexpected C-beta density; possible extra sidechain density; "
+              f"density {cb_density:.4f} at/above threshold {peak_threshold:.4f}. "
+              "Check residue identity and nearby atoms; this is a tentative flag.",
+              navigation_metadata,
+            )
 
       support_fraction, supported_points, total_points = _backbone_density_support(map_id, atom_xyz, peak_threshold)
+      if total_points:
+        backbone_records[-1]["backbone_support"] = support_fraction
       if total_points == 0 or support_fraction < EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION:
         add_result(
           "Weak Backbone",
@@ -5297,6 +5718,9 @@ def _collect_odd_residue_dialog_data():
           f"({support_fraction:.0%}) below threshold",
           use_navigation=True,
         )
+        continue
+
+      if residue_name_here == "GLY":
         continue
 
       stage_specs = _emringer_stage_specs(atom_xyz, atom_records, residue_name_here)
@@ -5352,17 +5776,69 @@ def _collect_odd_residue_dialog_data():
         use_navigation=True,
       )
 
+    for first, last, weak_count, mean_support in _odd_weak_region_hits(backbone_records):
+      start, end = backbone_records[first], backbone_records[last]
+      count = last - first + 1
+      label = (f"{_format_residue_id(chain_id, start['resno'], start['ins'])} - "
+               f"{_format_residue_id(chain_id, end['resno'], end['ins'])} | "
+               f"{count} residues | BB support {mean_support:.0%}")
+      middle = backbone_records[(first + last) // 2]
+      navigation = _odd_residue_navigation_metadata(
+        mol_id, chain_id, middle["resno"], middle["ins"], middle["serial"])
+      navigation["type"] = "polymer_range"
+      navigation["residue_specs"] = [
+        [chain_id, record["resno"], record["ins"] or ""]
+        for record in backbone_records[first:last + 1]]
+      _append_odd_residue_entry(
+        categorized_entries, "Weak regions", (mean_support, chain_index, first), label,
+        middle["xyz"]["CA"],
+        f"{label}; {weak_count}/{count} residues meet the Weak Backbone criterion "
+        f"(support below {EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION:.0%} at the current contour).",
+        navigation)
+
+    for index, context, phi, psi in _odd_backbone_context_hits(backbone_records):
+      record = backbone_records[index]
+      detail = (f"{_format_residue_id(chain_id, record['resno'], record['ins'])} {record['name']}: "
+                f"phi {phi:.1f}, psi {psi:.1f}; possible disruption within a {context}-like backbone run")
+      _append_odd_residue_entry(
+        categorized_entries, "Unusual phi/psi in context", (chain_index, record["serial"]),
+        _odd_residue_dialog_label(chain_id, record["resno"], record["ins"], record["name"]),
+        record["xyz"]["CA"], detail,
+        _odd_residue_navigation_metadata(mol_id, chain_id, record["resno"], record["ins"], record["serial"]))
+
+    for first, last, kind, pattern_count, hbond_supported in _odd_helical_feature_hits(backbone_records):
+      record, end = backbone_records[first], backbone_records[last]
+      start_id = _format_residue_id(chain_id, record["resno"], record["ins"])
+      end_id = _format_residue_id(chain_id, end["resno"], end["ins"])
+      label = f"{start_id} - {end_id}: {kind}"
+      confidence_note = "All expected backbone H-bonds also fit the geometry." if hbond_supported else \
+                       "No consistent supporting backbone H-bond pattern was found."
+      detail = (f"{label}; {pattern_count} consecutive C-alpha geometry windows. "
+                f"{confidence_note} Tentative geometry flag, not a validation error.")
+      middle_index = (first+last)//2
+      middle = backbone_records[middle_index]
+      navigation = _odd_residue_navigation_metadata(
+        mol_id, chain_id, middle["resno"], middle["ins"], middle["serial"])
+      navigation["type"] = "polymer_range"
+      navigation["residue_specs"] = [
+        [chain_id, item["resno"], item["ins"] or ""] for item in backbone_records[first:last+1]]
+      _append_odd_residue_entry(
+        categorized_entries, "Helical features", (chain_index, first), label,
+        middle["xyz"]["CA"], detail,
+        navigation)
+
   sorted_gui_categories, sorted_detail_categories = _sorted_categorized_outputs(
     categorized_entries,
     ODD_RESIDUE_CATEGORY_ORDER,
   )
-  numbered_gui_categories = _numbered_gui_categories(sorted_gui_categories)
   total_hits = sum(len(entries) for entries in categorized_entries.values())
   return {
     "mol_id": mol_id,
     "map_id": map_id,
     "peak_threshold": peak_threshold,
-    "gui_categories": numbered_gui_categories,
+    "gui_categories": sorted_gui_categories,
+    "chain_choices": [(chain, f"Chain {chain or '(blank)'}: {chain_n_residues(chain, mol_id)} residues")
+                      for chain in chain_ids(mol_id)],
     "detail_categories": sorted_detail_categories,
     "title": _odd_residue_dialog_title(mol_id, map_id),
     "total_hits": total_hits,
@@ -5392,12 +5868,13 @@ def find_odd_residues():
       refreshed_data["peak_threshold"],
       refreshed_data["detail_categories"],
     )
-    return refreshed_data["title"], refreshed_data["gui_categories"]
+    return refreshed_data["title"], refreshed_data["gui_categories"], refreshed_data["chain_choices"]
 
   categorized_interesting_things_gui(
     dialog_data["title"],
     dialog_data["gui_categories"],
     refresh_function=refresh_payload,
+    chain_choices=dialog_data["chain_choices"],
   )
   _log_odd_residue_results(
     dialog_data["mol_id"],
@@ -7758,22 +8235,27 @@ def prompt_generate_smart_local_extra_restraints():
 
 
 def flip_active_peptide():
-  if coot_fitting and hasattr(coot_fitting, "pepflip_active_residue"):
-    return coot_fitting.pepflip_active_residue()
-  active_atom = closest_atom_simple()
+  # The installed coot_fitting helper may call the removed coot.closest_atom_raw()
+  # name; use the supported Python bindings directly instead.
+  active_atom = coot.closest_atom_simple_py() if hasattr(coot, "closest_atom_simple_py") else False
   if not active_atom:
     add_status_bar_text("No active residue")
     return None
   imol = active_atom[0]
-  atom_spec = closest_atom_raw()
+  atom_spec = coot.closest_atom_raw_py() if hasattr(coot, "closest_atom_raw_py") else False
+  if isinstance(atom_spec, (list, tuple)) and atom_spec and isinstance(atom_spec[0], (list, tuple)):
+    atom_spec = atom_spec[0]
+  if not isinstance(atom_spec, (list, tuple)) or len(atom_spec) < 6:
+    add_status_bar_text("Could not identify the peptide at the screen centre")
+    return None
   chain_id = atom_spec[1]
   res_no = atom_spec[2]
   ins_code = atom_spec[3]
   atom_name = atom_spec[4]
   alt_conf = atom_spec[5]
-  if atom_name == " N  ":
+  if str(atom_name).strip() == "N":
     res_no = res_no - 1
-  return pepflip(imol, chain_id, res_no, ins_code, alt_conf)
+  return coot.pepflip(imol, chain_id, res_no, ins_code, alt_conf)
 
 
 def add_water_and_refine():
@@ -10004,15 +10486,17 @@ def _clear_custom_colour_additional_representations(mol_id, clear_user_colours=T
 
 
 def _direct_user_defined_blank_rows_for_molecule(mol_id, blank_colour=0):
-  blank_rows = []
-  for residue_spec in _all_residue_specs_for_colouring(mol_id):
-    blank_rows.append((residue_spec, blank_colour))
-  return blank_rows
+  del mol_id
+  # Coot's CID "//" selects the whole molecule. Use one native rule rather
+  # than building thousands of per-residue selections for large models.
+  return [("//", blank_colour)]
 
 
 def _graphics_to_legacy_user_defined_representation(mol_id, colour_rows):
   if _supports_direct_user_defined_colouring():
     graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
+    cycle_rep_flag[mol_id] = _representation_sequence().index(
+      graphics_to_user_defined_atom_colours_all_atoms_representation)
     return
   for item in colour_rows or []:
     if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -10494,6 +10978,28 @@ def _representation_sequence():
 def _cycle_rep_flag_or_default(mol_id):
   representation_sequence = _representation_sequence()
   flag = cycle_rep_flag.get(mol_id, DEFAULT_REPRESENTATION_INDEX)
+  # Seed an unknown model from Coot, then advance our requested position.
+  # Re-reading on every keypress can pin the cycle if native mode reporting
+  # lags or a native representation transition is a no-op.
+  get_bond_type = getattr(coot, "get_graphics_molecule_bond_type", None)
+  if mol_id not in cycle_rep_flag and callable(get_bond_type):
+    bond_type_functions = {
+      1: graphics_to_bonds_representation,
+      15: graphics_to_bonds_representation,
+      4: graphics_to_ca_plus_ligands_representation,
+      17: graphics_to_ca_plus_ligands_and_sidechains_representation,
+      7: graphics_to_ca_plus_ligands_sec_struct_representation,
+      9: graphics_to_rainbow_representation,
+      10: graphics_to_b_factor_representation,
+      12: graphics_to_user_defined_atom_colours_all_atoms_representation,
+      13: graphics_to_user_defined_atom_colours_representation,
+    }
+    try:
+      current_function = bond_type_functions.get(get_bond_type(mol_id))
+      if current_function in representation_sequence:
+        flag = representation_sequence.index(current_function)
+    except Exception:
+      pass
   if flag not in range(len(representation_sequence)):
     flag = DEFAULT_REPRESENTATION_INDEX
   cycle_rep_flag[mol_id] = flag
