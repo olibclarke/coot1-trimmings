@@ -15,6 +15,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import time
 import traceback
 import warnings
 from bisect import bisect_left
@@ -25,6 +26,11 @@ from contextlib import contextmanager
 STARTUP_DIAGNOSTIC_MESSAGES = []
 _STARTUP_DIAGNOSTIC_DIALOGS_SHOWN = set()
 _GTK_REPOSITORY_WARNINGS_SHOWN = set()
+_MODEL_EDIT_EPOCHS = {}
+
+
+def _mark_model_changed(mol_id):
+  _MODEL_EDIT_EPOCHS[mol_id] = _MODEL_EDIT_EPOCHS.get(mol_id, 0) + 1
 
 
 @contextmanager
@@ -43,6 +49,7 @@ def _grouped_model_edit(mol_id):
       coot.turn_on_backup(mol_id)
     else:
       coot.turn_off_backup(mol_id)
+    _mark_model_changed(mol_id)
 
 
 def _record_startup_diagnostic(level, message):
@@ -457,7 +464,7 @@ RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
   or os.environ.get("USERNAME")
   or ""
 )
-RESIDUE_ANNOTATION_SCHEMA_VERSION = "3"
+RESIDUE_ANNOTATION_SCHEMA_VERSION = "4"
 RESIDUE_ANNOTATION_NEARBY_RADIUS = 6.0
 RESIDUE_ANNOTATION_POLL_INTERVAL_MS = 300
 
@@ -542,6 +549,12 @@ EMRINGER_HELPER_BACKBONE_ATOM_NAMES = {"N", "CA", "C", "O", "OXT", "CB"}
 RESIDUE_ANNOTATION_CATEGORY_PREFIX = "_cootnote_residue_note."
 RESIDUE_ANNOTATION_META_VERSION_TAG = "_cootnote_annotation_meta.version"
 RESIDUE_ANNOTATION_META_PROGRAM_TAG = "_cootnote_annotation_meta.program"
+RESIDUE_ANNOTATION_RANGE_FIELDS = (
+  "target_kind", "end_label_comp_id", "end_label_asym_id", "end_label_seq_id",
+  "end_auth_asym_id", "end_auth_seq_id", "end_pdbx_PDB_ins_code",
+)
+RESIDUE_ANNOTATION_REGION_HIGHLIGHTS = {}
+RESIDUE_ANNOTATION_RANGE_PICK_STATE = {}
 
 
 @lru_cache(maxsize=1)
@@ -609,20 +622,25 @@ def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restr
       res_limits = [start_resno - 1, stop_resno + 1]
 
     if all([residue_exists_qm(imol, chain_id, resno, "") for resno in res_limits]):
+      existing_models = set(model_molecule_list())
       imol_backwards = coot.copy_molecule(imol)
-      if valid_model_molecule_qm(imol_backwards):
-        temp_imols.add(imol_backwards)
+      if imol_backwards in existing_models or not valid_model_molecule_qm(imol_backwards):
+        raise RuntimeError("Could not create an independent backwards fitting model.")
+      temp_imols.add(imol_backwards)
       loop_len = abs(start_resno - stop_resno) + 1
       imol_both = coot.copy_molecule(imol) if loop_len >= 6 else None
-      if imol_both is not None and valid_model_molecule_qm(imol_both):
+      if imol_both is not None:
+        if imol_both in existing_models or imol_both == imol_backwards or not valid_model_molecule_qm(imol_both):
+          raise RuntimeError("Could not create an independent combined fitting model.")
         temp_imols.add(imol_both)
 
       atom_selection = "//" + chain_id + "/" + str(min(start_resno, stop_resno) - 1) + \
                        "-" + str(max(start_resno, stop_resno) + 1)
       imol_fragment_backup = coot.new_molecule_by_atom_selection(imol, atom_selection)
-      if valid_model_molecule_qm(imol_fragment_backup):
-        temp_imols.add(imol_fragment_backup)
-        coot.set_mol_displayed(imol_fragment_backup, 0)
+      if imol_fragment_backup in existing_models or imol_fragment_backup in temp_imols or not valid_model_molecule_qm(imol_fragment_backup):
+        raise RuntimeError("Could not create an independent gap backup fragment.")
+      temp_imols.add(imol_fragment_backup)
+      coot.set_mol_displayed(imol_fragment_backup, 0)
 
       gap.fit_gap_generic(imol, chain_id, start_resno, stop_resno, sequence)
       gap.fit_gap_generic(imol_backwards, chain_id, stop_resno, start_resno, sequence)
@@ -642,32 +660,22 @@ def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restr
         gap.fit_gap_generic(imol_both, chain_id, start_resno1, stop_resno1, sequence1)
         gap.fit_gap_generic(imol_both, chain_id, stop_resno2, start_resno2, sequence2)
         immediate_refinement_mode = coot.refinement_immediate_replacement_state()
-        coot.set_refinement_immediate_replacement(1)
-        coot.refine_zone(imol_both, chain_id, stop_resno1 - loop_len//3, start_resno2 + loop_len//3, "")
-        coot.accept_regularizement()
-        coot.set_refinement_immediate_replacement(immediate_refinement_mode)
+        try:
+          coot.set_refinement_immediate_replacement(1)
+          coot.refine_zone(imol_both, chain_id, stop_resno1 - loop_len//3, start_resno2 + loop_len//3, "")
+          coot.accept_regularizement()
+        finally:
+          coot.set_refinement_immediate_replacement(immediate_refinement_mode)
         result_c = gap.low_density_average(imol_map, imol_both, chain_id, start_resno, stop_resno)
         loop_list.append([imol_both, result_c])
 
-      i = 0
-      while i < (len(loop_list) - 1):
-        j = i + 1
-        while j < len(loop_list):
-          max_score = max(loop_list[i][1], loop_list[j][1])
-          if max_score != 0 and (min(loop_list[i][1], loop_list[j][1]) / max_score > 0.90):
-            temp_imols.discard(loop_list[j][0])
-            coot.close_molecule(loop_list[j][0])
-            loop_list.pop(j)
-          j += 1
-        i += 1
-
-      if result_a > result_b:
-        temp_imols.discard(imol_backwards)
-        coot.close_molecule(imol_backwards)
-      else:
-        coot.replace_fragment(imol, imol_backwards, atom_selection)
-        temp_imols.discard(imol_backwards)
-        coot.close_molecule(imol_backwards)
+      candidates = [(candidate, float(score)) for candidate, score in loop_list
+                    if valid_model_molecule_qm(candidate) and math.isfinite(float(score))]
+      if not candidates:
+        raise RuntimeError("Gap fitting produced no valid scored candidate.")
+      winner, _score = max(candidates, key=lambda item: item[1])
+      if winner != imol and not coot.replace_fragment(imol, winner, atom_selection):
+        raise RuntimeError("Coot rejected the best gap-fit fragment.")
     else:
       gap.fit_gap_generic(imol, chain_id, start_resno, stop_resno, sequence)
   finally:
@@ -677,6 +685,7 @@ def fit_gap(imol, chain_id, start_resno, stop_resno, sequence="", use_rama_restr
     coot.set_refine_ramachandran_angles(rama_status)
     if backup_mode == 1:
       coot.turn_on_backup(imol)
+    _mark_model_changed(imol)
 
 if gap is not None:
   gap.fit_gap = fit_gap
@@ -900,8 +909,9 @@ if "set_user_defined_atom_colour_by_residue_py" not in globals():
     return coot.set_user_defined_atom_colour_by_selection_py(mol_id, selection_colour_list)
 
 
-def _set_user_defined_atom_colour_by_residue_rows_py(mol_id, residue_specs_colour_index_tuple_list_py):
-  ensure_user_defined_colour_table()
+def _set_user_defined_atom_colour_by_residue_rows_py(mol_id, residue_specs_colour_index_tuple_list_py, palette_ready=False):
+  if not palette_ready:
+    ensure_user_defined_colour_table()
   selection_colour_list = []
   for item in residue_specs_colour_index_tuple_list_py or []:
     if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -938,16 +948,23 @@ if "graphics_to_user_defined_atom_colours_all_atoms_representation" not in globa
   )
 
 
-_coot_graphics_to_bonds_representation = graphics_to_bonds_representation
-_coot_graphics_to_rainbow_representation = graphics_to_rainbow_representation
-_coot_graphics_to_b_factor_representation = graphics_to_b_factor_representation
-_coot_graphics_to_ca_plus_ligands_representation = graphics_to_ca_plus_ligands_representation
-_coot_graphics_to_ca_plus_ligands_and_sidechains_representation = (
-  graphics_to_ca_plus_ligands_and_sidechains_representation
-)
-_coot_graphics_to_ca_plus_ligands_sec_struct_representation = (
-  graphics_to_ca_plus_ligands_sec_struct_representation
-)
+def _native_representation_function(name):
+  # Keep originals on the module: startup scripts may be re-executed in place.
+  originals = getattr(coot, "_trimmings_native_representations", None)
+  if originals is None:
+    originals = {}
+    coot._trimmings_native_representations = originals
+  if name not in originals:
+    originals[name] = getattr(coot, name)
+  return originals[name]
+
+
+_coot_graphics_to_bonds_representation = _native_representation_function("graphics_to_bonds_representation")
+_coot_graphics_to_rainbow_representation = _native_representation_function("graphics_to_rainbow_representation")
+_coot_graphics_to_b_factor_representation = _native_representation_function("graphics_to_b_factor_representation")
+_coot_graphics_to_ca_plus_ligands_representation = _native_representation_function("graphics_to_ca_plus_ligands_representation")
+_coot_graphics_to_ca_plus_ligands_and_sidechains_representation = _native_representation_function("graphics_to_ca_plus_ligands_and_sidechains_representation")
+_coot_graphics_to_ca_plus_ligands_sec_struct_representation = _native_representation_function("graphics_to_ca_plus_ligands_sec_struct_representation")
 LAST_STANDARD_REPRESENTATION_BY_MOL = {}
 
 
@@ -1359,11 +1376,25 @@ def _active_atom_context_or_status():
   }
 
 
-def _segment_range_for_residue(mol_id, chain_id, resno):
+def _segment_specs_for_residue(mol_id, chain_id, resno, ins_code="", rows=None):
+  rows = _segment_chain_snapshot(mol_id, chain_id) if rows is None else rows
+  index = next((i for i, row in enumerate(rows)
+                if (row["number"], row["ins"]) == (resno, ins_code or "")), None)
+  if index is None or rows[index]["name"] not in _SEGMENT_POLYMER_NAMES:
+    return []
+  first = last = index
+  while first and _segment_rows_connected(rows[first-1], rows[first]):
+    first -= 1
+  while last+1 < len(rows) and _segment_rows_connected(rows[last], rows[last+1]):
+    last += 1
+  return [(chain_id, row["number"], row["ins"]) for row in rows[first:last+1]]
+
+
+def _segment_range_for_residue(mol_id, chain_id, resno, ins_code=""):
   """Return the contiguous polymer segment containing a residue number."""
-  for _mol_id, seg_chain_id, seg_start, seg_end in segment_list_chain(mol_id, chain_id):
-    if seg_chain_id == chain_id and seg_start <= resno <= seg_end:
-      return (seg_start, seg_end)
+  specs = _segment_specs_for_residue(mol_id, chain_id, resno, ins_code)
+  if specs:
+    return (specs[0][1], specs[-1][1])
   return None
 
 
@@ -1372,16 +1403,18 @@ def _active_segment_context_or_status():
   atom_context = _active_atom_context_or_status()
   if not atom_context:
     return None
-  segment_range = _segment_range_for_residue(
+  specs = _segment_specs_for_residue(
     atom_context["mol_id"],
     atom_context["chain_id"],
     atom_context["resno"],
+    atom_context["ins_code"],
   )
-  if segment_range is None:
+  if not specs:
     add_status_bar_text("No active segment")
     return None
-  atom_context["segment_start"] = segment_range[0]
-  atom_context["segment_end"] = segment_range[1]
+  atom_context["segment_start"] = specs[0][1]
+  atom_context["segment_end"] = specs[-1][1]
+  atom_context["segment_specs"] = specs
   return atom_context
 
 
@@ -1418,6 +1451,10 @@ def _renumber_residue_range_or_dialog(mol_id, ch_id, start_res, last_res, offset
   if not status:
     info_dialog(failure_message)
     return 0
+  _mark_model_changed(mol_id)
+  remembered = globals().get("NAVIGATION_LAST_RESIDUE")
+  if remembered and remembered["mol_id"] == mol_id and remembered["chain_id"] == ch_id and start_res <= remembered["resno"] <= last_res:
+    remembered["resno"] += int(offset)
   return status
 
 
@@ -1444,6 +1481,18 @@ def _residue_is_polymer(mol_id, chain_id, resno, ins_code):
 
 def _residue_serial_number(mol_id, chain_id, resno, ins_code):
   """Return the exact serial number for a residue, including insertion code."""
+  remembered = globals().get("NAVIGATION_LAST_RESIDUE")
+  if remembered and (remembered["mol_id"], remembered["chain_id"], remembered["resno"], remembered["ins_code"]) == (mol_id, chain_id, resno, ins_code or ""):
+    serial = remembered.get("serial_number")
+    if serial is not None and 0 <= serial < chain_n_residues(chain_id, mol_id) and seqnum_from_serial_number(mol_id, chain_id, serial) == resno and insertion_code_from_serial_number(mol_id, chain_id, serial) == (ins_code or ""):
+      return serial
+  all_specs = getattr(coot, "all_residues_with_serial_numbers_py", None)
+  if callable(all_specs):
+    for entry in all_specs(mol_id) or []:
+      parsed = _coot_residue_spec_from_spec(entry[1:])
+      if parsed == (chain_id, resno, ins_code or ""):
+        return int(entry[0])
+    return -1
   for serial_number in range(chain_n_residues(chain_id, mol_id)):
     if seqnum_from_serial_number(mol_id, chain_id, serial_number) != resno:
       continue
@@ -1480,20 +1529,19 @@ def _nearest_polymer_residue_to_rotation_centre(mol_id, chain_id=None, max_dista
   centre = _rotation_centre_xyz()
   best_residue = None
   best_distance_sq = max_distance * max_distance
-  chain_ids_to_search = [chain_id] if chain_id and chain_id in chain_ids(mol_id) else chain_ids(mol_id)
-  for current_chain_id in chain_ids_to_search:
-    for serial_number in range(chain_n_residues(current_chain_id, mol_id)):
-      resno = seqnum_from_serial_number(mol_id, current_chain_id, serial_number)
-      ins_code = insertion_code_from_serial_number(mol_id, current_chain_id, serial_number)
-      if not _residue_is_polymer(mol_id, current_chain_id, resno, ins_code):
-        continue
-      residue_centre = residue_centre_py(mol_id, current_chain_id, resno, ins_code)
-      if not isinstance(residue_centre, (list, tuple)) or len(residue_centre) != 3:
-        continue
-      distance_sq = _distance_sq(centre, residue_centre)
-      if distance_sq <= best_distance_sq:
-        best_distance_sq = distance_sq
-        best_residue = (current_chain_id, resno, ins_code)
+  for current_chain_id, resno, ins_code in _residue_specs_near_point(mol_id, centre, max_distance):
+    if chain_id is not None and current_chain_id != chain_id:
+      continue
+    if not _residue_is_polymer(mol_id, current_chain_id, resno, ins_code):
+      continue
+    xyz = _trimmed_atom_xyz_map(mol_id, current_chain_id, resno, ins_code)
+    anchor = _default_navigation_target_xyz(xyz, residue_name(mol_id, current_chain_id, resno, ins_code))
+    if anchor is None:
+      continue
+    distance_sq = _distance_sq(centre, anchor)
+    if distance_sq <= best_distance_sq:
+      best_distance_sq = distance_sq
+      best_residue = (current_chain_id, resno, ins_code)
   return best_residue
 
 
@@ -1510,12 +1558,15 @@ def _navigation_residue_near_rotation_centre(reference_residue, max_distance=6.0
   resno = reference_residue["resno"]
   ins_code = reference_residue["ins_code"]
   rotation_centre = _rotation_centre_xyz()
+  reference_xyz = _trimmed_atom_xyz_map(mol_id, chain_id, resno, ins_code)
+  reference_centre = _default_navigation_target_xyz(reference_xyz, residue_name(mol_id, chain_id, resno, ins_code))
+  if reference_centre is not None and _distance_sq(rotation_centre, reference_centre) <= 0.5**2:
+    return reference_residue
   nearest_residue = _nearest_polymer_residue_to_rotation_centre(mol_id, chain_id, max_distance=max_distance)
   if nearest_residue is None:
     return reference_residue
   if nearest_residue == (chain_id, resno, ins_code):
     return reference_residue
-  reference_centre = residue_centre_py(mol_id, chain_id, resno, ins_code)
   if not isinstance(reference_centre, (list, tuple)) or len(reference_centre) != 3:
     reference_residue = dict(reference_residue)
     reference_residue.update({
@@ -1527,10 +1578,13 @@ def _navigation_residue_near_rotation_centre(reference_residue, max_distance=6.0
     reference_residue.pop("serial_number", None)
     return reference_residue
   reference_distance_sq = _distance_sq(rotation_centre, reference_centre)
-  nearest_centre = residue_centre_py(mol_id, nearest_residue[0], nearest_residue[1], nearest_residue[2])
+  nearest_xyz = _trimmed_atom_xyz_map(mol_id, *nearest_residue)
+  nearest_centre = _default_navigation_target_xyz(nearest_xyz, residue_name(mol_id, *nearest_residue))
   if not isinstance(nearest_centre, (list, tuple)) or len(nearest_centre) != 3:
     return reference_residue
   nearest_distance_sq = _distance_sq(rotation_centre, nearest_centre)
+  if nearest_distance_sq > 0.5**2:
+    return reference_residue
   if nearest_distance_sq + (distance_tolerance * distance_tolerance) >= reference_distance_sq:
     return reference_residue
   reference_residue = dict(reference_residue)
@@ -1546,6 +1600,18 @@ def _navigation_residue_near_rotation_centre(reference_residue, max_distance=6.0
 
 def _navigation_reference_residue():
   """Resolve the residue that navigation should use as its starting point."""
+  remembered = globals().get("NAVIGATION_LAST_RESIDUE")
+  if remembered and remembered.get("view_centre") is not None and _distance_sq(_rotation_centre_xyz(), remembered["view_centre"]) < 1e-6:
+    mol_id = remembered["mol_id"]
+    if mol_id in model_molecule_list() and _residue_is_polymer(mol_id, remembered["chain_id"], remembered["resno"], remembered["ins_code"]):
+      active = active_residue()
+      spec = (remembered["chain_id"], remembered["resno"], remembered["ins_code"])
+      anchor = _default_navigation_target_xyz(_trimmed_atom_xyz_map(mol_id, *spec), residue_name(mol_id, *spec))
+      if anchor is not None and _distance_sq(anchor, remembered["view_centre"]) < 0.5**2 and (not active or active[0] == mol_id):
+        result = dict(remembered)
+        result["source"] = "stored"
+        result["serial_number"] = _residue_serial_number(mol_id, remembered["chain_id"], remembered["resno"], remembered["ins_code"])
+        return result
   residue = active_residue()
   if residue and _residue_is_polymer(residue[0], residue[1], residue[2], residue[3]):
     return _navigation_residue_near_rotation_centre({
@@ -1741,6 +1807,7 @@ def _go_to_navigation_residue(mol_id, chain_id, resno, ins_code, serial_number=N
     "resno": resno,
     "ins_code": ins_code,
     "serial_number": serial_number,
+    "view_centre": _rotation_centre_xyz(),
   }
   add_status_bar_text(
     _navigation_status_bar_label(mol_id, chain_id, resno, ins_code, residue_name_here)
@@ -1757,6 +1824,78 @@ def _distance_sq(point_1, point_2):
   dy = point_1[1] - point_2[1]
   dz = point_1[2] - point_2[2]
   return dx*dx + dy*dy + dz*dz
+
+
+def _spatial_index(items, position, cell_size):
+  bins = {}
+  for item in items:
+    xyz = position(item)
+    key = tuple(math.floor(float(value) / cell_size) for value in xyz)
+    bins.setdefault(key, []).append((xyz, item))
+  return (float(cell_size), bins)
+
+
+def _model_coordinate_snapshot(mol_id):
+  """Read full-precision coordinates once; fall back on older Coot builds."""
+  bulk = getattr(coot, "python_representation_kk", None)
+  model_count = getattr(coot, "n_models", None)
+  if callable(model_count) and model_count(mol_id) != 1:
+    raise ValueError("This operation requires a single-model molecule.")
+  if callable(bulk):
+    models = bulk(mol_id)
+    if not isinstance(models, (list, tuple)) or not models:
+      raise RuntimeError("Coot could not read the model coordinates.")
+    if len(models) != 1:
+      raise ValueError("This operation requires a single-model molecule.")
+    records = {}
+    for chain, residues in models[0]:
+      for number, ins, name, atoms in residues:
+        spec = (str(chain), int(number), str(ins or ""))
+        if spec in records:
+          raise ValueError("Ambiguous residue identifiers in model snapshot.")
+        records[spec] = {"name": name, "atoms": atoms}
+    return records
+  return {tuple(spec): {"name": residue_name(mol_id, *spec),
+                        "atoms": residue_info_py(mol_id, *spec) or []}
+          for spec in _all_residue_specs_for_colouring(mol_id)}
+
+
+def _coordinate_snapshot_centres(snapshot):
+  result = {}
+  for spec, record in snapshot.items():
+    points = [atom[2] for atom in record["atoms"]]
+    if points:
+      result[spec] = tuple(sum(point[axis] for point in points) / len(points) for axis in range(3))
+  return result
+
+
+def _spatial_query(index, point, radius):
+  cell_size, bins = index
+  lower = [math.floor((value-radius) / cell_size) for value in point]
+  upper = [math.floor((value+radius) / cell_size) for value in point]
+  radius_sq = radius * radius
+  for x in range(lower[0], upper[0]+1):
+    for y in range(lower[1], upper[1]+1):
+      for z in range(lower[2], upper[2]+1):
+        for xyz, item in bins.get((x, y, z), ()):
+          if _distance_sq(xyz, point) <= radius_sq:
+            yield item
+
+
+def _residue_specs_near_point(mol_id, point, radius):
+  native_query = getattr(coot, "residues_near_position_py", None)
+  if callable(native_query):
+    raw = native_query(mol_id, list(point), float(radius))
+    if raw is False or raw is None:
+      raise RuntimeError("Coot could not query nearby residues.")
+    return list(dict.fromkeys(spec for spec in
+      (_coot_residue_spec_from_spec(value) for value in raw) if spec is not None))
+  specs = []
+  for spec, record in _model_coordinate_snapshot(mol_id).items():
+    if any(_distance_sq(atom[2], point) <= radius * radius
+           for atom in record["atoms"]):
+      specs.append(tuple(spec))
+  return specs
 
 
 def _vector_subtract(point_1, point_2):
@@ -2265,10 +2404,9 @@ def _find_model_molecule_for_click_spec(chain_id, resno, ins_code):
   """Find the clicked model by residue identity when the click payload lacks a usable imol."""
   if not chain_id or resno is False:
     return -1
-  for imol in model_molecule_list():
-    if residue_exists_qm(imol, chain_id, resno, ins_code):
-      return imol
-  return -1
+  matches = [imol for imol in model_molecule_list()
+             if residue_exists_qm(imol, chain_id, resno, ins_code)]
+  return matches[0] if len(matches) == 1 else -1
 
 
 def _click_spec_field(click_spec, long_index, short_index, default=None):
@@ -2283,31 +2421,22 @@ def _click_spec_field(click_spec, long_index, short_index, default=None):
 
 
 def _click_spec_imol(click_spec):
-  """Return a best-effort model molecule id from a Coot click spec.
-
-  Coot 1.x click payloads often contain correct chain/residue information but
-  unreliable molecule ids. Prefer a valid model id when present, otherwise fall
-  back to a residue lookup and finally the active residue.
-  """
+  """Decode molecule identity without confusing PDB model number with imol."""
   valid_model_mols = model_molecule_list()
   if not isinstance(click_spec, (list, tuple)):
-    residue = active_residue()
-    return residue[0] if residue and residue[0] in valid_model_mols else -1
-  first_imol = _coot_int_arg(_click_spec_field(click_spec, 0, 0, -1))
-  second_imol = _coot_int_arg(_click_spec_field(click_spec, 1, 0, -1))
-  if isinstance(first_imol, int) and first_imol in valid_model_mols:
-    return first_imol
-  if len(click_spec) >= 7 and isinstance(second_imol, int) and second_imol in valid_model_mols:
-    return second_imol
+    return -1
+  imol = _coot_int_arg(_click_spec_field(click_spec, 1, 0, -1))
+  if isinstance(imol, int) and imol in valid_model_mols:
+    return imol
+  if len(click_spec) >= 6:
+    # An explicit but invalid imol must never redirect an edit to another model.
+    return -1
   chain_id = _click_spec_chain_id(click_spec)
   resno = _click_spec_res_no(click_spec)
   ins_code = _click_spec_ins_code(click_spec)
   imol = _find_model_molecule_for_click_spec(chain_id, resno, ins_code)
   if imol in valid_model_mols:
     return imol
-  residue = active_residue()
-  if residue and residue[0] in valid_model_mols:
-    return residue[0]
   return -1
 
 
@@ -3038,6 +3167,7 @@ if _preloaded_coot_gui is not None:
     note_default_text,
     go_button_label,
     handle_go_function,
+    close_function=None,
   ):
     """Small GTK4 prompt for adding a titled/authored multiline residue note."""
     window = Gtk.Window()
@@ -3110,8 +3240,17 @@ if _preloaded_coot_gui is not None:
     note_scrolled.set_child(note_view)
 
     def close_window(*_args):
+      if callable(close_function):
+        close_function()
       window.destroy()
       return False
+
+    def on_close_request(*_args):
+      if callable(close_function):
+        close_function()
+      return False
+
+    window.connect("close-request", on_close_request)
 
     def submit(*_args):
       start_iter = note_buffer.get_start_iter()
@@ -3122,7 +3261,7 @@ if _preloaded_coot_gui is not None:
         note_buffer.get_text(start_iter, end_iter, False),
       )
       if status not in (0, False):
-        window.destroy()
+        close_window()
       return False
 
     cancel_button.connect("clicked", close_window)
@@ -3343,6 +3482,7 @@ if _preloaded_coot_gui is not None:
     window = Gtk.Window()
     window.set_title("Coot")
     window.set_default_size(560, 520)
+    closed = {"value": False}
 
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     navigation_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -3379,7 +3519,9 @@ if _preloaded_coot_gui is not None:
     scrolled.set_child(inside_vbox)
 
     def close_window(*_args):
+      closed["value"] = True
       _clear_odd_helical_feature_highlights()
+      population_epoch["value"] += 1
       window.destroy()
 
     def jump_to_entry(entry, category_name=None):
@@ -3392,6 +3534,8 @@ if _preloaded_coot_gui is not None:
     selected_button = {"value": None}
     category_expanded = {}
     category_widgets = {}
+    population_epoch = {"value": 0}
+    glib = _coot_gui_repository_module("GLib")
     filter_state = {"choices": [(None, "All chains")] + list(chain_choices or []),
                     "chain": None, "updating": False, "title": dialog_name,
                     "categories": categorized_thing_lists}
@@ -3426,7 +3570,49 @@ if _preloaded_coot_gui is not None:
         except Exception:
           pass
 
+    def ensure_entry_button(entry_index):
+      category_name, entry, button = flat_entry_specs[entry_index]
+      if button is None:
+        button = Gtk.Button(label=str(entry[0]))
+        button.connect("clicked", lambda _button, idx=entry_index: activate_entry(idx))
+        flat_entry_specs[entry_index][2] = button
+        box = category_widgets[category_name]["box"]
+        indices = category_widgets[category_name]["indices"]
+        previous = None
+        previous_index = entry_index - 1
+        while previous_index >= indices[0]:
+          previous = flat_entry_specs[previous_index][2]
+          if previous is not None:
+            break
+          previous_index -= 1
+        box.insert_child_after(button, previous)
+      return button
+
+    def category_toggled(widget, _param, category_name):
+      category_expanded[category_name] = widget.get_expanded()
+      state = category_widgets[category_name]
+      if not widget.get_expanded() or state["pending"]:
+        return
+      epoch = population_epoch["value"]
+      state["pending"] = True
+      def populate():
+        if epoch != population_epoch["value"] or not widget.get_expanded():
+          state["pending"] = False
+          return False
+        stop = min(state["cursor"] + 40, len(state["indices"]))
+        for index in state["indices"][state["cursor"]:stop]:
+          ensure_entry_button(index)
+        state["cursor"] = stop
+        state["pending"] = stop < len(state["indices"])
+        return state["pending"]
+      if glib is not None:
+        glib.idle_add(populate)
+      else:
+        while populate():
+          pass
+
     def render_categories(current_dialog_name, current_categorized_thing_lists):
+      population_epoch["value"] += 1
       if chain_dropdown is not None:
         filter_state["title"] = current_dialog_name
         filter_state["categories"] = current_categorized_thing_lists
@@ -3451,25 +3637,21 @@ if _preloaded_coot_gui is not None:
         shown_any_category = True
 
         expander = Gtk.Expander(label=f"{category_name} ({len(thing_list)})")
-        expander.set_expanded(category_expanded.get(category_name, False))
-        expander.connect("notify::expanded", lambda widget, _param, name=category_name:
-                         category_expanded.__setitem__(name, widget.get_expanded()))
-        category_widgets[category_name] = expander
+        expander.connect("notify::expanded", lambda widget, param, name=category_name:
+                         category_toggled(widget, param, name))
         category_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         expander.set_child(category_box)
         inside_vbox.append(expander)
+        category_widgets[category_name] = {"expander": expander, "box": category_box,
+                                           "indices": [], "pending": False, "cursor": 0}
 
         for entry in thing_list:
           if len(entry) < 4:
             continue
-          button = Gtk.Button(label=str(entry[0]))
           entry_index = len(flat_entry_specs)
-          flat_entry_specs.append((category_name, entry, button))
-          button.connect(
-            "clicked",
-            lambda _button, idx=entry_index: activate_entry(idx),
-          )
-          category_box.append(button)
+          flat_entry_specs.append([category_name, entry, None])
+          category_widgets[category_name]["indices"].append(entry_index)
+        expander.set_expanded(category_expanded.get(category_name, False))
 
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         separator.set_margin_top(4)
@@ -3490,7 +3672,8 @@ if _preloaded_coot_gui is not None:
       entry_index = entry_index % len(flat_entry_specs)
       current_index["value"] = entry_index
       category_name, entry, button = flat_entry_specs[entry_index]
-      category_widgets[category_name].set_expanded(True)
+      category_widgets[category_name]["expander"].set_expanded(True)
+      button = ensure_entry_button(entry_index)
       jump_to_entry(entry, category_name)
       set_selected_button(button)
       try:
@@ -3515,13 +3698,21 @@ if _preloaded_coot_gui is not None:
     def refresh_categories(*_args):
       if not callable(refresh_function):
         return None
-      refreshed_payload = refresh_function()
-      if not refreshed_payload:
-        return None
-      refreshed_dialog_name, refreshed_categorized_thing_lists = refreshed_payload[:2]
-      if chain_dropdown is not None and len(refreshed_payload) > 2:
-        update_chain_choices(refreshed_payload[2])
-      render_categories(refreshed_dialog_name, refreshed_categorized_thing_lists)
+      def completed(refreshed_payload):
+        if closed["value"]:
+          return
+        refresh_button.set_sensitive(True)
+        if not refreshed_payload:
+          return
+        refreshed_dialog_name, refreshed_categorized_thing_lists = refreshed_payload[:2]
+        if chain_dropdown is not None and len(refreshed_payload) > 2:
+          update_chain_choices(refreshed_payload[2])
+        render_categories(refreshed_dialog_name, refreshed_categorized_thing_lists)
+      start_async = getattr(refresh_function, "start_async", None)
+      if callable(start_async):
+        refresh_button.set_sensitive(False)
+        return start_async(completed)
+      return completed(refresh_function())
 
     def chain_changed(*_args):
       if filter_state["updating"]:
@@ -3535,6 +3726,7 @@ if _preloaded_coot_gui is not None:
     next_button.connect("clicked", lambda *_args: activate_next())
     refresh_button.connect("clicked", refresh_categories)
     close_button.connect("clicked", close_window)
+    window.connect("close-request", lambda *_: close_window() or False)
     refresh_button.set_sensitive(callable(refresh_function))
 
     render_categories(dialog_name, categorized_thing_lists)
@@ -3722,8 +3914,11 @@ else:
     _note_default_text,
     _go_button_label,
     _handle_go_function,
+    close_function=None,
   ):
     info_dialog(_gui_unavailable_message(function_label))
+    if callable(close_function):
+      close_function()
 
   def generic_author_note_entry(
     function_label,
@@ -3788,6 +3983,13 @@ def add_key_binding(name, key, thunk):
   if isinstance(key, str) and key.startswith("Control_"):
     ctrl_key = 1
     key_value = key[len("Control_"):]
+  if isinstance(key_value, str) and len(key_value) > 1:
+    named_keys = {"Tab": 65289, "Return": 65293, "Escape": 65307,
+                  "Left": 65361, "Up": 65362, "Right": 65363, "Down": 65364,
+                  "BackSpace": 65288, "Delete": 65535, "space": 32}
+    if key_value not in named_keys:
+      raise ValueError(f"Unknown named key: {key_value}")
+    key_value = named_keys[key_value]
 
   def wrapped_thunk():
     try:
@@ -4544,9 +4746,10 @@ def _active_polymer_molecule_or_status():
   return reference["mol_id"]
 
 
-def _residue_atom_records_and_xyz(imol, chain_id, resno, ins_code):
+def _residue_atom_records_and_xyz(imol, chain_id, resno, ins_code, snapshot=None):
   """Parse a residue once into both atom records and an atom-name lookup map."""
-  atom_info = residue_info_py(imol, chain_id, resno, ins_code)
+  atom_info = (snapshot.get((chain_id, resno, ins_code or ""), {}).get("atoms", [])
+               if snapshot is not None else residue_info_py(imol, chain_id, resno, ins_code))
   if not isinstance(atom_info, list):
     return [], {}
 
@@ -5484,8 +5687,9 @@ ODD_HELICAL_FEATURE_COLOUR_INDEX = 28
 ODD_HELICAL_HIGHLIGHT_STATE = {}
 
 
-def _clear_odd_helical_feature_highlights():
-  for mol_id, state in list(ODD_HELICAL_HIGHLIGHT_STATE.items()):
+def _clear_odd_helical_feature_highlights(highlight_state=None):
+  highlight_state = ODD_HELICAL_HIGHLIGHT_STATE if highlight_state is None else highlight_state
+  for mol_id, state in list(highlight_state.items()):
     try:
       if state.get("handles"):
         for handle in state["handles"]:
@@ -5507,15 +5711,19 @@ def _clear_odd_helical_feature_highlights():
         _restore_last_standard_representation(mol_id, representation)
     except Exception:
       traceback.print_exc()
-    ODD_HELICAL_HIGHLIGHT_STATE.pop(mol_id, None)
+    highlight_state.pop(mol_id, None)
 
 
-def _highlight_odd_helical_range(navigation):
+def _highlight_odd_helical_range(navigation, highlight_state=None):
+  if globals().get("_USER_DEFINED_COLOUR_JOB_ACTIVE", False):
+    add_status_bar_text("Please wait for colouring to finish before highlighting a region.")
+    return False
+  highlight_state = ODD_HELICAL_HIGHLIGHT_STATE if highlight_state is None else highlight_state
   mol_id = navigation.get("mol_id")
   residue_specs = navigation.get("residue_specs") or []
   if mol_id is None or not residue_specs:
     return False
-  existing = ODD_HELICAL_HIGHLIGHT_STATE.get(mol_id)
+  existing = highlight_state.get(mol_id)
   if existing and _supports_direct_user_defined_colouring():
     previous_specs = existing.get("residue_specs", [])
     previous_keys = {tuple(spec[:3]) for spec in previous_specs}
@@ -5528,12 +5736,17 @@ def _highlight_odd_helical_range(navigation):
     ]
     if changed_rows and not _set_user_defined_atom_colour_by_residue_rows_py(mol_id, changed_rows):
       return False
-    if changed_rows:
-      _graphics_to_legacy_user_defined_representation(mol_id, changed_rows)
+    get_bond_type = getattr(coot, "get_graphics_molecule_bond_type", None)
+    try:
+      ca_view_active = callable(get_bond_type) and get_bond_type(mol_id) == 13
+    except Exception:
+      ca_view_active = False
+    if changed_rows or not ca_view_active:
+      _graphics_to_legacy_user_defined_representation(mol_id, changed_rows, ca_only=True)
     existing["residue_specs"] = list(residue_specs)
     return True
   if existing:
-    _clear_odd_helical_feature_highlights()
+    _clear_odd_helical_feature_highlights(highlight_state)
   rows = [(spec, ODD_HELICAL_FEATURE_COLOUR_INDEX) for spec in residue_specs]
   try:
     representation = _last_standard_representation_function(mol_id)
@@ -5544,7 +5757,7 @@ def _highlight_odd_helical_range(navigation):
       result = _set_user_defined_atom_colour_by_residue_rows_py(
         mol_id, blank_rows + rows)
       if result:
-        _graphics_to_legacy_user_defined_representation(mol_id, blank_rows + rows)
+        _graphics_to_legacy_user_defined_representation(mol_id, blank_rows + rows, ca_only=True)
     else:
       blank_rows = None
       result = _apply_user_defined_residue_colours(mol_id, [], rows)
@@ -5552,7 +5765,7 @@ def _highlight_odd_helical_range(navigation):
       return False
     handles = list(CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS.get(mol_id, [])) \
       if not _supports_direct_user_defined_colouring() else []
-    ODD_HELICAL_HIGHLIGHT_STATE[mol_id] = {
+    highlight_state[mol_id] = {
       "representation": representation,
       "handles": handles,
       "residue_specs": list(residue_specs),
@@ -5609,7 +5822,7 @@ def _odd_weak_region_hits(records):
   return regions
 
 
-def _collect_odd_residue_dialog_data():
+def _iter_odd_residue_dialog_data():
   """Build the current Odd residues dialog payload from the active model/map."""
   map_id = _active_analysis_map_or_status()
   if map_id is None:
@@ -5628,15 +5841,28 @@ def _collect_odd_residue_dialog_data():
 
   categorized_entries = {category_name: [] for category_name in ODD_RESIDUE_CATEGORY_ORDER}
   missing_atom_residue_keys = _missing_atom_residue_keys(mol_id)
+  snapshot = _model_coordinate_snapshot(mol_id)
+  chain_records = {}
+  for spec, record in snapshot.items():
+    chain_records.setdefault(spec[0], []).append((spec, record))
+  edit_epoch = _MODEL_EDIT_EPOCHS.get(mol_id, 0)
+  processed = 0
 
-  for chain_index, chain_id in enumerate(chain_ids(mol_id)):
+  for chain_index, (chain_id, records) in enumerate(chain_records.items()):
     backbone_records = []
-    for serial_number in range(chain_n_residues(chain_id, mol_id)):
-      residue_name_here = resname_from_serial_number(mol_id, chain_id, serial_number)
-      resno = seqnum_from_serial_number(mol_id, chain_id, serial_number)
-      ins_code = insertion_code_from_serial_number(mol_id, chain_id, serial_number)
+    for serial_number, (spec, record) in enumerate(records):
+      if processed % 8 == 0:
+        yield (processed, len(snapshot))
+        if not valid_model_molecule_qm(mol_id) or not valid_map_molecule_qm(map_id):
+          raise RuntimeError("The analysis model or map was closed.")
+        if (_MODEL_EDIT_EPOCHS.get(mol_id, 0) != edit_epoch or
+            _odd_residue_peak_threshold_or_status(map_id) != peak_threshold):
+          raise RuntimeError("Model or contour changed; please restart Odd residues.")
+      processed += 1
+      residue_name_here = record["name"]
+      _chain, resno, ins_code = spec
 
-      atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code)
+      atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code, snapshot=snapshot)
       backbone_records.append({"name": residue_name_here, "xyz": atom_xyz, "resno": resno,
                                "ins": ins_code, "serial": serial_number,
                                "backbone_support": None,
@@ -5827,6 +6053,8 @@ def _collect_odd_residue_dialog_data():
         middle["xyz"]["CA"], detail,
         navigation)
 
+  if snapshot != _model_coordinate_snapshot(mol_id):
+    raise RuntimeError("Model coordinates changed; please restart Odd residues.")
   sorted_gui_categories, sorted_detail_categories = _sorted_categorized_outputs(
     categorized_entries,
     ODD_RESIDUE_CATEGORY_ORDER,
@@ -5837,17 +6065,68 @@ def _collect_odd_residue_dialog_data():
     "map_id": map_id,
     "peak_threshold": peak_threshold,
     "gui_categories": sorted_gui_categories,
-    "chain_choices": [(chain, f"Chain {chain or '(blank)'}: {chain_n_residues(chain, mol_id)} residues")
-                      for chain in chain_ids(mol_id)],
+    "chain_choices": [(chain, f"Chain {chain or '(blank)'}: {len(records)} residues")
+                      for chain, records in chain_records.items()],
     "detail_categories": sorted_detail_categories,
     "title": _odd_residue_dialog_title(mol_id, map_id),
     "total_hits": total_hits,
   }
 
 
-def find_odd_residues():
-  """Find odd residues in the active molecule using density-based heuristics."""
-  dialog_data = _collect_odd_residue_dialog_data()
+def _collect_odd_residue_dialog_data():
+  iterator = _iter_odd_residue_dialog_data()
+  while True:
+    try:
+      next(iterator)
+    except StopIteration as result:
+      return result.value
+
+
+def _start_odd_residue_analysis(on_complete):
+  """Yield between small residue batches; never run Coot APIs on worker threads."""
+  glib = _coot_gui_repository_module("GLib")
+  if glib is None or Gtk is None:
+    return on_complete(_collect_odd_residue_dialog_data())
+  window = Gtk.Window(title="Odd residues")
+  window.set_default_size(340, 100)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  box.set_margin_top(12)
+  box.set_margin_bottom(12)
+  box.set_margin_start(12)
+  box.set_margin_end(12)
+  progress = Gtk.Label(label="Analysing model...")
+  cancel = Gtk.Button(label="Cancel")
+  box.append(progress)
+  box.append(cancel)
+  window.set_child(box)
+  state = {"cancelled": False}
+  iterator = _iter_odd_residue_dialog_data()
+  def cancel_analysis(*_args):
+    state["cancelled"] = True
+    return False
+  cancel.connect("clicked", cancel_analysis)
+  window.connect("close-request", cancel_analysis)
+  def step():
+    data = None
+    if not state["cancelled"]:
+      try:
+        count, total = next(iterator)
+        progress.set_text(f"Analysing residues: {count}/{total}")
+        return True
+      except StopIteration as result:
+        data = result.value
+      except Exception as error:
+        info_dialog(f"Odd residues analysis stopped: {error}")
+    iterator.close()
+    window.destroy()
+    on_complete(data)
+    return False
+  window.present()
+  glib.idle_add(step)
+  return window
+
+
+def _show_odd_residue_dialog_data(dialog_data):
   if dialog_data is None:
     return None
 
@@ -5870,6 +6149,14 @@ def find_odd_residues():
     )
     return refreshed_data["title"], refreshed_data["gui_categories"], refreshed_data["chain_choices"]
 
+  def refresh_async(done):
+    def completed(data):
+      if data is not None:
+        _log_odd_residue_results(data["mol_id"], data["map_id"], data["peak_threshold"], data["detail_categories"])
+      done((data["title"], data["gui_categories"], data["chain_choices"]) if data else None)
+    return _start_odd_residue_analysis(completed)
+  refresh_payload.start_async = refresh_async
+
   categorized_interesting_things_gui(
     dialog_data["title"],
     dialog_data["gui_categories"],
@@ -5883,6 +6170,11 @@ def find_odd_residues():
     dialog_data["detail_categories"],
   )
   return dialog_data["total_hits"]
+
+
+def find_odd_residues():
+  """Find odd residues without blocking the interface for a whole-model scan."""
+  return _start_odd_residue_analysis(_show_odd_residue_dialog_data)
 
 
 def find_emringer_like_sidechain_density_outliers():
@@ -6011,8 +6303,8 @@ def _annotation_prepare_note_fields(title_text, author_text, note_text):
   normalized_title = _annotation_optional_text(title_text)
   normalized_author = _annotation_text_or_empty(author_text).strip() or _annotation_default_author()
   normalized_note = _annotation_text_or_empty(note_text).strip()
-  if not normalized_note:
-    info_dialog("Please enter a note before saving the residue annotation.")
+  if not normalized_note and not normalized_title:
+    info_dialog("Please enter a title or note before saving the annotation.")
     return None
   return normalized_title, normalized_author, normalized_note
 
@@ -6054,7 +6346,7 @@ def _annotation_target_for_active_residue(expected_mol_id=None):
 
 
 def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
-  return {
+  entry = {
     "id": int(entry_id),
     "label_comp_id": target["residue_name"],
     "label_asym_id": _annotation_text_or_empty(target.get("label_asym_id")).strip(),
@@ -6067,6 +6359,15 @@ def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
     "modified_utc": _annotation_now_utc(),
     "note": _annotation_text_or_empty(note_text).strip(),
   }
+  entry["target_kind"] = "region" if target.get("end") else "residue"
+  if target.get("end"):
+    end = target["end"]
+    entry.update({"end_label_comp_id": end["residue_name"],
+                  "end_label_asym_id": end.get("label_asym_id", ""),
+                  "end_label_seq_id": end.get("label_seq_id", ""),
+                  "end_auth_asym_id": end["chain_id"], "end_auth_seq_id": end["resno"],
+                  "end_pdbx_PDB_ins_code": end.get("ins_code", "")})
+  return entry
 
 
 def _annotation_normalize_entry(raw_entry, fallback_id=None):
@@ -6091,9 +6392,54 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
     "modified_utc": _annotation_text_or_empty(raw_entry.get("modified_utc")).strip() or _annotation_now_utc(),
     "note": _annotation_text_or_empty(raw_entry.get("note")).strip(),
   }
-  if not normalized_entry["note"]:
+  if not normalized_entry["note"] and not normalized_entry["title"]:
     return None
+  kind = _annotation_text_or_empty(raw_entry.get("target_kind")).strip() or "residue"
+  if kind not in ("residue", "region"):
+    return None
+  normalized_entry["target_kind"] = kind
+  if kind == "region":
+    for field in RESIDUE_ANNOTATION_RANGE_FIELDS[1:]:
+      normalized_entry[field] = _annotation_text_or_empty(raw_entry.get(field)).strip()
+    end_number = _annotation_safe_int(raw_entry.get("end_auth_seq_id"))
+    if end_number is None or normalized_entry["end_auth_asym_id"] != auth_asym_id:
+      return None
+    if (normalized_entry["label_asym_id"] and normalized_entry["end_label_asym_id"]
+        and normalized_entry["label_asym_id"] != normalized_entry["end_label_asym_id"]):
+      return None
+    normalized_entry["end_auth_seq_id"] = end_number
   return normalized_entry
+
+
+def _annotation_entry_group_key(entry):
+  key = _annotation_residue_key(entry["auth_asym_id"], entry["auth_seq_id"],
+                                entry.get("pdbx_PDB_ins_code", ""), entry.get("label_comp_id", ""))
+  if entry.get("target_kind") == "region":
+    key += _annotation_residue_key(entry["end_auth_asym_id"], entry["end_auth_seq_id"],
+                                   entry.get("end_pdbx_PDB_ins_code", ""), entry.get("end_label_comp_id", ""))
+  return key
+
+
+def _annotation_entry_label(entry):
+  if entry.get("target_kind") == "region":
+    return (f"{entry['auth_asym_id']}:{entry['auth_seq_id']}{entry.get('pdbx_PDB_ins_code', '')}"
+            f"-{entry['end_auth_seq_id']}{entry.get('end_pdbx_PDB_ins_code', '')}")
+  return _odd_residue_dialog_label(entry["auth_asym_id"], entry["auth_seq_id"],
+                                 entry.get("pdbx_PDB_ins_code", ""), entry.get("label_comp_id", ""))
+
+
+def _annotation_region_specs(mol_id, entry, all_specs=None):
+  if entry.get("target_kind") != "region":
+    return [(entry["auth_asym_id"], entry["auth_seq_id"], entry.get("pdbx_PDB_ins_code", ""))]
+  specs = [tuple(s) for s in (_all_residue_specs_for_colouring(mol_id) if all_specs is None else all_specs)
+           if s[0] == entry["auth_asym_id"]]
+  first = (entry["auth_asym_id"], entry["auth_seq_id"], entry.get("pdbx_PDB_ins_code", ""))
+  last = (entry["end_auth_asym_id"], entry["end_auth_seq_id"], entry.get("end_pdbx_PDB_ins_code", ""))
+  if specs.count(first) != 1 or specs.count(last) != 1:
+    return []
+  lower, upper = sorted((specs.index(first), specs.index(last)))
+  members = [spec for spec in specs[lower:upper+1] if _residue_is_polymer(mol_id, *spec)]
+  return members if first in members and last in members else []
 
 
 def _annotation_entry_display_title(entry, fallback_from_note=True, max_length=None):
@@ -6120,21 +6466,15 @@ def _annotation_entry_sort_key(entry):
 def _annotation_groups_for_molecule(mol_id):
   grouped = {}
   for entry in _annotation_entries_for_molecule(mol_id):
-    group_key = _annotation_residue_key(
-      entry["auth_asym_id"],
-      entry["auth_seq_id"],
-      entry.get("pdbx_PDB_ins_code", ""),
-      entry.get("label_comp_id", ""),
-    )
+    group_key = _annotation_entry_group_key(entry)
     grouped.setdefault(group_key, []).append(entry)
 
   groups = []
   for group_key, entries in grouped.items():
     entries.sort(key=_annotation_entry_sort_key)
-    chain_id, resno, ins_code, residue_name_here = group_key
     groups.append({
       "key": group_key,
-      "dialog_label": _odd_residue_dialog_label(chain_id, resno, ins_code, residue_name_here),
+      "dialog_label": _annotation_entry_label(entries[0]),
       "entries": entries,
     })
   groups.sort(key=_annotation_group_sort_key)
@@ -6273,10 +6613,11 @@ def _annotation_render_group_detail_widgets(detail_box, group):
         margin_bottom=4,
       )
     )
-    note_box.append(_annotation_detail_label("Note:", selectable=False))
-    note_text_label = _annotation_detail_label(_annotation_text_or_empty(entry.get("note")) or "", selectable=True)
-    note_text_label.set_margin_start(24)
-    note_box.append(note_text_label)
+    if _annotation_text_or_empty(entry.get("note")).strip():
+      note_box.append(_annotation_detail_label("Note:", selectable=False))
+      note_text_label = _annotation_detail_label(_annotation_text_or_empty(entry.get("note")), selectable=True)
+      note_text_label.set_margin_start(24)
+      note_box.append(note_text_label)
 
     expander.set_child(note_box)
     detail_box.append(expander)
@@ -6343,6 +6684,17 @@ def _annotation_mmcif_rows(mol_id, entity_records=None):
         _annotation_text_or_empty(entry.get("note")),
       ]
     )
+    end_entry = {field: entry.get("end_" + field) for field in
+                 ("label_comp_id", "label_asym_id", "label_seq_id", "auth_asym_id",
+                  "auth_seq_id", "pdbx_PDB_ins_code")}
+    end_comp, end_asym, end_seq = _annotation_export_label_fields(
+      end_entry, polymer_residue_map, nonpoly_residue_map)
+    rows[-1].extend([entry.get("target_kind", "residue"),
+                    end_comp if entry.get("target_kind") == "region" else "?",
+                    end_asym or "?", end_seq or ".",
+                    _annotation_text_or_empty(entry.get("end_auth_asym_id")) or "?",
+                    _annotation_text_or_empty(entry.get("end_auth_seq_id")) or "?",
+                    _annotation_text_or_empty(entry.get("end_pdbx_PDB_ins_code")) or "?"])
   return rows
 
 
@@ -6422,7 +6774,7 @@ def _load_annotations_from_mmcif_file(file_path):
 
   def loop_text_field(row_index, plain_tag_name, legacy_b64_tag_name=None):
     if plain_tag_name in tag_indices:
-      return _annotation_text_or_empty(loop[row_index, tag_indices[plain_tag_name]])
+      return _annotation_text_or_empty(gemmi.cif.as_string(loop[row_index, tag_indices[plain_tag_name]]))
     if legacy_b64_tag_name is not None and legacy_b64_tag_name in tag_indices:
       return _annotation_decode_text(loop[row_index, tag_indices[legacy_b64_tag_name]])
     return ""
@@ -6456,15 +6808,13 @@ def _load_annotations_from_mmcif_file(file_path):
 
   entries = []
   for row_index in range(loop.length()):
+    identity = {name: loop_text_field(row_index, RESIDUE_ANNOTATION_CATEGORY_PREFIX + name)
+                for name in ("id", "label_comp_id", "label_asym_id", "label_seq_id",
+                             "auth_asym_id", "auth_seq_id", "pdbx_PDB_ins_code", "modified_utc",
+                             *RESIDUE_ANNOTATION_RANGE_FIELDS)}
     normalized_entry = _annotation_normalize_entry(
       {
-        "id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "id"]]),
-        "label_comp_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_comp_id"]]),
-        "label_asym_id": _annotation_text_or_empty(loop[row_index, tag_indices.get(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_asym_id", -1)]) if RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_asym_id" in tag_indices else "",
-        "label_seq_id": _annotation_text_or_empty(loop[row_index, tag_indices.get(RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_seq_id", -1)]) if RESIDUE_ANNOTATION_CATEGORY_PREFIX + "label_seq_id" in tag_indices else "",
-        "auth_asym_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_asym_id"]]),
-        "auth_seq_id": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "auth_seq_id"]]),
-        "pdbx_PDB_ins_code": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "pdbx_PDB_ins_code"]]),
+        **identity,
         "title": loop_text_field(
           row_index,
           RESIDUE_ANNOTATION_CATEGORY_PREFIX + "title",
@@ -6475,7 +6825,6 @@ def _load_annotations_from_mmcif_file(file_path):
           RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author",
           RESIDUE_ANNOTATION_CATEGORY_PREFIX + "author_b64",
         ),
-        "modified_utc": _annotation_text_or_empty(loop[row_index, tag_indices[RESIDUE_ANNOTATION_CATEGORY_PREFIX + "modified_utc"]]),
         "note": loop_text_field(
           row_index,
           RESIDUE_ANNOTATION_CATEGORY_PREFIX + "note",
@@ -6510,10 +6859,14 @@ def _annotation_write_entries_to_mmcif_block(block, entries):
         "author",
         "modified_utc",
         "note",
-      ],
+      ] + list(RESIDUE_ANNOTATION_RANGE_FIELDS),
     )
     for row in entries:
-      loop.add_row(row)
+      if len(row) == 11:
+        row = list(row) + ["residue", "?", "?", ".", "?", "?", "?"]
+      # Gemmi loop values are CIF tokens, not unquoted application strings.
+      loop.add_row([value if index in (3, 6, 12, 13, 14, 15, 16, 17) and value in (".", "?")
+                    else gemmi.cif.quote(str(value)) for index, value in enumerate(row)])
 
 
 def _write_annotations_into_mmcif_file(file_path, entries):
@@ -6665,19 +7018,20 @@ def _annotation_apply_export_entity_metadata(block, structure):
     nonpoly_table = _annotation_prepare_mmcif_table(block, "_pdbx_entity_nonpoly.", ["entity_id", "comp_id"])
 
   for record in entity_records:
-    entity_table.append_row([record["entity_id"], record["entity_type"]])
-    struct_asym_table.append_row([record["asym_id"], record["entity_id"]])
+    quote = gemmi.cif.quote
+    entity_table.append_row([quote(record["entity_id"]), quote(record["entity_type"])])
+    struct_asym_table.append_row([quote(record["asym_id"]), quote(record["entity_id"])])
     if record["kind"] == "polymer" and entity_poly_table is not None and entity_poly_seq_table is not None:
-      entity_poly_table.append_row([
+      entity_poly_table.append_row([quote(value) if value != "?" else "?" for value in [
         record["entity_id"],
         record["polymer_type"] or "other",
         record["asym_id"],
         record["one_letter_sequence"] or "?",
-      ])
+      ]])
       for index, mon_id in enumerate(record["sequence"], start=1):
-        entity_poly_seq_table.append_row([record["entity_id"], str(index), mon_id or "?"])
+        entity_poly_seq_table.append_row([quote(record["entity_id"]), str(index), quote(mon_id) if mon_id else "?"])
     elif record["kind"] == "nonpolymer" and nonpoly_table is not None:
-      nonpoly_table.append_row([record["entity_id"], record["comp_id"] or "?"])
+      nonpoly_table.append_row([quote(record["entity_id"]), quote(record["comp_id"]) if record["comp_id"] else "?"])
 
   return entity_records
 
@@ -6727,30 +7081,64 @@ def _annotation_apply_export_atom_site_metadata(block, entity_records):
     elif record["kind"] == "nonpolymer":
       nonpoly_residue_map[record["residue_key"]] = record
 
+  label_remap = {}
+  auth_remap = {}
   for row_index in range(len(group_column)):
-    auth_chain_id = auth_chain_column[row_index]
-    ins_code = ins_code_column[row_index]
+    auth_chain_id = gemmi.cif.as_string(auth_chain_column[row_index])
+    ins_code = gemmi.cif.as_string(ins_code_column[row_index])
     residue_key = (
       auth_chain_id,
-      auth_seq_column[row_index],
+      gemmi.cif.as_string(auth_seq_column[row_index]),
       "" if ins_code in (".", "?") else ins_code,
-      comp_id_column[row_index],
+      gemmi.cif.as_string(comp_id_column[row_index]),
     )
+    old_key = (gemmi.cif.as_string(chain_column[row_index]),
+               _annotation_label_seq_text(gemmi.cif.as_string(label_seq_column[row_index])), residue_key[3], residue_key[2])
     nonpoly_record = nonpoly_residue_map.get(residue_key)
     if nonpoly_record is not None:
-      chain_column[row_index] = nonpoly_record["asym_id"]
+      chain_column[row_index] = gemmi.cif.quote(nonpoly_record["asym_id"])
       entity_column[row_index] = nonpoly_record["entity_id"]
       label_seq_column[row_index] = "."
-      continue
+    else:
+      polymer_record = polymer_residue_map.get(auth_chain_id)
+      if polymer_record is None:
+        label_seq_column[row_index] = "."
+      else:
+        chain_column[row_index] = gemmi.cif.quote(polymer_record["asym_id"])
+        entity_column[row_index] = polymer_record["entity_id"]
+        label_seq_column[row_index] = polymer_record["residue_key_to_label_seq"].get(residue_key, ".")
+    new_labels = (chain_column[row_index], label_seq_column[row_index])
+    label_remap.setdefault(old_key, set()).add(new_labels)
+    auth_remap.setdefault(residue_key, set()).add(new_labels)
 
-    polymer_record = polymer_residue_map.get(auth_chain_id)
-    if polymer_record is None:
-      label_seq_column[row_index] = "."
-      continue
+  _annotation_remap_connection_labels(block, label_remap, auth_remap)
 
-    chain_column[row_index] = polymer_record["asym_id"]
-    entity_column[row_index] = polymer_record["entity_id"]
-    label_seq_column[row_index] = polymer_record["residue_key_to_label_seq"].get(residue_key, ".")
+
+def _annotation_remap_connection_labels(block, label_remap, auth_remap):
+  """Keep link endpoints synchronized with rewritten atom-site identifiers."""
+  for partner in ("ptnr1", "ptnr2"):
+    prefix = "_struct_conn." + partner + "_"
+    asym = block.find_values(prefix + "label_asym_id")
+    seq = block.find_values(prefix + "label_seq_id")
+    comp = block.find_values(prefix + "label_comp_id")
+    auth_asym = block.find_values(prefix + "auth_asym_id")
+    auth_seq = block.find_values(prefix + "auth_seq_id")
+    ins = block.find_values("_struct_conn.pdbx_" + partner + "_PDB_ins_code")
+    for index in range(len(asym)):
+      ins_code = gemmi.cif.as_string(ins[index]) if len(ins) else ""
+      name = gemmi.cif.as_string(comp[index]) if len(comp) else "?"
+      matches = set()
+      if len(auth_asym) and len(auth_seq):
+        matches = auth_remap.get((gemmi.cif.as_string(auth_asym[index]), gemmi.cif.as_string(auth_seq[index]), ins_code, name), set())
+      if not matches:
+        matches = label_remap.get((gemmi.cif.as_string(asym[index]),
+                  _annotation_label_seq_text(gemmi.cif.as_string(seq[index])) if len(seq) else ".", name, ins_code), set())
+      if len(matches) != 1:
+        raise ValueError("Cannot unambiguously remap an exported link endpoint.")
+      new_asym, new_seq = next(iter(matches))
+      asym[index] = new_asym
+      if len(seq):
+        seq[index] = new_seq
 
 
 def _annotation_sanitize_export_structure(structure):
@@ -6836,6 +7224,8 @@ def _write_model_with_embedded_annotations(mol_id, file_path):
     os.close(export_handle)
     export_handle = None
     export_document.write_file(export_path)
+    gemmi.cif.read_file(export_path).sole_block()
+    _load_annotations_from_mmcif_file(export_path)
     os.replace(export_path, file_path)
     return file_path
   finally:
@@ -7007,6 +7397,9 @@ def _append_annotation_for_target(target, title_text, author_text, note_text, re
   RESIDUE_ANNOTATION_LAST_AUTHOR = normalized_author
 
   mol_id = target["mol_id"]
+  if mol_id not in model_molecule_list():
+    info_dialog("The annotation model is no longer available.")
+    return 0
   annotation_entry = _new_annotation_entry(
     target,
     normalized_title,
@@ -7014,23 +7407,14 @@ def _append_annotation_for_target(target, title_text, author_text, note_text, re
     normalized_note,
     _annotation_next_id(mol_id),
   )
+  if annotation_entry["target_kind"] == "region":
+    if not _annotation_region_specs(mol_id, annotation_entry):
+      info_dialog("The region endpoints are no longer available or are ambiguous.")
+      return 0
   _annotation_entries_for_molecule(mol_id).append(annotation_entry)
-  residue_label = _odd_residue_dialog_label(
-    target["chain_id"],
-    target["resno"],
-    target["ins_code"],
-    target["residue_name"],
-  )
-  add_status_bar_text(f"Added residue annotation for {residue_label}")
+  add_status_bar_text(f"Added annotation for {_annotation_entry_label(annotation_entry)}")
   if callable(refresh_function):
-    refresh_function(
-      _annotation_residue_key(
-        target["chain_id"],
-        target["resno"],
-        target["ins_code"],
-        target["residue_name"],
-      )
-    )
+    refresh_function(_annotation_entry_group_key(annotation_entry))
   return 1
 
 
@@ -7059,6 +7443,227 @@ def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None)
       refresh_function,
     ),
   )
+  return 1
+
+
+def _annotation_parse_range(text):
+  match = re.fullmatch(r"\s*(-?\d+)([A-Za-z]*)\s*(?:-|,)\s*(-?\d+)([A-Za-z]*)\s*", str(text))
+  if not match:
+    raise ValueError("Use a range such as 75-80 or 75A-80B.")
+  return (int(match[1]), match[2]), (int(match[3]), match[4])
+
+
+def _prompt_annotation_for_range(mol_id, chain, first, last, refresh_function=None, selection_cleanup=None):
+  try:
+    if mol_id not in model_molecule_list():
+      raise ValueError("The annotation model is no longer available.")
+    snapshot = _model_coordinate_snapshot(mol_id)
+    start, end = (chain, *first), (chain, *last)
+    specs = [s for s in snapshot if s[0] == chain]
+    if start not in specs or end not in specs:
+      raise ValueError("Both endpoints must exist in the chosen chain.")
+    if not _residue_is_polymer(mol_id, *start) or not _residue_is_polymer(mol_id, *end):
+      raise ValueError("Region notes require polymer endpoints in the same chain.")
+    lower, upper = sorted((specs.index(start), specs.index(end)))
+    start, end = specs[lower], specs[upper]
+    def target_for(spec):
+      return {"mol_id": mol_id, "chain_id": spec[0], "resno": spec[1], "ins_code": spec[2],
+              "residue_name": snapshot[spec]["name"]}
+    target = target_for(start)
+    target["end"] = target_for(end)
+    label = _annotation_entry_label(_new_annotation_entry(target, "", "", "", 1))
+    generic_title_author_note_entry("Add region note", label, "", _annotation_default_author(), "",
+      "Add region note", lambda title, author, note: _append_annotation_for_target(
+        target, title, author, note, refresh_function), close_function=selection_cleanup)
+    return 1
+  except (ValueError, RuntimeError) as error:
+    if callable(selection_cleanup):
+      selection_cleanup()
+    info_dialog(str(error))
+    return 0
+
+
+def _annotation_click_spec_for_model(spec, mol_id):
+  """Use the annotation model to repair GTK4's unset molecule field."""
+  if not isinstance(spec, (list, tuple)) or len(spec) not in (6, 7):
+    raise ValueError("Coot returned an unrecognised atom pick.")
+  index = 1 if len(spec) == 7 else 0
+  clicked_model = _coot_int_arg(spec[index])
+  if clicked_model != -1:
+    if clicked_model != mol_id or mol_id not in model_molecule_list():
+      raise ValueError("Click an endpoint in the annotation model.")
+    return list(spec)
+  chain, number, ins = _click_spec_chain_id(spec), _click_spec_res_no(spec), _click_spec_ins_code(spec)
+  atom_name, alt = _click_spec_atom_name(spec).strip(), _click_spec_alt_conf(spec).strip()
+  if not chain or number is False or not atom_name:
+    raise ValueError("Coot returned an incomplete atom pick.")
+  if mol_id not in model_molecule_list():
+    raise ValueError("The annotation model is no longer available.")
+  displayed = getattr(coot, "mol_is_displayed", None)
+  if callable(displayed) and not displayed(mol_id):
+    raise ValueError("Display the annotation model before picking the range.")
+  if not residue_exists_qm(mol_id, chain, number, ins):
+    raise ValueError("The clicked atom is not in the displayed annotation model.")
+  atoms = coot.residue_info_py(mol_id, chain, number, ins) or []
+  if not any(a[0][0].strip() == atom_name and str(a[0][1] or "").strip() == alt for a in atoms):
+    raise ValueError("The clicked atom is not in the displayed annotation model.")
+  repaired = list(spec)
+  repaired[index] = mol_id
+  return repaired
+
+
+def _clear_annotation_range_pick():
+  state = dict(RESIDUE_ANNOTATION_RANGE_PICK_STATE)
+  RESIDUE_ANNOTATION_RANGE_PICK_STATE.clear()
+  if state.get("picking"):
+    clear_picks = getattr(coot, "clear_pending_picks", None)
+    if callable(clear_picks):
+      try:
+        clear_picks()
+      except Exception as error:
+        print("Could not cancel annotation endpoint picking:", error)
+  for obj in state.get("markers", []):
+    try:
+      coot.close_generic_object(obj)
+    except Exception as error:
+      print("Could not clear annotation endpoint marker:", error)
+  window = state.get("window")
+  if window is not None:
+    window.destroy()
+  draw = getattr(coot, "graphics_draw", None)
+  if state.get("markers") and callable(draw):
+    draw()
+
+
+def _mark_annotation_endpoint(spec, colour):
+  required = ("new_generic_object_number", "to_generic_object_add_point",
+              "set_display_generic_object", "close_generic_object")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    return
+  atoms = coot.residue_info_py(_click_spec_imol(spec), _click_spec_chain_id(spec),
+                             _click_spec_res_no(spec), _click_spec_ins_code(spec)) or []
+  candidates = [a for a in atoms if a[0][0].strip() == "CA"]
+  if not candidates:
+    candidates = [a for a in atoms if a[0][0].strip() == "P"] or atoms
+  if not candidates:
+    return
+  atom = max(candidates, key=lambda a: (not bool(a[0][1]), float(a[1][0])))
+  obj = coot.new_generic_object_number("Annotation range endpoint")
+  RESIDUE_ANNOTATION_RANGE_PICK_STATE.setdefault("markers", []).append(obj)
+  try:
+    coot.to_generic_object_add_point(obj, colour, 10, *atom[2])
+    coot.set_display_generic_object(obj, 1)
+    draw = getattr(coot, "graphics_draw", None)
+    if callable(draw):
+      draw()
+  except Exception as error:
+    print("Could not draw annotation endpoint marker:", error)
+    coot.close_generic_object(obj)
+    RESIDUE_ANNOTATION_RANGE_PICK_STATE["markers"].remove(obj)
+
+
+def _start_annotation_range_pick(mol_id, refresh_function=None):
+  _clear_annotation_range_pick()
+  token = object()
+  RESIDUE_ANNOTATION_RANGE_PICK_STATE.update(token=token, picking=True, markers=[])
+  def current():
+    return RESIDUE_ANNOTATION_RANGE_PICK_STATE.get("token") is token
+  def cleanup():
+    if current():
+      _clear_annotation_range_pick()
+  def decode(spec):
+    spec = _annotation_click_spec_for_model(spec, mol_id)
+    if not _residue_is_polymer(mol_id, _click_spec_chain_id(spec),
+                               _click_spec_res_no(spec), _click_spec_ins_code(spec)):
+      raise ValueError("Region endpoints must be polymer residues.")
+    return spec
+  def show_click(spec, suffix=""):
+    add_status_bar_text(_navigation_status_bar_label(mol_id, _click_spec_chain_id(spec),
+      _click_spec_res_no(spec), _click_spec_ins_code(spec)).replace("Current residue:", "Clicked residue:", 1) + suffix)
+  def reject(error, callback):
+    print("Annotation range picking:", error)
+    add_status_bar_text(str(error))
+    if current():
+      coot.user_defined_click_py(1, callback)
+  def last_clicked(first, raw_last):
+    if not current():
+      return
+    try:
+      first = decode(first)
+      last = decode(raw_last)
+      chain = _click_spec_chain_id(first)
+      if _click_spec_chain_id(last) != chain:
+        raise ValueError("Click the end residue in the same chain as the start residue.")
+    except ValueError as error:
+      reject(error, lambda last: last_clicked(first, last))
+      return
+    show_click(last)
+    _mark_annotation_endpoint(last, "orange")
+    RESIDUE_ANNOTATION_RANGE_PICK_STATE["picking"] = False
+    window = RESIDUE_ANNOTATION_RANGE_PICK_STATE.pop("window", None)
+    if window is not None:
+      window.destroy()
+    try:
+      _prompt_annotation_for_range(mol_id, chain, (_click_spec_res_no(first), _click_spec_ins_code(first)),
+                                  (_click_spec_res_no(last), _click_spec_ins_code(last)), refresh_function,
+                                  selection_cleanup=cleanup)
+    except Exception:
+      cleanup()
+      raise
+  def first_clicked(raw_first):
+    if not current():
+      return
+    try:
+      first = decode(raw_first)
+    except ValueError as error:
+      reject(error, first_clicked)
+      return
+    show_click(first, " | Click the end residue.")
+    _mark_annotation_endpoint(first, "cyan")
+    coot.user_defined_click_py(1, lambda last: last_clicked(first, last))
+  if globals().get("Gtk") is not None:
+    window = Gtk.Window()
+    window.set_title("Pick annotation range")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    box.set_margin_start(12)
+    box.set_margin_end(12)
+    box.set_margin_top(12)
+    box.set_margin_bottom(12)
+    box.append(Gtk.Label(label="Click the first and last residues.\nCyan = start; orange = end."))
+    cancel = Gtk.Button(label="Cancel picking")
+    cancel.connect("clicked", lambda *_args: cleanup())
+    box.append(cancel)
+    window.set_child(box)
+    window.connect("close-request", lambda *_args: cleanup() or False)
+    RESIDUE_ANNOTATION_RANGE_PICK_STATE["window"] = window
+    window.present()
+  add_status_bar_text("Region note: click the start residue.")
+  try:
+    coot.user_defined_click_py(1, first_clicked)
+  except Exception:
+    cleanup()
+    raise
+
+
+def prompt_add_annotation_for_region(mol_id=None, refresh_function=None):
+  if mol_id is None:
+    mol_id = _annotation_active_molecule_or_status()
+  if mol_id is None:
+    return 0
+  def enter_range():
+    residue = active_residue()
+    chain = residue[1] if residue and residue[0] == mol_id else "A"
+    def submitted(chain_text, range_text):
+      try:
+        first, last = _annotation_parse_range(range_text)
+      except ValueError as error:
+        info_dialog(str(error))
+        return 0
+      return _prompt_annotation_for_range(mol_id, chain_text.strip(), first, last, refresh_function)
+    generic_double_entry("Add region note", "Chain", chain, "Residue range", "75-80",
+                         "Continue", submitted)
+  action_button_dialog("Add region note", [["Click two endpoints", lambda: _start_annotation_range_pick(mol_id, refresh_function)],
+                                           ["Enter chain / range...", enter_range]])
   return 1
 
 
@@ -7140,7 +7745,24 @@ def _choose_annotation_entry_action(group, action_name, action_function):
 
 
 def _annotation_jump_to_group(mol_id, group):
-  chain_id, resno, ins_code, residue_name_here = group["key"]
+  entry = group["entries"][0]
+  if entry.get("target_kind") == "region":
+    specs = _annotation_region_specs(mol_id, entry)
+    if not specs:
+      _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
+      info_dialog("The annotated region endpoints are missing or ambiguous in this model.")
+      return 0
+    _clear_odd_helical_feature_highlights()
+    if not _highlight_odd_helical_range({"mol_id": mol_id, "residue_specs": specs},
+                                        RESIDUE_ANNOTATION_REGION_HIGHLIGHTS):
+      return 0
+    chain_id, resno, ins_code = specs[len(specs)//2]
+    result = _go_to_navigation_residue(mol_id, chain_id, resno, ins_code,
+                                      _residue_serial_number(mol_id, chain_id, resno, ins_code))
+    add_status_bar_text(f"{group['dialog_label']} - {_annotation_entry_display_title(entry)}")
+    return result
+  _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
+  chain_id, resno, ins_code, residue_name_here = group["key"][:4]
   residue_point = residue_centre_py(mol_id, chain_id, resno, ins_code)
   if not isinstance(residue_point, (list, tuple)) or len(residue_point) != 3:
     residue_point = None
@@ -7175,13 +7797,26 @@ def _annotation_groups_near_point(mol_id, point_xyz, radius, groups=None, positi
     radius_sq = float(radius) * float(radius)
   except Exception:
     return nearby_groups
-  for group in (_annotation_groups_for_molecule(mol_id) if groups is None else groups):
-    chain_id, resno, ins_code, _residue_name_here = group["key"]
-    residue_point = (residue_centre_py(mol_id, chain_id, resno, ins_code) if positions is None
-                     else positions.get((chain_id, resno, ins_code)))
-    if not isinstance(residue_point, (list, tuple)) or len(residue_point) != 3:
+  groups = _annotation_groups_for_molecule(mol_id) if groups is None else groups
+  all_specs = None
+  if any(g.get("entries") and g["entries"][0].get("target_kind") == "region" for g in groups):
+    all_specs = list(positions) if positions is not None else _all_residue_specs_for_colouring(mol_id)
+  for group in groups:
+    entry = group.get("entries", [{}])[0]
+    if entry.get("target_kind") == "region":
+      specs = group.get("region_specs")
+      if specs is None:
+        specs = _annotation_region_specs(mol_id, entry, all_specs)
+    else:
+      specs = [group["key"][:3]]
+    distances = []
+    for spec in specs:
+      point = residue_centre_py(mol_id, *spec) if positions is None else positions.get(tuple(spec))
+      if isinstance(point, (list, tuple)) and len(point) == 3:
+        distances.append(_distance_sq(point_xyz, point))
+    if not distances:
       continue
-    distance_sq = _distance_sq(point_xyz, residue_point)
+    distance_sq = min(distances)
     if distance_sq > radius_sq:
       continue
     nearby_group = dict(group)
@@ -7272,6 +7907,7 @@ def residue_annotations_gui():
   detail_scrolled = Gtk.ScrolledWindow()
   detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
   add_button = Gtk.Button(label="Add note for active residue")
+  add_region_button = Gtk.Button(label="Add region note...")
   edit_button = Gtk.Button(label="Edit selected note...")
   delete_button = Gtk.Button(label="Delete selected note...")
   export_button = Gtk.Button(label="Export annotated mmCIF...")
@@ -7358,6 +7994,8 @@ def residue_annotations_gui():
       return self.current_mol_id
 
     def stop_polling(self):
+      _clear_annotation_range_pick()
+      _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
       if glib_module is not None and self.active_residue_timer_id is not None:
         try:
           glib_module.source_remove(self.active_residue_timer_id)
@@ -7435,6 +8073,7 @@ def residue_annotations_gui():
       return None
 
     def clear_selected_group(self):
+      _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
       self.current_index = None
       self.selected_group_key = None
       detail_header.set_text("Selected notes: none")
@@ -7522,6 +8161,7 @@ def residue_annotations_gui():
       if target_mol_id is None and self.mol_id() in model_molecules:
         target_mol_id = self.mol_id()
       if target_mol_id is not None and target_mol_id != self.mol_id():
+        _clear_annotation_range_pick()
         self.current_mol_id = target_mol_id
         _ensure_residue_annotations_loaded(target_mol_id)
         self.render_groups()
@@ -7533,6 +8173,11 @@ def residue_annotations_gui():
       if mol_id is None:
         return None
       return prompt_add_annotation_for_active_residue(mol_id, self.refresh_groups)
+
+    def add_region_note(self, *_args):
+      mol_id = self.current_mol_id_or_dialog()
+      if mol_id is not None:
+        return prompt_add_annotation_for_region(mol_id, self.refresh_groups)
 
     def edit_selected_note(self, *_args):
       if self.current_mol_id_or_dialog() is None:
@@ -7630,6 +8275,7 @@ def residue_annotations_gui():
   browser = AnnotationBrowserState(initial_mol_id)
 
   add_button.connect("clicked", browser.add_note)
+  add_region_button.connect("clicked", browser.add_region_note)
   edit_button.connect("clicked", browser.edit_selected_note)
   delete_button.connect("clicked", browser.delete_selected_note)
   export_button.connect("clicked", browser.export_annotated_mmcif)
@@ -7646,6 +8292,7 @@ def residue_annotations_gui():
   browser.start_polling()
 
   action_row_top.append(add_button)
+  action_row_top.append(add_region_button)
   action_row_top.append(edit_button)
   action_row_top.append(delete_button)
   action_row_bottom.append(export_button)
@@ -7785,6 +8432,9 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       self.cached_annotation_entries = None
       self.cached_annotation_groups = []
       self.last_nearby_query = None
+      self.cached_positions = {}
+      self.positions_updated_at = -float("inf")
+      self.positions_epoch = None
 
     def mol_id(self):
       return self.current_mol_id
@@ -7952,14 +8602,35 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
         self.cached_annotation_entries = [dict(entry) for entry in entries]
         self.cached_annotation_groups = _annotation_groups_for_molecule(target_mol_id)
         force = True
-      positions = {}
-      for group in self.cached_annotation_groups:
-        key = group["key"][:3]
-        if key not in positions:
-          position = residue_centre_py(target_mol_id, *key)
-          positions[key] = tuple(position) if isinstance(position, (list, tuple)) and len(position) == 3 else None
-      # Native edits have no portable revision counter. Read centres each poll,
-      # but reuse grouping and avoid all filtering/rendering for unchanged input.
+      now = time.monotonic()
+      epoch = _MODEL_EDIT_EPOCHS.get(target_mol_id, 0)
+      # Script edits invalidate immediately. Native edits/Undo outside this
+      # script are picked up by the bounded fallback refresh.
+      if force or epoch != self.positions_epoch or now - self.positions_updated_at >= 1.5:
+        positions = {}
+        has_regions = any(group.get("entries") and group["entries"][0].get("target_kind") == "region"
+                          for group in self.cached_annotation_groups)
+        bulk_centres = (_coordinate_snapshot_centres(_model_coordinate_snapshot(target_mol_id))
+                        if len(self.cached_annotation_groups) >= 64 or has_regions else None)
+        if has_regions:
+          needed = set()
+          for group in self.cached_annotation_groups:
+            entry = group.get("entries", [{}])[0]
+            if entry.get("target_kind") == "region":
+              group["region_specs"] = _annotation_region_specs(target_mol_id, entry, bulk_centres)
+              needed.update(group["region_specs"])
+            else:
+              needed.add(group["key"][:3])
+          positions.update((spec, point) for spec, point in bulk_centres.items() if spec in needed)
+        for group in self.cached_annotation_groups:
+          key = group["key"][:3]
+          if key not in positions:
+            position = bulk_centres.get(key) if bulk_centres is not None else residue_centre_py(target_mol_id, *key)
+            positions[key] = tuple(position) if isinstance(position, (list, tuple)) and len(position) == 3 else None
+        self.cached_positions = positions
+        self.positions_updated_at = now
+        self.positions_epoch = epoch
+      positions = self.cached_positions
       query = (target_mol_id, tuple(rotation_centre), self.radius, tuple(positions.items()))
       if not force and query == self.last_nearby_query:
         return None
@@ -8027,6 +8698,9 @@ def _generate_smart_local_extra_restraints_for_mol(
     distance_cutoff = float(distance_cutoff)
   except (TypeError, ValueError):
     distance_cutoff = 3.7
+  if not math.isfinite(distance_cutoff) or distance_cutoff <= 0:
+    info_dialog("Restraint distance cutoff must be finite and positive.")
+    return None
   max_sequence_separation = 10
   restraint_esd = 0.05
   backbone_donor_names = {"N"}
@@ -8035,7 +8709,8 @@ def _generate_smart_local_extra_restraints_for_mol(
   sequence_index_by_residue = {}
   next_sequence_index_by_chain = {}
   ordered_residue_specs_by_chain = {}
-  for residue_spec_list in _all_residue_specs_for_colouring(mol_id):
+  model_snapshot = _model_coordinate_snapshot(mol_id)
+  for residue_spec_list in model_snapshot:
     residue_spec = _coot_residue_spec_from_spec(residue_spec_list)
     if residue_spec is None:
       continue
@@ -8051,8 +8726,7 @@ def _generate_smart_local_extra_restraints_for_mol(
     return math.sqrt(dx*dx + dy*dy + dz*dz)
 
   def residue_atoms(residue_spec):
-    chain_id, resno, ins_code = residue_spec
-    return residue_info_py(mol_id, chain_id, resno, ins_code) or []
+    return model_snapshot[residue_spec]["atoms"]
 
   def parsed_atom_record(atom):
     position = residue_atom_to_position(atom)
@@ -8077,7 +8751,7 @@ def _generate_smart_local_extra_restraints_for_mol(
         backbone_hbond_atoms.append(parsed_atom)
     if not parsed_atoms:
       return None
-    is_polymer = _residue_is_polymer(mol_id, residue_spec[0], residue_spec[1], residue_spec[2])
+    is_polymer = model_snapshot[residue_spec]["name"] in POLYMER_RESIDUE_NAMES
     return {
       "spec": residue_spec,
       "atoms": parsed_atoms,
@@ -8111,7 +8785,6 @@ def _generate_smart_local_extra_restraints_for_mol(
     nonlocal added_restraints
     if not record_1 or not record_2:
       return
-    residue_pair_key = ordered_pair_key(record_1["spec"], record_2["spec"])
     atoms_1 = record_1["backbone_hbond_atoms"] if backbone_only else record_1["atoms"]
     atoms_2 = record_2["backbone_hbond_atoms"] if backbone_only else record_2["atoms"]
     if backbone_only and not (record_1["polymer"] and record_2["polymer"]):
@@ -8124,33 +8797,27 @@ def _generate_smart_local_extra_restraints_for_mol(
         alt_conf_2 = atom_2["alt_conf"]
         if backbone_only and not is_backbone_hbond_candidate(atom_name_1, atom_name_2):
           continue
-        restraint_key = (
-          residue_pair_key,
-          (atom_name_1, alt_conf_1),
-          (atom_name_2, alt_conf_2)
-        )
-        reverse_restraint_key = (
-          residue_pair_key,
-          (atom_name_2, alt_conf_2),
-          (atom_name_1, alt_conf_1)
-        )
-        if restraint_key in seen_restraints or reverse_restraint_key in seen_restraints:
+        if alt_conf_1 and alt_conf_2 and alt_conf_1 != alt_conf_2:
+          continue
+        restraint_key = tuple(sorted((
+          (*record_1["spec"], atom_name_1, alt_conf_1),
+          (*record_2["spec"], atom_name_2, alt_conf_2))))
+        if restraint_key in seen_restraints:
           continue
         distance = atom_distance(atom_1, atom_2)
         if distance is None or distance >= distance_cutoff:
           continue
-        add_extra_geman_mcclure_restraint(
+        pending_restraints.append((
           mol_id,
           record_1["spec"][0], record_1["spec"][1], record_1["spec"][2], atom_name_1, alt_conf_1,
           record_2["spec"][0], record_2["spec"][1], record_2["spec"][2], atom_name_2, alt_conf_2,
           distance, restraint_esd
-        )
+        ))
         seen_restraints.add(restraint_key)
         added_restraints += 1
 
-  delete_all_extra_restraints(mol_id)
-
   added_restraints = 0
+  pending_restraints = []
   seen_restraints = set()
   processed_backbone_hbond_pairs = set()
   residue_records = {}
@@ -8168,12 +8835,16 @@ def _generate_smart_local_extra_restraints_for_mol(
         residue_spec_2 = residue_specs[neighbour_index]
         add_restraints_between_records(record_1, residue_records.get(residue_spec_2))
 
+  hbond_atoms = [(record["spec"], atom) for record in residue_records.values()
+                 if record and record["polymer"] for atom in record["backbone_hbond_atoms"]]
+  hbond_index = _spatial_index(hbond_atoms, lambda item: item[1]["position"], distance_cutoff)
   all_residue_specs = list(residue_records.keys())
   for residue_spec_1 in all_residue_specs:
     record_1 = residue_records.get(residue_spec_1)
     if not record_1 or not record_1["polymer"]:
       continue
-    nearby_residue_specs = residues_near_residue(mol_id, list(residue_spec_1), distance_cutoff) or []
+    nearby_residue_specs = {spec for atom in record_1["backbone_hbond_atoms"]
+                            for spec, _other in _spatial_query(hbond_index, atom["position"], distance_cutoff)}
     for nearby_spec in nearby_residue_specs:
       residue_spec_2 = _coot_residue_spec_from_spec(nearby_spec)
       if residue_spec_2 is None:
@@ -8189,6 +8860,10 @@ def _generate_smart_local_extra_restraints_for_mol(
         continue
       add_restraints_between_records(record_1, residue_records.get(residue_spec_2), backbone_only=True)
 
+  # Finish all discovery before replacing existing restraints.
+  delete_all_extra_restraints(mol_id)
+  for args in pending_restraints:
+    add_extra_geman_mcclure_restraint(*args)
   set_show_extra_restraints(mol_id, 0)
   set_show_extra_restraints(mol_id, 1)
   set_show_extra_distance_restraints(1)
@@ -8394,19 +9069,49 @@ def widen_clipping_symmetric():
   increase_clipping_back()
 
 
-def _set_map_radius_both(radius):
-  """Keep the standard and EM map-radius settings in sync."""
-  set_map_radius(radius)
-  set_map_radius_em(radius)
+def _map_radius_controls(map_id, allow_inferred=False):
+  native_type = getattr(coot, "is_EM_map", None)
+  if callable(native_type):
+    is_em = bool(native_type(map_id))
+  else:
+    if not allow_inferred:
+      # Older APIs cannot report user-overridden/PANDDA map classification.
+      # Keep both radius settings synchronized rather than update the wrong one.
+      return None
+    # Match Coot's default P1/orthogonal-cell classification, not filename.
+    sg = str(coot.space_group_py(map_id) or "").replace(" ", "").upper()
+    parameters = map_cell(map_id)
+    if not parameters or len(parameters) < 6 or not sg:
+      return None
+    is_em = sg == "P1" and all(abs(math.radians(float(angle)-90.0)) < 0.0001 for angle in parameters[3:6])
+  return (get_map_radius_em, set_map_radius_em) if is_em else (get_map_radius, set_map_radius)
+
+
+def _current_map_radius(map_id=None):
+  if map_id is None:
+    map_id = _scrollable_map_or_status()
+  controls = _map_radius_controls(map_id, allow_inferred=True) if map_id is not None else None
+  return controls[0]() if controls else get_map_radius()
+
+
+def _set_map_radius_both(radius, map_id=None):
+  """Compatibility name: change only the radius used by the target map."""
+  if map_id is None:
+    map_id = _scrollable_map_or_status()
+  controls = _map_radius_controls(map_id) if map_id is not None else None
+  for getter, setter in ([controls] if controls else
+                         [(get_map_radius, set_map_radius), (get_map_radius_em, set_map_radius_em)]):
+    if abs(float(getter()) - float(radius)) > 1e-5:
+      setter(radius)
 
 
 def increase_map_radius():
-  current_radius = get_map_radius()
+  current_radius = _current_map_radius()
   _set_map_radius_both(current_radius + 2.0)
 
 
 def decrease_map_radius():
-  current_radius = get_map_radius()
+  current_radius = _current_map_radius()
   new_radius = max(2.0, current_radius - 2.0)
   _set_map_radius_both(new_radius)
 
@@ -8784,14 +9489,16 @@ def _tq_support_radius(sigma, enclosed_mass_percent):
   return 0.5 * (low + high) * float(sigma)
 
 
-def _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True):
+def _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True, snapshot=None):
   parsed = _coot_residue_spec_from_spec(residue_spec)
   if parsed is None:
     return []
   chain_id, resno, ins_code = parsed
-  residue_name_here = _tq_residue_name(mol_id, chain_id, resno, ins_code)
+  cached = snapshot.get(parsed) if snapshot is not None else None
+  residue_name_here = cached["name"] if cached is not None else _tq_residue_name(mol_id, chain_id, resno, ins_code)
   atom_records = []
-  for atom in _tq_residue_info(mol_id, chain_id, resno, ins_code):
+  atoms = cached["atoms"] if cached is not None else _tq_residue_info(mol_id, chain_id, resno, ins_code)
+  for atom in atoms:
     try:
       atom_name = _coot_text_arg(atom[0][0]).strip()
       alt_conf = _coot_text_arg(atom[0][1]).strip()
@@ -8803,6 +9510,8 @@ def _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True):
       continue
     if not atom_name:
       continue
+    if not math.isfinite(occupancy) or not all(math.isfinite(value) for value in xyz):
+      raise RuntimeError(f"Invalid atom coordinates or occupancy at {chain_id}:{resno}{ins_code}.")
     if heavy_atoms_only and not _tq_is_heavy_atom(atom_name, element):
       continue
     atom_records.append(
@@ -8853,7 +9562,10 @@ def _tq_residue_specs_near_residue_centres(
     seed_residue_specs,
     radius=THRESHOLDED_Q_LOCAL_RADIUS,
     max_residues=THRESHOLDED_Q_LOCAL_MAX_RESIDUES,
+    snapshot=None,
 ):
+  snapshot = _model_coordinate_snapshot(mol_id) if snapshot is None else snapshot
+  centres = _coordinate_snapshot_centres(snapshot)
   seed_specs = []
   seed_centres = []
   for residue_spec in seed_residue_specs:
@@ -8861,7 +9573,7 @@ def _tq_residue_specs_near_residue_centres(
     if parsed is None:
       continue
     seed_specs.append(parsed)
-    centre = _tq_residue_centre(mol_id, parsed[0], parsed[1], parsed[2])
+    centre = centres.get(parsed)
     if centre is not None:
       seed_centres.append(centre)
   if not seed_specs:
@@ -8875,43 +9587,46 @@ def _tq_residue_specs_near_residue_centres(
   for seed_spec in seed_specs:
     nearby_entries.append((0.0, seed_spec))
 
-  for chain_id in _tq_chain_ids(mol_id):
-    for residue_spec in _tq_chain_residue_specs(mol_id, chain_id):
-      if residue_spec in seen_specs:
-        continue
-      centre = _tq_residue_centre(mol_id, residue_spec[0], residue_spec[1], residue_spec[2])
-      if centre is None:
-        continue
-      nearest_seed_distance_sq = min(_distance_sq(centre, seed_centre) for seed_centre in seed_centres)
-      if nearest_seed_distance_sq > radius_sq:
-        continue
-      nearby_entries.append((nearest_seed_distance_sq, residue_spec))
-      seen_specs.add(residue_spec)
+  centre_index = _spatial_index(centres.items(), lambda item: item[1], max(float(radius), 1.0))
+  for seed_centre in seed_centres:
+    for residue_spec, centre in _spatial_query(centre_index, seed_centre, float(radius)):
+      if residue_spec not in seen_specs:
+        nearest_seed_distance_sq = min(_distance_sq(centre, point) for point in seed_centres)
+        nearby_entries.append((nearest_seed_distance_sq, residue_spec))
+        seen_specs.add(residue_spec)
 
   nearby_entries.sort(key=lambda item: (item[0], item[1][0], item[1][1], item[1][2]))
-  return [entry[1] for entry in nearby_entries[:int(max_residues)]]
+  return [entry[1] for entry in (nearby_entries if max_residues is None else nearby_entries[:int(max_residues)])]
 
 
-def _tq_context_atom_records(mol_id, score_residue_specs, context_radius):
+def _tq_context_atom_records(mol_id, score_residue_specs, context_radius, snapshot=None,
+                             influence_radius=0.0):
+  snapshot = _model_coordinate_snapshot(mol_id) if snapshot is None else snapshot
   context_residue_specs = _tq_residue_specs_near_residue_centres(
     mol_id,
     score_residue_specs,
     radius=context_radius,
-    max_residues=max(THRESHOLDED_Q_LOCAL_MAX_RESIDUES * 2, len(score_residue_specs)),
+    max_residues=None,
+    snapshot=snapshot,
   )
+  selected = set(context_residue_specs)
+  score_points = [atom[2] for spec in score_residue_specs for atom in snapshot.get(tuple(spec), {}).get("atoms", [])]
+  if score_points and influence_radius > 0:
+    centre = tuple(sum(point[axis] for point in score_points) / len(score_points) for axis in range(3))
+    bound_sq = (max(math.sqrt(_distance_sq(point, centre)) for point in score_points) + influence_radius)**2
+    selected.update(spec for spec, record in snapshot.items()
+                    if any(_distance_sq(atom[2], centre) <= bound_sq for atom in record["atoms"]))
   atom_records = []
-  for residue_spec in context_residue_specs:
-    atom_records.extend(_tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True))
+  for residue_spec in sorted(selected):
+    atom_records.extend(_tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True, snapshot=snapshot))
   return atom_records
 
 
 def _tq_prune_context_atoms(score_atom_records, context_atom_records, sigma, sample_radius):
-  influence_radius_sq = (float(sample_radius) + float(sigma) * THRESHOLDED_Q_CONTEXT_ATOM_INFLUENCE_SIGMA) ** 2
-  score_atom_xyzs = [atom_record["xyz"] for atom_record in score_atom_records]
-  pruned_context_atoms = []
-  for context_atom in context_atom_records:
-    if min(_distance_sq(context_atom["xyz"], score_atom_xyz) for score_atom_xyz in score_atom_xyzs) <= influence_radius_sq:
-      pruned_context_atoms.append(context_atom)
+  influence_radius = float(sample_radius) + float(sigma) * THRESHOLDED_Q_CONTEXT_ATOM_INFLUENCE_SIGMA
+  index = _spatial_index(enumerate(context_atom_records), lambda item: item[1]["xyz"], influence_radius)
+  keep = {i for atom in score_atom_records for i, _record in _spatial_query(index, atom["xyz"], influence_radius)}
+  pruned_context_atoms = [record for i, record in enumerate(context_atom_records) if i in keep]
   return pruned_context_atoms or list(context_atom_records)
 
 
@@ -8951,9 +9666,65 @@ def _tq_candidate_grid_indices(score_atom_records, sample_radius, grid_spacing):
   return sorted(candidate_indices)
 
 
+def _tq_numpy_module():
+  module = globals().get("_THRESHOLDED_Q_NUMPY", False)
+  if module is False:
+    try:
+      import numpy as module
+    except ImportError:
+      module = None
+    globals()["_THRESHOLDED_Q_NUMPY"] = module
+  return module
+
+
+def _tq_sample_density(map_id, x, y, z):
+  try:
+    value = float(density_at_point(map_id, x, y, z))
+    if not math.isfinite(value):
+      raise ValueError("non-finite density")
+    return value
+  except Exception as error:
+    raise RuntimeError(
+      f"Map #{map_id} density sampling failed at ({x:.3f}, {y:.3f}, {z:.3f}): {error}"
+    ) from error
+
+
+def _tq_residue_point_records_numpy(np, map_id, score_atoms, context_atoms, sigma, radius, spacing):
+  indices = _tq_candidate_grid_indices(score_atoms, radius, spacing)
+  coordinates = np.asarray([atom["xyz"] for atom in context_atoms], dtype=float)
+  occupancies = np.asarray([atom.get("occupancy", 1.0) for atom in context_atoms], dtype=float)
+  score_keys = {atom["atom_key"] for atom in score_atoms}
+  owners = np.asarray([atom["atom_key"] in score_keys for atom in context_atoms], dtype=bool)
+  # Bound temporary point-by-atom matrices, even in very crowded regions.
+  batch_size = max(1, min(512, 262144 // len(context_atoms)))
+  records = []
+  for start in range(0, len(indices), batch_size):
+    points = np.asarray(indices[start:start+batch_size], dtype=float) * spacing
+    distances = np.zeros((len(points), len(context_atoms)), dtype=float)
+    for axis in range(3):
+      delta = points[:, axis, None] - coordinates[None, :, axis]
+      distances += delta * delta
+    keep = owners[np.argmin(distances, axis=1)]
+    points = points[keep]
+    distances = distances[keep]
+    distances *= -1.0 / (2.0 * sigma * sigma)
+    np.exp(distances, out=distances)
+    distances *= occupancies
+    ideals = distances.sum(axis=1)
+    for point, ideal in zip(points, ideals):
+      x, y, z = (float(value) for value in point)
+      records.append({"experimental_density": _tq_sample_density(map_id, x, y, z),
+                      "ideal_density": float(ideal)})
+  return records
+
+
 def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, sigma, sample_radius, grid_spacing):
   if not score_atom_records or not context_atom_records:
     return []
+  np = _tq_numpy_module()
+  if np is not None:
+    return _tq_residue_point_records_numpy(np, map_id, score_atom_records, context_atom_records,
+                                            sigma, sample_radius, grid_spacing)
 
   score_atom_keys = {atom_record["atom_key"] for atom_record in score_atom_records}
   context_atom_data = [
@@ -8964,7 +9735,6 @@ def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, 
   distances = [0.0] * len(context_atom_data)
   gaussian_denominator = 2.0 * sigma * sigma
   exp = math.exp
-  sample_density = density_at_point
   point_records = []
   candidate_indices = _tq_candidate_grid_indices(score_atom_records, sample_radius, grid_spacing)
 
@@ -8990,14 +9760,7 @@ def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, 
     for distance_sq, occupancy in zip(distances, occupancies):
       ideal_density += occupancy * exp(-distance_sq / gaussian_denominator)
 
-    try:
-      experimental_density = float(sample_density(map_id, x, y, z))
-      if not math.isfinite(experimental_density):
-        raise ValueError("non-finite density")
-    except Exception as error:
-      raise RuntimeError(
-        f"Map #{map_id} density sampling failed at ({x:.3f}, {y:.3f}, {z:.3f}): {error}"
-      ) from error
+    experimental_density = _tq_sample_density(map_id, x, y, z)
 
     point_records.append(
       {
@@ -9104,14 +9867,16 @@ def _tq_prepare_scored_residues(
     sample_shell_padding=THRESHOLDED_Q_SAMPLE_SHELL_PADDING,
     context_radius=None,
     backbone_only=False,
+    snapshot=None,
 ):
   try:
     sigma = float(sigma)
     grid_spacing = float(grid_spacing)
     sample_shell_padding = float(sample_shell_padding)
+    ideal_enclosed_mass_percent = float(ideal_enclosed_mass_percent)
   except Exception:
     return None
-  if sigma <= 0.0 or grid_spacing <= 0.0 or sample_shell_padding < 0.0:
+  if not all(math.isfinite(value) for value in (sigma, grid_spacing, sample_shell_padding, ideal_enclosed_mass_percent)) or sigma <= 0.0 or grid_spacing <= 0.0 or sample_shell_padding < 0.0 or not 0 <= ideal_enclosed_mass_percent <= 100:
     return None
 
   score_residue_specs = []
@@ -9127,14 +9892,17 @@ def _tq_prepare_scored_residues(
   if context_radius is None:
     context_radius = THRESHOLDED_Q_LOCAL_RADIUS
   context_radius = max(float(context_radius), float(sample_radius))
-  context_atom_records = _tq_context_atom_records(mol_id, score_residue_specs, context_radius)
+  snapshot = _model_coordinate_snapshot(mol_id) if snapshot is None else snapshot
+  influence_radius = sample_radius + sigma * THRESHOLDED_Q_CONTEXT_ATOM_INFLUENCE_SIGMA
+  context_atom_records = _tq_context_atom_records(mol_id, score_residue_specs, context_radius,
+                                                snapshot=snapshot, influence_radius=influence_radius)
   if not context_atom_records:
     return None
 
   prepared_residues = []
   for residue_spec in score_residue_specs:
     score_atom_records = _tq_score_atom_records(
-      _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True),
+      _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True, snapshot=snapshot),
       backbone_only=backbone_only,
     )
     if not score_atom_records:
@@ -9161,7 +9929,6 @@ def _tq_prepare_scored_residues(
         "n_points": len(point_records),
         "ideal_density_threshold": ideal_density_threshold,
         "region_sweep_data": _tq_residue_region_sweep_data(point_records, ideal_density_threshold),
-        "point_records": point_records,
       }
     )
 
@@ -9186,7 +9953,7 @@ def _tq_prepare_scored_residues_or_status(*args, quiet=False, **kwargs):
     if prepared is None and not quiet:
       _tq_status("Thresholded Q-residue: no scorable atoms or invalid sampling parameters")
     return prepared
-  except RuntimeError as error:
+  except (RuntimeError, ValueError, TypeError, OverflowError) as error:
     # Never optimize against a partially sampled map or fabricated zero density.
     if not quiet:
       _tq_status(f"Thresholded Q-residue: calculation aborted. {error}")
@@ -9240,6 +10007,14 @@ def thresholded_q_residues(
       contour_level = None
   if contour_level is None:
     contour_level = 0.0
+  try:
+    contour_level = float(contour_level)
+    if not math.isfinite(contour_level):
+      raise ValueError("non-finite contour")
+  except (TypeError, ValueError, OverflowError):
+    if not quiet:
+      _tq_status("Thresholded Q-residue: invalid contour level")
+    return None
 
   prepared = _tq_prepare_scored_residues_or_status(
     map_id,
@@ -9357,6 +10132,7 @@ def optimize_local_threshold_by_thresholded_q(
     backbone_only=False,
     apply_contour=False,
     quiet=False,
+    snapshot=None,
 ):
   map_id = _tq_map_id_or_default(map_id)
   try:
@@ -9364,8 +10140,21 @@ def optimize_local_threshold_by_thresholded_q(
     grid_spacing = float(grid_spacing)
     sample_shell_padding = float(sample_shell_padding)
     n_steps = int(n_steps)
+    ideal_enclosed_mass_percent = float(ideal_enclosed_mass_percent)
+    if not all(math.isfinite(value) for value in (sigma, grid_spacing, sample_shell_padding, ideal_enclosed_mass_percent)):
+      raise ValueError("Non-finite sampling parameter")
+    if not 0.0 < ideal_enclosed_mass_percent <= 100.0:
+      raise ValueError("Enclosed mass must be in (0, 100]")
+    contour_min = float(contour_min) if contour_min is not None else None
+    contour_max = float(contour_max) if contour_max is not None else None
+    contour_min_sigma = float(contour_min_sigma) if contour_min_sigma is not None else None
+    contour_max_sigma = float(contour_max_sigma) if contour_max_sigma is not None else None
+    if not all(math.isfinite(value) for value in (contour_min, contour_max, contour_min_sigma, contour_max_sigma) if value is not None):
+      raise ValueError("Non-finite contour bound")
     if context_radius is not None:
       context_radius = float(context_radius)
+      if not math.isfinite(context_radius) or context_radius <= 0:
+        raise ValueError("Invalid context radius")
   except Exception:
     message = "Thresholded Q-residue optimizer: invalid numeric parameter"
     if not quiet:
@@ -9425,6 +10214,7 @@ def optimize_local_threshold_by_thresholded_q(
     context_radius=context_radius,
     backbone_only=backbone_only,
     quiet=quiet,
+    snapshot=snapshot,
   )
   if prepared is None:
     return None
@@ -9523,7 +10313,7 @@ def optimize_local_threshold_by_thresholded_q_current_view(
   except Exception:
     _tq_status("Thresholded Q-residue optimizer: invalid radius/max_residues")
     return None
-  if radius <= 0.0:
+  if not math.isfinite(radius) or radius <= 0.0:
     _tq_status("Thresholded Q-residue optimizer: radius must be > 0")
     return None
   if max_residues <= 0:
@@ -9544,22 +10334,33 @@ def optimize_local_threshold_by_thresholded_q_current_view(
     _tq_status("Thresholded Q-residue optimizer: no target molecule")
     return None
 
-  score_residue_specs = _tq_residue_specs_near_residue_centres(
-    mol_id,
-    residue_specs,
-    radius=radius,
-    max_residues=max_residues,
-  )
+  try:
+    snapshot = _model_coordinate_snapshot(mol_id)
+    score_residue_specs = _tq_residue_specs_near_residue_centres(
+      mol_id, residue_specs, radius=radius, max_residues=max_residues, snapshot=snapshot)
+  except (RuntimeError, ValueError, TypeError) as error:
+    _tq_status(f"Thresholded Q-residue optimizer: calculation aborted. {error}")
+    return None
   if not score_residue_specs:
     _tq_status("Thresholded Q-residue optimizer: no local residues to score")
     return None
   context_radius = kwargs.pop("context_radius", radius + THRESHOLDED_Q_CONTEXT_RADIUS_PADDING)
+  if context_radius is None:
+    context_radius = radius + THRESHOLDED_Q_CONTEXT_RADIUS_PADDING
+  try:
+    context_radius = float(context_radius)
+    if not math.isfinite(context_radius) or context_radius <= 0:
+      raise ValueError("context radius must be finite and positive")
+  except (ValueError, TypeError) as error:
+    _tq_status(f"Thresholded Q-residue optimizer: {error}")
+    return None
   return optimize_local_threshold_by_thresholded_q(
     map_id,
     mol_id,
     score_residue_specs,
     context_radius=max(radius, context_radius),
     apply_contour=apply_contour,
+    snapshot=snapshot,
     **kwargs,
   )
 
@@ -10180,7 +10981,7 @@ def _map_global_extent_radius(map_id):
 
 def _save_global_view_settings(map_id):
   MAP_GLOBAL_VIEW_SETTINGS[map_id] = {
-    "map_radius": get_map_radius(),
+    "map_radius": _current_map_radius(map_id),
     "clipping_front": get_clipping_plane_front(),
     "clipping_back": get_clipping_plane_back(),
     "map_colour": list(map_colour_components_py(map_id)),
@@ -10191,20 +10992,20 @@ def _save_global_view_settings(map_id):
 def _restore_global_view_settings(map_id, fallback_radius):
   saved = MAP_GLOBAL_VIEW_SETTINGS.get(map_id)
   if not saved:
-    _set_map_radius_both(fallback_radius)
+    _set_map_radius_both(fallback_radius, map_id)
     return
-  _set_map_radius_both(saved["map_radius"])
+  _set_map_radius_both(saved["map_radius"], map_id)
   set_clipping_front(saved["clipping_front"])
   set_clipping_back(saved["clipping_back"])
 
 
 def _set_global_view_extent(map_id):
-  current_radius = max(get_map_radius(), 1.0)
+  current_radius = max(_current_map_radius(map_id), 1.0)
   global_radius = max(_map_global_extent_radius(map_id), current_radius)
   front = get_clipping_plane_front()
   back = get_clipping_plane_back()
   scale = global_radius / current_radius
-  _set_map_radius_both(global_radius)
+  _set_map_radius_both(global_radius, map_id)
   set_clipping_front(front * scale)
   set_clipping_back(back * scale)
 
@@ -10375,34 +11176,22 @@ def toggle_map_display():
 
 #Colour active segment
 def colour_active_segment():
-  chain_context = _active_chain_context_or_status()
-  if not chain_context:
+  context = _active_segment_context_or_status()
+  if not context:
     return None
-  mol_id = chain_context["mol_id"]
-  segments=segment_list(mol_id)
-  res_here = chain_context["resno"]
-  ch_id = chain_context["chain_id"]
-  colour_list=[]
-  blank_list=[]
-  segment_colour=34
-  blank_colour=0
-  for seg in segments:
-    if (res_here>=seg[2]) and (res_here<=seg[3]) and (ch_id==seg[1]):
-      res_start=seg[2]
-      res_end=seg[3]
-      ch_id=seg[1]
-      for res in range(res_start,res_end+1):
-        colour_list.append(([ch_id,res,""],segment_colour))
-    else:
-      res_start=seg[2]
-      res_end=seg[3]
-      ch_id_here=seg[1]
-      for res in range(res_start,res_end+1):
-        blank_list.append(([ch_id_here,res,""],blank_colour))
+  mol_id = context["mol_id"]
+  selected = set(context["segment_specs"])
+  colour_list = [(list(spec), 34) for spec in context["segment_specs"]]
+  blank_list = [(spec, 0) for spec in _all_residue_specs_for_colouring(mol_id) if tuple(spec) not in selected]
   _apply_user_defined_residue_colours(mol_id, blank_list, colour_list)
 
 
 def _all_residue_specs_for_colouring(mol_id):
+  if callable(getattr(coot, "python_representation_kk", None)):
+    try:
+      return [list(spec) for spec in _model_coordinate_snapshot(mol_id)]
+    except ValueError:
+      pass
   residue_specs=[]
   for residue_entry in all_residues_with_serial_numbers(mol_id) or []:
     if not isinstance(residue_entry, list) or len(residue_entry) < 4:
@@ -10492,11 +11281,12 @@ def _direct_user_defined_blank_rows_for_molecule(mol_id, blank_colour=0):
   return [("//", blank_colour)]
 
 
-def _graphics_to_legacy_user_defined_representation(mol_id, colour_rows):
+def _graphics_to_legacy_user_defined_representation(mol_id, colour_rows, ca_only=False):
   if _supports_direct_user_defined_colouring():
-    graphics_to_user_defined_atom_colours_all_atoms_representation(mol_id)
-    cycle_rep_flag[mol_id] = _representation_sequence().index(
-      graphics_to_user_defined_atom_colours_all_atoms_representation)
+    representation = (graphics_to_user_defined_atom_colours_representation if ca_only
+                      else graphics_to_user_defined_atom_colours_all_atoms_representation)
+    representation(mol_id)
+    cycle_rep_flag[mol_id] = _representation_sequence().index(representation)
     return
   for item in colour_rows or []:
     if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -10604,34 +11394,105 @@ def clear_custom_colour_representations_for_active_molecule():
   add_status_bar_text("Cleared custom colour representations")
 
 
-def _apply_direct_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
-  ensure_user_defined_colour_table()
-  _clear_custom_colour_additional_representations(mol_id, clear_user_colours=False)
-  full_colour_list = list(blank_res_list or []) + list(colour_list or [])
+def _compact_direct_colour_rows(rows):
+  """Resolve last-write-wins residue rules against a single neutral baseline."""
+  resolved = {}
+  for item in rows:
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+      continue
+    spec, colour = item[:2]
+    if not isinstance(spec, (list, tuple)) or len(spec) != 3:
+      # Arbitrary CIDs may overlap residue rules; preserve their ordering.
+      return rows
+    resolved[tuple(spec)] = colour
+  neutral = _legacy_user_colour_index_to_coot_index(0)
+  return [(list(spec), colour) for spec, colour in resolved.items()
+          if _legacy_user_colour_index_to_coot_index(colour) != neutral]
+
+
+def _consume_colour_steps(iterator):
+  while True:
+    try:
+      next(iterator)
+    except StopIteration as result:
+      return result.value
+
+
+def _iter_direct_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  full_colour_list = [item[:2] for item in list(blank_res_list or []) + list(colour_list or [])
+                     if isinstance(item, (list, tuple)) and len(item) >= 2]
   if not full_colour_list:
     if info_message:
       info_dialog(info_message)
     return None
+  epoch = _MODEL_EDIT_EPOCHS.get(mol_id, 0)
+  rows = _compact_direct_colour_rows(full_colour_list)
+  yield "Preparing colours", 0.05, True
+  snapshot = None
+  # Explicit atom addressing is faster than thousands of full-model CID scans.
+  # It addresses MODEL 1 only, so ensemble/ambiguous models retain the CID path.
+  if (len(rows) >= 128 and all(isinstance(spec, (list, tuple)) for spec, _ in rows)
+      and callable(getattr(coot, "python_representation_kk", None))
+      and callable(getattr(coot, "set_user_defined_atom_colour_py", None))):
+    try:
+      snapshot = _model_coordinate_snapshot(mol_id)
+    except ValueError:
+      pass
+  atom_rows = []
+  if snapshot is not None:
+    for index, (spec, colour) in enumerate(rows):
+      record = snapshot.get(tuple(spec))
+      if record is not None:
+        native_colour = _legacy_user_colour_index_to_coot_index(colour)
+        for atom in record["atoms"]:
+          name, alt = atom[0][:2]
+          atom_rows.append(([mol_id, *spec, name, alt], native_colour))
+      if (index + 1) % 200 == 0:
+        yield f"Preparing residues: {index + 1}/{len(rows)}", 0.05 + 0.45*(index+1)/len(rows), True
+  yield "Applying colours", 0.5, True
+  if not valid_model_molecule_qm(mol_id) or _MODEL_EDIT_EPOCHS.get(mol_id, 0) != epoch:
+    raise RuntimeError("The model changed while preparing colours; please try again.")
+  if snapshot is not None and snapshot != _model_coordinate_snapshot(mol_id):
+    raise RuntimeError("The model changed while preparing colours; please try again.")
+  # Once assignments start, complete the operation rather than leaving partial colours.
+  yield "Applying colours", 0.5, False
+  ensure_user_defined_colour_table()
+  _clear_custom_colour_additional_representations(mol_id, clear_user_colours=False)
   neutral_rows = _direct_user_defined_blank_rows_for_molecule(mol_id)
-  overwrite_rows = neutral_rows + list(colour_list or [])
-  colour_count = _set_user_defined_atom_colour_by_residue_rows_py(mol_id, overwrite_rows)
-  if not colour_count:
-    info_dialog("Failed to set user-defined atom colours for the requested residues.")
-    return None
-  _graphics_to_legacy_user_defined_representation(mol_id, overwrite_rows)
+  if not _set_user_defined_atom_colour_by_residue_rows_py(mol_id, neutral_rows, palette_ready=True):
+    raise RuntimeError("Failed to initialise user-defined atom colours.")
+  if snapshot is not None:
+    for start in range(0, len(atom_rows), 4096):
+      coot.set_user_defined_atom_colour_py(mol_id, atom_rows[start:start+4096])
+      count = min(start+4096, len(atom_rows))
+      yield f"Colouring atoms: {count}/{len(atom_rows)}", 0.5 + 0.45*count/len(atom_rows), False
+  else:
+    for start in range(0, len(rows), 64):
+      if not _set_user_defined_atom_colour_by_residue_rows_py(mol_id, rows[start:start+64], palette_ready=True):
+        raise RuntimeError("Failed to set user-defined atom colours.")
+      count = min(start+64, len(rows))
+      yield f"Colouring selections: {count}/{len(rows)}", 0.5 + 0.45*count/len(rows), False
+  yield "Rebuilding display", 0.98, False
+  _graphics_to_legacy_user_defined_representation(mol_id, neutral_rows + rows)
+  yield "Colouring complete", 1.0, False
   if info_message:
     info_dialog(info_message)
-  return colour_count
+  return len(rows) + 1
 
 
-def _apply_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+def _apply_direct_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  return _consume_colour_steps(_iter_direct_user_defined_residue_colours(
+    mol_id, blank_res_list, colour_list, info_message))
+
+
+def _iter_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
   del blank_res_list
-  ensure_user_defined_colour_table()
-  _clear_custom_colour_additional_representations(mol_id)
   if not colour_list:
     if info_message:
       info_dialog(info_message)
     return None
+  yield "Assigning compatible atom colours", 0.05, False
+  _clear_custom_colour_additional_representations(mol_id)
   clear_user_defined_atom_colours(mol_id)
   colour_count = _set_user_defined_atom_colour_by_residue_atoms_py(mol_id, colour_list)
   if not colour_count:
@@ -10639,8 +11500,10 @@ def _apply_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_l
     info_dialog("Failed to set user-defined atom colours for the requested residues.")
     return None
   handles = []
+  CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS[mol_id] = handles
   seen_residue_specs = set()
-  for residue_spec, _colour_index in colour_list:
+  yield "Building compatible representations", 0.2, False
+  for index, (residue_spec, _colour_index) in enumerate(colour_list):
     residue_key = tuple(residue_spec[:3])
     if residue_key in seen_residue_specs:
       continue
@@ -10648,33 +11511,137 @@ def _apply_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_l
     handle = _make_custom_colour_additional_representation(mol_id, residue_spec)
     if handle is not None:
       handles.append(handle)
-  CUSTOM_COLOUR_ADDITIONAL_REPRESENTATIONS[mol_id] = handles
+    if (index + 1) % 4 == 0:
+      yield f"Building representations: {index+1}/{len(colour_list)}", 0.2 + 0.75*(index+1)/len(colour_list), False
   clear_user_defined_atom_colours(mol_id)
   if not handles:
     info_dialog("Failed to create a custom-colour additional representation.")
     return None
+  yield "Colouring complete", 1.0, False
   if info_message:
     info_dialog(info_message)
   return handles
 
 
-def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+def _apply_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None):
+  return _consume_colour_steps(_iter_overlay_user_defined_residue_colours(
+    mol_id, blank_res_list, colour_list, info_message))
+
+
+def _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message=None, defer_apply=False):
+  if not defer_apply and _USER_DEFINED_COLOUR_JOB_ACTIVE:
+    add_status_bar_text("Please wait for the current colouring operation to finish.")
+    return None
   if _supports_direct_user_defined_colouring():
+    if defer_apply:
+      return _iter_direct_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message)
     return _apply_direct_user_defined_residue_colours(
       mol_id,
       blank_res_list,
       colour_list,
       info_message=info_message,
     )
-  return _apply_overlay_user_defined_residue_colours(
-    mol_id,
-    blank_res_list,
-    colour_list,
-    info_message=info_message,
-  )
+  steps = _iter_overlay_user_defined_residue_colours(mol_id, blank_res_list, colour_list, info_message)
+  return steps if defer_apply else _consume_colour_steps(steps)
 
 
-def color_by_rama_native(mol_id):
+_USER_DEFINED_COLOUR_JOB_ACTIVE = False
+
+
+def _start_user_defined_colour_action(mol_id, action, title):
+  """Keep native graphics calls on the GTK thread, yielding between batches."""
+  global _USER_DEFINED_COLOUR_JOB_ACTIVE
+  if _USER_DEFINED_COLOUR_JOB_ACTIVE:
+    add_status_bar_text("A colouring operation is already running.")
+    return None
+  glib = _coot_gui_repository_module("GLib")
+  if glib is None or Gtk is None:
+    return action(mol_id)
+  window = Gtk.Window(title=title)
+  window.set_default_size(360, 110)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  label = Gtk.Label(label="Preparing colouring...")
+  bar = Gtk.ProgressBar()
+  cancel = Gtk.Button(label="Cancel")
+  for widget in (label, bar, cancel):
+    box.append(widget)
+  window.set_child(box)
+  state = {"cancelled": False, "cancellable": True, "iterator": None, "finished": False,
+           "applying": False}
+  epoch = _MODEL_EDIT_EPOCHS.get(mol_id, 0)
+  _USER_DEFINED_COLOUR_JOB_ACTIVE = True
+  def cancel_job(*_args):
+    if state["cancellable"]:
+      state["cancelled"] = True
+    return True
+  cancel.connect("clicked", cancel_job)
+  window.connect("close-request", cancel_job)
+  def finish():
+    global _USER_DEFINED_COLOUR_JOB_ACTIVE
+    if state["finished"]:
+      return
+    state["finished"] = True
+    if state["iterator"] is not None:
+      state["iterator"].close()
+    _USER_DEFINED_COLOUR_JOB_ACTIVE = False
+    window.destroy()
+  def step():
+    if state["finished"]:
+      return False
+    if state["cancelled"]:
+      finish()
+      add_status_bar_text("Colouring cancelled; existing colours retained.")
+      return False
+    try:
+      if not valid_model_molecule_qm(mol_id) or _MODEL_EDIT_EPOCHS.get(mol_id, 0) != epoch:
+        raise RuntimeError("The model changed during colouring; please try again.")
+      if state["iterator"] is None:
+        state["cancellable"] = False
+        cancel.set_sensitive(False)
+        result = action(mol_id, defer_apply=True)
+        if result is None:
+          finish()
+          return False
+        state["iterator"] = iter(result)
+      message, fraction, cancellable = next(state["iterator"])
+      state["cancellable"] = cancellable
+      state["applying"] = state["applying"] or not cancellable
+      label.set_text(message)
+      cancel.set_sensitive(cancellable)
+      if fraction is None:
+        bar.pulse()
+      else:
+        bar.set_fraction(fraction)
+      if fraction == 1.0:
+        # Dismiss before any colour-key info dialog is presented.
+        window.destroy()
+      return True
+    except StopIteration:
+      finish()
+      add_status_bar_text("Colouring complete.")
+    except Exception as error:
+      traceback.print_exc()
+      if state["applying"] and valid_model_molecule_qm(mol_id):
+        try:
+          if not _supports_direct_user_defined_colouring():
+            _clear_custom_colour_additional_representations(mol_id)
+          _restore_last_standard_representation(mol_id)
+        except Exception:
+          traceback.print_exc()
+      finish()
+      info_dialog(f"Colouring stopped: {error}")
+    return False
+  label.set_text("Calculating colours / scores...")
+  bar.pulse()
+  window.present()
+  # A timed idle-sized batch allows the progress window to paint before native work.
+  glib.timeout_add(30, step)
+  return window
+
+
+def color_by_rama_native(mol_id, defer_apply=False):
   rama_results=all_molecule_ramachandran_score(mol_id)
   if not isinstance(rama_results, list) or len(rama_results) < 6:
     info_dialog("Unable to obtain Ramachandran scores.")
@@ -10698,11 +11665,12 @@ def color_by_rama_native(mol_id):
       rama_colour_list.append((list(residue_spec), rama_outlier_colour))
     elif rama_score < 0.02:
       rama_colour_list.append((list(residue_spec), rama_allowed_colour))
-  _apply_user_defined_residue_colours(
+  return _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
     rama_colour_list,
     "Ramachandran coloring:\n\nRed = outlier (<0.2%)\n\nOrange = allowed/disfavored (<2%)",
+    defer_apply=defer_apply,
   )
 
 
@@ -10710,10 +11678,10 @@ def color_by_rama_native_for_active_residue():
   mol_id=_active_polymer_molecule_for_colouring("Ramachandran coloring")
   if mol_id is None:
     return None
-  return color_by_rama_native(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_by_rama_native, "Ramachandran colouring")
 
 
-def color_by_density_fit_native(mol_id):
+def color_by_density_fit_native(mol_id, defer_apply=False):
   map_id=imol_refinement_map()
   if map_id==-1:
     info_dialog("You need a refinement map for density-fit coloring.")
@@ -10743,12 +11711,13 @@ def color_by_density_fit_native(mol_id):
       continue
     colour_index=_density_fit_score_to_colour_index(score)
     density_colour_list.append((list(residue_spec), colour_index))
-  _apply_user_defined_residue_colours(
+  return _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
     density_colour_list,
     "Active molecule colored by model/map correlation.\n\n"
     + _colour_band_legend_text("CC", 0.0, 1.0),
+    defer_apply=defer_apply,
   )
 
 
@@ -10756,10 +11725,10 @@ def color_by_density_fit_native_for_active_residue():
   mol_id=_active_polymer_molecule_for_colouring("Density-fit coloring")
   if mol_id is None:
     return None
-  return color_by_density_fit_native(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_by_density_fit_native, "Density-fit colouring")
 
 
-def color_by_ncs_difference(mol_id):
+def color_by_ncs_difference(mol_id, defer_apply=False):
   if mol_id not in model_molecule_list():
     info_dialog("You need an active model for NCS-difference coloring.")
     return None
@@ -10823,11 +11792,12 @@ def color_by_ncs_difference(mol_id):
     colour_index=int(normalized_score*31+2)
     ncs_colour_list.append(([residue_spec[0], residue_spec[1], residue_spec[2]], colour_index))
 
-  _apply_user_defined_residue_colours(
+  return _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
     ncs_colour_list,
     "Active molecule colored by NCS difference, in spectral coloring (blue=low difference, red=high difference)",
+    defer_apply=defer_apply,
   )
 
 
@@ -10835,10 +11805,10 @@ def color_by_ncs_difference_for_active_residue():
   mol_id=_active_polymer_molecule_for_colouring("NCS-difference coloring")
   if mol_id is None:
     return None
-  return color_by_ncs_difference(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_by_ncs_difference, "NCS-difference colouring")
 
 
-def color_by_clash_score(mol_id):
+def color_by_clash_score(mol_id, defer_apply=False):
   if mol_id not in model_molecule_list():
     info_dialog("You need an active model for clash coloring.")
     return None
@@ -10904,12 +11874,13 @@ def color_by_clash_score(mol_id):
     colour_index=_density_fit_score_to_colour_index(1.0-normalized_score)
     clash_colour_list.append(([residue_spec[0], residue_spec[1], residue_spec[2]], colour_index))
 
-  _apply_user_defined_residue_colours(
+  return _apply_user_defined_residue_colours(
     mol_id,
     blank_res_list,
     clash_colour_list,
     "Active molecule colored by per-residue maximum clash overlap.\n\n"
     + _colour_band_legend_text("overlap", 0.0, 2.0, reverse=True),
+    defer_apply=defer_apply,
   )
 
 
@@ -10917,7 +11888,7 @@ def color_by_clash_score_for_active_molecule():
   mol_id=_active_molecule_or_status()
   if mol_id is None:
     return None
-  return color_by_clash_score(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_by_clash_score, "Clash colouring")
 
 #Set refinement map to currently scrollable map
 def set_map_to_scrollable_map():
@@ -11131,6 +12102,7 @@ def undo_visible():
     return None
   set_undo_molecule(residue[0])
   apply_undo()
+  _mark_model_changed(residue[0])
   
 def redo_visible():
   residue = _active_residue_or_status()
@@ -11138,6 +12110,7 @@ def redo_visible():
     return None
   set_undo_molecule(residue[0])
   apply_redo()
+  _mark_model_changed(residue[0])
 
 #Cycle rotamers for active residue
 rotamer_number=0
@@ -11172,17 +12145,26 @@ def toggle_env_dist():
 _SEGMENT_POLYMER_NAMES = set("A C T G U DA DC DT DG DU ALA UNK ARG ASN ASP CYS GLU GLN GLY HIS ILE LEU LYS MET MSE PHE PRO SER THR TRP TYR VAL".split())
 
 
-def _segment_chain_snapshot(mol_id, ch_id):
+def _segment_chain_snapshot(mol_id, ch_id, model_snapshot=None):
+  if model_snapshot is None and callable(getattr(coot, "python_representation_kk", None)):
+    model_snapshot = _model_coordinate_snapshot(mol_id)
   rows = []
-  for sn in range(chain_n_residues(ch_id, mol_id)):
-    number = seqnum_from_serial_number(mol_id, ch_id, sn)
-    ins = insertion_code_from_serial_number(mol_id, ch_id, sn)
-    atoms = residue_info_py(mol_id, ch_id, number, ins) or []
+  if model_snapshot is not None:
+    entries = [(number, ins, record["name"], record["atoms"])
+               for (chain, number, ins), record in model_snapshot.items() if chain == ch_id]
+  else:
+    entries = []
+    for sn in range(chain_n_residues(ch_id, mol_id)):
+      number = seqnum_from_serial_number(mol_id, ch_id, sn)
+      ins = insertion_code_from_serial_number(mol_id, ch_id, sn)
+      entries.append((number, ins, resname_from_serial_number(mol_id, ch_id, sn),
+                      residue_info_py(mol_id, ch_id, number, ins) or []))
+  for number, ins, name, atoms in entries:
     xyz = {}
     for atom in sorted(atoms, key=lambda a: (bool(a[0][1]), -float(a[1][0]))):
       xyz.setdefault(atom[0][0].strip(), atom[2])
     rows.append({"number": number, "ins": ins,
-                 "name": resname_from_serial_number(mol_id, ch_id, sn), "xyz": xyz})
+                 "name": name, "xyz": xyz})
   return rows
 
 
@@ -11317,12 +12299,34 @@ def sn_of_active_res():
     
 #Get monomer and delete hydrogens
 def get_monomer_no_H(mon):
-  get_monomer(mon)
-  delete_hydrogens(molecule_number_list()[-1])    
+  existing = set(model_molecule_list())
+  mol_id = get_monomer(mon)
+  if mol_id in existing or not valid_model_molecule_qm(mol_id):
+    info_dialog(f"Could not create monomer {mon}; existing models were not changed.")
+    return -1
+  delete_hydrogens(mol_id)
+  return mol_id
     
 #Return list of segments in active mol
 def segment_list(mol_id):
-  return [segment for ch_id in chain_ids(mol_id) for segment in segment_list_chain(mol_id, ch_id)]
+  return [[mol_id, specs[0][0], specs[0][1], specs[-1][1]]
+          for specs in _model_segment_specs(mol_id)]
+
+
+def _model_segment_specs(mol_id):
+  snapshot = _model_coordinate_snapshot(mol_id)
+  result = []
+  for chain in dict.fromkeys(spec[0] for spec in snapshot):
+    previous = None
+    for row in _segment_chain_snapshot(mol_id, chain, model_snapshot=snapshot):
+      if row["name"] not in _SEGMENT_POLYMER_NAMES:
+        previous = None
+        continue
+      if previous is None or not _segment_rows_connected(previous, row):
+        result.append([])
+      result[-1].append((chain, row["number"], row["ins"]))
+      previous = row
+  return result
   
 def segment_list_chain(mol_id, ch_id):
   rows = _segment_chain_snapshot(mol_id, ch_id)
@@ -11554,12 +12558,69 @@ def cut_active_chain():
     return None
   mol_id = chain_context["mol_id"]
   ch_id = chain_context["chain_id"]
-  new_molecule_by_atom_selection(mol_id, "//%s//" % ch_id)
-  with _grouped_model_edit(mol_id):
-    while (is_polymer(mol_id, ch_id) == 1) or (is_solvent_chain_p(mol_id, ch_id) != -1):
-      first_res = first_residue(mol_id, ch_id)
-      last_res = last_residue(mol_id, ch_id)
-      delete_residue_range(mol_id, ch_id, first_res, last_res)
+  return _cut_residue_specs_verified(mol_id, _tq_chain_residue_specs(mol_id, ch_id))
+
+
+def _atom_snapshot_for_specs(mol_id, specs):
+  if coot.n_models(mol_id) != 1:
+    raise ValueError("This operation requires a single-model molecule.")
+  result = {}
+  for ch, number, ins in specs:
+    atoms = residue_info_py(mol_id, ch, number, ins) or []
+    if not atoms:
+      raise ValueError(f"Residue {ch}:{number}{ins} is missing.")
+    name = residue_name(mol_id, ch, number, ins)
+    for atom in atoms:
+      key = (ch, number, ins, name, atom[0][0], atom[0][1], repr(atom[1]))
+      if key in result:
+        raise ValueError("Ambiguous atom identity in selection.")
+      result[key] = tuple(atom[2])
+  if not result:
+    raise ValueError("The selection contains no atoms.")
+  return result
+
+
+def _selection_for_residue_specs(specs):
+  return "||".join(_residue_spec_to_cid_compat(spec) for spec in specs)
+
+
+def _copy_residue_specs_verified(mol_id, specs):
+  """Verify an independent, complete copy before any destructive edit."""
+  original = _atom_snapshot_for_specs(mol_id, specs)
+  existing = set(model_molecule_list())
+  copy_function = getattr(coot, "new_molecule_by_residue_specs_py", None)
+  copied = (copy_function(mol_id, [list(spec) for spec in specs]) if callable(copy_function)
+            else new_molecule_by_atom_selection(mol_id, _selection_for_residue_specs(specs)))
+  if copied in existing or not valid_model_molecule_qm(copied):
+    raise RuntimeError("Coot could not create an independent copy; original unchanged.")
+  try:
+    copied_specs = _all_residue_specs_for_colouring(copied)
+    if _atom_snapshot_for_specs(copied, copied_specs) != original:
+      raise RuntimeError("Copied atoms do not match the selection; original unchanged.")
+  except Exception:
+    close_molecule(copied)
+    raise
+  return copied
+
+
+def _delete_residue_specs(mol_id, specs):
+  delete_many = getattr(coot, "delete_residues_py", None)
+  if callable(delete_many):
+    delete_many(mol_id, [list(spec) for spec in specs])
+  else:
+    for spec in specs:
+      delete_residue(mol_id, *spec)
+
+
+def _cut_residue_specs_verified(mol_id, specs):
+  try:
+    copied = _copy_residue_specs_verified(mol_id, specs)
+    with _grouped_model_edit(mol_id):
+      _delete_residue_specs(mol_id, specs)
+    return copied
+  except Exception as error:
+    info_dialog(f"Cut stopped: {error}")
+    return -1
 
 def _rigid_fit_atom_snapshot(mol_id, chain=None, start=None, end=None):
   """Index coordinates by full atom identity, not transient serial indices."""
@@ -11643,14 +12704,7 @@ def copy_active_segment():
   segment_context = _active_segment_context_or_status()
   if not segment_context:
     return None
-  new_molecule_by_atom_selection(
-    segment_context["mol_id"],
-    "//{ch_id}/{res_start}-{res_end}/".format(
-      ch_id=segment_context["chain_id"],
-      res_start=segment_context["segment_start"],
-      res_end=segment_context["segment_end"],
-    ),
-  )
+  return _copy_residue_specs_verified(segment_context["mol_id"], segment_context["segment_specs"])
 
 #Cut active segment
 def cut_active_segment():
@@ -11661,20 +12715,15 @@ def cut_active_segment():
   ch_id = segment_context["chain_id"]
   res_start = segment_context["segment_start"]
   res_end = segment_context["segment_end"]
-  new_molecule_by_atom_selection(mol_id, "//{ch_id}/{res_start}-{res_end}/".format(ch_id=ch_id, res_start=res_start, res_end=res_end))
-  delete_residue_range(mol_id, ch_id, res_start, res_end)
+  return _cut_residue_specs_verified(mol_id, segment_context["segment_specs"])
 
 #Delete active segment
 def delete_active_segment():
   segment_context = _active_segment_context_or_status()
   if not segment_context:
     return None
-  delete_residue_range(
-    segment_context["mol_id"],
-    segment_context["chain_id"],
-    segment_context["segment_start"],
-    segment_context["segment_end"],
-  )
+  with _grouped_model_edit(segment_context["mol_id"]):
+    _delete_residue_specs(segment_context["mol_id"], segment_context["segment_specs"])
 
 
 #Jiggle-fits active chain to map
@@ -11695,11 +12744,23 @@ def jiggle_fit_active_chain_smooth():
   chain_context = _active_chain_context_or_status()
   if not chain_context:
     return None
-  sharpen(imol_refinement_map(),200)
+  original_map = imol_refinement_map()
+  existing = set(map_molecule_list())
+  blur = getattr(coot, "sharpen_blur_map", None)
+  if not callable(blur):
+    info_dialog("This Coot build cannot create a disposable blurred map.")
+    return None
+  blurred = blur(original_map, 200)
+  if blurred in existing or blurred not in map_molecule_list():
+    info_dialog("Could not create a blurred fitting map; original map unchanged.")
+    return None
   try:
+    set_map_displayed(blurred, 0)
+    set_imol_refinement_map(blurred)
     fit_chain_to_map_by_random_jiggle(chain_context["mol_id"], chain_context["chain_id"], 1000, 0.1)
   finally:
-    sharpen(imol_refinement_map(),0)
+    set_imol_refinement_map(original_map)
+    close_molecule(blurred)
     
 #Jiggle-fits active chain to map (more thorough)
 def jiggle_fit_active_chain_slow():
@@ -11866,13 +12927,28 @@ def _clicked_same_chain_residue_range(res1, res2, allow_single_residue=True, err
   ch_id_2=_click_spec_chain_id(res2)
   resno_1=_click_spec_res_no(res1)
   resno_2=_click_spec_res_no(res2)
-  if (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2):
+  if mol_id_1 < 0 or (mol_id_1!=mol_id_2) or (ch_id_1!=ch_id_2):
     info_dialog(error_message)
     return None
-  if resno_1 == resno_2 and not allow_single_residue:
+  if (resno_1, _click_spec_ins_code(res1)) == (resno_2, _click_spec_ins_code(res2)) and not allow_single_residue:
     info_dialog(error_message)
     return None
   return (mol_id_1, ch_id_1, min(resno_1, resno_2), max(resno_1, resno_2))
+
+
+def _clicked_residue_specs(res1, res2):
+  clicked = _clicked_same_chain_residue_range(res1, res2)
+  if clicked is None:
+    return []
+  mol_id, chain, _first, _last = clicked
+  specs = _tq_chain_residue_specs(mol_id, chain)
+  first = (chain, _click_spec_res_no(res1), _click_spec_ins_code(res1))
+  last = (chain, _click_spec_res_no(res2), _click_spec_ins_code(res2))
+  if first not in specs or last not in specs:
+    info_dialog("One of the clicked residues is no longer present.")
+    return []
+  a, b = sorted((specs.index(first), specs.index(last)))
+  return specs[a:b+1]
 
 
 def _atom_selection_for_residue_range(ch_id, res_start, res_end):
@@ -11889,8 +12965,9 @@ def copy_frag_by_click():
     if clicked_range is None:
       return None
     mol_id, ch_id, res_start, res_end = clicked_range
-    atom_sel = _atom_selection_for_residue_range(ch_id, res_start, res_end)
-    new_molecule_by_atom_selection(mol_id, atom_sel)
+    specs = _clicked_residue_specs(res1, res2)
+    if specs:
+      return _copy_residue_specs_verified(mol_id, specs)
   user_defined_click(2,copy_frag)
   
 #Cut fragment (click start and end)
@@ -11900,10 +12977,9 @@ def cut_frag_by_click():
     if clicked_range is None:
       return None
     mol_id, ch_id, res_start, res_end = clicked_range
-    atom_sel = _atom_selection_for_residue_range(ch_id, res_start, res_end)
-    with _grouped_model_edit(mol_id):
-      new_molecule_by_atom_selection(mol_id, atom_sel)
-      delete_residue_range(mol_id, ch_id, res_start, res_end)
+    specs = _clicked_residue_specs(res1, res2)
+    if specs:
+      return _cut_residue_specs_verified(mol_id, specs)
   user_defined_click(2,cut_frag)
 
 
@@ -12924,45 +14000,28 @@ def force_add_terminal_residue():
     ch_id=_click_spec_chain_id(res1)
     res_no=_click_spec_res_no(res1)
     ins_code=_click_spec_ins_code(res1)
-    res_type="auto"
-    add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-    res_type,-57.82,-47)
-    if residue_exists_qm(mol_id,ch_id,res_no+1,ins_code):
-      set_b_factor_residue_range(mol_id,ch_id,res_no+1,res_no+1,default_new_atoms_b_factor())
-    elif residue_exists_qm(mol_id,ch_id,res_no-1,ins_code):
-      set_b_factor_residue_range(mol_id,ch_id,res_no-1,res_no-1,default_new_atoms_b_factor())
-    sort_residues(mol_id)
+    if mol_id < 0 or ins_code:
+      info_dialog("Select a uniquely identified terminal residue without an insertion code.")
+      return 0
+    return force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, res_no, -57.82, -47)
   user_defined_click(1,force_addition)
   
 def force_add_terminal_residue_noclick(mol_id,ch_id,res_no):
-  res_type="auto"
-  add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-  res_type,-57.82,-47)
-  if residue_exists_qm(mol_id,ch_id,res_no+1,""):
-    set_b_factor_residue_range(mol_id,ch_id,res_no+1,res_no+1,default_new_atoms_b_factor())
-  elif residue_exists_qm(mol_id,ch_id,res_no-1,""):
-    set_b_factor_residue_range(mol_id,ch_id,res_no-1,res_no-1,default_new_atoms_b_factor())
-  sort_residues(mol_id)
+  return force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, res_no, -57.82, -47)
 
-def force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,res_no,phi,psi):
-  res_type="auto"
-  add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-  res_type,float(phi),float(psi))
-  if residue_exists_qm(mol_id,ch_id,res_no+1,""):
-    set_b_factor_residue_range(mol_id,ch_id,res_no+1,res_no+1,default_new_atoms_b_factor())
-  elif residue_exists_qm(mol_id,ch_id,res_no-1,""):
-    set_b_factor_residue_range(mol_id,ch_id,res_no-1,res_no-1,default_new_atoms_b_factor())
+def force_add_terminal_residue_noclick_phi_psi(mol_id,ch_id,res_no,phi,psi,res_type="auto"):
+  candidates = (res_no-1, res_no+1)
+  before = {number for number in candidates if residue_exists_qm(mol_id, ch_id, number, "")}
+  add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,res_type,float(phi),float(psi))
+  created = [number for number in candidates if number not in before
+             and residue_exists_qm(mol_id, ch_id, number, "")]
+  for number in created:
+    set_b_factor_residue_range(mol_id, ch_id, number, number, default_new_atoms_b_factor())
   sort_residues(mol_id)
+  return int(len(created) == 1)
 
 def force_add_terminal_residue_noclick_strand(mol_id,ch_id,res_no):
-  res_type="auto"
-  add_terminal_residue_using_phi_psi(mol_id,ch_id,res_no,
-  res_type,-139,135)
-  if residue_exists_qm(mol_id,ch_id,res_no+1,""):
-    set_b_factor_residue_range(mol_id,ch_id,res_no+1,res_no+1,default_new_atoms_b_factor())
-  elif residue_exists_qm(mol_id,ch_id,res_no-1,""):
-    set_b_factor_residue_range(mol_id,ch_id,res_no-1,res_no-1,default_new_atoms_b_factor())
-  sort_residues(mol_id)
+  return force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, res_no, -139, 135)
 
 #Paul
 def key_binding_terminal_spin():
@@ -13004,6 +14063,20 @@ def _cycle_terminal_residue_torsion(vary_phi):
   atom_name = growth_context["atom_name"]
   anchor_resno = growth_context["first_in_seg"] if growth_context["grow_from_n_term"] else growth_context["last_in_seg"]
   insertion_resno = anchor_resno + 1 if growth_context["grow_from_n_term"] else anchor_resno - 1
+  specs = growth_context["segment_specs"]
+  if len(specs) < 2 or any(spec[2] for spec in specs):
+    info_dialog("Terminal torsion cycling needs a neighbouring anchor and no insertion codes.")
+    return 0
+  endpoint = (ch_id, anchor_resno, "")
+  neighbour = specs[1] if growth_context["grow_from_n_term"] else specs[-2]
+  if neighbour[1] != insertion_resno:
+    info_dialog("Terminal torsion cycling needs consecutive endpoint numbering.")
+    return 0
+  original_atoms = residue_info_py(mol_id, *endpoint) or []
+  if any(atom[0][1] for atom in original_atoms):
+    info_dialog("Terminal torsion cycling cannot safely rebuild alternate conformers.")
+    return 0
+  original_type = residue_name(mol_id, *endpoint)
   next_cycle_index = (cycle_index + 1) % len(RESIDUE_TORSION_CYCLE_VALUES)
   if vary_phi:
     phi = chosen_angle
@@ -13013,12 +14086,26 @@ def _cycle_terminal_residue_torsion(vary_phi):
     phi = current_phi
     psi = chosen_angle
     residue_psi_cycle = next_cycle_index
+  fragment = None
+  try:
+    fragment = _copy_residue_specs_verified(mol_id, specs)
+    set_mol_displayed(fragment, 0)
+    delete_residue(fragment, *endpoint)
+    if not force_add_terminal_residue_noclick_phi_psi(
+        fragment, ch_id, insertion_resno, phi, psi, original_type):
+      raise RuntimeError("Coot could not rebuild the terminal residue.")
+    if not residue_exists_qm(fragment, *endpoint) or residue_name(fragment, *endpoint) != original_type:
+      raise RuntimeError("The rebuilt endpoint has an unexpected identity.")
+    with _grouped_model_edit(mol_id):
+      if not coot.replace_fragment(mol_id, fragment, _residue_spec_to_cid_compat(endpoint)):
+        raise RuntimeError("Coot rejected the rebuilt endpoint; use Undo if necessary.")
+  except Exception as error:
+    info_dialog(f"Terminal torsion cycling stopped: {error}")
+    return 0
+  finally:
+    if fragment is not None and valid_model_molecule_qm(fragment):
+      close_molecule(fragment)
   set_go_to_atom_molecule(mol_id)
-  set_new_atom_b_fac_to_mean()
-  set_go_to_atom_chain_residue_atom_name(ch_id, anchor_resno, atom_name)
-  delete_residue(mol_id, ch_id, anchor_resno, "")
-  force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, insertion_resno, phi, psi)
-  sort_residues(mol_id)
   set_go_to_atom_chain_residue_atom_name(ch_id, anchor_resno, atom_name)
   current_phi = phi
   current_psi = psi
@@ -13083,10 +14170,13 @@ def shorten_loop():
   _refresh_extra_restraints_display(mol_id)
   r1=resn-1
   r2=resn+2
-  set_refinement_immediate_replacement(1)
-  refine_zone(mol_id,ch_id,r1,r2,"")
-  accept_regularizement()
-  set_refinement_immediate_replacement(0)
+  previous_replacement = refinement_immediate_replacement_state()
+  try:
+    set_refinement_immediate_replacement(1)
+    refine_zone(mol_id,ch_id,r1,r2,"")
+    accept_regularizement()
+  finally:
+    set_refinement_immediate_replacement(previous_replacement)
 
 #Lengthen loop by one residue
 def lengthen_loop():
@@ -13111,6 +14201,7 @@ def lengthen_loop():
   _refresh_extra_restraints_display(mol_id)
   r1=resn-1
   r2=resn
+  previous_replacement = refinement_immediate_replacement_state()
   set_refinement_immediate_replacement(1)
   try:
     status = add_residue_by_map_fit(mol_id,ch_id,r1,"auto",1)
@@ -13120,7 +14211,7 @@ def lengthen_loop():
     refine_zone(mol_id,ch_id,r1,r2+1,"")
     accept_regularizement()
   finally:
-    set_refinement_immediate_replacement(0)
+    set_refinement_immediate_replacement(previous_replacement)
 
 #Get fractional coordinates of active atom. Useful when inspecting heavy atom sites.
 def get_fract_coords():
@@ -13176,32 +14267,41 @@ def autoscale_b_factor():
   graphics_to_b_factor_representation(mol_id)
     
 #Color molecule by rotamer and missing atom outliers
-def color_rotamer_outliers_and_missing_atoms(mol_id):
+def _iter_rotamer_outlier_colours(mol_id, defer_apply):
   missing_atoms_list=[]
   missing_atoms_colour=2
   rotamer_outlier_list=[]
   rotamer_outlier_colour=34
   blank_colour=0
   for x in missing_atom_info(mol_id):
-    missing_atoms_spec=[(x,missing_atoms_colour)]
-    missing_atoms_list=missing_atoms_list+missing_atoms_spec
-  for ch_id in chain_ids(mol_id):
-    first_res=first_residue(mol_id,ch_id)
-    last_res=last_residue(mol_id,ch_id)
-    for resn in range(first_res,last_res):
-      if residue_exists_qm(mol_id,ch_id,resn,""):
-        rot_prob=rotamer_score(mol_id,ch_id,resn,"","")
-        if rot_prob<0.5 and rot_prob>0.0:
-          rotamer_outlier_spec=[([ch_id,resn,""],rotamer_outlier_colour)]
-          rotamer_outlier_list=rotamer_outlier_list+rotamer_outlier_spec
-        else:
-          rotamer_outlier_spec=[([ch_id,resn,""],blank_colour)]
-          rotamer_outlier_list=rotamer_outlier_list+rotamer_outlier_spec
+    missing_atoms_list.append((x, missing_atoms_colour))
+  specs = _all_residue_specs_for_colouring(mol_id)
+  for index, (ch_id, resn, ins) in enumerate(specs):
+    rot_prob = rotamer_score(mol_id, ch_id, resn, ins, "")
+    colour = rotamer_outlier_colour if 0.0 < rot_prob < 0.5 else blank_colour
+    rotamer_outlier_list.append(([ch_id, resn, ins], colour))
+    if (index + 1) % 50 == 0:
+      yield f"Scoring rotamers: {index+1}/{len(specs)}", None, True
   colour_list = rotamer_outlier_list + missing_atoms_list
-  _apply_user_defined_residue_colours(mol_id, [], colour_list)
+  result = _apply_user_defined_residue_colours(mol_id, [], colour_list, defer_apply=defer_apply)
+  if defer_apply:
+    return (yield from result)
+  return result
 
 
-def color_polars_and_hphobs(mol_id):
+def color_rotamer_outliers_and_missing_atoms(mol_id, defer_apply=False):
+  steps = _iter_rotamer_outlier_colours(mol_id, defer_apply)
+  return steps if defer_apply else _consume_colour_steps(steps)
+
+
+def _residue_names_for_colouring(mol_id):
+  try:
+    return [(list(spec), record["name"]) for spec, record in _model_coordinate_snapshot(mol_id).items()]
+  except ValueError:
+    return [(spec, residue_name(mol_id, *spec)) for spec in _all_residue_specs_for_colouring(mol_id)]
+
+
+def color_polars_and_hphobs(mol_id, defer_apply=False):
   hphob_list=["CYS","ILE","LEU","VAL","TYR","MET","PHE","TRP","ALA"]
   polar_list=["SER","ASN","GLN","HIS","ARG","LYS","GLU","ASP","THR"]
   #based these on Moon&Fleming PNAS 2011 and MacCallum TIBS 2011
@@ -13216,38 +14316,21 @@ def color_polars_and_hphobs(mol_id):
   gly_res_list=[]
   pro_res_list=[]
   blank_res_list=[]
-  for ch_id in chain_ids(mol_id):
-    for sn in _iter_chain_serial_numbers(mol_id, ch_id):
-      resname_here=resname_from_serial_number(mol_id,ch_id,sn)
-      if resname_here in polar_list:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],polar_colour)]
-        polar_res_list=polar_res_list+residue_to_color
-      elif resname_here in hphob_list:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],hphob_colour)]
-        hphob_res_list=hphob_res_list+residue_to_color
-      elif resname_here=="GLY":
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],gly_colour)]
-        gly_res_list=gly_res_list+residue_to_color
-      elif resname_here=="PRO":
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],pro_colour)]
-        pro_res_list=pro_res_list+residue_to_color
-      else:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
+  for spec, resname_here in _residue_names_for_colouring(mol_id):
+    if resname_here in polar_list:
+      polar_res_list.append((spec, polar_colour))
+    elif resname_here in hphob_list:
+      hphob_res_list.append((spec, hphob_colour))
+    elif resname_here == "GLY":
+      gly_res_list.append((spec, gly_colour))
+    elif resname_here == "PRO":
+      pro_res_list.append((spec, pro_colour))
+    else:
+      blank_res_list.append((spec, blank_colour))
   colour_list = polar_res_list + hphob_res_list + gly_res_list + pro_res_list
-  _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
+  return _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, defer_apply=defer_apply)
   
-def color_by_charge(mol_id):
+def color_by_charge(mol_id, defer_apply=False):
   pos_list=["ARG","LYS","HIS"]
   neg_list=["GLU","ASP"]
   pos_colour=4
@@ -13256,29 +14339,21 @@ def color_by_charge(mol_id):
   pos_res_list=[]
   neg_res_list=[]
   blank_res_list=[]
-  for ch_id in chain_ids(mol_id):
-    for sn in _iter_chain_serial_numbers(mol_id, ch_id):
-      resname_here=resname_from_serial_number(mol_id,ch_id,sn)
-      if resname_here in pos_list:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],pos_colour)]
-        pos_res_list=pos_res_list+residue_to_color
-      elif resname_here in neg_list:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],neg_colour)]
-        neg_res_list=neg_res_list+residue_to_color
-      else:
-        resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-        ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-        residue_to_color=[([ch_id,resn,ins_id],blank_colour)]
-        blank_res_list=blank_res_list+residue_to_color
+  for spec, resname_here in _residue_names_for_colouring(mol_id):
+    if resname_here in pos_list:
+      pos_res_list.append((spec, pos_colour))
+    elif resname_here in neg_list:
+      neg_res_list.append((spec, neg_colour))
+    else:
+      blank_res_list.append((spec, blank_colour))
   colour_list = pos_res_list + neg_res_list
-  _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
+  return _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, defer_apply=defer_apply)
 
 
 def _append_chain_residue_colours(colour_rows, mol_id, ch_id, colour_index):
+  if _supports_direct_user_defined_colouring():
+    colour_rows.append((f"//{ch_id}", colour_index))
+    return
   for sn in _iter_chain_serial_numbers(mol_id, ch_id):
     resn = seqnum_from_serial_number(mol_id, ch_id, sn)
     ins_id = str(insertion_code_from_serial_number(mol_id, ch_id, sn))
@@ -13296,7 +14371,11 @@ def uncolor_other_chains():
   for ch_id in chain_ids(mol_id):
     if ch_id!=ch_id_here:
       _append_chain_residue_colours(blank_res_list, mol_id, ch_id, blank_colour)
-  _apply_user_defined_residue_colours(mol_id, blank_res_list, [])
+  if _supports_direct_user_defined_colouring():
+    _set_user_defined_atom_colour_by_residue_rows_py(mol_id, blank_res_list)
+    _graphics_to_legacy_user_defined_representation(mol_id, blank_res_list)
+  else:
+    _apply_user_defined_residue_colours(mol_id, blank_res_list, [])
 
 def color_active_chain():
   chain_context = _active_chain_context_or_status()
@@ -13331,7 +14410,7 @@ def color_active_chain_by_num(chain_colour):
       _append_chain_residue_colours(chain_res_list, mol_id, ch_id, chain_colour)
   _apply_user_defined_residue_colours(mol_id, blank_res_list, chain_res_list)
     
-def color_protein_na(mol_id):
+def color_protein_na(mol_id, defer_apply=False):
   blank_colour=0
   protein_colour=22 #yellow
   na_colour=31
@@ -13346,60 +14425,56 @@ def color_protein_na(mol_id):
     else:
       _append_chain_residue_colours(blank_res_list, mol_id, ch_id, blank_colour)
   colour_list = protein_res_list + na_res_list
-  _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list)
+  return _apply_user_defined_residue_colours(mol_id, blank_res_list, colour_list, defer_apply=defer_apply)
 
 
-def color_waters(mol_id):
+def color_waters(mol_id, defer_apply=False):
   water_colour=31
   blank_colour=0
   water_list=[]
   blank_res_list=[]
-  for ch_id in chain_ids(mol_id):
-    for sn in _iter_chain_serial_numbers(mol_id, ch_id):
-      resname_here=resname_from_serial_number(mol_id,ch_id,sn)
-      resn=seqnum_from_serial_number(mol_id,ch_id,sn)
-      ins_id=str(insertion_code_from_serial_number(mol_id,ch_id,sn))
-      colour_entry = ([ch_id,resn,ins_id], water_colour if resname_here=="HOH" else blank_colour)
-      if resname_here=="HOH":
-        water_list.append(colour_entry)
-      else:
-        blank_res_list.append(colour_entry)
-  _apply_user_defined_residue_colours(mol_id, blank_res_list, water_list)
+  for spec, resname_here in _residue_names_for_colouring(mol_id):
+    colour_entry = (spec, water_colour if resname_here=="HOH" else blank_colour)
+    if resname_here=="HOH":
+      water_list.append(colour_entry)
+    else:
+      blank_res_list.append(colour_entry)
+  return _apply_user_defined_residue_colours(mol_id, blank_res_list, water_list, defer_apply=defer_apply)
 
 
 def color_rotamer_outliers_and_missing_atoms_for_active_molecule():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  return color_rotamer_outliers_and_missing_atoms(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_rotamer_outliers_and_missing_atoms, "Rotamer / missing-atom colouring")
 
 
 def color_polars_and_hphobs_for_active_molecule():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  return color_polars_and_hphobs(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_polars_and_hphobs, "Polarity colouring")
 
 
 def color_by_charge_for_active_molecule():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  return color_by_charge(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_by_charge, "Charge colouring")
 
 
 def color_protein_na_for_active_molecule():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  return color_protein_na(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_protein_na, "Protein / nucleic-acid colouring")
 
 
 def color_waters_for_active_molecule():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  return color_waters(mol_id)
+  return _start_user_defined_colour_action(mol_id, color_waters, "Water colouring")
 
 
 CHAIN_BREAK_PROTEIN_RESNAMES = {'ALA','UNK','ARG','ASN','ASP','CYS','GLU','GLN','GLY','HIS','ILE','LEU','LYS','MET','MSE','PHE','PRO','SER','THR','TRP','TYR','VAL'}
@@ -13462,31 +14537,35 @@ def _chain_break_label(ch_id, start_resno, end_resno, res_missing, distance, dis
 def _highlight_chain_breaks_for_molecule(mol_id, collect_missing_segments):
   clear_ball_and_stick(mol_id)
   missing_segments_list = []
+  snapshot = _model_coordinate_snapshot(mol_id)
   with _grouped_model_edit(mol_id):
     obj_number = generic_object_with_name("chain_breaks_{mol_id}".format(mol_id=mol_id))
     generic_object_clear(obj_number)
     for ch_id in chain_ids(mol_id):
+      rows = _segment_chain_snapshot(mol_id, ch_id, snapshot)
+      breaks = [left["name"] in _SEGMENT_POLYMER_NAMES and right["name"] in _SEGMENT_POLYMER_NAMES
+                and not _segment_rows_connected(left, right) for left, right in zip(rows, rows[1:])]
       previous_terminus_xyz = {}
-      for resn in range(0, chain_n_residues(ch_id, mol_id)):
-        resname = resname_from_serial_number(mol_id, ch_id, resn)
+      for resn, row in enumerate(rows):
+        resname = row["name"]
         config = _chain_break_config_for_resname(resname)
         if not config:
           continue
         atom_name, warning_threshold = config
-        seqnum = seqnum_from_serial_number(mol_id, ch_id, resn)
+        seqnum = row["number"]
         if seqnum == -10000:
           continue
-        if (resn == 0) or (is_last_polymer_residue_sn(mol_id, ch_id, resn) == 1):
-          sel_string = "//{ch_id}/{seqnum}/{atom_name}".format(ch_id=ch_id, seqnum=seqnum, atom_name=atom_name)
+        if resn == 0 or resn == len(rows)-1 or rows[resn-1]["name"] not in _SEGMENT_POLYMER_NAMES or (resn+1 < len(rows) and rows[resn+1]["name"] not in _SEGMENT_POLYMER_NAMES):
+          sel_string = _residue_spec_to_cid_compat((ch_id, seqnum, row["ins"])) + "/" + atom_name
           make_ball_and_stick(mol_id, sel_string, 0, 0.5, 1)
-        if is_term_type_mc_sn(mol_id, ch_id, resn) == 1:
-          previous_xyz = _atom_xyz_or_none(mol_id, ch_id, seqnum, atom_name)
+        if resn < len(breaks) and breaks[resn]:
+          previous_xyz = row["xyz"].get(atom_name.strip())
           if previous_xyz is not None:
             previous_terminus_xyz[atom_name] = previous_xyz
-        if is_term_type_mn_sn(mol_id, ch_id, resn) == 1:
+        if resn and breaks[resn-1]:
           previous_xyz = previous_terminus_xyz.get(atom_name)
-          current_xyz = _atom_xyz_or_none(mol_id, ch_id, seqnum, atom_name)
-          previous_seqnum = seqnum_from_serial_number(mol_id, ch_id, resn-1)
+          current_xyz = row["xyz"].get(atom_name.strip())
+          previous_seqnum = rows[resn-1]["number"]
           if previous_xyz is None or current_xyz is None or previous_seqnum == -10000:
             continue
           res_missing = seqnum - previous_seqnum
@@ -13577,12 +14656,9 @@ def rigid_body_fit_segments():
   previous_immediate_replacement = refinement_immediate_replacement_state()
   with _grouped_model_edit(mol_id):
     try:
-      for seg in segment_list(mol_id):
-        res_start=seg[2]
-        res_end=seg[3]
-        ch_id=seg[1]
+      for specs in _model_segment_specs(mol_id):
         set_refinement_immediate_replacement(1)
-        rigid_body_refine_zone(mol_id,ch_id,res_start,res_end)
+        _rigid_fit_residue_specs(mol_id, specs)
         accept_regularizement()
     finally:
       set_refinement_immediate_replacement(previous_immediate_replacement)
@@ -13600,15 +14676,22 @@ def fit_this_segment():
   with _grouped_model_edit(mol_id):
     try:
       set_refinement_immediate_replacement(1)
-      rigid_body_refine_zone(
-        mol_id,
-        segment_context["chain_id"],
-        segment_context["segment_start"],
-        segment_context["segment_end"],
-      )
+      _rigid_fit_residue_specs(mol_id, segment_context["segment_specs"])
       accept_regularizement()
     finally:
       set_refinement_immediate_replacement(previous_immediate_replacement)
+
+
+def _rigid_fit_residue_specs(mol_id, specs):
+  fit = getattr(coot, "rigid_body_refine_by_atom_selection", None)
+  if callable(fit):
+    return fit(mol_id, _selection_for_residue_specs(specs))
+  chain = specs[0][0]
+  start, end = min(spec[1] for spec in specs), max(spec[1] for spec in specs)
+  actual = {tuple(spec) for spec in _tq_chain_residue_specs(mol_id, chain) if start <= spec[1] <= end}
+  if any(spec[2] for spec in specs) or actual != set(specs):
+    raise ValueError("This Coot build cannot rigid-fit this insertion-coded segment safely.")
+  return rigid_body_refine_zone(mol_id, chain, start, end)
 
 #Set default b-fac for new atoms to mean B for active mol
 def set_new_atom_b_fac_to_mean():
@@ -13626,8 +14709,13 @@ def _active_terminal_growth_context_or_status():
   mol_id = active_atom["mol_id"]
   ch_id = active_atom["chain_id"]
   resn = active_atom["resno"]
-  first_in_seg = first_residue_in_seg(mol_id, ch_id, resn)
-  last_in_seg = last_residue_in_seg(mol_id, ch_id, resn)
+  specs = _segment_specs_for_residue(mol_id, ch_id, resn, active_atom["ins_code"])
+  if not specs:
+    add_status_bar_text("No connected polymer segment at the active residue")
+    return None
+  first_in_seg = specs[0][1]
+  last_in_seg = specs[-1][1]
+  active_atom["segment_specs"] = specs
   active_atom["first_in_seg"] = first_in_seg
   active_atom["last_in_seg"] = last_in_seg
   active_atom["grow_from_n_term"] = abs(first_in_seg - resn) <= abs(last_in_seg - resn)
@@ -13637,6 +14725,11 @@ def _active_terminal_growth_context_or_status():
 def _run_terminal_growth_action(builder):
   growth_context = _active_terminal_growth_context_or_status()
   if not growth_context:
+    return None
+  anchor = (growth_context["segment_specs"][0] if growth_context["grow_from_n_term"]
+            else growth_context["segment_specs"][-1])
+  if anchor[2]:
+    info_dialog("Terminal growth at an insertion-coded residue is not supported by Coot's numbered builder.")
     return None
   set_go_to_atom_molecule(growth_context["mol_id"])
   set_new_atom_b_fac_to_mean()
@@ -15201,8 +16294,7 @@ def place_common_monomer(monomer_code):
       pass
     place_typed_atom_at_pointer(pointer_type)
     return target_mol_id
-  get_monomer_no_H(monomer_code)
-  return molecule_number_list()[-1]
+  return get_monomer_no_H(monomer_code)
 
 
 def add_common_monomer_menu_entries(menu, entries):
@@ -15378,7 +16470,7 @@ METAL_LINK_ESTIMATE_RADII = {
 }
 
 
-def _metal_link_candidates(imol, metal_spec, radius, estimate=None):
+def _metal_link_candidates(imol, metal_spec, radius, estimate=None, candidate_specs=None):
   """Return chemistry-filtered candidates; observed distances only rank the search."""
   profiles = {"MG": (6, 6), "NA": (4, 8), "K": (6, 9),
               "CA": (6, 8), "ZN": (4, 6), "FE": (4, 6)}
@@ -15422,9 +16514,9 @@ def _metal_link_candidates(imol, metal_spec, radius, estimate=None):
       existing.add(a)
   protein = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split())
   candidates = []
-  for spec in _all_residue_specs_for_colouring(imol):
-    if list(spec) == metal_spec[:3]:
-      continue
+  if candidate_specs is None:
+    candidate_specs = _residue_specs_near_point(imol, ion[0][2], radius)
+  for spec in candidate_specs:
     resname = residue_name(imol, *spec).strip().upper()
     ligand = resname not in protein and resname not in ("HOH", "WAT", "DOD")
     for atom in residue_info_py(imol, *spec) or []:
@@ -15699,7 +16791,8 @@ def auto_metal_links_current_residue():
           try:
             if not valid_model_molecule_qm(imol):
               raise ValueError("Target model is no longer available.")
-            _, _, _, fresh = _metal_link_candidates(imol, metal_spec, radius, estimate)
+            _, _, _, fresh = _metal_link_candidates(imol, metal_spec, radius, estimate,
+                                                    candidate_specs=[tuple(spec[:3])])
             if tuple(spec) not in {tuple(item[0]) for item in fresh}:
               raise ValueError("The candidate changed or is already linked. Please restart the search.")
             coot.make_link_py(imol, metal_spec, spec, "dummy", target)
@@ -15979,7 +17072,7 @@ def _parse_phenix_metal_edits(text):
   return bonds
 
 
-def _phenix_metal_atom_spec(imol, selection):
+def _phenix_metal_atom_spec(imol, selection, residue_index=None):
   """Resolve a restricted Phenix selection to exactly one Coot atom."""
   import shlex
   tokens = shlex.split(selection, comments=True)
@@ -16003,13 +17096,15 @@ def _phenix_metal_atom_spec(imol, selection):
     raise ValueError(f"Selection requires name, chain and resseq: {selection}")
   chain, resno = fields["chain"], int(fields["resseq"])
   matches = []
-  for spec in _all_residue_specs_for_colouring(imol):
+  if residue_index is None:
+    residue_index = _residue_identity_index(_model_coordinate_snapshot(imol))
+  for spec, record in residue_index.get((chain, resno), []):
     ch, rn, ins = spec
     if ch != chain or rn != resno or ("icode" in fields and ins != fields["icode"].strip()):
       continue
-    if "resname" in fields and residue_name(imol, ch, rn, ins).strip() != fields["resname"].strip():
+    if "resname" in fields and record["name"].strip() != fields["resname"].strip():
       continue
-    for atom in residue_info_py(imol, ch, rn, ins) or []:
+    for atom in record["atoms"]:
       name, alt = atom[0][:2]
       if name.strip() == fields["name"].strip() and ("altloc" not in fields or alt.strip() == fields["altloc"].strip()):
         matches.append([ch, rn, ins, name, alt])
@@ -16018,14 +17113,23 @@ def _phenix_metal_atom_spec(imol, selection):
   return matches[0]
 
 
-def _phenix_link_warning(imol, a, b):
+def _residue_identity_index(snapshot):
+  index = {}
+  for spec, record in snapshot.items():
+    index.setdefault(spec[:2], []).append((spec, record))
+  return index
+
+
+def _phenix_link_warning(imol, a, b, snapshot=None):
   """Conservative coordination heuristic, not a full chemical validation."""
   metals = set("LI NA K RB CS FR BE MG CA SR BA RA SC TI V CR MN FE CO NI CU ZN "
                "Y ZR NB MO TC RU RH PD AG CD HF TA W RE OS IR PT AU HG AL GA IN TL "
                "SN PB BI LA CE PR ND PM SM EU GD TB DY HO ER TM YB LU AC TH PA U NP PU AM CM BK CF ES FM MD NO LR".split())
   elements = []
   for spec in (a, b):
-    matches = [atom for atom in residue_info_py(imol, *spec[:3]) or []
+    atoms = (snapshot.get(tuple(spec[:3]), {}).get("atoms", []) if snapshot is not None
+             else residue_info_py(imol, *spec[:3]) or [])
+    matches = [atom for atom in atoms
                if list(atom[0][:2]) == spec[3:]]
     if len(matches) != 1:
       raise ValueError(f"Atom is no longer uniquely available: {spec}")
@@ -16045,9 +17149,10 @@ def _apply_phenix_metal_links(imol, prepared):
     return 0
   # Revalidate after the asynchronous review, before making any changes.
   try:
+    snapshot = _model_coordinate_snapshot(imol)
     for a, b, distance in prepared:
-      _phenix_link_warning(imol, a, b)
-  except (ValueError, TypeError, IndexError) as error:
+      _phenix_link_warning(imol, a, b, snapshot=snapshot)
+  except (ValueError, TypeError, IndexError, RuntimeError) as error:
     info_dialog(f"Import cancelled; no links added.\n\n{error}")
     return 0
   added = 0
@@ -16099,9 +17204,11 @@ def import_phenix_metal_edits(imol, file_name):
     with open(os.path.expanduser(file_name.strip()), encoding="utf-8") as handle:
       bonds = _parse_phenix_metal_edits(handle.read())
     prepared, seen = [], {}
+    snapshot = _model_coordinate_snapshot(imol)
+    residue_index = _residue_identity_index(snapshot)
     for bond in bonds:
-      a = _phenix_metal_atom_spec(imol, bond["atom_selection_1"])
-      b = _phenix_metal_atom_spec(imol, bond["atom_selection_2"])
+      a = _phenix_metal_atom_spec(imol, bond["atom_selection_1"], residue_index=residue_index)
+      b = _phenix_metal_atom_spec(imol, bond["atom_selection_2"], residue_index=residue_index)
       if a == b:
         raise ValueError("A bond cannot join an atom to itself.")
       pair = tuple(sorted((tuple(a), tuple(b))))
@@ -16114,10 +17221,10 @@ def import_phenix_metal_edits(imol, file_name):
       prepared.append((a, b, values))
     warnings_to_review = []
     for index, (a, b, distance) in enumerate(prepared):
-      warning = _phenix_link_warning(imol, a, b)
+      warning = _phenix_link_warning(imol, a, b, snapshot=snapshot)
       if warning:
         warnings_to_review.append((index, warning))
-  except (OSError, ValueError, TypeError, IndexError) as error:
+  except (OSError, ValueError, TypeError, IndexError, RuntimeError) as error:
     info_dialog(f"Phenix metal edits import cancelled; no links added.\n\n{error}")
     return 0
   return _review_phenix_metal_links(imol, prepared, warnings_to_review)
@@ -16203,13 +17310,12 @@ def _regularize_linked_residues(imol, base_spec, new_res_spec_py):
   if not new_spec:
     return 0
 
-  base_chain_id, base_resno, _base_ins_code = base_spec
-  new_chain_id, new_resno, _new_ins_code = new_spec
-  if base_chain_id != new_chain_id:
+  regularize = getattr(coot, "regularize_residues_py", None)
+  if not callable(regularize):
+    add_status_bar_text("This Coot build cannot regularize an explicit linked residue pair.")
     return 0
-
-  status = regularize_zone(imol, base_chain_id, min(base_resno, new_resno), max(base_resno, new_resno), "")
-  if status == 1:
+  status = regularize(imol, [list(base_spec), list(new_spec)])
+  if status:
     accept_regularizement()
   return status
 
@@ -16592,11 +17698,10 @@ def _place_new_secondary_structure(prompt_label, button_label, phi, psi):
     count = _parse_int_entry(n, f"{button_label} requires a positive integer.", minimum_value=1)
     if count is None:
       return 0
-    get_monomer_no_H("ALA")
-    if not model_molecule_list():
+    mol_id = get_monomer_no_H("ALA")
+    if not valid_model_molecule_qm(mol_id):
       info_dialog(f"Failed to create the starting monomer for {button_label}.")
       return 0
-    mol_id=model_molecule_list()[-1]
     ch_id=chain_ids(mol_id)[0]
     res_no=1
     ins_code=""
@@ -16686,51 +17791,31 @@ def place_new_3_10_helix():
 
 #Renumber active segment by active residue
 def renumber_seg_by_active_res():
-  chain_context = _active_chain_context_or_status()
-  if not chain_context:
+  context = _active_segment_context_or_status()
+  if not context:
     return None
-  current_num=chain_context["resno"]
-  mol_id=chain_context["mol_id"]
-  ch_id=chain_context["chain_id"]
+  current_num = context["resno"]
+  mol_id = context["mol_id"]
+  ch_id = context["chain_id"]
+  selected = set(context["segment_specs"])
   def renum_seg(new_num):
     new_num = _parse_int_entry(new_num, "Renumbering requires an integer residue number.")
     if new_num is None:
       return 0
-    seg_count=0
-    segments=segment_list(mol_id)
-    last_res=last_polymer_residue(mol_id,ch_id)
-    first_res=first_residue(mol_id,ch_id)
-    new_seg_list=[]
-    for seg in segments:
-      if ch_id==seg[1]:
-        new_seg_list.append(seg) 
-    for seg in new_seg_list:
-      seg_count=seg_count+1
-      if (current_num>=seg[2]) and (current_num<=seg[3]):
-        res_start=seg[2]
-        res_end=seg[3]
-        ch_id=seg[1]
-        if res_end<last_res:
-          seg_next=new_seg_list[seg_count]
-        if res_start>first_res:
-          seg_prev=new_seg_list[seg_count-2]
-        offset=new_num-current_num
-        if ((((res_start==first_res) or (res_start+offset)>seg_prev[3])) and (((res_end==last_res) or (res_end+offset)<seg_next[2]))):
-          if not _renumber_residue_range_or_dialog(
-            mol_id,
-            ch_id,
-            res_start,
-            res_end,
-            offset,
-            "Failed to renumber the active segment.\n\n"
-            "This usually means the requested renumbering would create overlapping sequence numbering.",
-          ):
-            return 0
-        else:
-          info_dialog("No can do, this would result in overlapping sequence numbering!")
-        _refresh_extra_restraints_display(mol_id)
-        return 1
-    return 0
+    specs = [tuple(spec) for spec in _tq_chain_residue_specs(mol_id, ch_id)]
+    start, end = min(spec[1] for spec in selected), max(spec[1] for spec in selected)
+    if {spec for spec in specs if start <= spec[1] <= end} != selected:
+      info_dialog("The numbered range includes residues outside this segment; nothing was renumbered.")
+      return 0
+    offset = new_num - current_num
+    occupied = set(specs) - selected
+    if any((chain, number + offset, ins) in occupied for chain, number, ins in selected):
+      info_dialog("Renumbering would overlap existing residues; nothing was renumbered.")
+      return 0
+    if not _renumber_residue_range_or_dialog(mol_id, ch_id, start, end, offset):
+      return 0
+    _refresh_extra_restraints_display(mol_id)
+    return 1
   generic_single_entry("New number for this residue?",
   str(current_num),"Renumber",renum_seg)
 
