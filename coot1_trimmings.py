@@ -11728,59 +11728,88 @@ def color_by_density_fit_native_for_active_residue():
   return _start_user_defined_colour_action(mol_id, color_by_density_fit_native, "Density-fit colouring")
 
 
+def _ncs_difference_scores_from_ghosts(snapshot, ghosts):
+  """Mean matched-atom displacement after Coot's peer-to-master NCS transform."""
+  chains = {}
+  for spec, record in snapshot.items():
+    chains.setdefault(spec[0], {})[spec[1:]] = record
+  atom_cache = {}
+  def atom_positions(spec, record):
+    if spec not in atom_cache:
+      positions = {}
+      for atom in record["atoms"]:
+        name, alt = atom[0]
+        point = tuple(float(value) for value in atom[2])
+        if len(point) == 3 and all(math.isfinite(value) for value in point):
+          positions.setdefault((str(name).strip(), str(alt or "").strip()), point)
+      atom_cache[spec] = positions
+    return atom_cache[spec]
+  scores = {}
+  seen_pairs = set()
+  for ghost in ghosts:
+    if not isinstance(ghost, (list, tuple)) or len(ghost) < 4:
+      raise ValueError("Coot returned an unrecognised NCS operator.")
+    peer, master, operator = ghost[1:4]
+    if peer == master or (peer, master) in seen_pairs:
+      continue
+    if not isinstance(operator, (list, tuple)) or len(operator) != 2:
+      raise ValueError("Coot could not calculate an NCS operator.")
+    rotation, translation = (tuple(float(v) for v in part) for part in operator)
+    if len(rotation) != 9 or len(translation) != 3 or not all(
+        math.isfinite(value) for value in rotation + translation):
+      raise ValueError("Coot returned an invalid NCS operator.")
+    seen_pairs.add((peer, master))
+    target_chain = chains.get(master, {})
+    for key, record in chains.get(peer, {}).items():
+      target = target_chain.get(key)
+      name = str(record["name"]).strip().upper()
+      if target is None or name in {"HOH", "WAT", "DOD"} or name != str(target["name"]).strip().upper():
+        continue
+      peer_spec, target_spec = (peer, *key), (master, *key)
+      positions = atom_positions(peer_spec, record)
+      target_positions = atom_positions(target_spec, target)
+      total, count = 0.0, 0
+      for atom_key, point in positions.items():
+        other = target_positions.get(atom_key)
+        if other is None:
+          continue
+        transformed = [sum(rotation[3*axis+j]*point[j] for j in range(3)) + translation[axis]
+                       for axis in range(3)]
+        total += math.sqrt(sum((a-b)**2 for a, b in zip(transformed, other)))
+        count += 1
+      if count:
+        mean = total/count
+        for spec in (peer_spec, target_spec):
+          scores[spec] = max(scores.get(spec, 0.0), mean)
+  return scores
+
+
 def color_by_ncs_difference(mol_id, defer_apply=False):
   if mol_id not in model_molecule_list():
     info_dialog("You need an active model for NCS-difference coloring.")
     return None
-  ncs_data=None
-  for chain_id in chain_ids(mol_id):
-    try:
-      diffs=ncs_chain_differences(mol_id, chain_id)
-    except Exception:
-      diffs=False
-    if diffs:
-      ncs_data=diffs
-      break
-  if not ncs_data:
-    info_dialog("No NCS-difference data were found for the active molecule.")
+  try:
+    # ncs_chain_differences_py still slices the old residue-spec layout in
+    # recent builds, losing the residue numbers. Read operators instead.
+    ghosts = coot.ncs_ghosts_py(mol_id) or []
+    if ghosts and any(not ghost[3] for ghost in ghosts):
+      coot.make_ncs_ghosts_maybe(mol_id)
+      ghosts = coot.ncs_ghosts_py(mol_id) or []
+    if not ghosts:
+      info_dialog("No NCS-related chain pairs were found for the active molecule.")
+      return None
+    snapshot = _model_coordinate_snapshot(mol_id)
+    ncs_scores = _ncs_difference_scores_from_ghosts(snapshot, ghosts)
+  except Exception as error:
+    print("NCS-difference coloring failed:")
+    traceback.print_exc()
+    info_dialog(f"Could not calculate NCS differences: {error}")
     return None
-
-  blank_colour=0
-  blank_res_list=[]
-  ncs_scores={}
-
-  for residue_spec in _all_residue_specs_for_colouring(mol_id):
-    blank_res_list.append((residue_spec, blank_colour))
-
-  for i in range(0, len(ncs_data), 3):
-    try:
-      peer_chain_id=ncs_data[i]
-      current_target_chain_id=ncs_data[i+1]
-      residue_diffs=ncs_data[i+2]
-    except Exception:
-      continue
-    if not isinstance(residue_diffs, list):
-      continue
-    for residue_diff in residue_diffs:
-      if not isinstance(residue_diff, list) or len(residue_diff) < 3:
-        continue
-      peer_residue=residue_diff[0]
-      target_residue=residue_diff[1]
-      mean_diff=residue_diff[2]
-      try:
-        mean_diff=float(mean_diff)
-      except Exception:
-        continue
-      if isinstance(peer_residue, list) and len(peer_residue) >= 2:
-        peer_spec=(peer_chain_id, peer_residue[0], peer_residue[1])
-        ncs_scores[peer_spec]=max(ncs_scores.get(peer_spec, 0.0), mean_diff)
-      if isinstance(target_residue, list) and len(target_residue) >= 2:
-        target_spec=(current_target_chain_id, target_residue[0], target_residue[1])
-        ncs_scores[target_spec]=max(ncs_scores.get(target_spec, 0.0), mean_diff)
-
   if not ncs_scores:
-    info_dialog("No NCS-difference values were available for coloring.")
+    info_dialog("NCS chains were found, but no matching residues/atoms could be compared.")
     return None
+
+  blank_res_list = [(list(spec), 0) for spec in snapshot]
 
   ncs_colour_list=[]
   for residue_spec, mean_diff in ncs_scores.items():
@@ -11796,7 +11825,9 @@ def color_by_ncs_difference(mol_id, defer_apply=False):
     mol_id,
     blank_res_list,
     ncs_colour_list,
-    "Active molecule colored by NCS difference, in spectral coloring (blue=low difference, red=high difference)",
+    "Active molecule colored by NCS difference.\n"
+    "Mean matched-atom displacement after NCS superposition; each master residue shows its largest peer difference.\n"
+    "Spectral scale: blue=0.0 A, red=2.0 A or greater; gray=not compared.",
     defer_apply=defer_apply,
   )
 
