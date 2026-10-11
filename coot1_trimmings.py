@@ -849,6 +849,9 @@ def ensure_user_defined_colour_table():
   # Alphafold colouring utilities shipped with Coot) can mutate the global
   # user-defined colour table, so a one-time initialization is not reliable.
   colours = _make_default_user_defined_colours()
+  multimap = getattr(coot, "_trimmings_multimap_refinement", None)
+  if multimap is not None:
+    colours = _make_multimap_user_defined_colours(multimap)
   coot.set_user_defined_colours_py(colours)
   USER_DEFINED_COLOUR_TABLE_READY = True
 
@@ -12043,6 +12046,1340 @@ def cycle_rep_down_current():
   cycle_rep_down(mol_id)
 
 
+# Embedded multimap tool: kept identical to multimap_refinement.py by tests.
+# Load lazily in its own namespace so helper names cannot shadow trimmings.
+_MULTIMAP_REFINEMENT_SOURCE = r'''"""Experimental, sequential multi-map refinement for Coot 1 / Python 3.
+
+Load this file in Coot, then call multimap_refinement_gui(). Nothing runs on load.
+Native edits are main-thread only; Pause/Stop take effect between refinement calls.
+"""
+
+import math
+import traceback
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RefinementStage:
+    map_id: int
+    weight: float
+    repeats: int = 1
+    autofit_rotamers: bool = False
+
+    def __post_init__(self):
+        if type(self.map_id) is not int or self.map_id < 0:
+            raise ValueError("Map must be a non-negative molecule number.")
+        if not math.isfinite(self.weight) or self.weight <= 0:
+            raise ValueError("Map weight must be finite and positive.")
+        if type(self.repeats) is not int or self.repeats < 1:
+            raise ValueError("Stage repeats must be a positive integer.")
+        if type(self.autofit_rotamers) is not bool:
+            raise ValueError("Autofit rotamers must be True or False.")
+
+
+@dataclass(frozen=True)
+class RefinementOptions:
+    window_size: int = 11
+    step_size: int = 5
+    contact_radius: float = 4.0
+    neighbour_padding: int = 1
+    max_moving_residues: int = 0
+    hydrogen_bonds: bool = False
+    hbond_target: float = 2.9
+    hbond_sigma: float = 0.15
+    auto_pause: bool = False
+    minimum_mean_cc: float = 0.2
+    maximum_cc_drop: float = 0.1
+    maximum_geometry: float = 5.0
+    order: str = "window"
+    follow_refinement: bool = True
+
+    def __post_init__(self):
+        for name in ("window_size", "step_size"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(name + " must be a positive integer.")
+        if type(self.max_moving_residues) is not int or self.max_moving_residues < 0:
+            raise ValueError("Moving residue limit must be a non-negative integer (0 = automatic).")
+        if self.step_size > self.window_size:
+            raise ValueError("Step size cannot exceed window size (would leave gaps).")
+        if type(self.neighbour_padding) is not int or self.neighbour_padding < 0:
+            raise ValueError("Neighbour padding must be a non-negative integer.")
+        for name in ("contact_radius", "maximum_cc_drop"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(name + " must be finite and non-negative.")
+        for name in ("hbond_target", "hbond_sigma", "maximum_geometry"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(name + " must be finite and positive.")
+        if not math.isfinite(self.minimum_mean_cc) or not -1 <= self.minimum_mean_cc <= 1:
+            raise ValueError("Minimum CC must be between -1 and 1.")
+        if self.order not in ("window", "stage"):
+            raise ValueError("Order must be 'window' or 'stage'.")
+
+    @property
+    def moving_residue_limit(self):
+        return self.max_moving_residues or max(500, 5 * self.window_size)
+
+
+def _residue_spec(value):
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Invalid Coot residue specification.")
+    if len(value) == 4:
+        value = value[1:]
+    if len(value) != 3 or not isinstance(value[0], str):
+        raise ValueError("Invalid Coot residue specification: " + repr(value))
+    return (value[0], int(value[1]), str(value[2] or ""))
+
+
+def residue_windows(specs, window_size, step_size):
+    """Use actual residue order, including insertion codes; do not leave a tail gap."""
+    specs = tuple(_residue_spec(s) for s in specs)
+    if not specs or len(set(specs)) != len(specs):
+        raise ValueError("Range must contain distinct residues.")
+    if len({s[0] for s in specs}) != 1 or list(specs) != sorted(specs):
+        raise ValueError("Range must be ordered and within one chain.")
+    if window_size < 1 or not 1 <= step_size <= window_size:
+        raise ValueError("Invalid window/step sizes.")
+    if len(specs) <= window_size:
+        return [specs]
+    starts = list(range(0, len(specs) - window_size + 1, step_size))
+    if starts[-1] != len(specs) - window_size:
+        starts.append(len(specs) - window_size)
+    return [specs[i:i + window_size] for i in starts]
+
+
+def refinement_windows(specs, window_size, step_size):
+    """Split the scope by chain before constructing sliding windows."""
+    specs = tuple(_residue_spec(s) for s in specs)
+    if not specs or len(set(specs)) != len(specs):
+        raise ValueError("Select at least one distinct polymer residue.")
+    chains = {}
+    for spec in specs:
+        chains.setdefault(spec[0], []).append(spec)
+    return [window for chain in chains.values()
+            for window in residue_windows(chain, window_size, step_size)]
+
+
+def _atom_key(spec):
+    # Native atom specs may have a leading success/model field.
+    if len(spec) == 6:
+        spec = spec[1:]
+    if len(spec) != 5:
+        raise ValueError("Invalid atom specification: " + repr(spec))
+    return (str(spec[0]), int(spec[1]), str(spec[2] or ""),
+            str(spec[3]).strip(), str(spec[4] or ""))
+
+
+def _distance(a, b):
+    return math.sqrt(sum((x - y)**2 for x, y in zip(a, b)))
+
+
+def _angle(a, b, c):
+    u, v = [x-y for x, y in zip(a, b)], [x-y for x, y in zip(c, b)]
+    length = math.sqrt(sum(x*x for x in u) * sum(x*x for x in v))
+    if not length:
+        return 0.0
+    return math.degrees(math.acos(max(-1, min(1, sum(x*y for x, y in zip(u, v))/length))))
+
+
+_CHI_ATOMS = {
+    "ARG": ("N CA CB CG", "CA CB CG CD", "CB CG CD NE", "CG CD NE CZ"),
+    "ASN": ("N CA CB CG", "CA CB CG OD1"),
+    "ASP": ("N CA CB CG", "CA CB CG OD1"),
+    "CYS": ("N CA CB SG",),
+    "GLN": ("N CA CB CG", "CA CB CG CD", "CB CG CD OE1"),
+    "GLU": ("N CA CB CG", "CA CB CG CD", "CB CG CD OE1"),
+    "HIS": ("N CA CB CG", "CA CB CG ND1"),
+    "ILE": ("N CA CB CG1", "CA CB CG1 CD1"),
+    "LEU": ("N CA CB CG", "CA CB CG CD1"),
+    "LYS": ("N CA CB CG", "CA CB CG CD", "CB CG CD CE", "CG CD CE NZ"),
+    "MET": ("N CA CB CG", "CA CB CG SD", "CB CG SD CE"),
+    "MSE": ("N CA CB CG", "CA CB CG SE", "CB CG SE CE"),
+    "PHE": ("N CA CB CG", "CA CB CG CD1"),
+    "PRO": ("N CA CB CG", "CA CB CG CD"),
+    "SER": ("N CA CB OG",),
+    "THR": ("N CA CB OG1",),
+    "TRP": ("N CA CB CG", "CA CB CG CD1"),
+    "TYR": ("N CA CB CG", "CA CB CG CD1"),
+    "VAL": ("N CA CB CG1",),
+}
+_CHANGE_METRICS = {
+    "ca": ("C-alpha RMSD", "A", (0.1, 0.25, 0.5, 1.0, 2.0)),
+    "chi": ("Largest chi change", "deg", (5, 15, 30, 60, 120)),
+    "backbone": ("Largest phi/psi/omega change", "deg", (5, 15, 30, 60, 120)),
+}
+_CHANGE_COLOURS = ((0.18, 0.36, 0.98), (0.08, 0.70, 0.90), (0.10, 0.78, 0.42),
+                   (0.96, 0.90, 0.20), (0.98, 0.50, 0.06), (0.78, 0.00, 0.12))
+
+
+def _comparison_coordinates(records):
+    """Copy occupied coordinates only; no live native objects or molecule copies."""
+    result = {}
+    for spec, record in records.items():
+        atoms = {}
+        for atom in record["atoms"]:
+            if float(atom[1][0]) <= 0:
+                continue
+            key = (str(atom[0][0]).strip(), str(atom[0][1] or ""))
+            xyz = tuple(float(x) for x in atom[2])
+            if key in atoms or len(xyz) != 3 or not all(math.isfinite(x) for x in xyz):
+                raise ValueError("Ambiguous or invalid comparison coordinates: " + repr(spec))
+            atoms[key] = xyz
+        result[spec] = {"name": str(record["name"]).upper(), "atoms": atoms}
+    return result
+
+
+def _dihedral(points):
+    def cross(a, b):
+        return (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
+    bonds = [tuple(y-x for x, y in zip(a, b)) for a, b in zip(points, points[1:])]
+    n1, n2 = cross(bonds[0], bonds[1]), cross(bonds[1], bonds[2])
+    length = math.sqrt(sum(x*x for x in bonds[1]))
+    if length < 1e-10 or min(sum(x*x for x in n1), sum(x*x for x in n2)) < 1e-20:
+        return None
+    axis = tuple(x/length for x in bonds[1])
+    return math.degrees(math.atan2(sum(x*y for x, y in zip(cross(n1, n2), axis)),
+                                   sum(x*y for x, y in zip(n1, n2))))
+
+
+def _matched_points(initial, current, addresses):
+    """Compare the same alternate identifier, allowing shared blank-alt atoms."""
+    records = [model.get(spec) for model in (initial, current) for spec, _ in addresses]
+    if any(record is None for record in records):
+        return
+    alts = {alt for record in records for _, alt in record["atoms"]} | {""}
+    seen = set()
+    for alt in sorted(alts):
+        pairs = []
+        for model in (initial, current):
+            points = [model[spec]["atoms"].get((name, alt), model[spec]["atoms"].get((name, "")))
+                      for spec, name in addresses]
+            if any(point is None for point in points):
+                break
+            pairs.append(points)
+        if len(pairs) == 2:
+            key = tuple(tuple(points) for points in pairs)
+            if key not in seen:
+                seen.add(key)
+                yield pairs
+
+
+def _connected_pair(initial, current, left, right, backbone=False):
+    if left[0] != right[0] or not (right[1] == left[1]+1 or
+                                  (right[1] == left[1] and right[2] > left[2])):
+        return False
+    names, limits = (("C", "N"), (1.0, 2.0)) if backbone else (("CA", "CA"), (2.5, 4.5))
+    return any(all(limits[0] <= _distance(*points) <= limits[1] for points in pair)
+               for pair in _matched_points(initial, current, [(left, names[0]), (right, names[1])]))
+
+
+def model_change_scores(initial, current, metric="ca", window_size=5):
+    """Per-residue map-frame RMSD or maximum wrapped angular change.
+
+    Inputs are detached records from _comparison_coordinates. Missing values
+    are None. CA windows are centred, truncated at termini and chain breaks.
+    Chi/backbone values take the largest change over comparable torsions/alts.
+    """
+    if metric not in _CHANGE_METRICS:
+        raise ValueError("Unknown change metric: " + str(metric))
+    if type(window_size) is not int or window_size < 1 or window_size % 2 != 1:
+        raise ValueError("C-alpha window size must be a positive odd integer.")
+    specs = sorted(s for s in current if {"N", "CA"} <= {name for name, _ in current[s]["atoms"]})
+    values = {s: None for s in specs}
+    if metric == "ca":
+        segments = []
+        for spec in specs:
+            if not segments or not _connected_pair(initial, current, segments[-1][-1], spec):
+                segments.append([])
+            segments[-1].append(spec)
+        for segment in segments:
+            squares = []
+            for spec in segment:
+                pairs = list(_matched_points(initial, current, [(spec, "CA")]))
+                squares.append(sum(_distance(a[0], b[0])**2 for a, b in pairs)/len(pairs) if pairs else None)
+            sums, counts = [0.0], [0]
+            for value in squares:
+                sums.append(sums[-1] + (value or 0.0))
+                counts.append(counts[-1] + (value is not None))
+            half = window_size//2
+            for i, spec in enumerate(segment):
+                lo, hi = max(0, i-half), min(len(segment), i+half+1)
+                count = counts[hi]-counts[lo]
+                if squares[i] is not None and count:
+                    values[spec] = math.sqrt(max(0, sums[hi]-sums[lo])/count)
+        return values
+    for i, spec in enumerate(specs):
+        torsions = []
+        if metric == "chi":
+            if spec not in initial or initial[spec]["name"] != current[spec]["name"]:
+                continue
+            name = current[spec]["name"]
+            for j, atoms in enumerate(_CHI_ATOMS.get(name, ())):
+                period = 180 if (name, j) in (("ASP", 1), ("GLU", 2), ("PHE", 1), ("TYR", 1)) else 360
+                torsions.append(([(spec, atom) for atom in atoms.split()], period))
+        else:
+            if i and _connected_pair(initial, current, specs[i-1], spec, backbone=True):
+                torsions.append(([(specs[i-1], "C"), (spec, "N"), (spec, "CA"), (spec, "C")], 360))
+            if i+1 < len(specs) and _connected_pair(initial, current, spec, specs[i+1], backbone=True):
+                other = specs[i+1]
+                torsions.extend((([(spec, "N"), (spec, "CA"), (spec, "C"), (other, "N")], 360),
+                                 ([(spec, "CA"), (spec, "C"), (other, "N"), (other, "CA")], 360)))
+        deltas = []
+        for addresses, period in torsions:
+            for pair in _matched_points(initial, current, addresses):
+                if metric == "backbone" and any(
+                        addresses[k][0] != addresses[k+1][0] and not 1.0 <= _distance(points[k], points[k+1]) <= 2.0
+                        for points in pair for k in range(3)):
+                    continue
+                a, b = (_dihedral(points) for points in pair)
+                if a is not None and b is not None:
+                    deltas.append(abs((b-a+period/2) % period-period/2))
+        if deltas:
+            values[spec] = max(deltas)
+    return values
+
+
+def change_colour_legend(metric):
+    title, unit, limits = _CHANGE_METRICS[metric]
+    bands = (0,) + limits
+    lines = [title + " (" + unit + ")"]
+    for i, name in enumerate(("Blue", "Cyan", "Green", "Yellow", "Orange", "Red")):
+        lines.append("%s: %g-%g" % (name, bands[i], bands[i+1]) if i < 5 else "Red: >= %g" % bands[i])
+    return "\n".join(lines + ["Grey: unprocessed or no comparable atoms/torsions"])
+
+
+def _change_colour_table():
+    # Align positional CA lookup with explicit atom-colour keys, without
+    # overriding standard 0..59 colours or clearing native colours to -1.
+    neutral = 120
+    palette = [(neutral, [0.72, 0.72, 0.72]) for _ in range(neutral+1)]
+    palette.extend((neutral+1+i, list(rgb)) for i, rgb in enumerate(_CHANGE_COLOURS))
+    return palette
+
+
+def backbone_hbond_pairs(records, moving):
+    """Conservative O...N candidates, without changing global H-bond settings.
+
+    Backbone only, no proline donors, 2.6--3.3 A, C-O-N and CA-N-O >=110 deg.
+    Separate alternate conformers are never joined. At least one endpoint moves.
+    """
+    donors, acceptors = [], []
+    for spec, record in records.items():
+        atoms = record["atoms"]
+        for (name, alt), (native, xyz) in atoms.items():
+            if name == "N" and record["name"] != "PRO":
+                ca = atoms.get(("CA", alt)) or atoms.get(("CA", ""))
+                if ca:
+                    donors.append((spec, alt, native, xyz, ca[1]))
+            if name == "O":
+                carbon = atoms.get(("C", alt)) or atoms.get(("C", ""))
+                if carbon:
+                    acceptors.append((spec, alt, native, xyz, carbon[1]))
+    # Local spatial bins keep this cheap even for large contact shells.
+    bins = {}
+    for acceptor in acceptors:
+        key = tuple(math.floor(x / 3.3) for x in acceptor[3])
+        bins.setdefault(key, []).append(acceptor)
+    result = []
+    for ds, da, dn, dp, dca in donors:
+        key = tuple(math.floor(x / 3.3) for x in dp)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for os, oa, on, op, oc in bins.get((key[0]+dx, key[1]+dy, key[2]+dz), []):
+                        if ds == os or (ds not in moving and os not in moving):
+                            continue
+                        if da and oa and da != oa:
+                            continue
+                        if ds[0] == os[0] and abs(ds[1] - os[1]) <= 1:
+                            continue
+                        if (2.6 <= _distance(dp, op) <= 3.3 and
+                                _angle(oc, op, dp) >= 110 and _angle(dca, dp, op) >= 110):
+                            result.append((dn, on))
+    return result
+
+
+class CootRefinementBackend:
+    """Coot adapter. Settings and only our own temporary restraints are scoped per step."""
+
+    def __init__(self, api=None):
+        if api is None:
+            import coot
+            api = coot
+        self.api = api
+        required = ("python_representation_kk", "refine_residues_py", "accept_regularizement",
+                    "matrix_state", "set_matrix", "imol_refinement_map", "set_imol_refinement_map",
+                    "refinement_immediate_replacement_state", "set_refinement_immediate_replacement",
+                    "is_valid_model_molecule", "is_valid_map_molecule",
+                    "residue_info_py", "residue_name")
+        missing = [name for name in required if not callable(getattr(api, name, None))]
+        if missing:
+            raise RuntimeError("Unsupported Coot build; missing: " + ", ".join(missing))
+        self.chain_specs = {}
+        self.polymer_specs = set()
+        self.positions = {}
+        self._grid_radius = None
+        self._grid = {}
+        self._grid_keys = {}
+
+    def snapshot(self, imol):
+        if not self.api.is_valid_model_molecule(imol):
+            raise ValueError("Model has been closed or is not a coordinate molecule.")
+        count = getattr(self.api, "n_models", None)
+        if callable(count) and count(imol) != 1:
+            raise ValueError("A single-model coordinate molecule is required.")
+        models = self.api.python_representation_kk(imol)
+        if not models or len(models) != 1:
+            raise ValueError("A single-model coordinate molecule is required.")
+        records = {}
+        self.chain_specs = {}
+        self.polymer_specs = set()
+        self.positions = {}
+        self._grid_radius = None
+        self._grid = {}
+        self._grid_keys = {}
+        for chain, residues in models[0]:
+            for number, ins, name, atoms in residues:
+                spec = (str(chain), int(number), str(ins or ""))
+                if spec in records:
+                    raise ValueError("Ambiguous residue identifiers in model.")
+                records[spec] = {"name": name, "atoms": atoms}
+                self.positions[spec] = self._positions(atoms)
+                names = {atom[0][0].strip() for atom in atoms}
+                if {"N", "CA", "C"} <= names or {"C3'", "C4'"} <= names:
+                    self.polymer_specs.add(spec)
+                self.chain_specs.setdefault(spec[0], []).append(spec)
+        for specs in self.chain_specs.values():
+            specs.sort()
+        return records
+
+    def colour_changes(self, imol, records, values, metric):
+        graphics_state = getattr(self.api, "use_graphics_interface_state", None)
+        if callable(graphics_state) and graphics_state() == 0:
+            raise RuntimeError("Change colouring requires Coot's graphical interface.")
+        ca_representation = "graphics_to_user_defined_atom_colours_representation"
+        atom_representation = "graphics_to_user_defined_atom_colours_all_atoms_representation"
+        representations = ((ca_representation, atom_representation) if metric == "chi"
+                           else (atom_representation, ca_representation))
+        for name in ("set_user_defined_colours_py", "set_user_defined_atom_colour_py", *representations):
+            if not callable(getattr(self.api, name, None)):
+                raise RuntimeError("This Coot build cannot display change colours; missing " + name)
+        if not values:
+            raise ValueError("No comparable atoms/torsions for this metric.")
+        neutral = 120
+        limits = _CHANGE_METRICS[metric][2]
+        self.api.set_user_defined_colours_py(_change_colour_table())
+        rows = []
+        for spec, record in records.items():
+            value = values.get(spec)
+            colour = neutral if value is None else neutral+1+sum(value >= cutoff for cutoff in limits)
+            for atom in record["atoms"]:
+                rows.append(([imol, *spec, *atom[0][:2]], colour))
+                if len(rows) == 4096:
+                    self.api.set_user_defined_atom_colour_py(imol, rows)
+                    rows = []
+        if rows:
+            self.api.set_user_defined_atom_colour_py(imol, rows)
+        # Refresh both views from the new assignments, ending in the metric's
+        # usual view so switching representations cannot retain an older metric.
+        for representation in representations:
+            getattr(self.api, representation)(imol)
+        self.redraw()
+
+    @staticmethod
+    def _positions(atoms):
+        points = []
+        for atom in atoms:
+            if float(atom[1][0]) > 0:
+                xyz = tuple(float(x) for x in atom[2])
+                if len(xyz) != 3 or not all(math.isfinite(x) for x in xyz):
+                    raise ValueError("Invalid atom coordinates.")
+                points.append(xyz)
+        return points
+
+    def _index_positions(self, spec):
+        radius = self._grid_radius
+        keys = set()
+        for xyz in self.positions[spec]:
+            key = tuple(math.floor(x / radius) for x in xyz)
+            self._grid.setdefault(key, {}).setdefault(spec, []).append(xyz)
+            keys.add(key)
+        self._grid_keys[spec] = keys
+
+    def _refresh_positions(self, imol, specs):
+        for spec in specs:
+            self.positions[spec] = self._positions(self.api.residue_info_py(imol, *spec) or [])
+            if self._grid_radius is not None:
+                for key in self._grid_keys.get(spec, ()):
+                    bucket = self._grid[key]
+                    bucket.pop(spec, None)
+                    if not bucket:
+                        del self._grid[key]
+                self._index_positions(spec)
+
+    def validate(self, imol, stages, options, specs):
+        self._check_idle()
+        records = self.snapshot(imol)
+        if not self.api.is_valid_map_molecule(self.api.imol_refinement_map()):
+            raise ValueError("Select a refinement map in Coot before starting (needed for state restoration).")
+        if any(s not in records for s in specs):
+            raise ValueError("A requested residue no longer exists.")
+        for stage in stages:
+            if not self.api.is_valid_map_molecule(stage.map_id):
+                raise ValueError("Map #%s has been closed or is not a map." % stage.map_id)
+        if options.auto_pause and not callable(getattr(self.api, "map_to_model_correlation_per_residue_py", None)):
+            raise RuntimeError("CC guard is unavailable in this Coot build.")
+        if options.hydrogen_bonds:
+            for name in ("add_extra_bond_restraint", "delete_extra_restraint_py", "list_extra_restraints_py"):
+                if not callable(getattr(self.api, name, None)):
+                    raise RuntimeError("Temporary H-bond restraints require " + name)
+        if any(stage.autofit_rotamers for stage in stages):
+            for name in ("auto_fit_best_rotamer", "rotamer_auto_fit_do_post_refine_state",
+                         "set_rotamer_auto_fit_do_post_refine"):
+                if not callable(getattr(self.api, name, None)):
+                    raise RuntimeError("Rotamer autofitting requires " + name)
+
+    def _check_idle(self):
+        ongoing = getattr(self.api, "refinement_already_ongoing_p", None)
+        if callable(ongoing) and ongoing():
+            raise RuntimeError("Finish/accept/reject the existing Coot refinement first.")
+
+    def moving_selection(self, imol, seed, options):
+        selected = set(seed)
+        if options.contact_radius:
+            # Native contact wrappers share borrowed Python references on some builds.
+            # Use a spatial index and update only moved residues after each refinement.
+            radius = options.contact_radius
+            if self._grid_radius != radius:
+                self._grid_radius, self._grid, self._grid_keys = radius, {}, {}
+                for spec in self.positions:
+                    self._index_positions(spec)
+            radius_sq = radius * radius
+            for spec in seed:
+                for xyz in self.positions[spec]:
+                    key = tuple(math.floor(x / radius) for x in xyz)
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            for dz in (-1, 0, 1):
+                                for other, points in self._grid.get((key[0]+dx, key[1]+dy, key[2]+dz), {}).items():
+                                    if other not in selected and any(sum((a-b)**2 for a, b in zip(xyz, p)) <= radius_sq for p in points):
+                                        selected.add(other)
+        # Pad contact residues by actual chain order, retaining waters/ligands as contacts.
+        contacts = set(selected)
+        for chain, ordered in self.chain_specs.items():
+            ordered = [s for s in ordered if s in self.polymer_specs]
+            indices = {s: i for i, s in enumerate(ordered)}
+            for spec in contacts:
+                if spec[0] == chain and spec in indices:
+                    i = indices[spec]
+                    selected.update(ordered[max(0, i-options.neighbour_padding):i+options.neighbour_padding+1])
+        if len(selected) > options.moving_residue_limit:
+            raise ValueError("Moving selection has %d residues (window %d + contacts %d; limit %d). "
+                             "Increase the moving residue limit in Options, or reduce the contact radius/padding." %
+                             (len(selected), len(seed), len(selected)-len(seed), options.moving_residue_limit))
+        for spec in selected:
+            if not self.api.residue_info_py(imol, *spec):
+                raise ValueError("Moving residue disappeared: " + repr(spec))
+        return sorted(selected)
+
+    def local_records(self, imol, specs):
+        records = {}
+        for spec in specs:
+            atoms = {}
+            for atom in self.api.residue_info_py(imol, *spec) or []:
+                name, alt = atom[0]
+                xyz = tuple(float(x) for x in atom[2])
+                if not all(math.isfinite(x) for x in xyz):
+                    raise ValueError("Non-finite coordinates in " + repr(spec))
+                if float(atom[1][0]) <= 0:
+                    continue
+                key = (name.strip(), str(alt or ""))
+                if key in atoms:
+                    raise ValueError("Ambiguous atom identity in " + repr(spec))
+                atoms[key] = (list(spec) + [name, str(alt or "")], xyz)
+            records[spec] = {"name": self.api.residue_name(imol, *spec), "atoms": atoms}
+        return records
+
+    def correlation(self, imol, specs, map_id):
+        rows = self.api.map_to_model_correlation_per_residue_py(imol, [list(s) for s in specs], 0, map_id)
+        scores = {}
+        for spec, value in rows or []:
+            spec = _residue_spec(spec)
+            if spec in specs and math.isfinite(float(value)):
+                scores[spec] = float(value)
+        if len(scores) != len(specs):
+            raise RuntimeError("CC guard could score only %d/%d residues." % (len(scores), len(specs)))
+        return sum(scores.values()) / len(scores)
+
+    def autofit_rotamers(self, imol, seed, stage):
+        """Fit the window (not its contact shell), preserving search/backrub settings."""
+        self._check_idle()
+        api = self.api
+        if not api.is_valid_model_molecule(imol) or not api.is_valid_map_molecule(stage.map_id):
+            raise ValueError("Model or stage map has been closed.")
+        previous_map = api.imol_refinement_map()
+        post_refine = api.rotamer_auto_fit_do_post_refine_state()
+        if not api.is_valid_map_molecule(previous_map):
+            raise ValueError("Select a refinement map before starting.")
+        report = {"attempted": 0, "failed": []}
+        amino_acids = {"ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "HIS", "ILE", "LEU",
+                      "LYS", "MET", "MSE", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"}
+        try:
+            if api.set_imol_refinement_map(stage.map_id) != stage.map_id:
+                raise RuntimeError("Could not set rotamer-fitting map.")
+            api.set_rotamer_auto_fit_do_post_refine(0)
+            for spec in seed:
+                if api.residue_name(imol, *spec).strip().upper() not in amino_acids:
+                    continue
+                atoms = api.residue_info_py(imol, *spec) or []
+                alts = sorted({str(a[0][1]) for a in atoms if a[0][1] and float(a[1][0]) > 0})
+                if not any(float(a[1][0]) > 0 for a in atoms):
+                    continue
+                for alt in alts or [""]:
+                    score = api.auto_fit_best_rotamer(imol, *spec, alt, stage.map_id, 1, 0.3)
+                    report["attempted"] += 1
+                    if not isinstance(score, (int, float)) or not math.isfinite(score) or score <= -99.89:
+                        report["failed"].append(tuple(spec) + (alt,))
+            return report
+        finally:
+            errors = []
+            # Fitting/backrub may move neighbours or delete clashing waters.
+            for function, args in ((api.set_rotamer_auto_fit_do_post_refine, (post_refine,)),
+                                   (api.set_imol_refinement_map, (previous_map,)),
+                                   (self.snapshot, (imol,)), (self.redraw, ())):
+                try:
+                    function(*args)
+                except Exception as error:
+                    errors.append(str(error))
+            if errors:
+                raise RuntimeError("Rotamer cleanup failed: " + "; ".join(errors))
+
+    def navigate(self, imol, seed):
+        """Centre on backbone anchors, without changing orientation or zoom."""
+        anchors = []
+        for spec in seed:
+            atoms = self.api.residue_info_py(imol, *spec) or []
+            backbone = [a for a in atoms if a[0][0].strip() in ("CA", "C4'") and float(a[1][0]) > 0]
+            if backbone:
+                anchors.append(tuple(float(x) for x in max(backbone, key=lambda a: float(a[1][0]))[2]))
+            elif self.positions.get(spec):
+                points = self.positions[spec]
+                anchors.append(tuple(sum(p[i] for p in points) / len(points) for i in range(3)))
+        if not anchors:
+            raise ValueError("No occupied atoms remain in the working region.")
+        centre = tuple(sum(p[i] for p in anchors) / len(anchors) for i in range(3))
+        if not all(math.isfinite(x) for x in centre):
+            raise ValueError("Invalid coordinates in the working region.")
+        self.api.set_rotation_centre(*centre)
+        self.redraw()
+
+    def redraw(self):
+        draw = getattr(self.api, "graphics_draw", None)
+        if callable(draw):
+            draw()
+
+    def refine(self, imol, specs, stage, options):
+        api = self.api
+        self._check_idle()
+        if not api.is_valid_model_molecule(imol) or not api.is_valid_map_molecule(stage.map_id):
+            raise ValueError("Model or stage map has been closed.")
+        previous = (api.imol_refinement_map(), api.matrix_state(), api.refinement_immediate_replacement_state())
+        if not api.is_valid_map_molecule(previous[0]):
+            raise ValueError("Select a refinement map before starting.")
+        owned = []
+        attempted = False
+        try:
+            if options.hydrogen_bonds:
+                existing = {frozenset((_atom_key(row[1]), _atom_key(row[2])))
+                            for row in api.list_extra_restraints_py(imol) or [] if row[0] == "bond"}
+                for a, b in backbone_hbond_pairs(self.local_records(imol, specs), set(specs)):
+                    key = frozenset((_atom_key(a), _atom_key(b)))
+                    if key in existing:
+                        continue
+                    index = api.add_extra_bond_restraint(imol, *a, *b, options.hbond_target, options.hbond_sigma)
+                    if index < 0:
+                        raise RuntimeError("Could not add temporary H-bond restraint.")
+                    owned.append(["bond", a, b])
+                    existing.add(key)
+            if api.set_imol_refinement_map(stage.map_id) != stage.map_id:
+                raise RuntimeError("Could not set refinement map.")
+            api.set_matrix(stage.weight)
+            api.set_refinement_immediate_replacement(1)
+            attempted = True
+            result = api.refine_residues_py(imol, [list(s) for s in specs])
+            if result is False or result is None:
+                raise RuntimeError("Coot could not set up refinement (check dictionaries/selection).")
+            ongoing = getattr(api, "refinement_already_ongoing_p", None)
+            if not callable(ongoing) or ongoing():
+                accept = getattr(api, "accept_moving_atoms_py", None)
+                if callable(accept):
+                    accepted = accept()
+                    if accepted:
+                        result = accepted
+                else:
+                    api.accept_regularizement()
+            self._refresh_positions(imol, specs)
+            self.redraw()
+            return result, len(owned)
+        except Exception:
+            ongoing = getattr(api, "refinement_already_ongoing_p", None)
+            clear = getattr(api, "clear_up_moving_atoms", None)
+            if attempted and callable(ongoing) and ongoing() and callable(clear):
+                clear()
+            raise
+        finally:
+            # Run every cleanup even if another cleanup fails; surface errors to the runner.
+            cleanup_errors = []
+            actions = [(api.delete_extra_restraint_py, (imol, row)) for row in owned] if owned else []
+            actions += [(api.set_refinement_immediate_replacement, (previous[2],)),
+                        (api.set_matrix, (previous[1],)), (api.set_imol_refinement_map, (previous[0],))]
+            for function, args in actions:
+                try:
+                    function(*args)
+                except Exception as error:
+                    cleanup_errors.append(str(error))
+            if cleanup_errors:
+                raise RuntimeError("Cleanup failed: " + "; ".join(cleanup_errors))
+
+
+_MULTIMAP_RUNNING = None
+
+
+class MultimapRefinementJob:
+    """One bounded native refinement per tick; accepted edits remain on stop/error."""
+
+    def __init__(self, imol, specs, stages, options=None, backend=None, on_update=None):
+        self.imol = imol
+        self.options = options or RefinementOptions()
+        self.specs = tuple(_residue_spec(s) for s in specs)
+        self.stages = tuple(stages)
+        if not self.stages:
+            raise ValueError("Add at least one refinement stage.")
+        self.windows = refinement_windows(self.specs, self.options.window_size, self.options.step_size)
+        self.backend = backend or CootRefinementBackend()
+        self.backend.validate(imol, self.stages, self.options, self.specs)
+        stage_steps = [(i, r) for i, s in enumerate(self.stages) for r in range(s.repeats)]
+        if self.options.order == "window":
+            self.tasks = [(w, i, r) for w in range(len(self.windows)) for i, r in stage_steps]
+        else:
+            self.tasks = [(w, i, r) for i, r in stage_steps for w in range(len(self.windows))]
+        self.index = 0
+        self.state = "ready"
+        self.message = "Ready: %d windows, %d refinement steps." % (len(self.windows), len(self.tasks))
+        self.history = []
+        self.processed_residues = set()
+        self.on_update = on_update
+        self._busy = False
+        self._requested = None
+        self._prepared_index = None
+        self.initial_coordinates = None
+
+    def _notify(self):
+        print("Multimap refinement: " + self.message)
+        if self.on_update:
+            self.on_update(self)
+
+    def start(self):
+        global _MULTIMAP_RUNNING
+        if self.state not in ("ready", "paused"):
+            return
+        if self.index == len(self.tasks):
+            self._settle("complete", "Complete; no remaining refinement steps.")
+            return
+        if _MULTIMAP_RUNNING not in (None, self):
+            raise RuntimeError("Another multimap job is running; pause or stop it first.")
+        self.backend.validate(self.imol, self.stages, self.options, self.specs)
+        if self.initial_coordinates is None:
+            snapshot = getattr(self.backend, "snapshot", None)
+            if callable(snapshot):
+                self.initial_coordinates = _comparison_coordinates(snapshot(self.imol))
+        _MULTIMAP_RUNNING = self
+        self.state, self._requested = "running", None
+        self._prepared_index = None
+        self.message = "Running %d/%d." % (self.index, len(self.tasks))
+        self._notify()
+
+    def visualize_changes(self, metric="ca", window_size=5):
+        """Colour the current model against this run's initial coordinates."""
+        if self.state not in ("paused", "complete", "stopped", "failed") or self.initial_coordinates is None:
+            raise RuntimeError("Pause, finish or stop this run before displaying changes.")
+        if _MULTIMAP_RUNNING is not None:
+            raise RuntimeError("Stop the other multimap run before displaying changes.")
+        self.backend._check_idle()
+        records = self.backend.snapshot(self.imol)
+        values = model_change_scores(self.initial_coordinates, _comparison_coordinates(records), metric, window_size)
+        values = {spec: value if spec in self.processed_residues else None
+                  for spec, value in values.items()}
+        self.backend.colour_changes(self.imol, records, values, metric)
+        return values
+
+    def _settle(self, state, message):
+        global _MULTIMAP_RUNNING
+        self.state, self.message = state, message
+        if _MULTIMAP_RUNNING is self:
+            _MULTIMAP_RUNNING = None
+        self._notify()
+
+    def pause(self):
+        if self.state == "running":
+            if self._busy:
+                self._requested = "paused"
+            else:
+                self._settle("paused", "Paused at %d/%d." % (self.index, len(self.tasks)))
+
+    def stop(self):
+        if self.state in ("ready", "running", "paused"):
+            if self._busy:
+                self._requested = "stopped"
+            else:
+                self._settle("stopped", "Stopped; completed edits retained. Use Coot Undo if needed.")
+
+    def prepare_step(self):
+        """Publish the working region before a separate callback runs native work."""
+        if self.state != "running" or self._busy:
+            return False
+        if self._prepared_index == self.index:
+            return True
+        try:
+            w, si, repeat = self.tasks[self.index]
+            seed, stage = self.windows[w], self.stages[si]
+            navigate = getattr(self.backend, "navigate", None)
+            if self.options.follow_refinement and callable(navigate):
+                navigate(self.imol, seed)
+            self.message = "Refining %d/%d | %s:%d%s-%d%s | Stage %d/%d, map #%d, weight %g | Repeat %d/%d" % (
+                self.index+1, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
+                si+1, len(self.stages), stage.map_id, stage.weight, repeat+1, stage.repeats)
+            if stage.autofit_rotamers:
+                self.message += " | Autofit rotamers, then refine"
+            self._prepared_index = self.index
+            self._notify()
+        except Exception as error:
+            traceback.print_exc()
+            self._settle("failed", "Failed: %s. Earlier edits remain; use Coot Undo if needed." % error)
+        return self.state == "running"
+
+    def tick(self):
+        if not self.prepare_step():
+            return False
+        self._busy = True
+        try:
+            w, si, repeat = self.tasks[self.index]
+            seed, stage = self.windows[w], self.stages[si]
+            reference = self.stages[-1].map_id
+            before = self.backend.correlation(self.imol, seed, reference) if self.options.auto_pause else None
+            rotamers = self.backend.autofit_rotamers(self.imol, seed, stage) if stage.autofit_rotamers else None
+            moving = self.backend.moving_selection(self.imol, seed, self.options)
+            result, hbonds = self.backend.refine(self.imol, moving, stage, self.options)
+            self.index += 1  # Acceptance succeeded; never silently rerun an accepted step.
+            self.processed_residues.update(seed)
+            self.processed_residues.update(_residue_spec(spec) for spec in moving)
+            entry = {"window": w, "stage": si, "repeat": repeat, "moving": len(moving),
+                     "hbonds": hbonds, "result": result, "cc_before": before, "rotamers": rotamers}
+            self.history.append(entry)
+            self.message = "%d/%d | %s:%d%s-%d%s | Map #%d, weight %g | %d moving" % (
+                self.index, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
+                stage.map_id, stage.weight, len(moving))
+            if rotamers:
+                self.message += " | Rotamers %d/%d fitted" % (
+                    rotamers["attempted"] - len(rotamers["failed"]), rotamers["attempted"])
+                if rotamers["failed"]:
+                    print("Multimap rotamer fits unavailable:", rotamers["failed"])
+            reasons = []
+            if self.options.auto_pause:
+                after = self.backend.correlation(self.imol, seed, reference)
+                entry["cc_after"] = after
+                self.message += " | CC %.3f" % after
+                if after < self.options.minimum_mean_cc:
+                    reasons.append("mean CC %.3f below %.3f" % (after, self.options.minimum_mean_cc))
+                if before - after > self.options.maximum_cc_drop:
+                    reasons.append("CC fell %.3f" % (before - after))
+                for name, label, value in result[2] or []:
+                    if str(name).lower() in ("bonds", "angles", "chirals"):
+                        if not math.isfinite(float(value)) or float(value) > self.options.maximum_geometry:
+                            reasons.append(str(label))
+            if self._requested:
+                self._settle(self._requested, self._requested.capitalize() + "; completed edits retained.")
+            elif reasons:
+                self._settle("paused", self.message + " | CHECK: " + "; ".join(reasons))
+            elif self.index == len(self.tasks):
+                self._settle("complete", self.message + " | Complete.")
+            else:
+                self._notify()
+        except Exception as error:
+            traceback.print_exc()
+            self._settle("failed", "Failed: %s. Earlier edits remain; use Coot Undo if needed." % error)
+        finally:
+            self._busy = False
+        return self.state == "running"
+
+
+class MultimapRefinementRunner:
+    """One-shot, low-priority callbacks leave paint time before and after native work."""
+
+    def __init__(self, job, glib=None):
+        if glib is None:
+            from gi.repository import GLib
+            glib = GLib
+        self.job, self.glib, self.source = job, glib, None
+
+    def _cancel(self):
+        if self.source is not None:
+            self.glib.source_remove(self.source)
+            self.source = None
+
+    def _queue(self, prepare):
+        self.source = self.glib.timeout_add(75, self._dispatch, prepare,
+                                           priority=self.glib.PRIORITY_DEFAULT_IDLE)
+
+    def _dispatch(self, prepare):
+        self.source = None
+        keep = self.job.prepare_step() if prepare else self.job.tick()
+        if keep and self.job.state == "running":
+            self._queue(not prepare)
+        return False
+
+    def start(self):
+        self._cancel()
+        self.job.start()
+        if self.job.state == "running":
+            self._queue(True)
+
+    def pause(self):
+        self._cancel()
+        self.job.pause()
+
+    def stop(self):
+        self._cancel()
+        self.job.stop()
+
+
+def start_multimap_refinement(imol, residue_specs, stages, options=None):
+    """Start via GLib. Stages are explicit RefinementStage objects, in execution order."""
+    job = MultimapRefinementJob(imol, residue_specs, stages, options)
+    job.runner = MultimapRefinementRunner(job)
+    job.runner.start()
+    return job
+
+
+def multimap_refinement_gui():
+    """Map selectors and an ordered stage table; default scope is all polymer chains."""
+    from gi.repository import Gtk, GLib, Pango
+    backend = CootRefinementBackend()
+    api = backend.api
+    active = api.active_residue_py()
+    if not active:
+        api.info_dialog("Choose an active residue first.")
+        return
+    imol = active[0]
+    backend.snapshot(imol)
+    if not backend.polymer_specs:
+        api.info_dialog("The active model has no refinable polymer residues.")
+        return
+    maps = [i for i in range(api.graphics_n_molecules()) if api.is_valid_map_molecule(i)]
+    if not maps:
+        api.info_dialog("Load at least one refinement map first.")
+        return
+    gtk4 = Gtk.get_major_version() >= 4
+    window = Gtk.Window(title="Multimap refinement: model #%d" % imol)
+    window.set_default_size(650, 480)
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    for edge in ("top", "bottom", "start", "end"):
+        getattr(root, "set_margin_" + edge)(12)
+    window.set_child(root) if gtk4 else window.add(root)
+
+    def append(box, child, expand=False):
+        box.append(child) if gtk4 else box.pack_start(child, expand, expand, 0)
+
+    def label(text):
+        item = Gtk.Label(label=text)
+        item.set_xalign(0)
+        item.set_wrap(True) if gtk4 else item.set_line_wrap(True)
+        return item
+
+    def heading(text):
+        item = label("")
+        item.set_markup("<b>" + text + "</b>")
+        return item
+
+    def child(container, widget):
+        container.set_child(widget) if gtk4 else container.add(widget)
+
+    def grid():
+        item = Gtk.Grid()
+        item.set_row_spacing(6)
+        item.set_column_spacing(10)
+        return item
+
+    model_label = label("#%d  %s" % (imol, str(api.molecule_name(imol)).split("/")[-1]))
+    model_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+    append(root, model_label)
+    content_scroll = Gtk.ScrolledWindow()
+    content_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    content_scroll.set_vexpand(True)
+    content_scroll.set_hexpand(True)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    child(content_scroll, outer)
+    append(root, content_scroll, True)
+    controls = []
+
+    def spin(value, lower, upper, increment=1, digits=0):
+        field = Gtk.SpinButton.new_with_range(lower, upper, increment)
+        field.set_digits(digits)
+        field.set_numeric(True)
+        field.set_width_chars(6)
+        field.set_value(value)
+        return field
+
+    append(outer, heading("Scope"))
+    scope_grid = grid()
+    scope = Gtk.ComboBoxText()
+    polymer_chains = sorted({s[0] for s in backend.polymer_specs})
+    scope.append("all", "All polymer chains (%d chains, %d residues)" %
+                 (len(polymer_chains), len(backend.polymer_specs)))
+    for name in polymer_chains:
+        count = sum(s[0] == name for s in backend.polymer_specs)
+        scope.append("chain:" + name, "Chain %s only (%d residues)" % (name or "[blank]", count))
+    scope.set_active_id("all")
+    scope.set_hexpand(True)
+    scope_grid.attach(scope, 0, 0, 4, 1)
+    size, step = spin(11, 1, 2000), spin(5, 1, 2000)
+    scope_grid.attach(label("Window size"), 0, 1, 1, 1)
+    scope_grid.attach(size, 1, 1, 1, 1)
+    scope_grid.attach(label("Step size"), 2, 1, 1, 1)
+    scope_grid.attach(step, 3, 1, 1, 1)
+    append(outer, scope_grid)
+    controls.append(scope_grid)
+
+    append(outer, heading("Refinement stages"))
+    stage_grid = grid()
+    append(outer, stage_grid)
+    controls.append(stage_grid)
+    stage_rows = []
+    selected_map = api.imol_refinement_map()
+    if selected_map not in maps:
+        selected_map = maps[0]
+
+    def populate_maps(combo, chosen):
+        combo.remove_all()
+        for map_id in maps:
+            name = str(api.molecule_name(map_id)).split("/")[-1]
+            combo.append(str(map_id), "#%d  %s" % (map_id, name))
+        combo.set_active_id(str(chosen))
+        if combo.get_active_id() is not None:
+            combo.set_tooltip_text(str(api.molecule_name(int(combo.get_active_id()))))
+        else:
+            combo.set_tooltip_text("Choose a map; the previous map may have been closed.")
+
+    def redraw_stages():
+        if gtk4:
+            while stage_grid.get_first_child():
+                stage_grid.remove(stage_grid.get_first_child())
+        else:
+            for widget in stage_grid.get_children():
+                stage_grid.remove(widget)
+        for column, text in enumerate(("", "Map", "Weight", "Repeats", "Autofit\nrotamers", "")):
+            stage_grid.attach(label(text), column, 0, 1, 1)
+        for index, row in enumerate(stage_rows):
+            stage_grid.attach(label(str(index+1)), 0, index+1, 1, 1)
+            for column, key in enumerate(("map", "weight", "repeats", "autofit_rotamers"), 1):
+                stage_grid.attach(row[key], column, index+1, 1, 1)
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            for text, change, tooltip in (("^", -1, "Move stage earlier"),
+                                          ("v", 1, "Move stage later"),
+                                          ("-", 0, "Remove stage")):
+                button = Gtk.Button(label=text)
+                button.set_tooltip_text(tooltip)
+                button.set_sensitive((len(stage_rows) > 1 if not change else
+                                      0 <= index + change < len(stage_rows)))
+                def edit(_button, item=row, delta=change):
+                    current = stage_rows.index(item)
+                    if delta:
+                        stage_rows[current], stage_rows[current+delta] = stage_rows[current+delta], stage_rows[current]
+                    else:
+                        stage_rows.remove(item)
+                    redraw_stages()
+                button.connect("clicked", edit)
+                append(actions, button)
+            stage_grid.attach(actions, 5, index+1, 1, 1)
+        if not gtk4:
+            stage_grid.show_all()
+
+    def add_stage(_button=None):
+        chosen = stage_rows[-1]["map"].get_active_id() if stage_rows else str(selected_map)
+        weight = stage_rows[-1]["weight"].get_value() if stage_rows else api.matrix_state()
+        combo = Gtk.ComboBoxText()
+        combo.set_hexpand(True)
+        for renderer in combo.get_cells():
+            renderer.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+            renderer.set_property("max-width-chars", 32)
+        populate_maps(combo, chosen)
+        def map_changed(item):
+            value = item.get_active_id()
+            item.set_tooltip_text(str(api.molecule_name(int(value))) if value else "Choose a map")
+        combo.connect("changed", map_changed)
+        autofit = Gtk.CheckButton()
+        autofit.set_tooltip_text("Autofit this range's protein sidechains against this map before each refinement. Uses current rotamer/backrub mode.")
+        autofit.set_halign(Gtk.Align.CENTER)
+        stage_rows.append({"map": combo, "weight": spin(weight, 0.01, 100000, 1, 2),
+                           "repeats": spin(1, 1, 100), "autofit_rotamers": autofit})
+        redraw_stages()
+
+    def refresh_maps(_button=None):
+        maps[:] = [i for i in range(api.graphics_n_molecules()) if api.is_valid_map_molecule(i)]
+        for row in stage_rows:
+            populate_maps(row["map"], row["map"].get_active_id())
+
+    add_stage()
+    stage_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    for title, callback in (("Add stage", add_stage), ("Refresh maps", refresh_maps)):
+        item = Gtk.Button(label=title)
+        item.connect("clicked", callback)
+        append(stage_toolbar, item)
+    append(outer, stage_toolbar)
+    controls.append(stage_toolbar)
+    hb = Gtk.CheckButton(label="Temporary backbone H-bond restraints")
+    guard = Gtk.CheckButton(label="Auto-pause on poor fit or geometry")
+    for item in (hb, guard):
+        append(outer, item)
+        controls.append(item)
+    advanced = Gtk.Expander(label="Options")
+    advanced_box = grid()
+    child(advanced, advanced_box)
+    radius, padding, limit = spin(4, 0, 30, 0.5, 1), spin(1, 0, 10), spin(0, 0, 10000)
+    limit.set_tooltip_text("0 = automatic: at least 500 residues or 5 times the window size. A positive value sets an explicit cap.")
+    min_cc, cc_drop, geometry = spin(0.2, -1, 1, 0.05, 2), spin(0.1, 0, 2, 0.05, 2), spin(5, 0.1, 100, 0.5, 1)
+    for index, (text, field) in enumerate((("Contact shell (A)", radius), ("Neighbour padding", padding),
+                                          ("Moving limit (0 = auto)", limit), ("Minimum mean CC", min_cc),
+                                          ("Maximum CC drop", cc_drop), ("Maximum geometry distortion", geometry))):
+        advanced_box.attach(label(text), 0, index, 1, 1)
+        advanced_box.attach(field, 1, index, 1, 1)
+    controls.append(advanced_box)
+    append(outer, advanced)
+    append(outer, label("Each range: all stages top to bottom, then the next range.\nCC uses the last map. Pause/Stop act between steps; completed edits remain."))
+    changes = Gtk.Expander(label="Changes from starting model")
+    changes.set_sensitive(False)
+    changes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    child(changes, changes_box)
+    changes_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    change_metric = Gtk.ComboBoxText()
+    for key, text in (("ca", "C-alpha RMSD (sliding window)"), ("chi", "Rotamer torsion changes"),
+                      ("backbone", "Backbone dihedral changes")):
+        change_metric.append(key, text)
+    change_metric.set_active_id("ca")
+    change_metric.set_hexpand(True)
+    change_window = spin(5, 1, 101, 2)
+    change_window.set_tooltip_text("Odd-sized, centred C-alpha window; truncated at chain breaks and termini.")
+    show_changes = Gtk.Button(label="Colour model")
+    for item in (change_metric, label("Window"), change_window, show_changes):
+        append(changes_row, item)
+    append(changes_box, changes_row)
+    change_description = label("")
+    change_legend = label("")
+    change_legend.set_selectable(True)
+    change_summary = label("")
+    for item in (change_description, change_legend, change_summary):
+        append(changes_box, item)
+
+    def change_selection(_combo=None):
+        metric = change_metric.get_active_id()
+        change_window.set_sensitive(metric == "ca")
+        change_description.set_text({"ca": "Map-frame displacement; no superposition.",
+                                     "chi": "Largest wrapped chi change; symmetric terminal torsions folded.",
+                                     "backbone": "Largest wrapped phi, psi or omega change."}[metric])
+        change_legend.set_text(change_colour_legend(metric))
+
+    change_metric.connect("changed", change_selection)
+    change_selection()
+    append(outer, changes)
+    progress = Gtk.ProgressBar()
+    progress.set_show_text(True)
+    append(root, progress)
+    status = label("Ready.")
+    append(root, status)
+    buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    append(root, buttons)
+    state = {"job": None, "runner": None, "comparison_shown": False}
+
+    def visualize(_button):
+        try:
+            change_window.update()
+            metric = change_metric.get_active_id()
+            values = state["job"].visualize_changes(metric, change_window.get_value_as_int() if metric == "ca" else 5)
+            scorable = [v for v in values.values() if v is not None]
+            if scorable:
+                text = "%d/%d residues compared | Mean %.2f, max %.2f %s" % (
+                    len(scorable), len(values), sum(scorable)/len(scorable), max(scorable), _CHANGE_METRICS[metric][1])
+            else:
+                text = "0/%d residues compared | No processed residues with comparable data." % len(values)
+            change_summary.set_text(text)
+            api.add_status_bar_text(text)
+        except Exception as error:
+            change_summary.set_text(str(error))
+            traceback.print_exc()
+
+    show_changes.connect("clicked", visualize)
+
+    def update(job):
+        progress.set_fraction(job.index / len(job.tasks))
+        progress.set_text("%d / %d steps complete" % (job.index, len(job.tasks)))
+        status.set_text(job.message)
+        busy = job.state in ("running", "paused")
+        for control in controls:
+            control.set_sensitive(not busy)
+        run_button.set_sensitive(job.state != "running")
+        run_button.set_label("Resume" if job.state == "paused" else "Start")
+        pause_button.set_sensitive(job.state == "running")
+        stop_button.set_sensitive(busy)
+        available = job.state in ("paused", "complete", "stopped", "failed") and job.initial_coordinates is not None
+        changes.set_sensitive(available)
+        if available and not state["comparison_shown"]:
+            changes.set_expanded(True)
+            state["comparison_shown"] = True
+        api.add_status_bar_text(job.message)
+
+    def run(_button):
+        try:
+            job = state["job"]
+            if job is None or job.state != "paused":
+                backend.snapshot(imol)
+                chosen_scope = scope.get_active_id()
+                specs = sorted(s for s in backend.polymer_specs if chosen_scope == "all" or
+                               (chosen_scope and s[0] == chosen_scope[6:]))
+                stages = []
+                for index, row in enumerate(stage_rows):
+                    map_id = row["map"].get_active_id()
+                    if map_id is None or not api.is_valid_map_molecule(int(map_id)):
+                        raise ValueError("Choose an available map for stage %d." % (index+1))
+                    row["weight"].update()
+                    row["repeats"].update()
+                    stages.append(RefinementStage(int(map_id), row["weight"].get_value(),
+                                                  row["repeats"].get_value_as_int(),
+                                                  autofit_rotamers=row["autofit_rotamers"].get_active()))
+                for field in (size, step, radius, padding, limit, min_cc, cc_drop, geometry):
+                    field.update()
+                contact = radius.get_value()
+                options = RefinementOptions(window_size=size.get_value_as_int(), step_size=step.get_value_as_int(),
+                                            contact_radius=contact, neighbour_padding=padding.get_value_as_int() if contact else 0,
+                                            max_moving_residues=limit.get_value_as_int(),
+                                            hydrogen_bonds=hb.get_active(), auto_pause=guard.get_active(),
+                                            minimum_mean_cc=min_cc.get_value(), maximum_cc_drop=cc_drop.get_value(),
+                                            maximum_geometry=geometry.get_value(),
+                                            order="window")
+                refinement_windows(specs, options.window_size, options.step_size)
+                backend._check_idle()
+                if not api.is_valid_map_molecule(api.imol_refinement_map()):
+                    api.set_imol_refinement_map(stages[0].map_id)
+                job = MultimapRefinementJob(imol, specs, stages, options, backend, update)
+                state["job"] = job
+                state["comparison_shown"] = False
+                change_summary.set_text("")
+                state["runner"] = MultimapRefinementRunner(job, GLib)
+            state["runner"].start()
+        except Exception as error:
+            status.set_text(str(error))
+            traceback.print_exc()
+
+    def pause(_button):
+        if state["runner"]:
+            state["runner"].pause()
+
+    def stop(_button=None):
+        if state["runner"]:
+            state["runner"].stop()
+
+    def button(text, callback):
+        item = Gtk.Button(label=text)
+        item.connect("clicked", callback)
+        append(buttons, item)
+        return item
+
+    run_button = button("Start", run)
+    pause_button = button("Pause", pause)
+    stop_button = button("Stop", stop)
+    pause_button.set_sensitive(False)
+    stop_button.set_sensitive(False)
+    # Retain references for native widget smoke tests and interactive inspection.
+    window.multimap_widgets = {"scope": scope, "stages": stage_rows, "add_stage": add_stage,
+                               "refresh_maps": refresh_maps, "start": run_button, "status": status,
+                               "progress": progress, "pause": pause_button,
+                               "stop": stop_button, "changes": changes, "change_metric": change_metric,
+                               "change_window": change_window, "show_changes": show_changes,
+                               "change_summary": change_summary}
+    window.connect("close-request" if gtk4 else "delete-event", lambda *_: (stop(), False)[1])
+    window.present() if gtk4 else window.show_all()
+    return window
+'''
+
+
+def _make_multimap_user_defined_colours(module):
+  colours = _make_default_user_defined_colours()
+  return colours + module._standalone_change_colour_table()[len(colours):]
+
+
+def _multimap_refinement_module():
+  cached = getattr(coot, "_trimmings_multimap_refinement", None)
+  if cached is not None:
+    return cached
+  from types import ModuleType
+  name = "_coot_trimmings_multimap_refinement"
+  module = ModuleType(name)
+  # Dataclasses resolve type metadata through the registered module.
+  sys.modules[name] = module
+  try:
+    exec(compile(_MULTIMAP_REFINEMENT_SOURCE, "<coot-trimmings-multimap>", "exec"),
+         module.__dict__)
+    module._standalone_change_colour_table = module._change_colour_table
+    module._change_colour_table = lambda: _make_multimap_user_defined_colours(module)
+
+    class TrimmingsMultimapBackend(module.CootRefinementBackend):
+      def validate(self, *args, **kwargs):
+        if globals().get("_USER_DEFINED_COLOUR_JOB_ACTIVE"):
+          raise RuntimeError("Wait for model colouring to finish before starting refinement.")
+        return super().validate(*args, **kwargs)
+
+      def autofit_rotamers(self, imol, seed, stage):
+        try:
+          return super().autofit_rotamers(imol, seed, stage)
+        finally:
+          _mark_model_changed(imol)
+
+      def refine(self, imol, specs, stage, options):
+        try:
+          return super().refine(imol, specs, stage, options)
+        finally:
+          # Failed native operations can also leave partial coordinate edits.
+          _mark_model_changed(imol)
+
+      def colour_changes(self, imol, records, values, metric):
+        result = super().colour_changes(imol, records, values, metric)
+        representation = (graphics_to_user_defined_atom_colours_all_atoms_representation
+                          if metric == "chi" else
+                          graphics_to_user_defined_atom_colours_representation)
+        sequence = _representation_sequence()
+        if representation in sequence:
+          cycle_rep_flag[imol] = sequence.index(representation)
+        return result
+
+    module.CootRefinementBackend = TrimmingsMultimapBackend
+  except Exception:
+    if sys.modules.get(name) is module:
+      del sys.modules[name]
+    raise
+  # Keep paused/running jobs intact even if the startup script is reloaded.
+  coot._trimmings_multimap_refinement = module
+  return module
+
+
+def multimap_refinement_gui():
+  """Open stepped multimap refinement for the active model."""
+  try:
+    return _multimap_refinement_module().multimap_refinement_gui()
+  except Exception as error:
+    traceback.print_exc()
+    info_dialog("Multimap stepped refinement: " + str(error))
+    return None
+
+
+
 #Refine triple (Paul)
 def key_binding_refine_triple():
     active_atom = active_residue()
@@ -18050,6 +19387,11 @@ def _build_custom_user_colour_menu(submenu_colour):
 
 
 def _build_custom_fit_menu(submenu_fit):
+  add_simple_coot_menu_menuitem(
+    submenu_fit,
+    "Multimap stepped refinement...",
+    lambda func: multimap_refinement_gui(),
+  )
   add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", lambda func: rigid_fit_all_chains())
   add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", lambda func: rigid_fit_active_chain())
   add_simple_coot_menu_menuitem(
