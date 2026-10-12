@@ -14550,6 +14550,7 @@ def _apply_register_shift(mol_id, chain_id, plan, map_id, anchor_number=None):
     return False
   finally:
     coot.turn_on_backup(mol_id)
+    _mark_model_changed(mol_id)
   NAVIGATION_LAST_RESIDUE = None
   destination = (anchor_number if anchor_number is not None and plan["start"] <= anchor_number <= plan["end"] else plan["start"]) + plan["offset"]
   coot.set_go_to_atom_molecule(mol_id)
@@ -14618,6 +14619,20 @@ def _register_reference_sequence(mol_id, chain_id, records):
   return "", "Paste the reference sequence or a single FASTA record."
 
 
+def _register_shift_model_signature(mol_id):
+  """Guard native Undo, allowing the precision of Coot's PDB backups."""
+  digest = hashlib.sha256()
+  def rounded(value, digits):
+    value = round(float(value), digits)
+    return value if value else 0.0
+  for spec, record in sorted(_model_coordinate_snapshot(mol_id).items()):
+    atoms = sorted((a[0][0], a[0][1], rounded(a[1][0], 2), rounded(a[1][1], 2),
+                    str(a[1][2]).strip(), tuple(rounded(x, 3) for x in a[2]))
+                   for a in record["atoms"])
+    digest.update(repr((spec, record["name"], atoms)).encode("utf-8"))
+  return digest.digest()
+
+
 def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, selection_cleanup=None):
   required = ("n_models", "residue_info_py", "renumber_residue_range", "delete_residue", "mutate",
               "auto_fit_best_rotamer", "backup_state", "make_backup", "turn_off_backup", "turn_on_backup",
@@ -14650,7 +14665,11 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
       selection_cleanup()
     return False
   window.connect("close-request", closing)
-  window.set_title(f"Shift register: molecule #{mol_id}, {chain_id}:{start}-{end}")
+  region = {"start": min(start, end), "end": max(start, end), "anchor": anchor_number}
+  history = []
+  def update_title():
+    window.set_title(f"Shift register: molecule #{mol_id}, {chain_id}:{region['start']}-{region['end']}")
+  update_title()
   window.set_default_size(620, 440)
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for side in ("start", "end", "top", "bottom"):
@@ -14658,12 +14677,14 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
   source = ("PDB SEQRES" if sequence_message.startswith("PDB") else
             "Model-derived (verify identities)" if sequence_message.startswith("Model-derived") else
             "Associated sequence" if default_sequence else "Reference sequence required")
-  note = Gtk.Label(label=source + (" | Start inferred: verify" if origin is not None else " | Enter sequence start"))
+  needs_sequence_input = not default_sequence or origin is None or sequence_message.startswith("Model-derived")
+  note = Gtk.Label(label=source)
   note.set_tooltip_text(sequence_message + "\nPositive shift: 100 + 2 becomes 102.")
   note.set_wrap(True)
   note.set_xalign(0)
   box.append(note)
   entries = []
+  origin_row = None
   for label, value in (("Shift (+/-)", "1"), ("Sequence starts at", str(origin) if origin is not None else "")):
     row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     row.append(Gtk.Label(label=label))
@@ -14671,16 +14692,23 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
     entry.set_text(value)
     row.append(entry)
     entries.append(entry)
-    box.append(row)
+    if label == "Sequence starts at":
+      origin_row = row
+    else:
+      box.append(row)
   sequence_view = Gtk.TextView()
   sequence_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
   sequence_view.get_buffer().set_text(default_sequence)
   sequence_scroll = Gtk.ScrolledWindow()
   sequence_scroll.set_min_content_height(110)
   sequence_scroll.set_child(sequence_view)
-  reference = Gtk.Expander(label="Reference sequence (edit)")
-  reference.set_expanded(not bool(default_sequence))
-  reference.set_child(sequence_scroll)
+  reference = Gtk.Expander(label="Reference sequence needs verification")
+  reference.set_visible(needs_sequence_input)
+  reference.set_expanded(needs_sequence_input)
+  sequence_controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  sequence_controls.append(origin_row)
+  sequence_controls.append(sequence_scroll)
+  reference.set_child(sequence_controls)
   box.append(reference)
   detail = Gtk.TextView()
   detail.set_editable(False)
@@ -14693,7 +14721,14 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
   buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
   apply_button = Gtk.Button(label="Apply register shift")
   apply_button.set_sensitive(False)
+  undo_button = Gtk.Button(label="Undo")
+  undo_button.set_sensitive(False)
+  preview_button = Gtk.Button(label="Preview")
+  undo_available = all(callable(getattr(coot, name, None)) for name in ("set_undo_molecule", "apply_undo"))
+  undo_button.set_tooltip_text("Undo the last shift in this dialog, including trimmed residues."
+                               if undo_available else "Native Undo is unavailable in this Coot build.")
   state = {}
+  blocked = False
   def invalidate(*_args):
     state.clear()
     apply_button.set_sensitive(False)
@@ -14704,10 +14739,30 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
   def preview(*_args):
     invalidate()
     try:
+      if blocked:
+        raise ValueError("Reopen the shift dialog before making further edits.")
+      if history and not history[-1]["success"]:
+        raise ValueError("Undo the incomplete shift before trying another register.")
+      pending = getattr(coot, "get_continue_updating_refinement_atoms_state", None)
+      if callable(pending) and pending():
+        raise ValueError("Accept or cancel the current refinement before shifting registers.")
       buffer = sequence_view.get_buffer()
       sequence = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
-      plan = _register_plan(_register_chain_snapshot(mol_id, chain_id), start, end,
-                            int(entries[0].get_text()), sequence, int(entries[1].get_text()))
+      snapshot = _register_chain_snapshot(mol_id, chain_id)
+      offset = int(entries[0].get_text())
+      try:
+        clean = _register_clean_sequence(sequence)
+        sequence_start = int(entries[1].get_text())
+        first, last = region["start"]+offset, region["end"]+offset
+        if first < sequence_start or last >= sequence_start+len(clean):
+          raise ValueError("The shifted range is outside the reference sequence. Check the sequence and its start.")
+        if set(clean[first-sequence_start:last-sequence_start+1]) - set(_REGISTER_AA):
+          raise ValueError("The target sequence has unknown residues; enter their identities.")
+      except (ValueError, TypeError):
+        reference.set_visible(True)
+        reference.set_expanded(True)
+        raise
+      plan = _register_plan(snapshot, region["start"], region["end"], offset, clean, sequence_start)
       map_id = imol_refinement_map()
       if map_id not in map_molecule_list():
         raise ValueError("Select a refinement map in Coot before previewing.")
@@ -14717,12 +14772,90 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
     except (ValueError, TypeError) as error:
       detail.get_buffer().set_text(str(error))
   def apply(*_args):
-    if state and _apply_register_shift(mol_id, chain_id, state["plan"], state["map_id"], anchor_number):
-      close_dialog()
+    if not state:
+      return
+    plan, map_id = state["plan"], state["map_id"]
+    invalidate()
+    try:
+      before = _register_shift_model_signature(mol_id)
+      try:
+        success = _apply_register_shift(mol_id, chain_id, plan, map_id, region["anchor"])
+      except Exception as error:
+        traceback.print_exc()
+        success = False
+        info_dialog("Register shift stopped; Undo any partial edits.\n\n" + str(error))
+      after = _register_shift_model_signature(mol_id)
+      if after != before:
+        history.append({"before": before, "after": after, "region": dict(region), "success": success})
+      undo_button.set_sensitive(bool(history) and undo_available)
+      if success:
+        region["start"] += plan["offset"]
+        region["end"] += plan["offset"]
+        if region["anchor"] is not None:
+          region["anchor"] += plan["offset"]
+        update_title()
+        if selection_cleanup:
+          selection_cleanup()
+        detail.get_buffer().set_text("Applied. Undo to try from the previous register, or preview another shift.\n\n" +
+                                     _register_preview_text(plan, map_id))
+      else:
+        detail.get_buffer().set_text("Shift not completed. Undo any partial edits before trying again.")
+    except Exception as error:
+      traceback.print_exc()
+      detail.get_buffer().set_text(str(error))
+
+  def undo(*_args):
+    global NAVIGATION_LAST_RESIDUE
+    nonlocal blocked
+    if not history or not undo_available:
+      return
+    invalidate()
+    try:
+      if not valid_model_molecule_qm(mol_id):
+        raise ValueError("The model has been closed.")
+      displayed = getattr(coot, "mol_is_displayed", None)
+      if callable(displayed) and not displayed(mol_id):
+        raise ValueError("Display this model before undoing its register shift.")
+      modified = getattr(coot, "have_unsaved_changes_p", None)
+      if callable(modified) and modified(mol_id) != 1:
+        raise ValueError("This model has no pending edits to undo.")
+      pending = getattr(coot, "get_continue_updating_refinement_atoms_state", None)
+      if callable(pending) and pending():
+        raise ValueError("Accept or cancel the current refinement before undoing.")
+      if _register_shift_model_signature(mol_id) != history[-1]["after"]:
+        raise ValueError("The model changed outside this dialog. Use Coot's Undo for those edits first.")
+      coot.set_undo_molecule(mol_id)
+      if coot.apply_undo() != 1:
+        raise ValueError("Coot could not undo this shift; check that the model is displayed and its backups are available.")
+      _mark_model_changed(mol_id)
+      NAVIGATION_LAST_RESIDUE = None
+      restored = _register_shift_model_signature(mol_id)
+      if restored != history[-1]["before"]:
+        history.clear()
+        blocked = True
+        undo_button.set_sensitive(False)
+        raise ValueError("Undo restored a different model state. Reopen the shift dialog before making further edits.")
+      region.update(history.pop()["region"])
+      update_title()
+      undo_button.set_sensitive(bool(history))
+      if selection_cleanup:
+        selection_cleanup()
+      destination = region["anchor"] if region["anchor"] is not None else region["start"]
+      coot.set_go_to_atom_molecule(mol_id)
+      coot.set_go_to_atom_chain_residue_atom_name_full(chain_id, destination, "", " CA ", "")
+      add_status_bar_text(f"Undid register shift | {chain_id}:{region['start']}-{region['end']}")
+      preview()
+    except Exception as error:
+      traceback.print_exc()
+      detail.get_buffer().set_text(str(error))
+
+  for label, action in (("Close", close_dialog), ("Preview", preview), ("Undo", undo)):
+    if label == "Undo":
+      button = undo_button
+    elif label == "Preview":
+      button = preview_button
     else:
-      invalidate()
-  for label, action in (("Cancel", close_dialog), ("Preview", preview)):
-    button = Gtk.Button(label=label)
+      button = Gtk.Button(label=label)
     button.connect("clicked", action)
     buttons.append(button)
   apply_button.connect("clicked", apply)
@@ -14730,6 +14863,11 @@ def _register_shift_dialog(mol_id, chain_id, start, end, anchor_number=None, sel
   box.append(buttons)
   window.set_child(box)
   window.present()
+  window.register_shift_widgets = {"shift": entries[0], "origin": entries[1], "sequence": sequence_view,
+                                   "reference": reference, "detail": detail, "apply": apply_button,
+                                   "undo": undo_button, "preview": preview_button, "region": region}
+  preview()
+  return window
 
 
 def shift_register_active_segment():
@@ -17032,6 +17170,336 @@ def _gio_module():
 
 def _common_monomer_favorites_path():
   return os.path.join(_coot_trimmings_dir(), COMMON_MONOMER_FAVORITES_FILENAME)
+
+
+RECENT_FILES_LIMIT = 20
+RECENT_FILES_FILENAME = "coot_trimmings_recent_files.json"
+
+
+def _recent_files_path():
+  return os.path.join(_coot_trimmings_dir(), RECENT_FILES_FILENAME)
+
+
+def _recent_file_normalize(entry, category):
+  if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"].strip():
+    return None
+  path = os.path.realpath(os.path.abspath(os.path.expanduser(entry["path"])))
+  kind = entry.get("kind")
+  if kind not in (("model",) if category == "models" else ("map", "mtz")):
+    return None
+  result = {"path": path, "kind": kind}
+  if kind == "map":
+    result["difference"] = bool(entry.get("difference", False))
+  if kind == "mtz":
+    maps = entry.get("maps")
+    if not isinstance(maps, list):
+      return None
+    result["maps"] = []
+    for row in maps[:32]:
+      if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key].strip()
+                                         for key in ("f", "phi")):
+        continue
+      if not isinstance(row.get("weight", ""), str):
+        continue
+      normalized = {"f": row["f"], "phi": row["phi"], "weight": row.get("weight", ""),
+                    "use_weights": bool(row.get("use_weights", False)),
+                    "difference": bool(row.get("difference", False))}
+      if normalized["use_weights"] and not normalized["weight"].strip():
+        continue
+      if normalized not in result["maps"]:
+        result["maps"].append(normalized)
+    if not result["maps"]:
+      return None
+  return result
+
+
+def _recent_files_state():
+  state = getattr(coot, "_trimmings_recent_files", None)
+  if state is not None:
+    return state
+  state = {"data": {"models": [], "maps": []}, "seen": {}, "menus": {}, "timer": None,
+           "dirty": False, "write_blocked": False, "error": None}
+  try:
+    with open(_recent_files_path(), "r", encoding="utf-8") as handle:
+      raw = json.load(handle)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+      raise ValueError("Unsupported recent-files format")
+    for category in ("models", "maps"):
+      rows = raw.get(category, [])
+      if not isinstance(rows, list):
+        raise ValueError("Invalid recent-files list")
+      seen = set()
+      for row in rows:
+        entry = _recent_file_normalize(row, category)
+        if entry is not None and entry["path"] not in seen:
+          state["data"][category].append(entry)
+          seen.add(entry["path"])
+        if len(state["data"][category]) == RECENT_FILES_LIMIT:
+          break
+  except FileNotFoundError:
+    pass
+  except (OSError, ValueError, TypeError) as error:
+    state["write_blocked"] = True
+    print("Recent files: could not load history; preserving the existing file:", error)
+  coot._trimmings_recent_files = state
+  return state
+
+
+def _save_recent_files():
+  state = _recent_files_state()
+  if not state["dirty"] or state["write_blocked"]:
+    return False
+  temporary = None
+  try:
+    path = _recent_files_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".coot_recent_", suffix=".json", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump({"version": 1, **state["data"]}, handle, indent=2, ensure_ascii=True)
+      handle.write("\n")
+    os.replace(temporary, path)
+    temporary = None
+    state["dirty"], state["error"] = False, None
+    return True
+  except OSError as error:
+    if state["error"] != str(error):
+      print("Recent files: history is available for this session but could not be saved:", error)
+      state["error"] = str(error)
+    return False
+  finally:
+    if temporary is not None:
+      try:
+        os.remove(temporary)
+      except OSError:
+        pass
+
+
+def _record_recent_file(entry, category):
+  entry = _recent_file_normalize(entry, category)
+  if entry is None:
+    return False
+  state = _recent_files_state()
+  rows = state["data"][category]
+  previous = next((row for row in rows if row["path"] == entry["path"]), None)
+  if previous and entry["kind"] == previous["kind"] == "mtz":
+    # One MTZ entry restores all coefficient sets observed for that file.
+    entry["maps"] += [row for row in previous["maps"] if row not in entry["maps"]]
+    entry["maps"] = entry["maps"][:32]
+  updated = [entry] + [row for row in rows if row["path"] != entry["path"]]
+  updated = updated[:RECENT_FILES_LIMIT]
+  if updated == rows:
+    return False
+  state["data"][category] = updated
+  state["dirty"] = True
+  return True
+
+
+def _recent_molecule_metadata(imol):
+  if coot.is_valid_model_molecule(imol):
+    return ("models", coot.molecule_name(imol), None, False)
+  if coot.is_valid_map_molecule(imol):
+    getter = getattr(coot, "map_parameters_py", None)
+    params = getter(imol) if callable(getter) else None
+    if isinstance(params, (list, tuple)):
+      params = tuple(params)
+    return ("maps", coot.molecule_name(imol), params, bool(coot.map_is_difference_map(imol)))
+  return None
+
+
+def _recent_entry_from_metadata(metadata):
+  category, name, params, difference = metadata
+  if category == "maps" and isinstance(params, (list, tuple)) and len(params) == 5 and params[0]:
+    entry = _recent_file_normalize({"path": params[0], "kind": "mtz", "maps": [
+      {"f": params[1], "phi": params[2], "weight": params[3], "use_weights": params[4],
+       "difference": difference}]}, category)
+  else:
+    entry = _recent_file_normalize({"path": name, "kind": "model" if category == "models" else "map",
+                                    "difference": difference}, category)
+  # Derived maps, fragments and monomers normally have names, not file paths.
+  if entry is None or not os.path.isfile(entry["path"]):
+    return None
+  if category == "maps" and entry["kind"] == "map" and entry["path"].lower().endswith(".mtz"):
+    return None  # Never guess map columns when the build cannot report them.
+  return entry
+
+
+def _poll_recent_files():
+  state = _recent_files_state()
+  changed = False
+  current = {}
+  try:
+    for imol in range(coot.graphics_n_molecules()):
+      try:
+        metadata = _recent_molecule_metadata(imol)
+      except Exception as error:
+        message = str(error)
+        if state.get("poll_error") != message:
+          print("Recent files: could not inspect molecule #%d:" % imol, error)
+          state["poll_error"] = message
+        continue
+      if metadata is None:
+        continue
+      current[imol] = metadata
+      if metadata == state["seen"].get(imol):
+        continue
+      entry = _recent_entry_from_metadata(metadata)
+      if entry is not None:
+        changed = _record_recent_file(entry, metadata[0]) or changed
+    state["seen"] = current
+    if changed or state["dirty"]:
+      _save_recent_files()
+    if changed:
+      _refresh_recent_files_menus()
+  except Exception as error:
+    print("Recent files: metadata check failed:", error)
+  return True
+
+
+def _recent_short_directory(directory, tail=2):
+  directory = os.path.normpath(directory)
+  home = os.path.normpath(os.path.expanduser("~"))
+  if directory == home:
+    return "~"
+  if directory.startswith(home + os.sep):
+    prefix, parts = "~/", directory[len(home)+1:].split(os.sep)
+    head = 1
+  else:
+    prefix, parts = os.sep, directory.strip(os.sep).split(os.sep)
+    head = 2 if parts[0] == "Volumes" else 1
+  if len(parts) > head+tail:
+    parts = parts[:head] + ["..."] + parts[-tail:]
+  return prefix + os.sep.join(parts)
+
+
+def _recent_file_label(entry, rows):
+  name = os.path.basename(entry["path"])
+  directory = os.path.dirname(entry["path"])
+  peers = [os.path.dirname(row["path"]) for row in rows
+           if os.path.basename(row["path"]) == name and row["path"] != entry["path"]]
+  tail = 2
+  abbreviated = _recent_short_directory(directory, tail)
+  # Show more of the path when otherwise identical names would be ambiguous.
+  while any(other != directory and _recent_short_directory(other, tail) == abbreviated for other in peers):
+    tail += 1
+    abbreviated = _recent_short_directory(directory, tail)
+  name += " | " + abbreviated
+  if entry["kind"] == "mtz":
+    name += " (MTZ; %d map%s)" % (len(entry["maps"]), "s" if len(entry["maps"]) != 1 else "")
+  if not os.path.isfile(entry["path"]):
+    name += " [missing]"
+  return name
+
+
+def _refresh_recent_files_menus():
+  state = _recent_files_state()
+  for category, menu in state["menus"].items():
+    _clear_gio_menu(menu)
+    rows = state["data"][category]
+    if not rows:
+      menu.append("No recent files yet", None)
+    for index, entry in enumerate(rows):
+      # Reuse action names: rebuilding a live menu must not leak app actions.
+      # GMenu labels use underscores for mnemonics; double them only in the
+      # menu presentation, never in the stored path or plain button labels.
+      add_simple_action_to_menu(menu, _recent_file_label(entry, rows).replace("_", "__"),
+        f"coot_trimmings_recent_{category}_{index}",
+        lambda _action, _parameter, saved=entry: _open_recent_file(saved))
+    for key, label, action in (
+        ("refresh", "Refresh list", lambda category=category: _refresh_recent_files()),
+        ("remove", "Remove entry...", lambda category=category: _prompt_remove_recent_file(category)),
+        ("clear", "Clear list...", lambda category=category: _prompt_clear_recent_files(category))):
+      add_simple_action_to_menu(menu, label, f"coot_trimmings_recent_{category}_{key}",
+                                lambda _action, _parameter, action=action: action())
+
+
+def _refresh_recent_files():
+  _poll_recent_files()
+  _save_recent_files()
+  _refresh_recent_files_menus()
+
+
+def _remove_recent_file(category, path):
+  state = _recent_files_state()
+  state["data"][category] = [entry for entry in state["data"][category] if entry["path"] != path]
+  state["dirty"] = True
+  _save_recent_files()
+  _refresh_recent_files_menus()
+
+
+def _prompt_remove_recent_file(category):
+  rows = _recent_files_state()["data"][category]
+  if not rows:
+    info_dialog("No recent " + category + " are saved.")
+    return
+  action_button_dialog("Remove recent " + category,
+    [(_recent_file_label(entry, rows), lambda path=entry["path"]: _remove_recent_file(category, path))
+     for entry in rows], close_on_click=True)
+
+
+def _prompt_clear_recent_files(category):
+  def clear():
+    state = _recent_files_state()
+    state["data"][category] = []
+    state["dirty"] = True
+    _save_recent_files()
+    _refresh_recent_files_menus()
+  generic_confirm_dialog("Clear recent " + category,
+    "Remove these history entries? The actual files will not be changed.", "Cancel", lambda: None,
+    "Clear list", clear)
+
+
+def _open_recent_file(entry):
+  path = entry["path"]
+  if not os.path.isfile(path):
+    info_dialog("This recent file is missing or unavailable:\n\n" + path + "\n\nUse Remove entry to forget it.")
+    _refresh_recent_files_menus()
+    return None
+  opened = []
+  try:
+    existing = {imol for imol in range(coot.graphics_n_molecules())
+                if coot.is_valid_model_molecule(imol) or coot.is_valid_map_molecule(imol)}
+    def valid_new(imol, model=False):
+      valid = coot.is_valid_model_molecule if model else coot.is_valid_map_molecule
+      return type(imol) is int and imol >= 0 and imol not in existing and valid(imol)
+    if entry["kind"] == "model":
+      imol = coot.read_pdb(path)
+      if not valid_new(imol, model=True):
+        raise RuntimeError("Coot could not read this model.")
+      opened.append(imol)
+    elif entry["kind"] == "map":
+      imol = coot.read_ccp4_map(path, int(entry["difference"]))
+      if not valid_new(imol):
+        raise RuntimeError("Coot could not read this map.")
+      opened.append(imol)
+    else:
+      for row in entry["maps"]:
+        imol = coot.make_and_draw_map(path, row["f"], row["phi"], row["weight"],
+                                      int(row["use_weights"]), int(row["difference"]))
+        if not valid_new(imol):
+          raise RuntimeError("Could not load map columns %s / %s; the MTZ may have changed." % (row["f"], row["phi"]))
+        opened.append(imol)
+    _poll_recent_files()
+    add_status_bar_text("Opened recent file: " + path)
+    return opened
+  except Exception as error:
+    # Only close molecules created by this operation, never existing models/maps.
+    for imol in opened:
+      coot.close_molecule(imol)
+    info_dialog("Could not reopen recent file:\n\n" + path + "\n\n" + str(error))
+    return None
+
+
+def _install_recent_files_tracking(models_menu, maps_menu):
+  state = _recent_files_state()
+  state["menus"] = {"models": models_menu, "maps": maps_menu}
+  glib = _coot_gui_repository_module("GLib")
+  if state["timer"] is not None and glib is not None:
+    glib.source_remove(state["timer"])
+    state["timer"] = None
+  _poll_recent_files()
+  _refresh_recent_files_menus()
+  if glib is not None:
+    state["timer"] = glib.timeout_add_seconds(2, _poll_recent_files)
 
 
 @lru_cache(maxsize=1)
@@ -19687,6 +20155,8 @@ def build_custom_menu():
   submenu_mutate = Gio.Menu.new()
   submenu_modify = Gio.Menu.new()
   submenu_maps = Gio.Menu.new()
+  submenu_recent_models = Gio.Menu.new()
+  submenu_recent_maps = Gio.Menu.new()
 
   menu.append_submenu("Display", submenu_display)
   if _supports_direct_user_defined_colouring():
@@ -19698,6 +20168,8 @@ def build_custom_menu():
   menu.append_submenu("Mutate", submenu_mutate)
   menu.append_submenu("Modify", submenu_modify)
   menu.append_submenu("Maps", submenu_maps)
+  menu.append_submenu("Recent maps", submenu_recent_maps)
+  menu.append_submenu("Recent models", submenu_recent_models)
 
   _build_custom_display_menu(submenu_display)
   if _supports_direct_user_defined_colouring():
@@ -19715,6 +20187,7 @@ def build_custom_menu():
   _build_custom_mutate_menu(submenu_mutate)
   _build_custom_modify_menu(submenu_modify)
   _build_custom_maps_menu(submenu_maps)
+  _install_recent_files_tracking(submenu_recent_models, submenu_recent_maps)
   return menu
 
 if _coot_gui_module() is not None:
