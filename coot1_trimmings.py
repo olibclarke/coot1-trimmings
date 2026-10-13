@@ -2465,6 +2465,135 @@ def _click_spec_alt_conf(click_spec):
   return _coot_text_arg(_click_spec_field(click_spec, 6, 5, ""))
 
 
+def _resolve_script_click(spec):
+  """Repair GTK4's unset imol without guessing from the PDB model number or cofr."""
+  if not isinstance(spec, (list, tuple)) or len(spec) not in (6, 7):
+    raise ValueError("Coot returned an unrecognised atom pick; please click again.")
+  index = 1 if len(spec) == 7 else 0
+  imol = _coot_int_arg(spec[index])
+  models = model_molecule_list()
+  chain, number, ins = _click_spec_chain_id(spec), _click_spec_res_no(spec), _click_spec_ins_code(spec)
+  name, alt = _click_spec_atom_name(spec).strip(), _click_spec_alt_conf(spec).strip()
+  if chain is False or number is False or not name:
+    raise ValueError("Coot returned an incomplete atom pick; please click again.")
+  if imol != -1 and imol not in models:
+    raise ValueError("The clicked model is no longer available; please click again.")
+  displayed = getattr(coot, "mol_is_displayed", None)
+  pickable = getattr(coot, "mol_is_active", None)
+  matches = []
+  for model in models if imol == -1 else [imol]:
+    if callable(displayed) and not displayed(model):
+      continue
+    if callable(pickable) and not pickable(model):
+      continue
+    if not residue_exists_qm(model, chain, number, ins):
+      continue
+    atoms = coot.residue_info_py(model, chain, number, ins) or []
+    if any(a[0][0].strip() == name and str(a[0][1] or "").strip() == alt for a in atoms):
+      matches.append(model)
+  if len(matches) != 1:
+    if matches:
+      raise ValueError("Ambiguous atom pick: hide the other matching models, then click again.")
+    raise ValueError("The clicked atom is not in a displayed, pickable model; please click again.")
+  repaired = list(spec)
+  repaired[index] = matches[0]
+  return repaired
+
+
+_SCRIPT_CLICK_STATE = {}
+
+
+def _cancel_script_clicks():
+  state = dict(_SCRIPT_CLICK_STATE)
+  _SCRIPT_CLICK_STATE.clear()
+  if state.get("picking"):
+    clear = getattr(coot, "clear_pending_picks", None)
+    if callable(clear):
+      try:
+        clear()
+      except Exception as error:
+        print("Could not cancel atom picking:", error)
+  window = state.get("window")
+  if window is not None:
+    window.destroy()
+  cleanup = state.get("cleanup")
+  if callable(cleanup):
+    cleanup()
+
+
+def _script_user_defined_click(count, callback, on_pick=None, cleanup=None, title=None):
+  """Resolve each pick immediately, before the next click can change model context."""
+  _cancel_script_clicks()
+  clear_annotation = globals().get("_clear_annotation_range_pick")
+  if callable(clear_annotation):
+    clear_annotation()
+  token = object()
+  picks = []
+  _SCRIPT_CLICK_STATE.update(token=token, picking=True, cleanup=cleanup)
+  def current():
+    return _SCRIPT_CLICK_STATE.get("token") is token
+  def cancel():
+    if current():
+      _cancel_script_clicks()
+  def arm():
+    coot.user_defined_click_py(1, picked)
+  def picked(raw):
+    if not current():
+      return
+    try:
+      spec = _resolve_script_click(raw)
+    except ValueError as error:
+      add_status_bar_text(str(error))
+      print("Atom picking:", error)
+      try:
+        arm()
+      except Exception:
+        cancel()
+        raise
+      return
+    except Exception:
+      cancel()
+      raise
+    try:
+      picks.append(spec)
+      if callable(on_pick):
+        on_pick(spec, len(picks))
+      if len(picks) < count:
+        arm()
+        return
+      # A model may have been closed between the two clicks.
+      if any(_click_spec_imol(pick) < 0 for pick in picks):
+        raise ValueError("A picked model was closed; select the range again.")
+      _SCRIPT_CLICK_STATE["picking"] = False
+      window = _SCRIPT_CLICK_STATE.pop("window", None)
+      if window is not None:
+        window.destroy()
+      return callback(*picks)
+    except Exception:
+      cancel()
+      raise
+  try:
+    if title and globals().get("Gtk") is not None:
+      window = Gtk.Window()
+      window.set_title(title)
+      box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+      for edge in ("start", "end", "top", "bottom"):
+        getattr(box, "set_margin_" + edge)(12)
+      box.append(Gtk.Label(label="Click the first and last residues.\nCyan = start; orange = end."))
+      button = Gtk.Button(label="Cancel picking")
+      button.connect("clicked", lambda *_: cancel())
+      box.append(button)
+      window.set_child(box)
+      window.connect("close-request", lambda *_: cancel() or False)
+      _SCRIPT_CLICK_STATE["window"] = window
+      window.present()
+    arm()
+  except Exception:
+    cancel()
+    raise
+  return token
+
+
 def ncs_master_chain_id(imol):
   if hasattr(coot, "ncs_master_chains_py"):
     master_chains = coot.ncs_master_chains_py(imol)
@@ -7566,6 +7695,9 @@ def _mark_annotation_endpoint(spec, colour):
 
 
 def _start_annotation_range_pick(mol_id, refresh_function=None):
+  cancel_script = globals().get("_cancel_script_clicks")
+  if callable(cancel_script):
+    cancel_script()
   _clear_annotation_range_pick()
   token = object()
   RESIDUE_ANNOTATION_RANGE_PICK_STATE.update(token=token, picking=True, markers=[])
@@ -14228,7 +14360,7 @@ def fit_polyala_gui():
       return None
     loop_seq=length*"A"
     fit_gap(mol_id_1,ch_id_1,gap_start,gap_end,loop_seq,1)
-  user_defined_click(2,fit_polyala)
+  _script_user_defined_click(2,fit_polyala)
   
 # Try to rebuild with db_mainchain after fit_gap?
 
@@ -14243,11 +14375,13 @@ def refine_click():
     resno_2=_click_spec_res_no(res2)
     alt_conf_1=_click_spec_alt_conf(res1)
     alt_conf_2=_click_spec_alt_conf(res2)
+    if _clicked_same_chain_residue_range(res1, res2) is None:
+      return
     if resno_2>=resno_1:
       refine_zone(mol_id_1,ch_id_1,resno_1,resno_2,alt_conf_1)
     else:
       refine_zone(mol_id_1,ch_id_1,resno_2,resno_1,alt_conf_1)
-  user_defined_click(2,refine_click_a)
+  _script_user_defined_click(2,refine_click_a)
   
 #Refine a clicked residue range.
 def refine_residues_click():
@@ -14274,7 +14408,7 @@ def refine_residues_click():
         set_refinement_immediate_replacement(previous_immediate_replacement)
     else:
       info_dialog("Sorry, start and end residues must be in same mol and chain!")
-  user_defined_click(2,refine_residues_click_a)
+  _script_user_defined_click(2,refine_residues_click_a)
   
 def refine_residues_range(mol_id,ch_id,resno_1,resno_2,ins_code_1):
   if resno_1>=resno_2:
@@ -14336,7 +14470,7 @@ def copy_frag_by_click():
     specs = _clicked_residue_specs(res1, res2)
     if specs:
       return _copy_residue_specs_verified(mol_id, specs)
-  user_defined_click(2,copy_frag)
+  _script_user_defined_click(2,copy_frag)
   
 #Cut fragment (click start and end)
 def cut_frag_by_click():
@@ -14348,7 +14482,7 @@ def cut_frag_by_click():
     specs = _clicked_residue_specs(res1, res2)
     if specs:
       return _cut_residue_specs_verified(mol_id, specs)
-  user_defined_click(2,cut_frag)
+  _script_user_defined_click(2,cut_frag)
 
 
 #Delete sidechain range (click start and end)
@@ -14466,8 +14600,8 @@ def _register_preview_text(plan, map_id):
   first, last = plan["start"]+plan["offset"], plan["end"]+plan["offset"]
   changed = sum(c[4] for c in plan["changes"])
   text = [f"{plan['start']}-{plan['end']}  ->  {first}-{last}    ({plan['offset']:+d})", "",
-          f"Before  {old}",
-          f"After   {plan['target']}", "",
+          f"Before  {plan['start']}-{old}-{plan['end']}",
+          f"After   {first}-{plan['target']}-{last}", "",
           f"Rebuild/fit: {changed} of {len(plan['selected'])} residues | Map #{map_id}",
           "Delete: " + (", ".join(f"{r['number']} {r['name']}" for r in plan["trim"]) or "none"),
           "", "Current rotamer/backrub settings apply.",
@@ -14889,15 +15023,20 @@ def shift_register_active_segment():
 
 
 _REGISTER_SELECTION_MARKERS = []
+_REGISTER_SELECTION_TOKEN = None
 
 
 def _clear_register_selection_markers():
+  had_markers = bool(_REGISTER_SELECTION_MARKERS)
   while _REGISTER_SELECTION_MARKERS:
     obj = _REGISTER_SELECTION_MARKERS.pop()
     try:
       coot.close_generic_object(obj)
     except Exception as error:
       print("Could not clear register endpoint marker:", error)
+  draw = getattr(coot, "graphics_draw", None)
+  if had_markers and callable(draw):
+    draw()
 
 
 def _mark_register_endpoint(spec, colour):
@@ -14916,40 +15055,47 @@ def _mark_register_endpoint(spec, colour):
   try:
     coot.to_generic_object_add_point(obj, colour, 8, *atom[2])
     coot.set_display_generic_object(obj, 1)
+    draw = getattr(coot, "graphics_draw", None)
+    if callable(draw):
+      draw()
   except Exception as error:
     print("Could not draw register endpoint marker:", error)
     _clear_register_selection_markers()
 
 
 def shift_register_clicked_range():
+  global _REGISTER_SELECTION_TOKEN
   _clear_register_selection_markers()
+  token = object()
+  _REGISTER_SELECTION_TOKEN = token
+  def cleanup():
+    if _REGISTER_SELECTION_TOKEN is token:
+      _clear_register_selection_markers()
   def show_click(spec, prompt):
     add_status_bar_text(_navigation_status_bar_label(
       _click_spec_imol(spec), _click_spec_chain_id(spec),
       _click_spec_res_no(spec), _click_spec_ins_code(spec)).replace("Current residue:", "Clicked residue:", 1) + " | " + prompt)
   def clicked(first, last):
-    show_click(last, "Range selected")
-    _mark_register_endpoint(last, "orange")
     if _click_spec_ins_code(first) or _click_spec_ins_code(last):
-      _clear_register_selection_markers()
+      cleanup()
       info_dialog("Insertion-code endpoints are unsupported for register shifting.")
       return
     region = _clicked_same_chain_residue_range(first, last)
     if region:
       try:
         _register_shift_dialog(*region, anchor_number=_click_spec_res_no(first),
-                               selection_cleanup=_clear_register_selection_markers)
+                               selection_cleanup=cleanup)
       except Exception:
-        _clear_register_selection_markers()
+        cleanup()
         raise
     else:
-      _clear_register_selection_markers()
-  def first_clicked(first):
-    show_click(first, "Start selected; click the end residue")
-    _mark_register_endpoint(first, "cyan")
-    coot.user_defined_click_py(1, lambda last: clicked(first, last))
+      cleanup()
+  def show_endpoint(spec, index):
+    show_click(spec, "Start selected; click the end residue" if index == 1 else "Range selected")
+    _mark_register_endpoint(spec, "cyan" if index == 1 else "orange")
   add_status_bar_text("Shift register: click the start residue.")
-  coot.user_defined_click_py(1, first_clicked)
+  _script_user_defined_click(2, clicked, on_pick=show_endpoint, cleanup=cleanup,
+                             title="Pick register range")
 
 
 _REGISTER_REFERENCE_ORIGINS = {}
@@ -15476,7 +15622,7 @@ def mutate_residue_range_by_click_a():
       mutate_residue_range(mol_id,ch_id,res_start,res_end,target_seq)
       for resno in range(res_start,res_end+1):
         set_residue_name(mol_id,ch_id,resno,"","UNK")
-  user_defined_click(2,mutate_residue_range_by_click_b)
+  _script_user_defined_click(2,mutate_residue_range_by_click_b)
 
 #Mutate range to polyala
 def mutate_residue_range_by_click_ala_a():
@@ -15495,7 +15641,7 @@ def mutate_residue_range_by_click_ala_a():
       mutate_residue_range(mol_id,ch_id,res_start,res_end,target_seq)
       for resno in range(res_start,res_end+1):
         set_residue_name(mol_id,ch_id,resno,"","ALA")
-  user_defined_click(2,mutate_residue_range_by_click_ala_b)
+  _script_user_defined_click(2,mutate_residue_range_by_click_ala_b)
   
 #Force addition of residue - useful when
 #Coot says "No acceptable position found"
@@ -15510,7 +15656,7 @@ def force_add_terminal_residue():
       info_dialog("Select a uniquely identified terminal residue without an insertion code.")
       return 0
     return force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, res_no, -57.82, -47)
-  user_defined_click(1,force_addition)
+  _script_user_defined_click(1,force_addition)
   
 def force_add_terminal_residue_noclick(mol_id,ch_id,res_no):
   return force_add_terminal_residue_noclick_phi_psi(mol_id, ch_id, res_no, -57.82, -47)
@@ -16131,6 +16277,9 @@ def merge_chains():
     mol_id_2=_click_spec_imol(res2)
     ch_id_1=_click_spec_chain_id(res1)
     ch_id_2=_click_spec_chain_id(res2)
+    if mol_id_1 < 0 or mol_id_1 != mol_id_2 or ch_id_1 == ch_id_2:
+      info_dialog("Select two different chains in the same model.")
+      return
     first_res_sel1=first_residue(mol_id_1,ch_id_1)
     last_res_sel1=last_residue(mol_id_1,ch_id_1)
     first_res_sel2=first_residue(mol_id_2,ch_id_2)
@@ -16149,7 +16298,7 @@ def merge_chains():
         info_dialog(out[1])
     else:
       info_dialog("No can do, chains must be in the same mol and have non-overlapping ranges!")
-  user_defined_click(2,merge_chains_by_click)
+  _script_user_defined_click(2,merge_chains_by_click)
 
 #Fit all segments to map
 def rigid_body_fit_segments():
@@ -16567,7 +16716,7 @@ def _grow_secondary_structure_from_click(prompt_label, button_label, phi, psi, s
       return 1
 
     generic_single_entry(prompt_label, "10", button_label, grow_from_entry)
-  user_defined_click(1, grow_post_click)
+  _script_user_defined_click(1, grow_post_click)
 
 
 #Grow helix from selected terminus
@@ -18766,7 +18915,7 @@ def _start_coordination_link_clicks(label, metal_codes, metal_label, donor_eleme
     add_status_bar_text(f"{label}: added link ({distance:.3f} A)")
     return 1
 
-  coot.user_defined_click_py(2, make_link_from_clicks)
+  _script_user_defined_click(2, make_link_from_clicks)
   return 1
 
 
@@ -18819,7 +18968,7 @@ def make_custom_link():
     return 1
 
   try:
-    coot.user_defined_click_py(2, picked)
+    _script_user_defined_click(2, picked)
   except Exception as error:
     info_dialog(f"Could not start custom-link atom picking.\n\n{error}")
     return 0
@@ -19673,11 +19822,17 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
       def make_restr_dist(*args):
         atom_spec_1 = args[0]
         atom_spec_2 = args[1]
-        imol = atom_spec_1[1]
-        add_extra_bond_restraint(imol, atom_spec_1[2], atom_spec_1[3], atom_spec_1[4], atom_spec_1[5], atom_spec_1[6], atom_spec_2[2], atom_spec_2[3], atom_spec_2[4], atom_spec_2[5], atom_spec_2[6], bl, 0.035)
-      user_defined_click(2, make_restr_dist)
-      if continue_qm:
-        user_defined_add_arbitrary_length_bond_restraint(bl)
+        imol = _click_spec_imol(atom_spec_1)
+        if imol < 0 or imol != _click_spec_imol(atom_spec_2):
+          info_dialog("Extra distance restraints require two atoms in the same model.")
+          return
+        fields = (_click_spec_chain_id, _click_spec_res_no, _click_spec_ins_code,
+                  _click_spec_atom_name, _click_spec_alt_conf)
+        add_extra_bond_restraint(imol, *(f(spec) for spec in (atom_spec_1, atom_spec_2)
+                                       for f in fields), bl, 0.035)
+        if continue_qm:
+          user_defined_add_arbitrary_length_bond_restraint(bl)
+      _script_user_defined_click(2, make_restr_dist)
   def stay_open(*args):
     pass
   #generic_single_entry("Add a User-defined extra distance restraint",
