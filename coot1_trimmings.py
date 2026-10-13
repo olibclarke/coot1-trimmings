@@ -1070,7 +1070,7 @@ CUSTOM_COLOUR_ADDITIONAL_BOND_WIDTH = 0.14
 
 POLYMER_RESIDUE_NAMES = {
   # Standard RNA/DNA.
-  "A", "C", "G", "U", "T", "DA", "DC", "DG", "DT",
+  "A", "C", "G", "U", "T", "DA", "DC", "DG", "DT", "DU",
   # Common modified nucleotides seen in experimental models.
   "PSU", "H2U", "5MU", "OMU", "4SU",
   "1MA", "2MA", "6MA", "MIA",
@@ -5954,6 +5954,13 @@ def _odd_weak_region_hits(records):
   return regions
 
 
+def _chain_residue_count_text(records):
+  """Describe a chain from existing snapshot rows, not per-residue API calls."""
+  polymer = sum(record["name"].strip().upper() in POLYMER_RESIDUE_NAMES
+                for _spec, record in records)
+  return f"{polymer} polymer, {len(records) - polymer} non-polymer"
+
+
 def _iter_odd_residue_dialog_data():
   """Build the current Odd residues dialog payload from the active model/map."""
   map_id = _active_analysis_map_or_status()
@@ -6197,7 +6204,7 @@ def _iter_odd_residue_dialog_data():
     "map_id": map_id,
     "peak_threshold": peak_threshold,
     "gui_categories": sorted_gui_categories,
-    "chain_choices": [(chain, f"Chain {chain or '(blank)'}: {len(records)} residues")
+    "chain_choices": [(chain, f"Chain {chain or '(blank)'}: {_chain_residue_count_text(records)}")
                       for chain, records in chain_records.items()],
     "detail_categories": sorted_detail_categories,
     "title": _odd_residue_dialog_title(mol_id, map_id),
@@ -12191,6 +12198,23 @@ import traceback
 from dataclasses import dataclass
 
 
+_POLYMER_RESIDUE_NAMES = set("""A C G U T DA DC DG DT DU
+PSU H2U 5MU OMU 4SU 1MA 2MA 6MA MIA 5MC OMC 1MG 2MG 7MG M2G OMG YG
+ALA UNK ARG ASN ASP CYS GLU GLN GLY HIS ILE LEU LYS MET MSE PHE PRO SER THR TRP TYR VAL
+P1L SEP TPO PTR CSO CME MLY MLZ HYP KCX ALY FME PYL SEC""".split())
+
+
+def chain_residue_counts(records, polymer_specs=()):
+    """Count polymer/non-polymer residues without confusing missing atoms with ligands."""
+    polymer_specs = set(polymer_specs)
+    counts = {}
+    for spec, record in records.items():
+        row = counts.setdefault(spec[0], [0, 0])
+        polymer = spec in polymer_specs or record["name"].strip().upper() in _POLYMER_RESIDUE_NAMES
+        row[0 if polymer else 1] += 1
+    return counts
+
+
 @dataclass(frozen=True)
 class RefinementStage:
     map_id: int
@@ -13102,7 +13126,7 @@ def multimap_refinement_gui():
         api.info_dialog("Choose an active residue first.")
         return
     imol = active[0]
-    backend.snapshot(imol)
+    initial_records = backend.snapshot(imol)
     if not backend.polymer_specs:
         api.info_dialog("The active model has no refinable polymer residues.")
         return
@@ -13165,11 +13189,14 @@ def multimap_refinement_gui():
     scope_grid = grid()
     scope = Gtk.ComboBoxText()
     polymer_chains = sorted({s[0] for s in backend.polymer_specs})
-    scope.append("all", "All polymer chains (%d chains, %d residues)" %
-                 (len(polymer_chains), len(backend.polymer_specs)))
+    chain_counts = chain_residue_counts(initial_records, backend.polymer_specs)
+    scope.append("all", "All polymer chains (%d chains; %d polymer, %d non-polymer)" %
+                 (len(polymer_chains), sum(chain_counts[name][0] for name in polymer_chains),
+                  sum(chain_counts[name][1] for name in polymer_chains)))
     for name in polymer_chains:
-        count = sum(s[0] == name for s in backend.polymer_specs)
-        scope.append("chain:" + name, "Chain %s only (%d residues)" % (name or "[blank]", count))
+        polymer, nonpolymer = chain_counts[name]
+        scope.append("chain:" + name, "Chain %s only (%d polymer, %d non-polymer)" %
+                     (name or "[blank]", polymer, nonpolymer))
     scope.set_active_id("all")
     scope.set_hexpand(True)
     scope_grid.attach(scope, 0, 0, 4, 1)
