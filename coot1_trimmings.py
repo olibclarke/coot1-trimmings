@@ -529,6 +529,8 @@ MODEL_AMBIENT_ONLY_SPECULAR = (0.0, 64.0)
 # ============================================================================
 
 REGISTERED_KEYBINDING_CALLBACKS = []
+REGISTERED_KEYBINDINGS = {}
+_CUSTOM_KEY_BINDINGS_WINDOW = None
 MAP_SURFACE_DISPLAY_STATE = {}
 MAP_SURFACE_OPACITY_STATE = {}
 MAP_GLOBAL_VIEW_SETTINGS = {}
@@ -4133,6 +4135,130 @@ def add_key_binding(name, key, thunk):
 
   REGISTERED_KEYBINDING_CALLBACKS.append(wrapped_thunk)
   coot.add_key_binding_gtk4_py(key_value, ctrl_key, wrapped_thunk, name)
+  key_id = ord(key_value) if isinstance(key_value, str) else key_value
+  REGISTERED_KEYBINDINGS[(ctrl_key, key_id)] = (key, name)
+
+
+def _custom_key_binding_label(key):
+  if isinstance(key, str):
+    return "Ctrl+" + key[len("Control_"):] if key.startswith("Control_") else key
+  named = {65289: "Tab", 65293: "Return", 65307: "Escape", 65361: "Left",
+           65362: "Up", 65363: "Right", 65364: "Down", 65288: "BackSpace",
+           65535: "Delete", 32: "Space"}
+  return named.get(key, chr(key) if 33 <= key <= 126 else f"Key {key}")
+
+
+def _custom_key_binding_groups(query=""):
+  groups = {name: [] for name in ("Build / Edit", "Refinement", "Maps", "Navigation / Display", "Other")}
+  query = query.strip().casefold()
+  for key, action in REGISTERED_KEYBINDINGS.values():
+    key = _custom_key_binding_label(key)
+    if query and query not in f"{key} {action}".casefold():
+      continue
+    lower = action.casefold()
+    if any(word in lower for word in ("map", "density", "contour", "sigma", "surface")):
+      group = "Maps"
+    elif any(word in lower for word in ("representation", "display", "symmetry", "clipping", "ncs",
+                                       "distances", "measure", "pending picks", "residue in chain")):
+      group = "Navigation / Display"
+    elif any(word in lower for word in ("refine", "fit", "restraint")):
+      group = "Refinement"
+    elif any(word in lower for word in ("place", "copy", "paste", "delete", "sidechain", "water",
+                                       "terminal", "terminus", "peptide", "rotamer", "undo", "redo", "save")):
+      group = "Build / Edit"
+    else:
+      group = "Other"
+    groups[group].append((key, action))
+  return [(name, rows) for name, rows in groups.items() if rows]
+
+
+def custom_key_bindings_dialog():
+  """A read-only reference to the shortcuts successfully registered by this script."""
+  global _CUSTOM_KEY_BINDINGS_WINDOW
+  if Gtk is None:
+    info_dialog(_gui_unavailable_message("Custom Key Bindings"))
+    return None
+  if _CUSTOM_KEY_BINDINGS_WINDOW is not None and _CUSTOM_KEY_BINDINGS_WINDOW.get_visible():
+    _CUSTOM_KEY_BINDINGS_WINDOW.key_bindings_widgets["refresh"]()
+    _CUSTOM_KEY_BINDINGS_WINDOW.present()
+    return _CUSTOM_KEY_BINDINGS_WINDOW
+  window = Gtk.Window(title="Custom Key Bindings")
+  window.set_default_size(600, 500)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for edge in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + edge)(12)
+  hint = Gtk.Label(label="Keys are case-sensitive; uppercase letters require Shift.\nUse shortcuts with focus in the model view.")
+  hint.set_xalign(0)
+  hint.set_wrap(True)
+  box.append(hint)
+  search = Gtk.SearchEntry()
+  search.set_placeholder_text("Find a key or action")
+  box.append(search)
+  scroll = Gtk.ScrolledWindow()
+  scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+  scroll.set_hexpand(True)
+  scroll.set_vexpand(True)
+  content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+  scroll.set_child(content)
+  box.append(scroll)
+  footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  count = Gtk.Label()
+  count.set_xalign(0)
+  count.set_hexpand(True)
+  footer.append(count)
+  close = Gtk.Button(label="Close")
+  footer.append(close)
+  box.append(footer)
+  rows = []
+  def refresh(*_args):
+    child = content.get_first_child()
+    while child is not None:
+      content.remove(child)
+      child = content.get_first_child()
+    rows.clear()
+    groups = _custom_key_binding_groups(search.get_text())
+    for title, bindings in groups:
+      section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+      heading = Gtk.Label(label=title)
+      heading.set_xalign(0)
+      heading.add_css_class("heading")
+      section.append(heading)
+      grid = Gtk.Grid(column_spacing=16, row_spacing=4)
+      for index, (key, action) in enumerate(bindings):
+        key_label = Gtk.Label(label=key)
+        key_label.add_css_class("monospace")
+        key_label.set_xalign(0)
+        key_label.set_width_chars(10)
+        key_label.set_selectable(True)
+        action_label = Gtk.Label(label=action)
+        action_label.set_xalign(0)
+        action_label.set_wrap(True)
+        action_label.set_hexpand(True)
+        action_label.set_selectable(True)
+        grid.attach(key_label, 0, index, 1, 1)
+        grid.attach(action_label, 1, index, 1, 1)
+        rows.append((key, action))
+      section.append(grid)
+      content.append(section)
+    total = len(REGISTERED_KEYBINDINGS)
+    count.set_text(f"{len(rows)} / {total} shortcuts" if search.get_text().strip() else f"{total} shortcuts")
+    if not rows:
+      content.append(Gtk.Label(label="No matching shortcuts." if total else "No custom shortcuts registered in this build."))
+  def close_window(*_args):
+    global _CUSTOM_KEY_BINDINGS_WINDOW
+    _CUSTOM_KEY_BINDINGS_WINDOW = None
+    window.destroy()
+    return True
+  search.connect("search-changed", refresh)
+  close.connect("clicked", close_window)
+  window.connect("close-request", close_window)
+  window.set_child(box)
+  window.key_bindings_widgets = {"search": search, "content": content, "count": count,
+                                "close": close, "rows": rows, "refresh": refresh}
+  _CUSTOM_KEY_BINDINGS_WINDOW = window
+  refresh()
+  window.present()
+  return window
 
 if not CARBOHYDRATE_GUI_AVAILABLE:
   def add_module_carbohydrate_gui():
@@ -20324,6 +20450,8 @@ def build_custom_menu():
     globals()["Gio"] = coot_gui_module.Gio
 
   menu = attach_module_menu_button("Custom")
+  add_simple_coot_menu_menuitem(menu, "Custom Key Bindings...",
+                               lambda _item: custom_key_bindings_dialog())
   submenu_display = Gio.Menu.new()
   submenu_colour = Gio.Menu.new()
   submenu_fit = Gio.Menu.new()
