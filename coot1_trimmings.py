@@ -21,7 +21,8 @@ import warnings
 from bisect import bisect_left
 from datetime import datetime, timezone
 from functools import lru_cache
-from contextlib import contextmanager
+from itertools import product
+from contextlib import contextmanager, nullcontext
 
 STARTUP_DIAGNOSTIC_MESSAGES = []
 _STARTUP_DIAGNOSTIC_DIALOGS_SHOWN = set()
@@ -2523,6 +2524,13 @@ def _cancel_script_clicks():
     cleanup()
 
 
+def clear_pending_custom_picks():
+  """Cancel script pickers too, so Tab cannot leave endpoint markers behind."""
+  _cancel_script_clicks()
+  _clear_annotation_range_pick()
+  coot.clear_pending_picks()
+
+
 def _script_user_defined_click(count, callback, on_pick=None, cleanup=None, title=None):
   """Resolve each pick immediately, before the next click can change model context."""
   _cancel_script_clicks()
@@ -4338,7 +4346,7 @@ lambda: jiggle_fit_active_non_polymer_residue())
 
 #Clear pending picks
 add_key_binding("Clear Pending Picks","Tab",
-lambda: clear_pending_picks())
+lambda: clear_pending_custom_picks())
 
 #Toggle environment distances
 add_key_binding("Toggle environment distances","D",
@@ -14000,14 +14008,23 @@ def segment_list_chain(mol_id, ch_id):
 #Local cylinder refinement around the active residue:
 # main polymer range +/- 5 residues, contact-expanded secondary ranges,
 # then local polymer gap-filling/pruning while keeping non-polymer contacts.
-def auto_refine():
+def auto_refine(primary_specs=None, mol_id=None, secondary_structure=None):
   if imol_refinement_map()==-1:
     info_dialog("You must set a refinement map!")
     return None
-  residue = _active_residue_or_status()
-  if not residue:
+  if coot.refinement_already_ongoing_p():
+    info_dialog("Accept or reject the current refinement first.")
     return None
-  mol_id=residue[0]
+  if primary_specs is None:
+    residue = _active_residue_or_status()
+    if not residue:
+      return None
+    mol_id=residue[0]
+  else:
+    primary_specs = [tuple(spec) for spec in primary_specs]
+    if not primary_specs or mol_id not in model_molecule_list():
+      raise ValueError("Select a range in an available model.")
+    residue = [mol_id, *primary_specs[0]]
   ch_id=residue[1]
   resno=residue[2]
   half_window = 5
@@ -14128,7 +14145,14 @@ def auto_refine():
   main_range_specs = set()
   seed_residue_specs = []
 
-  if _residue_is_polymer(mol_id, ch_id, resno, active_ins_code):
+  if primary_specs is not None:
+    centre_residue_spec = primary_specs[0]
+    if any(not residue_exists_qm(mol_id, *spec) or not _residue_is_polymer(mol_id, *spec)
+           for spec in primary_specs):
+      raise ValueError("The primary range must contain existing polymer residues only.")
+    main_range_specs.update(primary_specs)
+    seed_residue_specs.extend(list(spec) for spec in primary_specs)
+  elif _residue_is_polymer(mol_id, ch_id, resno, active_ins_code):
     centre_residue_spec = (ch_id, resno, active_ins_code)
     fpr=first_polymer_residue(mol_id,ch_id)
     lpr=last_polymer_residue(mol_id,ch_id)
@@ -14169,13 +14193,199 @@ def auto_refine():
   selected_residue_specs = main_range_specs | secondary_polymer_specs | secondary_non_polymer_specs
 
   residue_list = [list(spec) for spec in sorted(selected_residue_specs, key=lambda spec: (spec[0], spec[1], spec[2]))]
-  previous_immediate_replacement = refinement_immediate_replacement_state()
+  return _start_cylinder_refinement(mol_id, residue_list, sorted(main_range_specs), secondary_structure)
+
+
+def _cylinder_secondary_restraints(snapshot, primary, kind):
+  """Coot's local helix/strand targets, confined to connected primary residues."""
+  if kind not in ("alpha helix", "beta strand"):
+    raise ValueError("Unknown cylinder secondary-structure mode.")
+  if len(primary) < (4 if kind == "alpha helix" else 3):
+    raise ValueError("Select at least four residues for a helix, or three for a strand.")
+  atoms = {}
+  for spec in primary:
+    groups = {}
+    for atom in snapshot[spec]["atoms"]:
+      if float(atom[1][0]) > 0:
+        groups.setdefault(atom[0][0].strip(), []).append(atom)
+    if not {"N", "CA", "C", "O"} <= groups.keys():
+      raise ValueError("Secondary-structure refinement needs complete protein N/CA/C/O atoms in the primary range.")
+    atoms[spec] = groups
+  def compatible(specs, names):
+    for selected in product(*(atoms[spec][name] for spec, name in zip(specs, names))):
+      if len({a[0][1] for a in selected if a[0][1]}) <= 1:
+        yield [[*spec, atom[0][0], atom[0][1]] for spec, atom in zip(specs, selected)]
+  runs = []
+  for spec in primary:
+    connected = False
+    if runs:
+      previous = runs[-1][-1]
+      if spec[0] == previous[0] and spec[1] - previous[1] in (0, 1):
+        connected = any(0.25 < _distance_sq(a[2], b[2]) <= 2.2**2
+                        for a in atoms[previous]["C"] for b in atoms[spec]["N"]
+                        if not a[0][1] or not b[0][1] or a[0][1] == b[0][1])
+    if not connected:
+      runs.append([])
+    runs[-1].append(spec)
+  restraints = []
+  for run in runs:
+    for i, spec in enumerate(run):
+      if kind == "alpha helix":
+        for step, on_target, oo_target in ((3, 3.181, 4.92), (4, 2.919, 6.16)):
+          if i + step >= len(run):
+            continue
+          other = run[i + step]
+          if snapshot[other]["name"] != "PRO":
+            restraints.extend(("bond", pair, on_target, 0.04)
+                              for pair in compatible((spec, other), ("O", "N")))
+          restraints.extend(("bond", pair, oo_target, 0.07)
+                            for pair in compatible((spec, other), ("O", "O")))
+      else:
+        if i + 1 < len(run):
+          restraints.extend(("bond", pair, 4.64, 0.08)
+                            for pair in compatible(run[i:i+2], ("O", "O")))
+        if i + 2 < len(run):
+          for name, target in (("O", 98.0), ("CA", 120.0)):
+            restraints.extend(("angle", triple, target, 0.5)
+                              for triple in compatible(run[i:i+3], (name, name, name)))
+  if not restraints:
+    raise ValueError("No connected primary residues support these secondary-structure restraints.")
+  return restraints
+
+
+def _cylinder_restraint_key(kind, specs):
+  atoms = tuple((str(s[-5]), int(s[-4]), str(s[-3] or ""),
+                 str(s[-2]).strip(), str(s[-1] or "")) for s in specs)
+  return kind, min(atoms, atoms[::-1])
+
+
+@contextmanager
+def _cylinder_temporary_restraints(mol_id, restraints):
+  owned = []
   try:
-    set_refinement_immediate_replacement(0)
-    refine_residues_py(mol_id, residue_list)
-    add_status_bar_text("Local cylinder refinement started")
+    existing = {_cylinder_restraint_key(row[0], row[1:3 if row[0] == "bond" else 4])
+                for row in (coot.list_extra_restraints_py(mol_id) or []) if row[0] in ("bond", "angle")}
+    for kind, specs, target, sigma in restraints:
+      key = _cylinder_restraint_key(kind, specs)
+      if key in existing:
+        continue
+      add = coot.add_extra_bond_restraint if kind == "bond" else coot.add_extra_angle_restraint
+      index = add(mol_id, *(field for spec in specs for field in spec), target, sigma)
+      if index is None or index < 0:
+        raise RuntimeError("Could not add a temporary secondary-structure restraint.")
+      owned.append([kind, *specs])
+      existing.add(key)
+    yield len(owned)
   finally:
-    set_refinement_immediate_replacement(previous_immediate_replacement)
+    errors = []
+    for row in reversed(owned):
+      try:
+        coot.delete_extra_restraint_py(mol_id, row)
+      except Exception as error:
+        errors.append(str(error))
+    if errors:
+      raise RuntimeError("Could not remove temporary cylinder restraints: " + "; ".join(errors))
+
+
+def _start_cylinder_refinement(mol_id, moving, primary, secondary_structure=None):
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept or reject the current refinement first.")
+  if not valid_model_molecule_qm(mol_id) or not valid_map_molecule_qm(imol_refinement_map()):
+    raise ValueError("Choose an available model and refinement map.")
+  restraints = []
+  if secondary_structure:
+    required = ("list_extra_restraints_py", "delete_extra_restraint_py", "add_extra_bond_restraint")
+    if secondary_structure == "beta strand":
+      required += ("add_extra_angle_restraint",)
+    if any(not callable(getattr(coot, name, None)) for name in required):
+      raise ValueError("This Coot build cannot safely add and remove temporary secondary-structure restraints.")
+    restraints = _cylinder_secondary_restraints(_model_coordinate_snapshot(mol_id), primary, secondary_structure)
+  previous = (coot.refinement_immediate_replacement_state(), coot.secondary_structure_restraints_type())
+  attempted = False
+  try:
+    coot.set_refinement_immediate_replacement(0)
+    # A global helix/strand mode would incorrectly restrain contact-shell residues too.
+    coot.set_secondary_structure_restraints_type(0)
+    with _cylinder_temporary_restraints(mol_id, restraints) if restraints else nullcontext():
+      attempted = True
+      result = coot.refine_residues_py(mol_id, moving)
+      if result is False or result is None or not coot.refinement_already_ongoing_p():
+        raise RuntimeError("Coot could not start cylinder refinement; check the selection and dictionaries.")
+    # Native refinement owns a copy of the restraints, so the source-model extras
+    # can be removed now without losing them from the live intermediate atoms.
+    add_status_bar_text(f"Cylinder refinement: {len(primary)} primary + {len(moving)-len(primary)} contact residues"
+                        + (f" | {secondary_structure}" if secondary_structure else "")
+                        + ". Inspect intermediate atoms and Accept or Reject in Coot.")
+    return result
+  except Exception:
+    if attempted and coot.refinement_already_ongoing_p():
+      coot.clear_up_moving_atoms()
+    raise
+  finally:
+    try:
+      coot.set_secondary_structure_restraints_type(previous[1])
+    finally:
+      coot.set_refinement_immediate_replacement(previous[0])
+
+
+def _pick_cylinder_refinement(secondary_structure=None):
+  if not valid_map_molecule_qm(imol_refinement_map()):
+    info_dialog("Select a refinement map before cylinder refinement.")
+    return
+  if coot.refinement_already_ongoing_p():
+    info_dialog("Accept or reject the current refinement first.")
+    return
+  markers = []
+  def cleanup():
+    while markers:
+      try:
+        coot.close_generic_object(markers.pop())
+      except Exception as error:
+        print("Could not clear cylinder endpoint marker:", error)
+    coot.graphics_draw()
+  def mark(spec, index):
+    _mark_register_endpoint(spec, "cyan" if index == 1 else "orange", markers,
+                            "Cylinder refinement endpoint")
+    add_status_bar_text(_navigation_status_bar_label(_click_spec_imol(spec), _click_spec_chain_id(spec),
+      _click_spec_res_no(spec), _click_spec_ins_code(spec)).replace("Current residue:", "Clicked residue:", 1)
+      + (" | Click the end residue." if index == 1 else " | Range selected."))
+  def picked(first, last):
+    try:
+      primary = _clicked_residue_specs(first, last)
+      if primary:
+        return auto_refine(primary, _click_spec_imol(first), secondary_structure)
+    except (ValueError, RuntimeError) as error:
+      info_dialog(f"Cylinder refinement could not start.\n\n{error}")
+    finally:
+      cleanup()
+  add_status_bar_text("Cylinder refinement: click the start residue.")
+  return _script_user_defined_click(2, picked, on_pick=mark, cleanup=cleanup, title="Pick cylinder refinement range")
+
+
+def cylinder_refine(mol_id=None, chain_id=None, start=None, end=None, secondary_structure=None):
+  """Refine a primary range plus local contacts, leaving native intermediate atoms."""
+  if all(value is None for value in (mol_id, chain_id, start, end)):
+    return _pick_cylinder_refinement(secondary_structure)
+  if any(value is None for value in (mol_id, chain_id, start, end)):
+    raise ValueError("Supply model, chain, start and end, or use no arguments to pick the range.")
+  if mol_id not in model_molecule_list():
+    raise ValueError("Select an available coordinate model.")
+  try:
+    start, end = sorted(int(str(value).strip()) for value in (start, end))
+  except (TypeError, ValueError):
+    raise ValueError("Range endpoints must be integer residue numbers.") from None
+  primary = [tuple(spec) for spec in _tq_chain_residue_specs(mol_id, chain_id) if start <= spec[1] <= end]
+  if not primary or not any(s[1] == start for s in primary) or not any(s[1] == end for s in primary):
+    raise ValueError("Both range endpoints must exist in the selected chain.")
+  return auto_refine(primary, mol_id, secondary_structure)
+
+
+def cylinder_refine_alpha_helix(mol_id=None, chain_id=None, start=None, end=None):
+  return cylinder_refine(mol_id, chain_id, start, end, secondary_structure="alpha helix")
+
+
+def cylinder_refine_beta_strand(mol_id=None, chain_id=None, start=None, end=None):
+  return cylinder_refine(mol_id, chain_id, start, end, secondary_structure="beta strand")
    
 
 #**** "Custom menu item functions ****
@@ -15192,19 +15402,24 @@ def _clear_register_selection_markers():
     draw()
 
 
-def _mark_register_endpoint(spec, colour):
+def _mark_register_endpoint(spec, colour, markers=None, label="Register range endpoint"):
+  markers = _REGISTER_SELECTION_MARKERS if markers is None else markers
   required = ("new_generic_object_number", "to_generic_object_add_point",
               "set_display_generic_object", "close_generic_object")
   if any(not callable(getattr(coot, name, None)) for name in required):
     return
   atoms = coot.residue_info_py(_click_spec_imol(spec), _click_spec_chain_id(spec),
                                _click_spec_res_no(spec), _click_spec_ins_code(spec)) or []
-  candidates = [a for a in atoms if a[0][0].strip() == "CA"]
+  candidates = []
+  for name in ("CA", "C4'", "C4*", "P"):
+    candidates = [a for a in atoms if a[0][0].strip() == name]
+    if candidates:
+      break
   if not candidates:
     return
   atom = max(candidates, key=lambda a: (not bool(a[0][1]), float(a[1][0])))
-  obj = coot.new_generic_object_number("Register range endpoint")
-  _REGISTER_SELECTION_MARKERS.append(obj)
+  obj = coot.new_generic_object_number(label)
+  markers.append(obj)
   try:
     coot.to_generic_object_add_point(obj, colour, 8, *atom[2])
     coot.set_display_generic_object(obj, 1)
@@ -15213,7 +15428,8 @@ def _mark_register_endpoint(spec, colour):
       draw()
   except Exception as error:
     print("Could not draw register endpoint marker:", error)
-    _clear_register_selection_markers()
+    coot.close_generic_object(obj)
+    markers.remove(obj)
 
 
 def shift_register_clicked_range():
@@ -20163,6 +20379,9 @@ def _build_custom_user_colour_menu(submenu_colour):
 
 
 def _build_custom_fit_menu(submenu_fit):
+  add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (click range)...", lambda func: cylinder_refine())
+  add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (alpha helix)...", lambda func: cylinder_refine_alpha_helix())
+  add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (beta strand)...", lambda func: cylinder_refine_beta_strand())
   add_simple_coot_menu_menuitem(
     submenu_fit,
     "Multimap stepped refinement...",
