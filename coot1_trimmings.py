@@ -6,6 +6,7 @@ The main user-editable knobs live near the top of the file under
 """
 
 import math
+import ast
 import base64
 import hashlib
 import json
@@ -458,6 +459,7 @@ HIGH_CONTRAST_BOND_THICKNESS = 2
 PROPORTIONAL_EDITING_RADIUS = 1.0
 COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
 DISPLAY_PREFERENCES_FILENAME = "coot_trimmings_preferences.py"
+CUSTOM_TOOLBAR_FILENAME = "coot_trimmings_toolbar.json"
 COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 WATER_REFINE_MAX_DISPLACEMENT = 1.0
 RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
@@ -532,6 +534,7 @@ MODEL_AMBIENT_ONLY_SPECULAR = (0.0, 64.0)
 REGISTERED_KEYBINDING_CALLBACKS = []
 REGISTERED_KEYBINDINGS = {}
 _CUSTOM_KEY_BINDINGS_WINDOW = None
+_CUSTOM_TOOLBAR_STATE = {}
 MAP_SURFACE_DISPLAY_STATE = {}
 MAP_SURFACE_OPACITY_STATE = {}
 MAP_GLOBAL_VIEW_SETTINGS = {}
@@ -14304,7 +14307,8 @@ def _start_cylinder_refinement(mol_id, moving, primary, secondary_structure=None
   attempted = False
   try:
     coot.set_refinement_immediate_replacement(0)
-    # A global helix/strand mode would incorrectly restrain contact-shell residues too.
+    # Disable forced global SS. Coot still auto-preserves detected helices in
+    # the contact shell; its Python API does not expose a switch for that.
     coot.set_secondary_structure_restraints_type(0)
     with _cylinder_temporary_restraints(mol_id, restraints) if restraints else nullcontext():
       attempted = True
@@ -14358,8 +14362,8 @@ def _pick_cylinder_refinement(secondary_structure=None):
       info_dialog(f"Cylinder refinement could not start.\n\n{error}")
     finally:
       cleanup()
-  add_status_bar_text("Cylinder refinement: click the start residue.")
-  return _script_user_defined_click(2, picked, on_pick=mark, cleanup=cleanup, title="Pick cylinder refinement range")
+  add_status_bar_text("Cylinder refinement: click start (cyan), then end (orange). Tab cancels.")
+  return _script_user_defined_click(2, picked, on_pick=mark, cleanup=cleanup)
 
 
 def cylinder_refine(mol_id=None, chain_id=None, start=None, end=None, secondary_structure=None):
@@ -20660,6 +20664,837 @@ def _build_custom_maps_menu(submenu_maps):
   )
 
 
+def _custom_menu_search_items(menu, path=(), ancestors=()):
+  """Read live GMenu actions, including dynamic submenus, without copying callbacks."""
+  if any(menu == parent for parent in ancestors) or len(ancestors) > 20:
+    return []
+  items = []
+  def attribute(index, name):
+    value = menu.get_item_attribute_value(index, name, None)
+    return value.unpack() if value is not None else None
+  for index in range(menu.get_n_items()):
+    label = attribute(index, "label") or ""
+    # GMenu uses single underscores for mnemonics and doubles literal ones.
+    label = label.replace("__", "\0").replace("_", "").replace("\0", "_")
+    submenu = menu.get_item_link(index, "submenu")
+    section = menu.get_item_link(index, "section")
+    if submenu is not None or section is not None:
+      child = submenu if submenu is not None else section
+      items.extend(_custom_menu_search_items(child, path + ((label,) if label else ()), ancestors + (menu,)))
+    else:
+      action = attribute(index, "action")
+      if label and action:
+        items.append({"label": label, "path": " > ".join(path), "action": action,
+                      "target": menu.get_item_attribute_value(index, "target", None)})
+  return items
+
+
+def _custom_menu_search_matches(menu, query):
+  terms = query.casefold().split()
+  if not terms:
+    return []
+  items = [item for item in _custom_menu_search_items(menu)
+           if all(term in (item["path"] + " " + item["label"]).casefold() for term in terms)]
+  phrase = " ".join(terms)
+  return sorted(items, key=lambda item: (not item["label"].casefold().startswith(phrase),
+                                         item["path"].casefold(), item["label"].casefold()))
+
+
+def _install_custom_menu_search(menu):
+  """Add a search entry inside the existing Custom popover; keep its native menus."""
+  gui = _coot_gui_module()
+  api = getattr(gui, "coot_gui_api", None)
+  glib = _coot_gui_repository_module("GLib")
+  if api is None or glib is None:
+    return None
+  toolbar = api.main_toolbar()
+  button = toolbar.get_first_child()
+  while button is not None:
+    if isinstance(button, Gtk.MenuButton):
+      popover = button.get_popover()
+      if isinstance(popover, Gtk.PopoverMenu) and popover.get_menu_model() == menu:
+        break
+    button = button.get_next_sibling()
+  if button is None:
+    return None
+  original_popover = popover
+  app = api.application()
+  body, root = Gio.Menu.new(), Gio.Menu.new()
+  slot = Gio.MenuItem.new(None, None)
+  slot.set_attribute_value("custom", glib.Variant("s", "coot-trimmings-search"))
+  root.append_item(slot)
+  root.append_section(None, body)
+  # Cascading native submenus avoid GTK's duplicate sliding-page names when
+  # the normal menu is removed/restored as a search begins or is cleared.
+  popover = Gtk.PopoverMenu.new_from_model_full(root, Gtk.PopoverMenuFlags.NESTED)
+  header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(header, "set_margin_" + side)(6)
+  search = Gtk.SearchEntry()
+  search.set_placeholder_text("Search Custom menu...")
+  search.set_size_request(340, -1)
+  if hasattr(search, "set_search_delay"):
+    search.set_search_delay(0)
+  header.append(search)
+  results = Gtk.ListBox()
+  results.set_selection_mode(Gtk.SelectionMode.SINGLE)
+  results.set_activate_on_single_click(True)
+  scroller = Gtk.ScrolledWindow()
+  scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+  scroller.set_propagate_natural_height(True)
+  scroller.set_max_content_height(360)
+  scroller.set_child(results)
+  header.append(scroller)
+  empty = Gtk.Label(label="No matching menu items.")
+  empty.add_css_class("dim-label")
+  empty.set_margin_top(8)
+  empty.set_margin_bottom(8)
+  header.append(empty)
+  state = {"search": search, "results": results, "body": body, "root": root, "popover": popover,
+           "rows": [], "launching": False, "filtering": None}
+  def enabled(item):
+    action = app.lookup_action(item["action"][4:]) if item["action"].startswith("app.") else None
+    return bool(action and action.get_enabled()) if item["action"].startswith("app.") else True
+  def refresh(*_args):
+    child = results.get_first_child()
+    while child is not None:
+      results.remove(child)
+      child = results.get_first_child()
+    state["rows"] = []
+    query = search.get_text().strip()
+    if bool(query) != state["filtering"]:
+      body.remove_all()
+      if not query:
+        body.append_section(None, menu)
+      state["filtering"] = bool(query)
+    if query:
+      for item in _custom_menu_search_matches(menu, query):
+        row = Gtk.ListBoxRow()
+        row.set_sensitive(enabled(item))
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        labels.set_margin_top(5)
+        labels.set_margin_bottom(5)
+        for text, dim in ((item["label"], False), (item["path"] or "Custom", True)):
+          label = Gtk.Label(label=text)
+          label.set_xalign(0)
+          label.set_wrap(True)
+          label.set_max_width_chars(52)
+          if dim:
+            label.add_css_class("dim-label")
+          labels.append(label)
+        row.set_child(labels)
+        row.set_tooltip_text(" > ".join(part for part in (item["path"], item["label"]) if part))
+        results.append(row)
+        state["rows"].append((row, item))
+      first = next((row for row, item in state["rows"] if row.get_sensitive()), None)
+      results.select_row(first)
+    scroller.set_visible(bool(query and state["rows"]))
+    empty.set_visible(bool(query and not state["rows"]))
+  def activate(_list=None, row=None):
+    if state["launching"]:
+      return
+    row = row or results.get_selected_row()
+    item = next((item for candidate, item in state["rows"] if candidate == row), None)
+    if item is None or not enabled(item):
+      return
+    # Recent-file action names are reused. Never dispatch a result whose label
+    # or target no longer matches the live menu entry behind that action name.
+    if item not in _custom_menu_search_items(menu):
+      refresh()
+      add_status_bar_text("Custom menu changed; please select the search result again.")
+      return
+    state["launching"] = True
+    popover.popdown()
+    def run():
+      state["launching"] = False
+      try:
+        if not enabled(item) or item not in _custom_menu_search_items(menu):
+          add_status_bar_text("Custom menu changed; please select the search result again.")
+          return False
+        if not button.activate_action(item["action"], item["target"]):
+          info_dialog("This menu action is no longer available.")
+      except Exception as error:
+        traceback.print_exc()
+        info_dialog(f"Custom menu action failed: {error}")
+      return False
+    glib.idle_add(run)
+  def key_pressed(_controller, keyval, _keycode, _modifiers):
+    if keyval in (65362, 65364) and search.get_text().strip():
+      rows = [row for row, item in state["rows"] if row.get_sensitive()]
+      if rows:
+        selected = results.get_selected_row()
+        index = rows.index(selected) if selected in rows else (-1 if keyval == 65364 else 0)
+        row = rows[(index + (1 if keyval == 65364 else -1)) % len(rows)]
+        results.select_row(row)
+        # Focusing the row scrolls it into view; keep typing in the search box.
+        row.grab_focus()
+        search.grab_focus()
+      return True
+    if keyval in (65293, 65421) and search.get_text().strip():
+      activate()
+      return True
+    if keyval == 65307:
+      if search.get_text():
+        search.set_text("")
+        refresh()
+      else:
+        popover.popdown()
+      return True
+    return False
+  def opened(*_args):
+    search.set_text("")
+    refresh()
+    def focus():
+      if popover.get_mapped():
+        search.grab_focus()
+      return False
+    glib.idle_add(focus)
+  controller = Gtk.EventControllerKey()
+  controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+  controller.connect("key-pressed", key_pressed)
+  search.add_controller(controller)
+  search.connect("search-changed", refresh)
+  search.connect("activate", lambda *_: activate())
+  results.connect("row-activated", activate)
+  popover.connect("map", opened)
+  state.update(refresh=refresh, activate=activate, key_pressed=key_pressed)
+  try:
+    if not popover.add_child(header, "coot-trimmings-search"):
+      raise RuntimeError("Coot could not embed the Custom menu search field.")
+    refresh()
+    button.set_popover(popover)
+  except Exception:
+    button.set_popover(original_popover)
+    raise
+  button.custom_menu_search = state
+  return state
+
+
+def _toolbar_parse_call(text):
+  """Accept one public function call, never statements or unrestricted eval."""
+  if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+    raise ValueError("Enter one function call, for example cylinder_refine().")
+  try:
+    tree = ast.parse(text.strip(), mode="eval")
+  except (SyntaxError, ValueError) as error:
+    raise ValueError("Enter a Python function call, not a statement or code block.") from error
+  allowed = (ast.Expression, ast.Call, ast.Name, ast.Load, ast.Attribute, ast.Constant,
+             ast.List, ast.Tuple, ast.Dict, ast.UnaryOp, ast.UAdd, ast.USub,
+             ast.Subscript, ast.Slice, ast.keyword)
+  nodes = list(ast.walk(tree))
+  if len(nodes) > 150 or not isinstance(tree.body, ast.Call):
+    raise ValueError("Enter a single, reasonably short function call.")
+  for node in nodes:
+    if not isinstance(node, allowed):
+      raise ValueError("Use calls, literal arguments, keywords and indexing; no operators or code blocks.")
+    if isinstance(node, ast.Name) and node.id.startswith("_"):
+      raise ValueError("Private names are not supported in toolbar calls.")
+    if isinstance(node, ast.Attribute) and (not isinstance(node.value, ast.Name)
+        or node.value.id not in ("coot", "coot_utils", "coot_fitting", "coot_gui") or node.attr.startswith("_")):
+      raise ValueError("Qualified functions must be public members of coot, coot_utils, coot_fitting or coot_gui.")
+    if isinstance(node, ast.Call) and not isinstance(node.func, (ast.Name, ast.Attribute)):
+      raise ValueError("Call a named function, not a computed callable.")
+    if isinstance(node, ast.Call) and len({kw.arg for kw in node.keywords}) != len(node.keywords):
+      raise ValueError("Keyword arguments must not be repeated.")
+    if isinstance(node, ast.keyword) and (node.arg is None or node.arg.startswith("_")):
+      raise ValueError("Expanded or private keyword arguments are not supported.")
+    if isinstance(node, ast.Dict) and any(key is None for key in node.keys):
+      raise ValueError("Expanded dictionaries are not supported.")
+  return tree.body
+
+
+def _toolbar_eval_call(node, execute=False):
+  """Resolve names while editing/loading; execute calls only after a click."""
+  if isinstance(node, ast.Constant):
+    return node.value
+  if isinstance(node, ast.Name):
+    if node.id not in globals():
+      raise ValueError(f"Function or value unavailable in this session: {node.id}")
+    return globals()[node.id]
+  if isinstance(node, ast.Attribute):
+    module = globals().get(node.value.id)
+    if module is None and node.value.id == "coot_gui":
+      module = _coot_gui_module()
+    if module is None or not hasattr(module, node.attr):
+      raise ValueError(f"API unavailable in this build: {node.value.id}.{node.attr}")
+    return getattr(module, node.attr)
+  if isinstance(node, ast.Call):
+    function = _toolbar_eval_call(node.func, execute)
+    if not callable(function):
+      raise ValueError("The selected name is not a function.")
+    args = [_toolbar_eval_call(arg, execute) for arg in node.args]
+    kwargs = {kw.arg: _toolbar_eval_call(kw.value, execute) for kw in node.keywords}
+    return function(*args, **kwargs) if execute else None
+  if isinstance(node, (ast.List, ast.Tuple)):
+    values = [_toolbar_eval_call(value, execute) for value in node.elts]
+    return tuple(values) if isinstance(node, ast.Tuple) else values
+  if isinstance(node, ast.Dict):
+    keys = [_toolbar_eval_call(key, execute) for key in node.keys]
+    values = [_toolbar_eval_call(value, execute) for value in node.values]
+    return dict(zip(keys, values)) if execute else None
+  if isinstance(node, ast.UnaryOp):
+    value = _toolbar_eval_call(node.operand, execute)
+    return (-value if isinstance(node.op, ast.USub) else +value) if execute else None
+  if isinstance(node, ast.Slice):
+    values = [_toolbar_eval_call(value, execute) if value is not None else None
+              for value in (node.lower, node.upper, node.step)]
+    return slice(*values) if execute else None
+  if isinstance(node, ast.Subscript):
+    value, index = _toolbar_eval_call(node.value, execute), _toolbar_eval_call(node.slice, execute)
+    return value[index] if execute else None
+  raise ValueError("Unsupported toolbar call expression.")
+
+
+def _toolbar_normalize_buttons(buttons):
+  if not isinstance(buttons, list) or len(buttons) > 100:
+    raise ValueError("Toolbar preferences must contain a list of at most 100 buttons.")
+  result, ids = [], set()
+  for button in buttons:
+    if not isinstance(button, dict):
+      raise ValueError("Invalid toolbar button definition.")
+    row = {}
+    for field, limit in (("id", 80), ("label", 100), ("tooltip", 500), ("icon", 250)):
+      value = button.get(field, "")
+      if not isinstance(value, str) or len(value) > limit:
+        raise ValueError(f"Invalid toolbar {field}.")
+      row[field] = value.strip()
+    if not row["id"] or row["id"] in ids or not row["label"]:
+      raise ValueError("Each button needs a label and a unique identifier.")
+    ids.add(row["id"])
+    for field in ("visible", "show_label"):
+      row[field] = button.get(field, True)
+      if type(row[field]) is not bool:
+        raise ValueError(f"Invalid toolbar {field} setting.")
+    icon = row["icon"]
+    if icon and (not icon.startswith(("theme:", "coot:")) or not icon.split(":", 1)[1]
+                 or any(char in icon for char in ("/", "\\", "\0")) or ".." in icon):
+      raise ValueError("Choose an icon from the available icon picker.")
+    row["kind"] = button.get("kind")
+    if row["kind"] == "call":
+      row["call"] = button.get("call", "")
+      _toolbar_parse_call(row["call"])
+    elif row["kind"] == "menu":
+      source = button.get("source")
+      if not isinstance(source, dict) or not isinstance(source.get("path"), str) or not isinstance(source.get("label"), str):
+        raise ValueError("Choose an item from the Custom menu.")
+      if not source["label"] or len(source["path"]) > 1000 or len(source["label"]) > 500:
+        raise ValueError("Invalid menu item identity.")
+      target = source.get("target")
+      if target is not None and (not isinstance(target, dict) or set(target) != {"type", "value"}
+                                 or not isinstance(target["type"], str) or len(target["type"]) > 100):
+        raise ValueError("Invalid menu action target.")
+      row["source"] = {"path": source["path"], "label": source["label"], "target": target}
+    else:
+      raise ValueError("Choose a menu action or a function call.")
+    result.append(row)
+  # Check that preferences really are JSON data, never widgets or callables.
+  json.dumps(result, allow_nan=False)
+  return result
+
+
+def _toolbar_state():
+  state = _CUSTOM_TOOLBAR_STATE
+  if "buttons" not in state:
+    state.update(buttons=[], menu=None, group=None, window=None, load_error=None)
+    path = os.path.join(_coot_trimmings_dir(), CUSTOM_TOOLBAR_FILENAME)
+    try:
+      with open(path, encoding="utf-8") as handle:
+        source = handle.read(1024*1024+1)
+      if len(source) > 1024*1024:
+        raise ValueError("Toolbar preferences file is too large.")
+      data = json.loads(source)
+      if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("Unsupported toolbar preferences version.")
+      state["buttons"] = _toolbar_normalize_buttons(data.get("buttons"))
+    except FileNotFoundError:
+      pass
+    except Exception as error:
+      state["load_error"] = (f"Could not read {path}: {error}. File left unchanged; "
+                             "repair or remove it and restart Coot before saving.")
+      print(state["load_error"])
+  return state
+
+
+def _toolbar_commit(buttons):
+  state = _toolbar_state()
+  if state["load_error"]:
+    raise ValueError(state["load_error"])
+  buttons = _toolbar_normalize_buttons(buttons)
+  path = os.path.join(_coot_trimmings_dir(), CUSTOM_TOOLBAR_FILENAME)
+  temporary = None
+  try:
+    fd, temporary = tempfile.mkstemp(prefix=".coot_toolbar_", suffix=".json", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump({"version": 1, "buttons": buttons}, handle, indent=2, ensure_ascii=True, allow_nan=False)
+      handle.write("\n")
+    os.replace(temporary, path)
+    temporary = None
+  finally:
+    if temporary is not None:
+      os.unlink(temporary)
+  state["buttons"] = buttons
+  _toolbar_render()
+
+
+def _toolbar_menu_source(item):
+  target = item["target"]
+  return {"path": item["path"], "label": item["label"],
+          "target": None if target is None else {"type": target.get_type_string(),
+              "value": json.loads(json.dumps(target.unpack(), allow_nan=False))}}
+
+
+def _toolbar_menu_items(query=""):
+  menu = _toolbar_state()["menu"]
+  if menu is None:
+    return []
+  items = _custom_menu_search_matches(menu, query) if query.strip() else _custom_menu_search_items(menu)
+  # A recent-file slot can point at a different file next session. Pin commands,
+  # not history slots; favourite monomers are resolved by their current label.
+  return [item for item in items if not item["path"].startswith(("Recent maps", "Recent models"))]
+
+
+def _toolbar_resolve_menu(source):
+  matches = [item for item in _toolbar_menu_items() if _toolbar_menu_source(item) == source]
+  if len(matches) != 1:
+    raise ValueError("Menu item unavailable or ambiguous: " + source["path"] + " > " + source["label"])
+  return matches[0]
+
+
+def _toolbar_problem(button):
+  try:
+    if button["kind"] == "call":
+      _toolbar_eval_call(_toolbar_parse_call(button["call"]), execute=False)
+    else:
+      item = _toolbar_resolve_menu(button["source"])
+      action = _coot_gui_module().coot_gui_api.application().lookup_action(item["action"].removeprefix("app."))
+      if action is None or not action.get_enabled():
+        raise ValueError("Menu action is not currently available.")
+  except Exception as error:
+    return str(error)
+  return ""
+
+
+def _toolbar_icon_theme(widget):
+  return Gtk.IconTheme.get_for_display(widget.get_display())
+
+
+def _toolbar_icon_image(token, widget):
+  if not token:
+    return None
+  theme = _toolbar_icon_theme(widget)
+  kind, name = token.split(":", 1)
+  image = None
+  if kind == "theme" and theme.has_icon(name):
+    image = Gtk.Image.new_from_icon_name(name)
+  elif kind == "coot":
+    for directory in theme.get_search_path():
+      path = os.path.join(directory, name)
+      if os.path.isfile(path):
+        image = Gtk.Image.new_from_file(path)
+        break
+  if image is not None:
+    image.set_pixel_size(24)
+  return image
+
+
+def _toolbar_icon_catalog(widget):
+  theme = _toolbar_icon_theme(widget)
+  result = {"theme:"+name: name for name in theme.get_icon_names()}
+  for directory in theme.get_search_path():
+    try:
+      for name in os.listdir(directory):
+        if name.lower().endswith((".svg", ".png", ".xpm")) and os.path.isfile(os.path.join(directory, name)):
+          result.setdefault("coot:"+name, "Coot: " + name)
+    except OSError:
+      continue
+  return sorted(result.items(), key=lambda item: (not item[0].startswith("coot:"), item[1].casefold()))
+
+
+def _toolbar_activate(button_id, widget):
+  button = next((row for row in _toolbar_state()["buttons"] if row["id"] == button_id), None)
+  if button is None:
+    return
+  try:
+    problem = _toolbar_problem(button)
+    if problem:
+      raise ValueError(problem)
+    if button["kind"] == "call":
+      return _toolbar_eval_call(_toolbar_parse_call(button["call"]), execute=True)
+    item = _toolbar_resolve_menu(button["source"])
+    if not widget.activate_action(item["action"], item["target"]):
+      raise ValueError("This menu action is no longer available.")
+  except Exception as error:
+    traceback.print_exc()
+    info_dialog(f"Toolbar button '{button['label']}' could not run:\n\n{error}")
+
+
+def _toolbar_render():
+  state = _toolbar_state()
+  group = state.get("group")
+  if group is None:
+    return
+  child = group.get_first_child()
+  while child is not None:
+    group.remove(child)
+    child = group.get_first_child()
+  for definition in state["buttons"]:
+    if not definition["visible"]:
+      continue
+    button = Gtk.Button()
+    content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    image = None
+    try:
+      image = _toolbar_icon_image(definition["icon"], group)
+    except Exception as error:
+      print("Toolbar icon unavailable:", error)
+    if image is not None:
+      content.append(image)
+    if definition["show_label"] or image is None:
+      content.append(Gtk.Label(label=definition["label"]))
+    button.set_child(content)
+    problem = _toolbar_problem(definition)
+    tooltip = definition["tooltip"] or definition["label"]
+    if definition["icon"] and image is None:
+      tooltip += "\nIcon unavailable; showing text."
+    button.set_tooltip_text(tooltip + ("\nUnavailable: " + problem if problem else ""))
+    button.set_sensitive(not problem)
+    button.custom_toolbar_id = definition["id"]
+    button.connect("clicked", lambda widget, button_id=definition["id"]: _toolbar_activate(button_id, widget))
+    group.append(button)
+  group.set_visible(any(button["visible"] for button in state["buttons"]))
+
+
+def _toolbar_choose_icon(parent, selected):
+  window = Gtk.Window(title="Choose toolbar icon")
+  window.set_transient_for(parent)
+  window.set_default_size(540, 440)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_"+side)(10)
+  search = Gtk.SearchEntry()
+  search.set_placeholder_text("Search Coot and GTK icons...")
+  box.append(search)
+  scroller = Gtk.ScrolledWindow()
+  scroller.set_vexpand(True)
+  grid = Gtk.FlowBox()
+  grid.set_selection_mode(Gtk.SelectionMode.NONE)
+  grid.set_max_children_per_line(6)
+  scroller.set_child(grid)
+  box.append(scroller)
+  footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  count = Gtk.Label()
+  more = Gtk.Button(label="Load more")
+  no_icon = Gtk.Button(label="Text only")
+  close = Gtk.Button(label="Cancel")
+  for widget in (count, more, no_icon, close):
+    footer.append(widget)
+  box.append(footer)
+  window.set_child(box)
+  catalog = _toolbar_icon_catalog(parent)
+  state = {"limit": 96}
+  def choose(token):
+    selected(token)
+    window.destroy()
+  def render(reset=False):
+    if reset:
+      state["limit"] = 96
+    child = grid.get_first_child()
+    while child is not None:
+      grid.remove(child)
+      child = grid.get_first_child()
+    terms = search.get_text().casefold().split()
+    matching = [(token, label) for token, label in catalog if all(term in label.casefold() for term in terms)]
+    for token, label in matching[:state["limit"]]:
+      button = Gtk.Button()
+      content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+      image = _toolbar_icon_image(token, parent)
+      if image is not None:
+        content.append(image)
+      name = label.removeprefix("Coot: ")
+      content.append(Gtk.Label(label=name if len(name) <= 13 else name[:10]+"..."))
+      button.set_child(content)
+      button.set_tooltip_text(label)
+      button.connect("clicked", lambda _widget, token=token: choose(token))
+      grid.append(button)
+    count.set_text(f"{min(len(matching), state['limit'])} / {len(matching)} icons")
+    more.set_visible(len(matching) > state["limit"])
+  def load_more(*_args):
+    state["limit"] += 96
+    render()
+  search.connect("search-changed", lambda *_: render(True))
+  more.connect("clicked", load_more)
+  no_icon.connect("clicked", lambda *_: choose(""))
+  close.connect("clicked", lambda *_: window.destroy())
+  window.toolbar_icon_widgets = {"search": search, "grid": grid, "more": more,
+                                "text_only": no_icon, "render": render, "choose": choose}
+  render()
+  window.present()
+  return window
+
+
+def custom_toolbar_dialog():
+  state = _toolbar_state()
+  if state.get("window") is not None:
+    state["window"].present()
+    return state["window"]
+  if globals().get("Gtk") is None or state.get("group") is None:
+    info_dialog("Custom toolbar buttons require Coot's GTK toolbar.")
+    return None
+  _toolbar_render()
+  window = Gtk.Window(title="Customize toolbar")
+  window.set_default_size(760, 620)
+  outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(outer, "set_margin_"+side)(12)
+  columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+  columns.set_vexpand(True)
+  outer.append(columns)
+  left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  left.set_size_request(220, -1)
+  left.append(Gtk.Label(label="Saved buttons", xalign=0))
+  saved = Gtk.ListBox()
+  saved.set_selection_mode(Gtk.SelectionMode.SINGLE)
+  scroll = Gtk.ScrolledWindow()
+  scroll.set_vexpand(True)
+  scroll.set_child(saved)
+  left.append(scroll)
+  columns.append(left)
+  right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  right.set_hexpand(True)
+  columns.append(right)
+  controls = {}
+  def field(label, widget):
+    right.append(Gtk.Label(label=label, xalign=0))
+    right.append(widget)
+    return widget
+  label = field("Button label", Gtk.Entry())
+  tooltip = field("Tooltip (optional)", Gtk.Entry())
+  mode = Gtk.ComboBoxText()
+  for text in ("Custom menu action", "Function call"):
+    mode.append_text(text)
+  field("Action", mode)
+  pages = Gtk.Stack()
+  right.append(pages)
+  menu_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+  menu_search = Gtk.SearchEntry()
+  menu_search.set_placeholder_text("Find a menu action...")
+  menu_page.append(menu_search)
+  choices = Gtk.ListBox()
+  choices.set_selection_mode(Gtk.SelectionMode.SINGLE)
+  menu_scroll = Gtk.ScrolledWindow()
+  menu_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+  menu_scroll.set_size_request(-1, 170)
+  menu_scroll.set_child(choices)
+  menu_page.append(menu_scroll)
+  pages.add_named(menu_page, "menu")
+  call_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  call = Gtk.Entry()
+  call.add_css_class("monospace")
+  call.set_placeholder_text("cylinder_refine()")
+  call_page.append(call)
+  hint = Gtk.Label(label="One API or script helper call, with arguments if needed.\n"
+                         "Runs only when clicked and may change your model.", xalign=0)
+  hint.set_wrap(True)
+  hint.add_css_class("dim-label")
+  call_page.append(hint)
+  pages.add_named(call_page, "call")
+  source_label = Gtk.Label(xalign=0)
+  source_label.set_wrap(True)
+  right.append(source_label)
+  icon_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  preview = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+  choose_icon = Gtk.Button(label="Choose icon...")
+  clear_icon = Gtk.Button(label="No icon")
+  for widget in (preview, choose_icon, clear_icon):
+    icon_row.append(widget)
+  right.append(icon_row)
+  show_label = Gtk.CheckButton(label="Show label beside icon")
+  visible = Gtk.CheckButton(label="Show button in toolbar")
+  right.append(show_label)
+  right.append(visible)
+  status = Gtk.Label(xalign=0)
+  status.set_wrap(True)
+  outer.append(status)
+  footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  save = Gtk.Button(label="Save button")
+  close = Gtk.Button(label="Close")
+  footer.append(save)
+  footer.append(close)
+  outer.append(footer)
+  window.set_child(outer)
+  editor = {"id": None, "source": None, "icon": "", "menu_rows": [], "saved_rows": [], "icon_window": None}
+  def set_icon(token):
+    editor["icon"] = token
+    child = preview.get_first_child()
+    while child is not None:
+      preview.remove(child)
+      child = preview.get_first_child()
+    image = _toolbar_icon_image(token, window)
+    preview.append(image if image is not None else Gtk.Label(label="Text only"))
+    preview.set_tooltip_text(token or "No icon")
+  def menu_selected(_list, row):
+    item = next((item for candidate, item in editor["menu_rows"] if candidate == row), None)
+    if item is not None:
+      old = editor["source"]
+      editor["source"] = _toolbar_menu_source(item)
+      if not label.get_text().strip() or (old and label.get_text() in (old["label"], old["label"].removesuffix("..."))):
+        label.set_text(item["label"].removesuffix("..."))
+      source_label.set_text(" > ".join(part for part in (item["path"], item["label"]) if part))
+  def filter_menu(*_args):
+    child = choices.get_first_child()
+    while child is not None:
+      choices.remove(child)
+      child = choices.get_first_child()
+    editor["menu_rows"] = []
+    for item in _toolbar_menu_items(menu_search.get_text()):
+      row = Gtk.ListBoxRow()
+      text = " > ".join(part for part in (item["path"], item["label"]) if part)
+      item_label = Gtk.Label(label=text, xalign=0)
+      item_label.set_wrap(True)
+      item_label.set_max_width_chars(48)
+      row.set_child(item_label)
+      choices.append(row)
+      editor["menu_rows"].append((row, item))
+      if _toolbar_menu_source(item) == editor["source"]:
+        choices.select_row(row)
+  def load(button=None):
+    editor.update(id=None if button is None else button["id"], source=None if button is None else button.get("source"))
+    label.set_text("" if button is None else button["label"])
+    tooltip.set_text("" if button is None else button["tooltip"])
+    call.set_text("" if button is None else button.get("call", ""))
+    show_label.set_active(button is None or button["show_label"])
+    visible.set_active(button is None or button["visible"])
+    mode.set_active(1 if button and button["kind"] == "call" else 0)
+    set_icon("" if button is None else button["icon"])
+    source = editor["source"]
+    source_label.set_text("" if source is None else source["path"] + " > " + source["label"])
+    filter_menu()
+    for control in ("up", "down", "hide", "remove"):
+      controls[control].set_sensitive(button is not None)
+  def refresh_saved(selected_id=None):
+    child = saved.get_first_child()
+    while child is not None:
+      saved.remove(child)
+      child = saved.get_first_child()
+    editor["saved_rows"] = []
+    selected = None
+    for button in state["buttons"]:
+      row = Gtk.ListBoxRow()
+      item = Gtk.Label(label=button["label"] + (" (hidden)" if not button["visible"] else ""), xalign=0)
+      item.set_wrap(True)
+      item.set_max_width_chars(24)
+      row.set_child(item)
+      saved.append(row)
+      editor["saved_rows"].append((row, button["id"]))
+      if button["id"] == selected_id:
+        selected = row
+    saved.select_row(selected)
+  def saved_selected(_list, row):
+    button_id = next((ident for candidate, ident in editor["saved_rows"] if candidate == row), None)
+    if button_id is not None:
+      load(next(button for button in state["buttons"] if button["id"] == button_id))
+  def commit(buttons, selected_id=None):
+    try:
+      _toolbar_commit(buttons)
+      refresh_saved(selected_id)
+      status.set_text("Saved for this session and future starts.")
+      return True
+    except Exception as error:
+      status.set_text("Could not save toolbar: " + str(error))
+      return False
+  def save_button(*_args):
+    button = {"id": editor["id"] or os.urandom(12).hex(), "label": label.get_text(),
+              "tooltip": tooltip.get_text(), "icon": editor["icon"], "show_label": show_label.get_active(),
+              "visible": visible.get_active(), "kind": "call" if mode.get_active() == 1 else "menu"}
+    button.update({"call": call.get_text()} if button["kind"] == "call" else {"source": editor["source"]})
+    try:
+      button = _toolbar_normalize_buttons([button])[0]
+    except Exception as error:
+      status.set_text(str(error))
+      return
+    buttons = [button if old["id"] == button["id"] else old for old in state["buttons"]]
+    if editor["id"] is None:
+      buttons.append(button)
+    if commit(buttons, button["id"]):
+      problem = _toolbar_problem(button)
+      if problem:
+        status.set_text("Saved, but disabled in this session: " + problem)
+  def change(operation):
+    buttons = [dict(button) for button in state["buttons"]]
+    index = next((i for i, button in enumerate(buttons) if button["id"] == editor["id"]), None)
+    if index is None:
+      return
+    selected_id = editor["id"]
+    if operation in ("up", "down"):
+      other = index + (-1 if operation == "up" else 1)
+      if not 0 <= other < len(buttons):
+        return
+      buttons[index], buttons[other] = buttons[other], buttons[index]
+    elif operation == "hide":
+      buttons[index]["visible"] = not buttons[index]["visible"]
+    else:
+      buttons.pop(index)
+      selected_id = None
+    if commit(buttons, selected_id) and selected_id is None:
+      load()
+  new = Gtk.Button(label="Add new button")
+  new.connect("clicked", lambda *_: (saved.unselect_all(), load()))
+  left.append(new)
+  order = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+  for key, text in (("up", "Up"), ("down", "Down"), ("hide", "Hide / Show"), ("remove", "Remove")):
+    button = Gtk.Button(label=text)
+    button.connect("clicked", lambda _widget, key=key: change(key))
+    controls[key] = button
+    order.append(button)
+  left.append(order)
+  def icon_picker(*_args):
+    previous = editor["icon_window"]
+    if previous is not None:
+      previous.destroy()
+    editor["icon_window"] = _toolbar_choose_icon(window, set_icon)
+  def closed(*_args):
+    if editor["icon_window"] is not None:
+      editor["icon_window"].destroy()
+    state["window"] = None
+    return False
+  def mode_changed(*_args):
+    is_call = mode.get_active() == 1
+    pages.set_visible_child_name("call" if is_call else "menu")
+    source_label.set_visible(not is_call)
+  mode.connect("changed", mode_changed)
+  menu_search.connect("search-changed", filter_menu)
+  choices.connect("row-selected", menu_selected)
+  saved.connect("row-selected", saved_selected)
+  choose_icon.connect("clicked", icon_picker)
+  clear_icon.connect("clicked", lambda *_: set_icon(""))
+  save.connect("clicked", save_button)
+  close.connect("clicked", lambda *_: window.close())
+  window.connect("close-request", closed)
+  state["window"] = window
+  window.toolbar_widgets = dict(controls, saved=saved, label=label, tooltip=tooltip, mode=mode, call=call,
+      menu_search=menu_search, choices=choices, save=save, new=new, visible=visible, show_label=show_label,
+      choose_icon=choose_icon, editor=editor, set_icon=set_icon, status=status, filter_menu=filter_menu)
+  refresh_saved()
+  load()
+  if state["load_error"]:
+    status.set_text(state["load_error"])
+  window.present()
+  return window
+
+
+def _install_custom_toolbar(menu):
+  state = _toolbar_state()
+  state["menu"] = menu
+  toolbar = _coot_gui_module().coot_gui_api.main_toolbar()
+  group = getattr(toolbar, "coot_trimmings_buttons", None)
+  if group is None:
+    group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    toolbar.append(group)
+    toolbar.coot_trimmings_buttons = group
+  state["group"] = group
+  _toolbar_render()
+
+
 def build_custom_menu():
   """Create the top-level Custom menu with direct Python submenu builders."""
   coot_gui_module = _coot_gui_module()
@@ -20671,6 +21506,8 @@ def build_custom_menu():
   menu = attach_module_menu_button("Custom")
   add_simple_coot_menu_menuitem(menu, "Custom Key Bindings...",
                                lambda _item: custom_key_bindings_dialog())
+  add_simple_coot_menu_menuitem(menu, "Customize toolbar...",
+                               lambda _item: custom_toolbar_dialog())
   submenu_display = Gio.Menu.new()
   submenu_colour = Gio.Menu.new()
   submenu_fit = Gio.Menu.new()
@@ -20717,6 +21554,14 @@ def build_custom_menu():
   _build_custom_modify_menu(submenu_modify)
   _build_custom_maps_menu(submenu_maps)
   _install_recent_files_tracking(submenu_recent_models, submenu_recent_maps)
+  try:
+    _install_custom_menu_search(menu)
+  except Exception as error:
+    print("Custom menu search unavailable; keeping the standard menu:", error)
+  try:
+    _install_custom_toolbar(menu)
+  except Exception as error:
+    print("Custom toolbar unavailable; keeping Coot's toolbar unchanged:", error)
   return menu
 
 if _coot_gui_module() is not None:
