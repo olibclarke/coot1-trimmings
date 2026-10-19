@@ -533,6 +533,7 @@ MODEL_AMBIENT_ONLY_SPECULAR = (0.0, 64.0)
 
 REGISTERED_KEYBINDING_CALLBACKS = []
 REGISTERED_KEYBINDINGS = {}
+REGISTERED_KEYBINDING_ACTIONS = {}
 _CUSTOM_KEY_BINDINGS_WINDOW = None
 _CUSTOM_TOOLBAR_STATE = {}
 MAP_SURFACE_DISPLAY_STATE = {}
@@ -4148,6 +4149,8 @@ def add_key_binding(name, key, thunk):
   coot.add_key_binding_gtk4_py(key_value, ctrl_key, wrapped_thunk, name)
   key_id = ord(key_value) if isinstance(key_value, str) else key_value
   REGISTERED_KEYBINDINGS[(ctrl_key, key_id)] = (key, name)
+  globals().setdefault("REGISTERED_KEYBINDING_ACTIONS", {})[(ctrl_key, key_id)] = {
+      "key": key, "name": name, "callback": wrapped_thunk}
 
 
 def _custom_key_binding_label(key):
@@ -20966,13 +20969,18 @@ def _toolbar_normalize_buttons(buttons):
       if type(row[field]) is not bool:
         raise ValueError(f"Invalid toolbar {field} setting.")
     icon = row["icon"]
-    if icon and (not icon.startswith(("theme:", "coot:")) or not icon.split(":", 1)[1]
+    if icon and (not icon.startswith(("theme:", "coot:", "custom:")) or not icon.split(":", 1)[1]
                  or any(char in icon for char in ("/", "\\", "\0")) or ".." in icon):
-      raise ValueError("Choose an icon from the available icon picker.")
+      raise ValueError("Choose or import an icon using the icon picker.")
     row["kind"] = button.get("kind")
     if row["kind"] == "call":
       row["call"] = button.get("call", "")
       _toolbar_parse_call(row["call"])
+    elif row["kind"] == "keybinding":
+      action = button.get("action")
+      if not isinstance(action, str) or not action.strip() or len(action) > 500:
+        raise ValueError("Choose a keybinding action.")
+      row["action"] = action
     elif row["kind"] == "menu":
       source = button.get("source")
       if not isinstance(source, dict) or not isinstance(source.get("path"), str) or not isinstance(source.get("label"), str):
@@ -20985,7 +20993,7 @@ def _toolbar_normalize_buttons(buttons):
         raise ValueError("Invalid menu action target.")
       row["source"] = {"path": source["path"], "label": source["label"], "target": target}
     else:
-      raise ValueError("Choose a menu action or a function call.")
+      raise ValueError("Choose a menu action, keybinding action or function call.")
     result.append(row)
   # Check that preferences really are JSON data, never widgets or callables.
   json.dumps(result, allow_nan=False)
@@ -21060,10 +21068,27 @@ def _toolbar_resolve_menu(source):
   return matches[0]
 
 
+def _toolbar_keybinding_items(query=""):
+  terms = query.casefold().split()
+  items = list(globals().get("REGISTERED_KEYBINDING_ACTIONS", {}).values())
+  return sorted((item for item in items if all(term in
+      (item["name"] + " " + _custom_key_binding_label(item["key"])).casefold() for term in terms)),
+      key=lambda item: item["name"].casefold())
+
+
+def _toolbar_resolve_keybinding(name):
+  matches = [item for item in _toolbar_keybinding_items() if item["name"] == name]
+  if len(matches) != 1:
+    raise ValueError("Keybinding action unavailable or ambiguous: " + name)
+  return matches[0]["callback"]
+
+
 def _toolbar_problem(button):
   try:
     if button["kind"] == "call":
       _toolbar_eval_call(_toolbar_parse_call(button["call"]), execute=False)
+    elif button["kind"] == "keybinding":
+      _toolbar_resolve_keybinding(button["action"])
     else:
       item = _toolbar_resolve_menu(button["source"])
       action = _coot_gui_module().coot_gui_api.application().lookup_action(item["action"].removeprefix("app."))
@@ -21076,6 +21101,285 @@ def _toolbar_problem(button):
 
 def _toolbar_icon_theme(widget):
   return Gtk.IconTheme.get_for_display(widget.get_display())
+
+
+def _toolbar_custom_icon_directory():
+  return os.path.join(_coot_trimmings_dir(), "coot_trimmings_toolbar_icons")
+
+
+def _toolbar_custom_icon_name(token):
+  if not isinstance(token, str) or not token.startswith("custom:"):
+    raise ValueError("Only imported custom icons can be renamed or removed.")
+  name = token.split(":", 1)[1]
+  stem, suffix = os.path.splitext(name)
+  if (len(stem) != 64 or any(char not in "0123456789abcdef" for char in stem)
+      or suffix not in (".png", ".svg", ".jpg", ".jpeg", ".xpm", ".webp")):
+    raise ValueError("Invalid custom icon filename.")
+  return name
+
+
+def _toolbar_validate_icon_names(names):
+  if not isinstance(names, dict):
+    raise ValueError("Invalid custom icon names.")
+  for filename, label in names.items():
+    if not isinstance(filename, str):
+      raise ValueError("Invalid custom icon filename.")
+    _toolbar_custom_icon_name("custom:" + filename)
+    if not isinstance(label, str) or not label.strip() or len(label) > 100 or not label.isprintable():
+      raise ValueError("Icon names must contain 1-100 printable characters.")
+  return names
+
+
+def _toolbar_icon_names():
+  path = os.path.join(_toolbar_custom_icon_directory(), ".names.json")
+  try:
+    with open(path, encoding="utf-8") as handle:
+      source = handle.read(256*1024+1)
+  except FileNotFoundError:
+    return {}
+  if len(source) > 256*1024:
+    raise ValueError("Custom icon names file is too large.")
+  data = json.loads(source)
+  if not isinstance(data, dict) or data.get("version") != 1:
+    raise ValueError("Unsupported custom icon names version.")
+  return _toolbar_validate_icon_names(data.get("names"))
+
+
+def _toolbar_write_icon_names(names):
+  names = _toolbar_validate_icon_names(names)
+  data = json.dumps({"version": 1, "names": names}, indent=2, ensure_ascii=True) + "\n"
+  if len(data) > 256*1024:
+    raise ValueError("Custom icon names file is too large.")
+  directory = _toolbar_custom_icon_directory()
+  os.makedirs(directory, exist_ok=True)
+  temporary = None
+  try:
+    fd, temporary = tempfile.mkstemp(prefix=".names_", suffix=".json", dir=directory)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      handle.write(data)
+    os.replace(temporary, os.path.join(directory, ".names.json"))
+    temporary = None
+  finally:
+    if temporary is not None:
+      os.unlink(temporary)
+
+
+def _toolbar_rename_icon(token, label):
+  filename = _toolbar_custom_icon_name(token)
+  if not isinstance(label, str):
+    raise ValueError("Enter an icon name.")
+  label = label.strip()
+  _toolbar_validate_icon_names({filename: label})
+  if not os.path.isfile(os.path.join(_toolbar_custom_icon_directory(), filename)):
+    raise ValueError("This custom icon is no longer available.")
+  names = _toolbar_icon_names()
+  names[filename] = label
+  _toolbar_write_icon_names(names)
+  return label
+
+
+def _toolbar_import_icon(path):
+  suffix = os.path.splitext(path)[1].lower()
+  if suffix not in (".png", ".svg", ".jpg", ".jpeg", ".xpm", ".webp"):
+    raise ValueError("Choose a PNG, SVG, JPEG, XPM or WebP image.")
+  with open(path, "rb") as handle:
+    data = handle.read(5*1024*1024+1)
+  if not data or len(data) > 5*1024*1024:
+    raise ValueError("Icon images must be nonempty and smaller than 5 MB.")
+  pixbuf = _coot_gui_repository_module("GdkPixbuf")
+  if pixbuf is None:
+    raise ValueError("Image loading is unavailable in this Coot build.")
+  loader = pixbuf.PixbufLoader.new()
+  loader.set_size(48, 48)
+  try:
+    loader.write(data)
+    loader.close()
+    if loader.get_pixbuf() is None:
+      raise ValueError("This image could not be loaded.")
+  except Exception as error:
+    raise ValueError("This image could not be loaded: " + str(error)) from error
+  name = hashlib.sha256(data).hexdigest() + suffix
+  names = _toolbar_icon_names()
+  directory = _toolbar_custom_icon_directory()
+  os.makedirs(directory, exist_ok=True)
+  temporary = None
+  try:
+    fd, temporary = tempfile.mkstemp(prefix=".icon_", dir=directory)
+    with os.fdopen(fd, "wb") as handle:
+      handle.write(data)
+    os.replace(temporary, os.path.join(directory, name))
+    temporary = None
+  finally:
+    if temporary is not None:
+      os.unlink(temporary)
+  if name not in names:
+    names[name] = "".join(char if char.isprintable() else " " for char in os.path.basename(path)).strip()[:100] or "Imported icon"
+    _toolbar_write_icon_names(names)
+  return "custom:" + name
+
+
+def _toolbar_remove_custom_icon(token):
+  name = _toolbar_custom_icon_name(token)
+  try:
+    os.unlink(os.path.join(_toolbar_custom_icon_directory(), name))
+  except FileNotFoundError:
+    pass
+  # Keep its label so re-importing the same image restores the searchable name.
+  _toolbar_render()
+
+
+def _toolbar_add_icon_drop(widget, import_path, show_error):
+  gdk = _coot_gui_repository_module("Gdk")
+  if gdk is None or not hasattr(gdk, "FileList") or not hasattr(Gtk, "DropTarget"):
+    return None
+  target = Gtk.DropTarget.new(gdk.FileList.__gtype__, gdk.DragAction.COPY)
+  def dropped(_target, value, _x, _y):
+    try:
+      files = value.get_files()
+      if len(files) != 1:
+        raise ValueError("Drop one image file at a time.")
+      path = files[0].get_path()
+      if not path:
+        raise ValueError("Drop an image saved on this computer.")
+      return bool(import_path(path))
+    except Exception as error:
+      show_error(str(error))
+      return False
+  target.connect("drop", dropped)
+  widget.add_controller(target)
+  return target
+
+
+def _toolbar_add_file_preview(chooser):
+  glib = _coot_gui_repository_module("GLib")
+  gio = _coot_gui_repository_module("Gio")
+  pixbuf = _coot_gui_repository_module("GdkPixbuf")
+  if (glib is None or gio is None or pixbuf is None
+      or not hasattr(pixbuf.Pixbuf, "new_from_stream_at_scale_async")):
+    return None
+  pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  pane.set_vexpand(True)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(pane, "set_margin_"+side)(10)
+  details = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+  details.set_hexpand(True)
+  details.append(Gtk.Label(label="Selected image", xalign=0))
+  description = Gtk.Label(label="Select an image to preview.", xalign=0)
+  description.set_wrap(True)
+  description.set_max_width_chars(45)
+  description.set_hexpand(True)
+  details.append(description)
+  pane.append(details)
+  # Gtk.Image applies icon sizing. Picture scales the cached preview to its
+  # allocation, including on resize, without decoding the selected file again.
+  image = Gtk.Picture()
+  image.set_can_shrink(True)
+  if hasattr(image, "set_content_fit") and hasattr(Gtk, "ContentFit"):
+    image.set_content_fit(Gtk.ContentFit.CONTAIN)
+  else:
+    image.set_keep_aspect_ratio(True)
+  image.set_hexpand(True)
+  image.set_vexpand(True)
+  image.set_size_request(-1, 180)
+  pane.append(image)
+  chooser.get_content_area().append(pane)
+  state = {"closed": False, "source": None, "path": None, "started": False,
+           "cancellable": None, "loads": 0}
+  def cancel_load():
+    if state["cancellable"] is not None:
+      state["cancellable"].cancel()
+      state["cancellable"] = None
+  def stop(*_args):
+    state["closed"] = True
+    if state["source"] is not None:
+      glib.source_remove(state["source"])
+      state["source"] = None
+    cancel_load()
+    return False
+  def close_stream(stream):
+    if stream is not None:
+      try:
+        stream.close(None)
+      except Exception:
+        pass
+  def start_load(file, path):
+    request = gio.Cancellable.new()
+    state["cancellable"] = request
+    def current():
+      return not state["closed"] and state["cancellable"] is request and not request.is_cancelled()
+    def failed(error):
+      if current():
+        description.set_text(os.path.basename(path) + "\nPreview unavailable: " + str(error))
+    def opened(source, result, *_args):
+      stream = None
+      try:
+        stream = source.read_finish(result)
+        if not current():
+          close_stream(stream)
+          return
+        def decoded(_source, result, *_args):
+          try:
+            thumbnail = pixbuf.Pixbuf.new_from_stream_finish(result)
+            if current():
+              image.set_pixbuf(thumbnail)
+              description.set_text(os.path.basename(path))
+          except Exception as error:
+            failed(error)
+          finally:
+            close_stream(stream)
+        state["loads"] += 1
+        pixbuf.Pixbuf.new_from_stream_at_scale_async(stream, 512, 384, True, request, decoded)
+      except Exception as error:
+        close_stream(stream)
+        failed(error)
+    def inspected(source, result, *_args):
+      try:
+        info = source.query_info_finish(result)
+        if not current():
+          return
+        if info.get_file_type() != gio.FileType.REGULAR:
+          description.set_text("Select an image file to preview.")
+        elif not 0 < info.get_size() <= 5*1024*1024:
+          description.set_text("Preview skipped: icon images must be nonempty and at most 5 MB.")
+        else:
+          file.read_async(glib.PRIORITY_DEFAULT, request, opened)
+      except Exception as error:
+        failed(error)
+    file.query_info_async("standard::size,standard::type", gio.FileQueryInfoFlags.NONE,
+                          glib.PRIORITY_DEFAULT, request, inspected)
+  def tick():
+    if state["closed"]:
+      state["source"] = None
+      return False
+    if not chooser.get_mapped():
+      return True
+    try:
+      file = chooser.get_file()
+      path = file.get_path() if file is not None else None
+      if path != state["path"]:
+        cancel_load()
+        state.update(path=path, started=False)
+        image.set_paintable(None)
+        description.set_text(os.path.basename(path) if path else "Select an image to preview.")
+        return True
+      if path and not state["started"]:
+        state["started"] = True
+        if os.path.splitext(path)[1].lower() in (".png", ".svg", ".jpg", ".jpeg", ".xpm", ".webp"):
+          start_load(file, path)
+        else:
+          description.set_text("Select a supported image file to preview.")
+    except Exception:
+      description.set_text("Preview unavailable.")
+      stop()
+      return False
+    return True
+  # GTK4 has no public selection-changed signal on FileChooser. Only poll while
+  # this browser is open; two equal samples debounce navigation without file I/O.
+  state["source"] = glib.timeout_add(250, tick)
+  chooser.connect("unrealize", stop)
+  chooser.toolbar_preview_widgets = {"image": image, "description": description,
+                                     "state": state, "stop": stop, "tick": tick}
+  return stop
 
 
 def _toolbar_icon_image(token, widget):
@@ -21092,6 +21396,10 @@ def _toolbar_icon_image(token, widget):
       if os.path.isfile(path):
         image = Gtk.Image.new_from_file(path)
         break
+  elif kind == "custom":
+    path = os.path.join(_toolbar_custom_icon_directory(), name)
+    if os.path.isfile(path):
+      image = Gtk.Image.new_from_file(path)
   if image is not None:
     image.set_pixel_size(24)
   return image
@@ -21100,6 +21408,16 @@ def _toolbar_icon_image(token, widget):
 def _toolbar_icon_catalog(widget):
   theme = _toolbar_icon_theme(widget)
   result = {"theme:"+name: name for name in theme.get_icon_names()}
+  directory = _toolbar_custom_icon_directory()
+  try:
+    names = _toolbar_icon_names()
+  except Exception as error:
+    names = {}
+    print("Could not read custom icon names; file left unchanged:", error)
+  if os.path.isdir(directory):
+    for name in sorted(os.listdir(directory)):
+      if not name.startswith(".") and os.path.isfile(os.path.join(directory, name)):
+        result["custom:"+name] = "Custom: " + names.get(name, name[:12] + os.path.splitext(name)[1])
   for directory in theme.get_search_path():
     try:
       for name in os.listdir(directory):
@@ -21107,7 +21425,8 @@ def _toolbar_icon_catalog(widget):
           result.setdefault("coot:"+name, "Coot: " + name)
     except OSError:
       continue
-  return sorted(result.items(), key=lambda item: (not item[0].startswith("coot:"), item[1].casefold()))
+  return sorted(result.items(), key=lambda item: (0 if item[0].startswith("custom:") else
+      1 if item[0].startswith("coot:") else 2, item[1].casefold()))
 
 
 def _toolbar_activate(button_id, widget):
@@ -21120,6 +21439,8 @@ def _toolbar_activate(button_id, widget):
       raise ValueError(problem)
     if button["kind"] == "call":
       return _toolbar_eval_call(_toolbar_parse_call(button["call"]), execute=True)
+    if button["kind"] == "keybinding":
+      return _toolbar_resolve_keybinding(button["action"])()
     item = _toolbar_resolve_menu(button["source"])
     if not widget.activate_action(item["action"], item["target"]):
       raise ValueError("This menu action is no longer available.")
@@ -21164,15 +21485,16 @@ def _toolbar_render():
   group.set_visible(any(button["visible"] for button in state["buttons"]))
 
 
-def _toolbar_choose_icon(parent, selected):
+def _toolbar_choose_icon(parent, selected, initial="", library_changed=None):
   window = Gtk.Window(title="Choose toolbar icon")
   window.set_transient_for(parent)
+  window.set_destroy_with_parent(True)
   window.set_default_size(540, 440)
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for side in ("start", "end", "top", "bottom"):
     getattr(box, "set_margin_"+side)(10)
   search = Gtk.SearchEntry()
-  search.set_placeholder_text("Search Coot and GTK icons...")
+  search.set_placeholder_text("Search icons...")
   box.append(search)
   scroller = Gtk.ScrolledWindow()
   scroller.set_vexpand(True)
@@ -21181,6 +21503,34 @@ def _toolbar_choose_icon(parent, selected):
   grid.set_max_children_per_line(6)
   scroller.set_child(grid)
   box.append(scroller)
+  preview_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  preview = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  preview.set_hexpand(True)
+  use_icon = Gtk.Button(label="Use icon")
+  use_icon.set_sensitive(False)
+  preview_row.append(preview)
+  preview_row.append(use_icon)
+  box.append(preview_row)
+  name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  name_row.append(Gtk.Label(label="Icon name"))
+  icon_name = Gtk.Entry()
+  icon_name.set_max_length(100)
+  icon_name.set_hexpand(True)
+  rename_icon = Gtk.Button(label="Rename")
+  name_row.append(icon_name)
+  name_row.append(rename_icon)
+  box.append(name_row)
+  library_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  import_icon = Gtk.Button(label="Import image...")
+  import_icon.set_tooltip_text("Copy your own image into the saved toolbar icons folder")
+  remove_icon = Gtk.Button(label="Remove custom icon")
+  remove_icon.set_sensitive(False)
+  library_row.append(import_icon)
+  library_row.append(remove_icon)
+  box.append(library_row)
+  status = Gtk.Label(xalign=0)
+  status.set_wrap(True)
+  box.append(status)
   footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
   count = Gtk.Label()
   more = Gtk.Button(label="Load more")
@@ -21191,17 +21541,63 @@ def _toolbar_choose_icon(parent, selected):
   box.append(footer)
   window.set_child(box)
   catalog = _toolbar_icon_catalog(parent)
-  state = {"limit": 96}
-  def choose(token):
-    selected(token)
+  state = {"limit": 96, "chooser": None, "closed": False, "parent_handler": None,
+           "selected": "", "confirm_remove": False, "tiles": []}
+  def dismiss_chooser():
+    chooser = state["chooser"]
+    state["chooser"] = None
+    if chooser is not None:
+      stop_preview = getattr(chooser, "toolbar_stop_preview", None)
+      if stop_preview is not None:
+        stop_preview()
+      chooser.destroy()
+  def cleanup(*_args):
+    state["closed"] = True
+    dismiss_chooser()
+    if state["parent_handler"] is not None:
+      parent.disconnect(state["parent_handler"])
+      state["parent_handler"] = None
+    return False
+  def close_picker(*_args):
+    cleanup()
     window.destroy()
+  def choose(token):
+    if state["closed"]:
+      return
+    selected(token)
+    close_picker()
+  def preview_icon(token):
+    if state["closed"]:
+      return
+    state.update(selected=token, confirm_remove=False)
+    child = preview.get_first_child()
+    while child is not None:
+      preview.remove(child)
+      child = preview.get_first_child()
+    image = _toolbar_icon_image(token, parent)
+    if image is not None:
+      image.set_pixel_size(48)
+      preview.append(image)
+    name = dict(catalog).get(token, "Choose an icon to preview")
+    preview.append(Gtk.Label(label=name if len(name) <= 35 else name[:32]+"...", xalign=0))
+    preview.set_tooltip_text(name)
+    use_icon.set_sensitive(bool(token))
+    remove_icon.set_label("Remove custom icon")
+    remove_icon.set_sensitive(token.startswith("custom:"))
+    name_row.set_visible(token.startswith("custom:"))
+    icon_name.set_text(name.removeprefix("Custom: ") if token.startswith("custom:") else "")
+    for tile, candidate in state["tiles"]:
+      if candidate == token:
+        tile.add_css_class("suggested-action")
+      else:
+        tile.remove_css_class("suggested-action")
+    status.set_text("")
   def render(reset=False):
-    if reset:
-      state["limit"] = 96
     child = grid.get_first_child()
     while child is not None:
       grid.remove(child)
       child = grid.get_first_child()
+    state["tiles"] = []
     terms = search.get_text().casefold().split()
     matching = [(token, label) for token, label in catalog if all(term in label.casefold() for term in terms)]
     for token, label in matching[:state["limit"]]:
@@ -21210,24 +21606,131 @@ def _toolbar_choose_icon(parent, selected):
       image = _toolbar_icon_image(token, parent)
       if image is not None:
         content.append(image)
-      name = label.removeprefix("Coot: ")
+      name = label.removeprefix("Coot: ").removeprefix("Custom: ")
       content.append(Gtk.Label(label=name if len(name) <= 13 else name[:10]+"..."))
       button.set_child(content)
       button.set_tooltip_text(label)
-      button.connect("clicked", lambda _widget, token=token: choose(token))
+      if token == state["selected"]:
+        button.add_css_class("suggested-action")
+      button.connect("clicked", lambda _widget, token=token: preview_icon(token))
       grid.append(button)
+      state["tiles"].append((button, token))
     count.set_text(f"{min(len(matching), state['limit'])} / {len(matching)} icons")
     more.set_visible(len(matching) > state["limit"])
   def load_more(*_args):
     state["limit"] += 96
     render()
+  def import_path(path):
+    if state["closed"]:
+      return False
+    try:
+      token = _toolbar_import_icon(path)
+      catalog[:] = _toolbar_icon_catalog(parent)
+      search.set_text("")
+      render()
+      preview_icon(token)
+      scroller.get_vadjustment().set_value(0)
+      status.set_text("Added to custom icons. Click Use icon to apply it to the button.")
+      return True
+    except Exception as error:
+      status.set_text(str(error))
+      return False
+  def remove_selected(*_args):
+    token = state["selected"]
+    if state["closed"] or not token.startswith("custom:"):
+      return
+    users = [button["label"] for button in _toolbar_state()["buttons"] if button["icon"] == token]
+    if not state["confirm_remove"]:
+      state["confirm_remove"] = True
+      remove_icon.set_label("Confirm removal")
+      warning = (f" Used by {len(users)} saved button(s); these will fall back to text." if users else "")
+      status.set_text("Remove this image from custom icons?" + warning + " The original file is kept.")
+      return
+    try:
+      _toolbar_remove_custom_icon(token)
+      catalog[:] = _toolbar_icon_catalog(parent)
+      preview_icon("")
+      render()
+      if library_changed is not None:
+        library_changed()
+      status.set_text("Removed from custom icons." + (" Buttons using it now show text." if users else ""))
+    except Exception as error:
+      status.set_text("Could not remove icon: " + str(error))
+  def rename_selected(*_args):
+    token = state["selected"]
+    if state["closed"] or not token.startswith("custom:"):
+      return
+    try:
+      label = _toolbar_rename_icon(token, icon_name.get_text())
+      catalog[:] = _toolbar_icon_catalog(parent)
+      search.set_text("")
+      render()
+      preview_icon(token)
+      status.set_text("Icon renamed to '" + label + "'.")
+    except Exception as error:
+      status.set_text("Could not rename icon: " + str(error))
+  def browse_image(*_args):
+    if state["closed"]:
+      return
+    if state["chooser"] is not None:
+      state["chooser"].present()
+      return
+    # Avoid the Quartz native chooser's asynchronous completion after its parent
+    # disappears. A GTK dialog also respects the picker window's stacking order.
+    chooser = Gtk.FileChooserDialog(title="Import toolbar icon", transient_for=window,
+        modal=True, action=Gtk.FileChooserAction.OPEN)
+    chooser.set_default_size(800, 640)
+    chooser.set_destroy_with_parent(True)
+    chooser.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Import", Gtk.ResponseType.ACCEPT)
+    chooser.set_default_response(Gtk.ResponseType.ACCEPT)
+    images = Gtk.FileFilter()
+    images.set_name("Icon images")
+    for suffix in ("png", "svg", "jpg", "jpeg", "xpm", "webp"):
+      images.add_pattern("*."+suffix)
+      images.add_pattern("*."+suffix.upper())
+    chooser.add_filter(images)
+    chooser.toolbar_stop_preview = _toolbar_add_file_preview(chooser)
+    def response(dialog, response_id):
+      if state["closed"] or state["chooser"] is not dialog:
+        return
+      chosen = dialog.get_file() if response_id == Gtk.ResponseType.ACCEPT else None
+      path = chosen.get_path() if chosen is not None else None
+      dismiss_chooser()
+      window.present()
+      if path:
+        import_path(path)
+    def chooser_closed(dialog):
+      response(dialog, Gtk.ResponseType.CANCEL)
+      return True
+    chooser.connect("response", response)
+    chooser.connect("close-request", chooser_closed)
+    state["chooser"] = chooser
+    chooser.present()
+  window.connect("close-request", cleanup)
+  window.connect("unrealize", cleanup)
+  state["parent_handler"] = parent.connect("unrealize", close_picker)
+  import_icon.connect("clicked", browse_image)
   search.connect("search-changed", lambda *_: render(True))
   more.connect("clicked", load_more)
+  use_icon.connect("clicked", lambda *_: choose(state["selected"]) if state["selected"] else None)
+  remove_icon.connect("clicked", remove_selected)
+  rename_icon.connect("clicked", rename_selected)
+  icon_name.connect("activate", rename_selected)
   no_icon.connect("clicked", lambda *_: choose(""))
-  close.connect("clicked", lambda *_: window.destroy())
+  close.connect("clicked", close_picker)
+  drop_target = _toolbar_add_icon_drop(box, import_path, status.set_text)
+  if drop_target is not None:
+    hint = Gtk.Label(label="Or drop an image file into this window.")
+    hint.add_css_class("dim-label")
+    box.append(hint)
   window.toolbar_icon_widgets = {"search": search, "grid": grid, "more": more,
-                                "text_only": no_icon, "render": render, "choose": choose}
+      "text_only": no_icon, "render": render, "choose": choose, "state": state,
+      "count": count, "import_icon": import_icon, "import_path": import_path, "status": status,
+      "cancel": close, "drop_target": drop_target, "preview_icon": preview_icon,
+      "use_icon": use_icon, "remove_icon": remove_icon, "preview": preview,
+      "icon_name": icon_name, "rename_icon": rename_icon, "name_row": name_row}
   render()
+  preview_icon(initial if initial in dict(catalog) else "")
   window.present()
   return window
 
@@ -21253,7 +21756,8 @@ def custom_toolbar_dialog():
   left.set_size_request(220, -1)
   left.append(Gtk.Label(label="Saved buttons", xalign=0))
   saved = Gtk.ListBox()
-  saved.set_selection_mode(Gtk.SelectionMode.SINGLE)
+  saved.set_selection_mode(Gtk.SelectionMode.NONE)
+  saved.set_activate_on_single_click(True)
   scroll = Gtk.ScrolledWindow()
   scroll.set_vexpand(True)
   scroll.set_child(saved)
@@ -21263,6 +21767,9 @@ def custom_toolbar_dialog():
   right.set_hexpand(True)
   columns.append(right)
   controls = {}
+  heading = Gtk.Label(label="Choose a button", xalign=0)
+  heading.add_css_class("heading")
+  right.append(heading)
   def field(label, widget):
     right.append(Gtk.Label(label=label, xalign=0))
     right.append(widget)
@@ -21270,7 +21777,7 @@ def custom_toolbar_dialog():
   label = field("Button label", Gtk.Entry())
   tooltip = field("Tooltip (optional)", Gtk.Entry())
   mode = Gtk.ComboBoxText()
-  for text in ("Custom menu action", "Function call"):
+  for text in ("Custom menu action", "Function call", "Keybinding action"):
     mode.append_text(text)
   field("Action", mode)
   pages = Gtk.Stack()
@@ -21316,13 +21823,20 @@ def custom_toolbar_dialog():
   status.set_wrap(True)
   outer.append(status)
   footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-  save = Gtk.Button(label="Save button")
+  save = Gtk.Button(label="Add button")
   close = Gtk.Button(label="Close")
   footer.append(save)
   footer.append(close)
   outer.append(footer)
   window.set_child(outer)
-  editor = {"id": None, "source": None, "icon": "", "menu_rows": [], "saved_rows": [], "icon_window": None}
+  editor = {"id": None, "source": None, "action": None, "icon": "", "menu_rows": [],
+            "saved_rows": [], "icon_window": None, "active": False, "loading": False}
+  def update_save(*_args):
+    if editor["loading"]:
+      return
+    action_ready = (bool(call.get_text().strip()) if mode.get_active() == 1 else
+                    bool(editor["action"]) if mode.get_active() == 2 else bool(editor["source"]))
+    save.set_sensitive(editor["active"] and bool(label.get_text().strip()) and action_ready)
   def set_icon(token):
     editor["icon"] = token
     child = preview.get_first_child()
@@ -21332,46 +21846,92 @@ def custom_toolbar_dialog():
     image = _toolbar_icon_image(token, window)
     preview.append(image if image is not None else Gtk.Label(label="Text only"))
     preview.set_tooltip_text(token or "No icon")
+  def import_icon_file(path):
+    if not editor["active"]:
+      status.set_text("Click New button or choose a saved button first.")
+      return False
+    picker = icon_picker()
+    return picker.toolbar_icon_widgets["import_path"](path)
+  drop_target = _toolbar_add_icon_drop(icon_row, import_icon_file, status.set_text)
+  if drop_target is not None:
+    hint = Gtk.Label(label="Or drop an image onto the icon row.", xalign=0)
+    hint.add_css_class("dim-label")
+    right.insert_child_after(hint, icon_row)
   def menu_selected(_list, row):
+    if not editor["active"] or editor["loading"]:
+      return
     item = next((item for candidate, item in editor["menu_rows"] if candidate == row), None)
     if item is not None:
+      if mode.get_active() == 2:
+        old = editor["action"]
+        editor["action"] = item["name"]
+        if not label.get_text().strip() or label.get_text() == old:
+          label.set_text(item["name"])
+        source_label.set_text(item["name"] + " (" + _custom_key_binding_label(item["key"]) + ")")
+        update_save()
+        return
       old = editor["source"]
       editor["source"] = _toolbar_menu_source(item)
       if not label.get_text().strip() or (old and label.get_text() in (old["label"], old["label"].removesuffix("..."))):
         label.set_text(item["label"].removesuffix("..."))
       source_label.set_text(" > ".join(part for part in (item["path"], item["label"]) if part))
+      update_save()
   def filter_menu(*_args):
     child = choices.get_first_child()
     while child is not None:
       choices.remove(child)
       child = choices.get_first_child()
     editor["menu_rows"] = []
-    for item in _toolbar_menu_items(menu_search.get_text()):
+    is_keybinding = mode.get_active() == 2
+    items = _toolbar_keybinding_items(menu_search.get_text()) if is_keybinding else _toolbar_menu_items(menu_search.get_text())
+    for item in items:
       row = Gtk.ListBoxRow()
-      text = " > ".join(part for part in (item["path"], item["label"]) if part)
+      text = (item["name"] + " (" + _custom_key_binding_label(item["key"]) + ")" if is_keybinding else
+              " > ".join(part for part in (item["path"], item["label"]) if part))
       item_label = Gtk.Label(label=text, xalign=0)
       item_label.set_wrap(True)
       item_label.set_max_width_chars(48)
       row.set_child(item_label)
       choices.append(row)
       editor["menu_rows"].append((row, item))
-      if _toolbar_menu_source(item) == editor["source"]:
+      if (item["name"] == editor["action"] if is_keybinding else _toolbar_menu_source(item) == editor["source"]):
         choices.select_row(row)
-  def load(button=None):
-    editor.update(id=None if button is None else button["id"], source=None if button is None else button.get("source"))
+  def load(button=None, draft=False):
+    editor["loading"] = True
+    if editor["icon_window"] is not None:
+      editor["icon_window"].destroy()
+      editor["icon_window"] = None
+    editor.update(id=None if button is None else button["id"], source=None if button is None else button.get("source"),
+                  action=None if button is None else button.get("action"), active=button is not None or draft)
+    heading.set_text("Editing: " + button["label"] if button is not None else "New button" if draft else "Choose a button")
+    save.set_label("Add button" if button is None else "Update button")
     label.set_text("" if button is None else button["label"])
     tooltip.set_text("" if button is None else button["tooltip"])
     call.set_text("" if button is None else button.get("call", ""))
     show_label.set_active(button is None or button["show_label"])
     visible.set_active(button is None or button["visible"])
-    mode.set_active(1 if button and button["kind"] == "call" else 0)
+    mode.set_active({"call": 1, "keybinding": 2}.get(button["kind"], 0) if button else 0)
     set_icon("" if button is None else button["icon"])
     source = editor["source"]
-    source_label.set_text("" if source is None else source["path"] + " > " + source["label"])
+    source_label.set_text(editor["action"] or ("" if source is None else source["path"] + " > " + source["label"]))
     filter_menu()
     for control in ("up", "down", "hide", "remove"):
       controls[control].set_sensitive(button is not None)
+    # No GTK selection exists until an existing button is explicitly opened.
+    saved.set_selection_mode(Gtk.SelectionMode.SINGLE if button is not None else Gtk.SelectionMode.NONE)
+    row = next((row for row, ident in editor["saved_rows"] if ident == editor["id"]), None)
+    if row is not None:
+      saved.select_row(row)
+    else:
+      saved.unselect_all()
+    right.set_sensitive(editor["active"])
+    editor["loading"] = False
+    update_save()
+    status.set_text("New button: enter a label and choose an action." if draft else
+        "Editing: " + button["label"] if button is not None else
+        "Click New button to create one, or choose a saved button to edit.")
   def refresh_saved(selected_id=None):
+    editor["loading"] = True
     child = saved.get_first_child()
     while child is not None:
       saved.remove(child)
@@ -21389,24 +21949,31 @@ def custom_toolbar_dialog():
       if button["id"] == selected_id:
         selected = row
     saved.select_row(selected)
+    editor["loading"] = False
   def saved_selected(_list, row):
+    if editor["loading"]:
+      return
     button_id = next((ident for candidate, ident in editor["saved_rows"] if candidate == row), None)
-    if button_id is not None:
+    if button_id is not None and button_id != editor["id"]:
       load(next(button for button in state["buttons"] if button["id"] == button_id))
   def commit(buttons, selected_id=None):
     try:
       _toolbar_commit(buttons)
       refresh_saved(selected_id)
+      load(next((button for button in state["buttons"] if button["id"] == selected_id), None))
       status.set_text("Saved for this session and future starts.")
       return True
     except Exception as error:
       status.set_text("Could not save toolbar: " + str(error))
       return False
   def save_button(*_args):
+    if not editor["active"]:
+      return
     button = {"id": editor["id"] or os.urandom(12).hex(), "label": label.get_text(),
               "tooltip": tooltip.get_text(), "icon": editor["icon"], "show_label": show_label.get_active(),
-              "visible": visible.get_active(), "kind": "call" if mode.get_active() == 1 else "menu"}
-    button.update({"call": call.get_text()} if button["kind"] == "call" else {"source": editor["source"]})
+              "visible": visible.get_active(), "kind": ("menu", "call", "keybinding")[mode.get_active()]}
+    button.update({"call": call.get_text()} if button["kind"] == "call" else
+                  {"action": editor["action"]} if button["kind"] == "keybinding" else {"source": editor["source"]})
     try:
       button = _toolbar_normalize_buttons([button])[0]
     except Exception as error:
@@ -21415,7 +21982,9 @@ def custom_toolbar_dialog():
     buttons = [button if old["id"] == button["id"] else old for old in state["buttons"]]
     if editor["id"] is None:
       buttons.append(button)
-    if commit(buttons, button["id"]):
+    is_new = editor["id"] is None
+    if commit(buttons, None if is_new else button["id"]):
+      status.set_text(("Added '" if is_new else "Updated '") + button["label"] + "'. Saved for future starts.")
       problem = _toolbar_problem(button)
       if problem:
         status.set_text("Saved, but disabled in this session: " + problem)
@@ -21437,8 +22006,8 @@ def custom_toolbar_dialog():
       selected_id = None
     if commit(buttons, selected_id) and selected_id is None:
       load()
-  new = Gtk.Button(label="Add new button")
-  new.connect("clicked", lambda *_: (saved.unselect_all(), load()))
+  new = Gtk.Button(label="New button")
+  new.connect("clicked", lambda *_: (load(draft=True), label.grab_focus()))
   left.append(new)
   order = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
   for key, text in (("up", "Up"), ("down", "Down"), ("hide", "Hide / Show"), ("remove", "Remove")):
@@ -21448,10 +22017,15 @@ def custom_toolbar_dialog():
     order.append(button)
   left.append(order)
   def icon_picker(*_args):
+    if not editor["active"]:
+      return None
     previous = editor["icon_window"]
-    if previous is not None:
-      previous.destroy()
-    editor["icon_window"] = _toolbar_choose_icon(window, set_icon)
+    if previous is not None and not previous.toolbar_icon_widgets["state"]["closed"]:
+      previous.present()
+      return previous
+    editor["icon_window"] = _toolbar_choose_icon(window, set_icon, initial=editor["icon"],
+        library_changed=lambda: set_icon(editor["icon"]))
+    return editor["icon_window"]
   def closed(*_args):
     if editor["icon_window"] is not None:
       editor["icon_window"].destroy()
@@ -21461,10 +22035,20 @@ def custom_toolbar_dialog():
     is_call = mode.get_active() == 1
     pages.set_visible_child_name("call" if is_call else "menu")
     source_label.set_visible(not is_call)
+    menu_search.set_placeholder_text("Find a keybinding action..." if mode.get_active() == 2 else "Find a menu action...")
+    source_label.set_text("")
+    filter_menu()
+    update_save()
   mode.connect("changed", mode_changed)
   menu_search.connect("search-changed", filter_menu)
   choices.connect("row-selected", menu_selected)
+  choices.connect("row-activated", menu_selected)
+  # In blank/new mode rows are activatable but not selectable. While editing,
+  # keyboard and mouse selection both load the highlighted button.
+  saved.connect("row-activated", saved_selected)
   saved.connect("row-selected", saved_selected)
+  label.connect("changed", update_save)
+  call.connect("changed", update_save)
   choose_icon.connect("clicked", icon_picker)
   clear_icon.connect("clicked", lambda *_: set_icon(""))
   save.connect("clicked", save_button)
@@ -21473,11 +22057,13 @@ def custom_toolbar_dialog():
   state["window"] = window
   window.toolbar_widgets = dict(controls, saved=saved, label=label, tooltip=tooltip, mode=mode, call=call,
       menu_search=menu_search, choices=choices, save=save, new=new, visible=visible, show_label=show_label,
-      choose_icon=choose_icon, editor=editor, set_icon=set_icon, status=status, filter_menu=filter_menu)
+      choose_icon=choose_icon, editor=editor, set_icon=set_icon, status=status, filter_menu=filter_menu,
+      heading=heading, drop_target=drop_target, form=right)
   refresh_saved()
   load()
   if state["load_error"]:
     status.set_text(state["load_error"])
+  window.set_focus(new)
   window.present()
   return window
 
