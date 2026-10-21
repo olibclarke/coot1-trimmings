@@ -461,6 +461,7 @@ PROPORTIONAL_EDITING_RADIUS_STATE = {"applied": 0.0, "pending": None, "source": 
 COMMON_MONOMER_FAVORITES_FILENAME = "coot_trimmings_favorites.json"
 DISPLAY_PREFERENCES_FILENAME = "coot_trimmings_preferences.py"
 CUSTOM_TOOLBAR_FILENAME = "coot_trimmings_toolbar.json"
+TRACKPAD_PREFERENCES_FILENAME = "coot_trimmings_trackpad.json"
 COMMON_MONOMER_FAVORITE_CIF_PREFIX = "coot_trimmings_favorite_"
 WATER_REFINE_MAX_DISPLACEMENT = 1.0
 RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
@@ -537,6 +538,10 @@ REGISTERED_KEYBINDINGS = {}
 REGISTERED_KEYBINDING_ACTIONS = {}
 _CUSTOM_KEY_BINDINGS_WINDOW = None
 _CUSTOM_TOOLBAR_STATE = {}
+_TRACKPAD_STATE = {"enabled": False, "bindings": [], "native_zoom": [], "pending": {}, "source": None,
+                   "pinch": {}, "scroll_active": {}, "window": None, "reverse": True, "startup": False,
+                   "save_source": None, "startup_source": None, "startup_attempts": 0,
+                   "sensitivity": {"rotate": 2.0, "translate": 2.0, "zoom": 2.0, "contour": 2.0, "clipping": 2.0}}
 MAP_SURFACE_DISPLAY_STATE = {}
 MAP_SURFACE_OPACITY_STATE = {}
 MAP_GLOBAL_VIEW_SETTINGS = {}
@@ -4672,6 +4677,533 @@ def default_background_to_black():
     return False
   add_status_bar_text("Black background enabled for this and future Coot sessions")
   return True
+
+
+def _trackpad_preferences_path():
+  return os.path.join(_coot_trimmings_dir(), TRACKPAD_PREFERENCES_FILENAME)
+
+
+def _trackpad_normalize_preferences(data):
+  if not isinstance(data, dict) or data.get("version", 1) != 1:
+    raise ValueError("Unsupported trackpad preferences")
+  result = {"version": 1, "startup": False, "reverse": True, "sensitivity": {}}
+  for name in ("startup", "reverse"):
+    value = data.get(name, result[name])
+    if type(value) is not bool:
+      raise ValueError(f"Invalid trackpad {name} setting")
+    result[name] = value
+  values = data.get("sensitivity", {})
+  if not isinstance(values, dict):
+    raise ValueError("Invalid trackpad sensitivities")
+  for name in ("zoom", "rotate", "translate", "contour", "clipping"):
+    value = values.get(name, 2.0)
+    if type(value) not in (float, int) or not math.isfinite(value) or not 0.1 <= value <= 3.0:
+      raise ValueError(f"Invalid trackpad {name} sensitivity")
+    result["sensitivity"][name] = float(value)
+  return result
+
+
+def _save_trackpad_preferences(startup=None):
+  state = _TRACKPAD_STATE
+  temporary = None
+  try:
+    data = _trackpad_normalize_preferences({
+      "startup": state["startup"] if startup is None else startup,
+      "reverse": state["reverse"], "sensitivity": state["sensitivity"]})
+    path = _trackpad_preferences_path()
+    fd, temporary = tempfile.mkstemp(prefix=".coot_trackpad_", suffix=".json", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump(data, handle, indent=2, allow_nan=False)
+      handle.write("\n")
+    os.replace(temporary, path)
+    temporary = None
+    state["startup"] = data["startup"]
+    return True
+  except Exception as error:
+    info_dialog(f"Could not save trackpad startup settings.\n\n{error}")
+    return False
+  finally:
+    if temporary is not None:
+      try:
+        os.unlink(temporary)
+      except OSError:
+        pass
+
+
+def _trackpad_save_tick():
+  _TRACKPAD_STATE["save_source"] = None
+  if _TRACKPAD_STATE["startup"]:
+    _save_trackpad_preferences()
+  return False
+
+
+def _schedule_trackpad_preferences_save():
+  state = _TRACKPAD_STATE
+  if state["startup"] and state["save_source"] is None:
+    state["save_source"] = _coot_gui_repository_module("GLib").timeout_add(400, _trackpad_save_tick)
+
+
+def _trackpad_startup_tick():
+  state = _TRACKPAD_STATE
+  if not state["startup"] or state["enabled"]:
+    state["startup_source"] = None
+    return False
+  try:
+    if _trackpad_model_areas():
+      state["startup_source"] = None
+      set_custom_trackpad_controls(True)
+      return False
+    # Wait only during startup, with a bound in case the drawing area never maps.
+    state["startup_attempts"] += 1
+    if state["startup_attempts"] < 20:
+      return True
+    print("WARNING:: trackpad startup skipped: no visible model drawing area")
+  except Exception as error:
+    print(f"WARNING:: could not start custom trackpad controls: {error}")
+  state["startup_source"] = None
+  return False
+
+
+def _initialize_trackpad_preferences():
+  state = _TRACKPAD_STATE
+  try:
+    with open(_trackpad_preferences_path(), encoding="utf-8") as handle:
+      data = _trackpad_normalize_preferences(json.load(handle))
+    for name in ("startup", "reverse", "sensitivity"):
+      state[name] = data[name]
+  except FileNotFoundError:
+    return
+  except Exception as error:
+    print(f"WARNING:: could not read trackpad settings; using defaults: {error}")
+    return
+  if state["startup"] and state["startup_source"] is None:
+    glib = _coot_gui_repository_module("GLib")
+    if glib is not None:
+      state["startup_attempts"] = 0
+      state["startup_source"] = glib.timeout_add(250, _trackpad_startup_tick)
+
+
+def _trackpad_model_areas():
+  """Search only the main Coot view, not other windows such as Ramachandran plots."""
+  gui = _coot_gui_module()
+  if gui is None:
+    return []
+  pending = [gui.coot_gui_api.main_hbox()]
+  areas = []
+  while pending:
+    widget = pending.pop()
+    if isinstance(widget, Gtk.GLArea) and widget.get_mapped():
+      areas.append(widget)
+    child = widget.get_first_child()
+    while child is not None:
+      pending.append(child)
+      child = child.get_next_sibling()
+  if not areas:
+    return []
+  largest = max(area.get_width() * area.get_height() for area in areas)
+  return [area for area in areas if area.get_width() * area.get_height() >= largest * 0.8]
+
+
+def _trackpad_unit_vector(vector):
+  length = math.sqrt(sum(float(v) ** 2 for v in vector))
+  if not math.isfinite(length) or length < 1e-8:
+    raise ValueError("Coot did not return usable screen vectors")
+  return tuple(float(v) / length for v in vector)
+
+
+def _trackpad_screen_frame():
+  vectors = coot.screen_vectors_py()
+  x = _trackpad_unit_vector(vectors[0])
+  # Coot's screen Y vector points down, not up. Orthogonalize to limit drift.
+  down = vectors[1]
+  dot = sum(x[i] * float(down[i]) for i in range(3))
+  y = _trackpad_unit_vector(tuple(-float(down[i]) + dot * x[i] for i in range(3)))
+  z = (x[1]*y[2] - x[2]*y[1], x[2]*y[0] - x[0]*y[2], x[0]*y[1] - x[1]*y[0])
+  return x, y, z
+
+
+def _trackpad_frame_quaternion(frame):
+  """Get XYZW from the view basis; older native quaternion getters return zero."""
+  m = frame
+  trace = m[0][0] + m[1][1] + m[2][2]
+  if trace > 0:
+    s = math.sqrt(trace + 1.0) * 2.0
+    return ((m[2][1]-m[1][2])/s, (m[0][2]-m[2][0])/s, (m[1][0]-m[0][1])/s, s/4.0)
+  i = max(range(3), key=lambda j: m[j][j])
+  j, k = (i+1) % 3, (i+2) % 3
+  s = math.sqrt(max(0.0, 1.0 + m[i][i] - m[j][j] - m[k][k])) * 2.0
+  q = [0.0] * 4
+  q[i], q[j], q[k], q[3] = s/4.0, (m[i][j]+m[j][i])/s, (m[i][k]+m[k][i])/s, (m[k][j]-m[j][k])/s
+  return tuple(q)
+
+
+def _trackpad_adjust_clipping(dy, sensitivity):
+  if dy == 0:
+    return
+  front, back = float(coot.get_clipping_plane_front()), float(coot.get_clipping_plane_back())
+  if not all(math.isfinite(v) for v in (front, back)):
+    raise ValueError("Coot returned invalid clipping planes")
+  perspective = bool(coot.use_perspective_projection_state())
+  # Orthographic near/far planes use -0.1*zoom*front and +0.3*zoom*back.
+  # Perspective getters instead return the actual near/far camera distances.
+  a, b = (front, back) if perspective else (-0.1 * front, 0.3 * back)
+  half = (b - a) / 2.0
+  if half <= 0:
+    return
+  factor = math.exp(max(-2.0, min(2.0, dy * 0.01 * sensitivity)))
+  if perspective:
+    delta = half * (factor - 1.0)
+    delta = max(-half * 0.99, min(delta, front - 2.01, 999.9 - back))
+    target_front, target_back = front - delta, back + delta
+  else:
+    # Centre on the rotation centre, NOT the existing slab midpoint. Coot's
+    # default front=back=1 has three times as much background as foreground.
+    half = min(100.0, max(0.00003, half * factor))
+    target_front, target_back = half / 0.1, half / 0.3
+  coot.set_clipping_front(target_front)
+  coot.set_clipping_back(target_back)
+  if perspective:
+    # Perspective also has eye-position limits not exposed by the API. If one
+    # setter rejects a plane, restore both to preserve the requested geometry.
+    actual_front = float(coot.get_clipping_plane_front())
+    actual_back = float(coot.get_clipping_plane_back())
+    if not math.isclose(front - actual_front, actual_back - back, rel_tol=1e-4, abs_tol=1e-4):
+      coot.set_clipping_front(front)
+      coot.set_clipping_back(back)
+
+
+def _trackpad_apply_motion(mode, value, area):
+  sensitivity = _TRACKPAD_STATE["sensitivity"]["clipping" if mode == "slab_translate" else mode]
+  if mode == "zoom":
+    coot.set_zoom(min(2000.0, max(0.2, float(value))))
+    return
+  dx, dy = value
+  if mode == "clipping":
+    _trackpad_adjust_clipping(dy, sensitivity)
+    return
+  if mode == "contour":
+    map_id = coot.scroll_wheel_map()
+    if coot.is_valid_map_molecule(map_id):
+      level = coot.get_contour_level_in_sigma(map_id)
+      coot.set_contour_level_in_sigma(map_id, max(0.01, level - dy * 0.01 * sensitivity))
+    return
+  frame = _trackpad_screen_frame()
+  if mode in ("translate", "slab_translate"):
+    scale = 0.6 * float(coot.zoom_factor()) / max(1, area.get_height()) * sensitivity
+    centre = [coot.rotation_centre_position(i) for i in range(3)]
+    qx, qy, qz, qw = _trackpad_frame_quaternion(frame)
+    # set_rotation_centre animates moves and ignores displacements below 0.3 A.
+    # The JSON setter jumps directly; its quaternion order is WXYZ, not XYZW.
+    if mode == "slab_translate":
+      # Moving the camera target in screen Z carries both world-space clip
+      # planes and the rotation centre together. Plane settings stay unchanged.
+      target = [centre[i] - scale * dy * frame[2][i] for i in range(3)]
+    else:
+      target = [centre[i] - scale * (dx * frame[0][i] - dy * frame[1][i]) for i in range(3)]
+    coot.set_view_from_json(json.dumps({
+      "rotation-centre": target,
+      "quaternion": [qw, qx, qy, qz], "zoom": float(coot.zoom_factor())}))
+    if coot.get_active_map_drag_flag():
+      coot.update_maps()
+    if coot.get_show_symmetry():
+      coot.set_show_symmetry_master(1)
+    return
+  qx, qy, qz, qw = _trackpad_frame_quaternion(frame)
+  ax, ay = math.radians(dy * 0.25 * sensitivity), math.radians(dx * 0.25 * sensitivity)
+  angle = math.hypot(ax, ay)
+  if angle < 1e-12:
+    return
+  factor = math.sin(angle / 2.0) / angle
+  x, y, w = ax * factor, ay * factor, math.cos(angle / 2.0)
+  q = (w*qx + x*qw + y*qz, w*qy + y*qw - x*qz,
+       w*qz + x*qy - y*qx, w*qw - x*qx - y*qy)
+  length = math.sqrt(sum(v*v for v in q))
+  coot.set_view_quaternion(*(v / length for v in q))
+
+
+def _trackpad_flush():
+  state = _TRACKPAD_STATE
+  state["source"] = None
+  pending, state["pending"] = state["pending"], {}
+  if not state["enabled"]:
+    return False
+  try:
+    for (mode, area), value in pending.items():
+      _trackpad_apply_motion(mode, value, area)
+  except Exception as error:
+    set_custom_trackpad_controls(False)
+    add_status_bar_text(f"Trackpad controls disabled: {error}")
+    traceback.print_exc()
+  return False
+
+
+def _trackpad_queue(mode, value, area):
+  state = _TRACKPAD_STATE
+  key = (mode, area)
+  if mode == "zoom":
+    state["pending"][key] = value
+  else:
+    previous = state["pending"].get(key, (0.0, 0.0))
+    state["pending"][key] = tuple(a+b for a, b in zip(previous, value))
+  if state["source"] is None:
+    state["source"] = _coot_gui_repository_module("GLib").timeout_add(16, _trackpad_flush)
+
+
+def _trackpad_cancel_pinch(area):
+  _TRACKPAD_STATE["pinch"].pop(area, None)
+  _TRACKPAD_STATE["pending"].pop(("zoom", area), None)
+
+
+def _trackpad_scroll_begin(_controller, area):
+  if _TRACKPAD_STATE["enabled"]:
+    _TRACKPAD_STATE["scroll_active"][area] = True
+
+
+def _trackpad_scroll_end(_controller, area):
+  _TRACKPAD_STATE["scroll_active"].pop(area, None)
+
+
+def _trackpad_scroll(controller, dx, dy, area):
+  """Use scalar GTK signals: raw Gdk.Event arguments can arrive as None."""
+  state = _TRACKPAD_STATE
+  if not state["enabled"]:
+    return False
+  try:
+    gdk = _coot_gui_repository_module("Gdk")
+    modifiers = controller.get_current_event_state()
+    if modifiers & (gdk.ModifierType.SHIFT_MASK | gdk.ModifierType.CONTROL_MASK |
+                    gdk.ModifierType.ALT_MASK | gdk.ModifierType.META_MASK):
+      _trackpad_cancel_pinch(area)
+    buttons = gdk.ModifierType.BUTTON1_MASK | gdk.ModifierType.BUTTON2_MASK | gdk.ModifierType.BUTTON3_MASK
+    if modifiers & (buttons | gdk.ModifierType.META_MASK):
+      return False
+    if modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.ALT_MASK:
+      return False
+    dx, dy = float(dx), float(dy)
+    # A zero-delta stop event must not reach Coot: native Shift-scroll treats
+    # even dy=0 as a zoom step. Handle this before deciding wheel vs surface.
+    if not math.isfinite(dx) or not math.isfinite(dy) or (dx == 0.0 and dy == 0.0):
+      return True
+    # Device source is MOUSE even for a Mac trackpad; use scroll units instead.
+    # Keep a continuous gesture captured even if GTK reports a wheel unit for
+    # one sample; otherwise native Shift-scroll can insert a fixed zoom step.
+    if controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
+      return False
+    direction = -1.0 if state["reverse"] else 1.0
+    mode = ("slab_translate" if modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.CONTROL_MASK else
+            "contour" if modifiers & gdk.ModifierType.ALT_MASK else
+            "translate" if modifiers & gdk.ModifierType.CONTROL_MASK else
+            "clipping" if modifiers & gdk.ModifierType.SHIFT_MASK else "rotate")
+    _trackpad_queue(mode, (dx * direction, dy * direction), area)
+    return True
+  except Exception as error:
+    set_custom_trackpad_controls(False)
+    add_status_bar_text(f"Trackpad controls disabled: {error}")
+    traceback.print_exc()
+    return False
+
+
+def _trackpad_pinch_begin(gesture, _sequence, area):
+  if not _TRACKPAD_STATE["enabled"]:
+    return
+  try:
+    gdk = _coot_gui_repository_module("Gdk")
+    buttons = gdk.ModifierType.BUTTON1_MASK | gdk.ModifierType.BUTTON2_MASK | gdk.ModifierType.BUTTON3_MASK
+    blocked = buttons | gdk.ModifierType.SHIFT_MASK | gdk.ModifierType.CONTROL_MASK | gdk.ModifierType.ALT_MASK | gdk.ModifierType.META_MASK
+    if gesture.get_current_event_state() & blocked:
+      _trackpad_cancel_pinch(area)
+      return
+    state = _TRACKPAD_STATE
+    state["pinch"][area] = state["pending"].get(("zoom", area), float(coot.zoom_factor()))
+  except Exception as error:
+    set_custom_trackpad_controls(False)
+    add_status_bar_text(f"Trackpad controls disabled: {error}")
+    traceback.print_exc()
+
+
+def _trackpad_pinch_scale(gesture, scale, area):
+  state = _TRACKPAD_STATE
+  if not state["enabled"] or area not in state["pinch"]:
+    return
+  try:
+    gdk = _coot_gui_repository_module("Gdk")
+    blocked = (gdk.ModifierType.SHIFT_MASK | gdk.ModifierType.CONTROL_MASK | gdk.ModifierType.ALT_MASK |
+               gdk.ModifierType.META_MASK | gdk.ModifierType.BUTTON1_MASK |
+               gdk.ModifierType.BUTTON2_MASK | gdk.ModifierType.BUTTON3_MASK)
+    if gesture.get_current_event_state() & blocked:
+      _trackpad_cancel_pinch(area)
+      return
+    scale = float(scale)
+    if not math.isfinite(scale) or scale <= 0:
+      return
+    zoom = state["pinch"][area] * math.exp(max(-20.0, min(20.0, -state["sensitivity"]["zoom"] * math.log(scale))))
+    _trackpad_queue("zoom", zoom, area)
+  except Exception as error:
+    set_custom_trackpad_controls(False)
+    add_status_bar_text(f"Trackpad controls disabled: {error}")
+    traceback.print_exc()
+
+
+def _trackpad_pinch_end(_gesture, _sequence, area):
+  _TRACKPAD_STATE["pinch"].pop(area, None)
+
+
+def set_custom_trackpad_controls(enabled=True):
+  """Install capture handlers and temporarily suspend Coot's pinch recognizers."""
+  state = _TRACKPAD_STATE
+  if not enabled:
+    state["enabled"] = False
+    if state["startup_source"] is not None:
+      _coot_gui_repository_module("GLib").source_remove(state["startup_source"])
+      state["startup_source"] = None
+    if state["source"] is not None:
+      _coot_gui_repository_module("GLib").source_remove(state["source"])
+      state["source"] = None
+    state["pending"].clear()
+    state["pinch"].clear()
+    state["scroll_active"].clear()
+    while state["bindings"]:
+      area, controller = state["bindings"].pop()
+      try:
+        area.remove_controller(controller)
+      except Exception as error:
+        print("Could not detach trackpad controller:", error)
+    while state["native_zoom"]:
+      controller, phase = state["native_zoom"].pop()
+      controller.set_propagation_phase(phase)
+    window = state.get("window")
+    if window is not None and hasattr(window, "trackpad_widgets"):
+      checkbox = window.trackpad_widgets["enabled"]
+      if checkbox.get_active():
+        checkbox.set_active(False)
+    add_status_bar_text("Native Coot trackpad controls restored")
+    return True
+  if state["enabled"]:
+    return True
+  try:
+    gdk = _coot_gui_repository_module("Gdk")
+    if (gdk is None or not hasattr(gdk, "ScrollUnit") or
+        not hasattr(Gtk.EventControllerScroll, "get_unit")):
+      raise RuntimeError("This mode needs GTK 4.8 or newer with Python event support")
+    if not callable(getattr(coot, "set_view_from_json", None)):
+      raise RuntimeError("This Coot build does not support direct camera panning")
+    areas = _trackpad_model_areas()
+    if not areas:
+      raise RuntimeError("No visible Coot model drawing area was found")
+    for area in areas:
+      controllers = area.observe_controllers()
+      for index in range(controllers.get_n_items()):
+        native = controllers.get_item(index)
+        if isinstance(native, Gtk.GestureZoom):
+          state["native_zoom"].append((native, native.get_propagation_phase()))
+          native.set_propagation_phase(Gtk.PropagationPhase.NONE)
+      controller = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.BOTH_AXES)
+      controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+      controller.connect("scroll", _trackpad_scroll, area)
+      controller.connect("scroll-begin", _trackpad_scroll_begin, area)
+      controller.connect("scroll-end", _trackpad_scroll_end, area)
+      area.add_controller(controller)
+      state["bindings"].append((area, controller))
+      pinch = Gtk.GestureZoom.new()
+      pinch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+      pinch.connect("begin", _trackpad_pinch_begin, area)
+      pinch.connect("scale-changed", _trackpad_pinch_scale, area)
+      pinch.connect("end", _trackpad_pinch_end, area)
+      pinch.connect("cancel", _trackpad_pinch_end, area)
+      area.add_controller(pinch)
+      state["bindings"].append((area, pinch))
+    state["enabled"] = True
+    add_status_bar_text("Trackpad: pinch zoom; swipe rotate; Ctrl pan; Option contour; Shift slab width; Shift-Ctrl slab Z")
+    return True
+  except Exception as error:
+    set_custom_trackpad_controls(False)
+    info_dialog(f"Could not enable custom trackpad controls.\n\n{error}")
+    return False
+
+
+def custom_trackpad_controls_dialog():
+  """Adjust current navigation and optionally remember it for startup."""
+  state = _TRACKPAD_STATE
+  if state["window"] is not None:
+    state["window"].present()
+    return state["window"]
+  window = Gtk.Window(title="Trackpad controls")
+  state["window"] = window
+  window.set_default_size(460, -1)
+  gui = _coot_gui_module()
+  parent = gui.coot_gui_api.main_toolbar().get_root() if gui else None
+  if isinstance(parent, Gtk.Window):
+    window.set_transient_for(parent)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for edge in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + edge)(12)
+  enabled = Gtk.CheckButton(label="Enable custom trackpad controls (this session)")
+  enabled.set_active(state["enabled"])
+  box.append(enabled)
+  startup = Gtk.CheckButton(label="Enable automatically on startup")
+  startup.set_active(state["startup"])
+  box.append(startup)
+  label = Gtk.Label(label="Pinch: zoom   |   Swipe: rotate\nCtrl + swipe: translate   |   Option + swipe: contour\nShift + swipe: slab width   |   Shift + Ctrl + swipe: slab Z")
+  label.set_xalign(0)
+  box.append(label)
+  grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+  sliders = {}
+  for row, (mode, name) in enumerate((("zoom", "Zoom"), ("rotate", "Rotation"),
+                                     ("translate", "Translation"), ("contour", "Contour"),
+                                     ("clipping", "Clipping (width/Z)"))):
+    grid.attach(Gtk.Label(label=name), 0, row, 1, 1)
+    slider = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 3.0, 0.1)
+    slider.set_digits(1)
+    slider.set_draw_value(True)
+    slider.set_value_pos(Gtk.PositionType.RIGHT)
+    slider.set_hexpand(True)
+    slider.set_value(state["sensitivity"][mode])
+    def sensitivity_changed(widget, key=mode):
+      state["sensitivity"][key] = widget.get_value()
+      _schedule_trackpad_preferences_save()
+    slider.connect("value-changed", sensitivity_changed)
+    grid.attach(slider, 1, row, 1, 1)
+    sliders[mode] = slider
+  box.append(grid)
+  reverse = Gtk.CheckButton(label="Reverse swipe direction")
+  reverse.set_active(state["reverse"])
+  def reverse_changed(widget):
+    state["reverse"] = widget.get_active()
+    _schedule_trackpad_preferences_save()
+  reverse.connect("toggled", reverse_changed)
+  box.append(reverse)
+  label = Gtk.Label(label="Sensitivity multipliers; 2.0 = default.\nMouse clicks and ordinary wheel input are unchanged.")
+  label.set_xalign(0)
+  box.append(label)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  restore = Gtk.Button(label="Restore native controls")
+  close = Gtk.Button(label="Close")
+  buttons.append(restore)
+  buttons.append(close)
+  box.append(buttons)
+  def toggle(widget):
+    if not set_custom_trackpad_controls(widget.get_active()):
+      widget.set_active(False)
+  enabled.connect("toggled", toggle)
+  def startup_changed(widget):
+    wanted = widget.get_active()
+    if wanted != state["startup"] and not _save_trackpad_preferences(wanted):
+      widget.set_active(state["startup"])
+  startup.connect("toggled", startup_changed)
+  restore.connect("clicked", lambda *_: enabled.set_active(False))
+  close.connect("clicked", lambda *_: window.close())
+  def closed(*_args):
+    if state["save_source"] is not None:
+      _coot_gui_repository_module("GLib").source_remove(state["save_source"])
+      _trackpad_save_tick()
+    state["window"] = None
+    return False
+  window.connect("close-request", closed)
+  window.trackpad_widgets = {"enabled": enabled, "startup": startup, "sliders": sliders, "reverse": reverse,
+                            "restore": restore, "close": close}
+  window.set_child(box)
+  window.present()
+  return window
 
 
 def _set_native_high_contrast_model_defaults(show_dialog=True):
@@ -20257,6 +20789,10 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
 def _build_custom_display_menu(submenu_display):
   """Populate the Display submenu in normal Python rather than exec'd text."""
   add_simple_coot_menu_menuitem(
+    submenu_display, "Trackpad controls...",
+    lambda func: custom_trackpad_controls_dialog(),
+  )
+  add_simple_coot_menu_menuitem(
     submenu_display,
     "Default model to high contrast display",
     lambda func: default_models_to_high_contrast_display(),
@@ -22192,6 +22728,8 @@ if _coot_gui_module() is not None:
   except Exception:
     print("coot_trimmings direct menu build failed")
     traceback.print_exc()
+
+_initialize_trackpad_preferences()
 
 # Keep this as the final startup action in the file.  It covers settings Coot
 # may have changed while the rest of this startup script was being evaluated;
