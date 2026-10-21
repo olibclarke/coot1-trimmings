@@ -538,7 +538,8 @@ REGISTERED_KEYBINDINGS = {}
 REGISTERED_KEYBINDING_ACTIONS = {}
 _CUSTOM_KEY_BINDINGS_WINDOW = None
 _CUSTOM_TOOLBAR_STATE = {}
-_TRACKPAD_STATE = {"enabled": False, "bindings": [], "native_zoom": [], "pending": {}, "source": None,
+_TRACKPAD_EDIT_STATE = None
+_TRACKPAD_STATE = {"enabled": False, "bindings": [], "native_zoom": [], "native_scroll": [], "claimed_scroll": {}, "pending": {}, "source": None,
                    "pinch": {}, "scroll_active": {}, "window": None, "reverse": True, "startup": False,
                    "save_source": None, "startup_source": None, "startup_attempts": 0,
                    "sensitivity": {"rotate": 2.0, "translate": 2.0, "zoom": 2.0, "contour": 2.0, "clipping": 2.0}}
@@ -4873,6 +4874,10 @@ def _trackpad_adjust_clipping(dy, sensitivity):
 
 
 def _trackpad_apply_motion(mode, value, area):
+  edit = globals().get("_TRACKPAD_EDIT_STATE")
+  if edit is not None and edit["move_selection"] and mode in ("rotate", "translate", "slab_translate"):
+    _trackpad_edit_motion(edit, mode, value, area)
+    return
   sensitivity = _TRACKPAD_STATE["sensitivity"]["clipping" if mode == "slab_translate" else mode]
   if mode == "zoom":
     coot.set_zoom(min(2000.0, max(0.2, float(value))))
@@ -4931,6 +4936,8 @@ def _trackpad_flush():
     for (mode, area), value in pending.items():
       _trackpad_apply_motion(mode, value, area)
   except Exception as error:
+    if globals().get("_TRACKPAD_EDIT_STATE") is not None:
+      _trackpad_edit_finish(False)
     set_custom_trackpad_controls(False)
     add_status_bar_text(f"Trackpad controls disabled: {error}")
     traceback.print_exc()
@@ -4963,9 +4970,57 @@ def _trackpad_scroll_end(_controller, area):
   _TRACKPAD_STATE["scroll_active"].pop(area, None)
 
 
+def _trackpad_claim_scroll(controller, area):
+  _TRACKPAD_STATE["claimed_scroll"][area] = controller.get_current_event_time()
+  return True
+
+
+def _trackpad_native_scroll_guard(controller, dx, dy, area, record):
+  """Never let a native wheel action repeat a captured trackpad event."""
+  state = _TRACKPAD_STATE
+  if not state["enabled"]:
+    return False
+  if state["claimed_scroll"].get(area) == controller.get_current_event_time():
+    return True
+  if _trackpad_scroll(controller, dx, dy, area):
+    return True
+  if not state["enabled"]:
+    return False
+  # Keep native wheel handling, including its real event/modifier context.
+  # Only replay events the custom controls declined; block this guard to
+  # avoid recursive emission and restore all handler states afterwards.
+  controller.handler_block(record["gate"])
+  try:
+    for handler in record["handlers"]:
+      controller.handler_unblock(handler)
+    return bool(controller.emit("scroll", dx, dy))
+  finally:
+    for handler in record["handlers"]:
+      controller.handler_block(handler)
+    controller.handler_unblock(record["gate"])
+
+
+def _trackpad_guard_native_scroll(controller, area):
+  gobject = _coot_gui_repository_module("GObject")
+  signal = gobject.signal_lookup("scroll", Gtk.EventControllerScroll)
+  record = {"controller": controller, "handlers": [], "gate": None}
+  _TRACKPAD_STATE["native_scroll"].append(record)
+  mask = gobject.SignalMatchType.ID | gobject.SignalMatchType.UNBLOCKED
+  while True:
+    handler = gobject.signal_handler_find(controller, mask, signal, 0, None, None, None)
+    if not handler:
+      break
+    if handler in record["handlers"]:
+      raise RuntimeError("Coot's native wheel handler could not be suspended safely.")
+    controller.handler_block(handler)
+    record["handlers"].append(handler)
+  record["gate"] = controller.connect("scroll", _trackpad_native_scroll_guard, area, record)
+
+
 def _trackpad_scroll(controller, dx, dy, area):
   """Use scalar GTK signals: raw Gdk.Event arguments can arrive as None."""
   state = _TRACKPAD_STATE
+  state["claimed_scroll"].pop(area, None)
   if not state["enabled"]:
     return False
   try:
@@ -4983,19 +5038,22 @@ def _trackpad_scroll(controller, dx, dy, area):
     # A zero-delta stop event must not reach Coot: native Shift-scroll treats
     # even dy=0 as a zoom step. Handle this before deciding wheel vs surface.
     if not math.isfinite(dx) or not math.isfinite(dy) or (dx == 0.0 and dy == 0.0):
-      return True
+      return _trackpad_claim_scroll(controller, area)
     # Device source is MOUSE even for a Mac trackpad; use scroll units instead.
     # Keep a continuous gesture captured even if GTK reports a wheel unit for
     # one sample; otherwise native Shift-scroll can insert a fixed zoom step.
-    if controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
+    slab_translate = bool(modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.CONTROL_MASK)
+    # Reserve this chord even outside scroll-begin/end: wheel-unit samples
+    # otherwise reach Coot's native Shift-Ctrl representation cycling.
+    if not slab_translate and controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
       return False
     direction = -1.0 if state["reverse"] else 1.0
-    mode = ("slab_translate" if modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.CONTROL_MASK else
+    mode = ("slab_translate" if slab_translate else
             "contour" if modifiers & gdk.ModifierType.ALT_MASK else
             "translate" if modifiers & gdk.ModifierType.CONTROL_MASK else
             "clipping" if modifiers & gdk.ModifierType.SHIFT_MASK else "rotate")
     _trackpad_queue(mode, (dx * direction, dy * direction), area)
-    return True
+    return _trackpad_claim_scroll(controller, area)
   except Exception as error:
     set_custom_trackpad_controls(False)
     add_status_bar_text(f"Trackpad controls disabled: {error}")
@@ -5062,12 +5120,20 @@ def set_custom_trackpad_controls(enabled=True):
     state["pending"].clear()
     state["pinch"].clear()
     state["scroll_active"].clear()
+    state["claimed_scroll"].clear()
     while state["bindings"]:
       area, controller = state["bindings"].pop()
       try:
         area.remove_controller(controller)
       except Exception as error:
         print("Could not detach trackpad controller:", error)
+    while state["native_scroll"]:
+      record = state["native_scroll"].pop()
+      controller = record["controller"]
+      if record["gate"] is not None:
+        controller.disconnect(record["gate"])
+      for handler in record["handlers"]:
+        controller.handler_unblock(handler)
     while state["native_zoom"]:
       controller, phase = state["native_zoom"].pop()
       controller.set_propagation_phase(phase)
@@ -5097,6 +5163,8 @@ def set_custom_trackpad_controls(enabled=True):
         if isinstance(native, Gtk.GestureZoom):
           state["native_zoom"].append((native, native.get_propagation_phase()))
           native.set_propagation_phase(Gtk.PropagationPhase.NONE)
+        elif isinstance(native, Gtk.EventControllerScroll):
+          _trackpad_guard_native_scroll(native, area)
       controller = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.BOTH_AXES)
       controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
       controller.connect("scroll", _trackpad_scroll, area)
@@ -5119,6 +5187,472 @@ def set_custom_trackpad_controls(enabled=True):
     set_custom_trackpad_controls(False)
     info_dialog(f"Could not enable custom trackpad controls.\n\n{error}")
     return False
+
+
+def _trackpad_edit_clear_pending():
+  state = _TRACKPAD_STATE
+  if state["source"] is not None:
+    _coot_gui_repository_module("GLib").source_remove(state["source"])
+    state["source"] = None
+  state["pending"].clear()
+  state["pinch"].clear()
+
+
+def _trackpad_native_widgets():
+  """Find native controls once per preview, never in the gesture hot path."""
+  roots = Gtk.Window.get_toplevels()
+  pending = [roots.get_item(i) for i in range(roots.get_n_items())]
+  found = {}
+  while pending:
+    widget = pending.pop()
+    name = Gtk.Buildable.get_buildable_id(widget)
+    if name:
+      found[name] = widget
+    child = widget.get_first_child()
+    while child is not None:
+      pending.append(child)
+      child = child.get_next_sibling()
+  return found
+
+
+def _trackpad_edit_update_buttons(edit):
+  button = edit.get("rigid_fit_button")
+  if button is not None:
+    button.set_sensitive(bool(edit.get("idle")) and not edit.get("fit_busy", False))
+
+
+def _trackpad_edit_begin_native(edit):
+  """Start Coot's own moving-atoms buffer, without a new model molecule."""
+  if coot.refinement_already_ongoing_p():
+    raise RuntimeError("Accept or cancel the current intermediate atoms first.")
+  action = _coot_gui_module().coot_gui_api.application().lookup_action("rotate_translate_" + edit["scope"])
+  if action is None:
+    raise RuntimeError("This Coot build does not expose the native Rotate/Translate action.")
+  # Native actions target the nearest atom. Temporarily put the stored target
+  # at the view centre and isolate picking, then restore everything in this UI turn.
+  centre = [coot.rotation_centre_position(i) for i in range(3)]
+  qx, qy, qz, qw = _trackpad_frame_quaternion(_trackpad_screen_frame())
+  view = {"rotation-centre": centre, "quaternion": [qw, qx, qy, qz], "zoom": float(coot.zoom_factor())}
+  picking = [(m, coot.mol_is_active(m), coot.mol_is_displayed(m)) for m in model_molecule_list()]
+  try:
+    if edit["scope"] != "residue_range":
+      atoms = coot.residue_info_py(edit["source"], *edit["specs"][0]) or []
+      if not atoms:
+        raise RuntimeError("The selected residue is no longer available.")
+      atom = next((a for a in atoms if not a[0][1] and a[0][0].strip() == "CA"), atoms[0])
+      for model, _active, _displayed in picking:
+        coot.set_mol_active(model, int(model == edit["source"]))
+      coot.set_mol_displayed(edit["source"], 1)
+      coot.set_view_from_json(json.dumps(dict(view, **{"rotation-centre": atom[2]})))
+    elif not edit.get("range_valid", False):
+      raise RuntimeError("The native residue range changed. Close this panel and select it again.")
+    coot.rot_trans_reset_previous()
+    # Coot exposes a setter but no getter for this native rotation preference.
+    coot.set_rotate_translate_zone_rotates_about_zone_centre(1)
+    action.activate(None)
+  finally:
+    coot.set_view_from_json(json.dumps(view))
+    for model, active, displayed in picking:
+      if valid_model_molecule_qm(model):
+        coot.set_mol_active(model, active)
+        coot.set_mol_displayed(model, displayed)
+  widgets = _trackpad_native_widgets()
+  dialog = widgets.get("rotate_translate_obj_dialog")
+  if dialog is None or not dialog.get_visible() or not coot.refinement_already_ongoing_p():
+    raise RuntimeError("Coot could not create the native movement preview.")
+  edit["owns_native"] = True
+  edit["native"] = dialog
+  edit["adjustments"] = [widgets["rotate_translate_obj_" + name + "_hscale"].get_adjustment()
+                         for name in ("xtrans", "ytrans", "ztrans", "xrot", "yrot", "zrot")]
+  dialog.set_visible(False)
+  edit["original"] = _atom_snapshot_for_specs(edit["source"], edit["specs"])
+  edit["dirty"] = False
+  edit["idle"] = False
+  _trackpad_edit_update_buttons(edit)
+
+
+def _trackpad_edit_discard_native(edit):
+  if edit.get("owns_native"):
+    coot.clear_up_moving_atoms()
+    coot.rot_trans_reset_previous()
+    if edit.get("native") is not None:
+      edit["native"].set_visible(False)
+  edit["owns_native"] = False
+  edit["adjustments"] = []
+  edit["idle"] = True
+  _trackpad_edit_update_buttons(edit)
+
+
+def _trackpad_edit_check(edit, check_coordinates=True):
+  if not valid_model_molecule_qm(edit["source"]):
+    raise RuntimeError("The selected model was closed.")
+  if not edit.get("adjustments") or not coot.refinement_already_ongoing_p():
+    raise RuntimeError("The native movement preview ended. Close this panel and start again.")
+  if check_coordinates and _atom_snapshot_for_specs(edit["source"], edit["specs"]) != edit["original"]:
+    raise RuntimeError("The selected atoms changed outside this panel. Close and reopen it.")
+
+
+def _trackpad_edit_adjust(edit, increments):
+  adjustments = edit["adjustments"]
+  # Native sliders are incremental and bounded. Rebase their remembered
+  # values before reaching a limit; sentinel + zero means no physical move.
+  steps = max(1, int(math.ceil(max(abs(v) for v in increments) / 90.0)))
+  for _ in range(steps):
+    if any(not a.get_lower() < a.get_value() + v/steps < a.get_upper()
+           for a, v in zip(adjustments, increments)):
+      coot.rot_trans_reset_previous()
+      for adjustment in adjustments:
+        adjustment.set_value(0.0)
+    for adjustment, value in zip(adjustments, increments):
+      if value:
+        adjustment.set_value(adjustment.get_value() + value/steps)
+  edit["dirty"] = True
+
+
+def _trackpad_edit_motion(edit, mode, value, area):
+  if edit.get("idle"):
+    if not valid_model_molecule_qm(edit["source"]):
+      raise RuntimeError("The selected model was closed.")
+    _trackpad_edit_begin_native(edit)
+  _trackpad_edit_check(edit, check_coordinates=False)
+  dx, dy = value
+  if not all(math.isfinite(v) for v in (dx, dy)) or max(abs(dx), abs(dy)) > 100000:
+    raise ValueError("Invalid trackpad movement.")
+  key = "clipping" if mode == "slab_translate" else mode
+  sensitivity = _TRACKPAD_STATE["sensitivity"][key]
+  increments = [0.0]*6
+  if mode == "rotate":
+    scale = math.radians(0.25) * sensitivity / 0.018
+    increments[3], increments[4] = dy * scale, -dx * scale
+  else:
+    scale = 300.0 / max(1, area.get_height()) * sensitivity
+    if mode == "slab_translate":
+      increments[2] = dy * scale
+    else:
+      increments[0], increments[1] = dx * scale, -dy * scale
+  _trackpad_edit_adjust(edit, increments)
+
+
+def _trackpad_edit_reset():
+  edit = _TRACKPAD_EDIT_STATE
+  if edit is None:
+    return
+  _trackpad_edit_clear_pending()
+  if edit.get("idle"):
+    add_status_bar_text("No unapplied movement to reset.")
+    return
+  try:
+    _trackpad_edit_check(edit)
+    _trackpad_edit_discard_native(edit)
+    add_status_bar_text("Movement reset to the last applied coordinates.")
+  except Exception as error:
+    _trackpad_edit_finish(False)
+    info_dialog(str(error))
+
+
+def _trackpad_edit_fit_selection(edit):
+  """Rigid fitting accepts one MMDB CID, not Coot's '||' selection extension."""
+  scope, specs = edit["scope"], edit["specs"]
+  if scope == "molecule":
+    return "/"
+  if not specs or len({spec[0] for spec in specs}) != 1:
+    raise ValueError("The stored fitting selection must be in one chain.")
+  chain = specs[0][0]
+  if not chain or any(c in chain for c in "/|*,[]"):
+    raise ValueError("This chain identifier cannot be represented safely by the rigid-fit API.")
+  if scope == "chain":
+    return "//" + chain
+  if scope == "residue" and len(specs) == 1:
+    return _residue_spec_to_cid_compat(specs[0])
+  if scope == "residue_range":
+    start, end = min(s[1] for s in specs), max(s[1] for s in specs)
+    actual = {tuple(s) for s in _tq_chain_residue_specs(edit["source"], chain) if start <= s[1] <= end}
+    if actual != set(map(tuple, specs)):
+      raise ValueError("The stored range no longer matches a complete native residue range. Select it again.")
+    return f"//{chain}/{start}-{end}"
+  raise ValueError("Unrecognised rigid-fit selection scope.")
+
+
+def _trackpad_edit_rigid_fit():
+  edit = _TRACKPAD_EDIT_STATE
+  if edit is None or edit.get("fit_busy"):
+    return False
+  pending_movement = edit["move_selection"] and any(
+    mode in ("rotate", "translate", "slab_translate") for mode, _area in _TRACKPAD_STATE["pending"])
+  if not edit.get("idle") or pending_movement:
+    add_status_bar_text("Apply or reset the manual movement before rigid fitting.")
+    return False
+  if coot.refinement_already_ongoing_p():
+    add_status_bar_text("Accept or cancel the current intermediate atoms before rigid fitting.")
+    return False
+  previous_immediate = None
+  started_fit = False
+  try:
+    if not valid_model_molecule_qm(edit["source"]):
+      raise RuntimeError("The selected model was closed.")
+    fit = getattr(coot, "rigid_body_refine_by_atom_selection", None)
+    if not callable(fit):
+      raise RuntimeError("This Coot build cannot rigid-fit an explicit atom selection.")
+    map_id = coot.imol_refinement_map()
+    if not coot.is_valid_map_molecule(map_id):
+      raise RuntimeError("Select a refinement map before rigid fitting.")
+    if coot.backup_state(edit["source"]) != 1:
+      raise RuntimeError("Enable Coot backups for this model so the fit can be undone.")
+    _atom_snapshot_for_specs(edit["source"], edit["specs"])
+    selection = _trackpad_edit_fit_selection(edit)
+    _trackpad_edit_clear_pending()
+    edit["fit_busy"] = True
+    _trackpad_edit_update_buttons(edit)
+    previous_immediate = coot.refinement_immediate_replacement_state()
+    coot.set_refinement_immediate_replacement(1)
+    started_fit = True
+    # This API creates fitted intermediate atoms; it does not commit them.
+    fit(edit["source"], selection)
+    if not coot.refinement_already_ongoing_p():
+      raise RuntimeError("Coot did not produce a rigid-fit solution; no fit was applied.")
+    with _grouped_model_edit(edit["source"]):
+      coot.accept_regularizement()
+    add_status_bar_text(f"Rigid fit applied to the stored selection using map #{map_id}. Swipe to continue; Undo restores the fit.")
+    return True
+  except Exception as error:
+    info_dialog(f"Could not rigid-fit the selection.\n\n{error}")
+    return False
+  finally:
+    try:
+      if started_fit:
+        coot.clear_up_moving_atoms()
+    finally:
+      if previous_immediate is not None:
+        coot.set_refinement_immediate_replacement(previous_immediate)
+      edit["fit_busy"] = False
+      _trackpad_edit_update_buttons(edit)
+
+
+def _trackpad_edit_finish(accept=False, keep_open=False):
+  global _TRACKPAD_EDIT_STATE
+  edit = _TRACKPAD_EDIT_STATE
+  if edit is None:
+    return False
+  if accept and _TRACKPAD_STATE["pending"]:
+    source = _TRACKPAD_STATE["source"]
+    if source is not None:
+      _coot_gui_repository_module("GLib").source_remove(source)
+    _trackpad_flush()
+    if _TRACKPAD_EDIT_STATE is not edit:
+      return False
+  else:
+    _trackpad_edit_clear_pending()
+  if accept:
+    try:
+      if not edit.get("idle"):
+        _trackpad_edit_check(edit)
+        if edit["dirty"]:
+          with _grouped_model_edit(edit["source"]):
+            # Calling the Python API retains the GIL. Emitting the native OK
+            # button through GI can release it while Coot runs Python hooks.
+            coot.accept_regularizement()
+        _trackpad_edit_discard_native(edit)
+      if keep_open:
+        add_status_bar_text("Movement applied. Rigid fit is available; swipe to resume moving the same selection.")
+        return True
+    except Exception as error:
+      info_dialog(f"Could not complete trackpad movement.\n\n{error}\nAny applied edits remain available in Coot Undo.")
+      return False
+  _TRACKPAD_EDIT_STATE = None
+  try:
+    _trackpad_edit_discard_native(edit)
+  finally:
+    if edit.get("range_watch") is not None:
+      widget, handler = edit["range_watch"]
+      widget.disconnect(handler)
+    if edit.get("window") is not None:
+      edit["window"].destroy()
+    if not edit["was_enabled"]:
+      set_custom_trackpad_controls(False)
+  add_status_bar_text("Trackpad movement applied; one Undo restores it." if accept else
+                      "Trackpad panel closed; unapplied movement discarded.")
+  return True
+
+
+def _trackpad_edit_panel(edit):
+  window = Gtk.Window(title="Trackpad Rotate/Translate")
+  edit["window"] = window
+  parent = _coot_gui_module().coot_gui_api.main_toolbar().get_root()
+  if isinstance(parent, Gtk.Window):
+    window.set_transient_for(parent)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for edge in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + edge)(12)
+  label = Gtk.Label(label=edit["label"] + "\nPivot: selection centre")
+  label.set_xalign(0)
+  box.append(label)
+  instructions = Gtk.Label(label="Swipe: rotate | Ctrl: X/Y | Shift-Ctrl: Z\nPinch: zoom | Option: contour\nApply, then rigid fit or swipe again. Close discards unapplied moves.")
+  instructions.set_xalign(0)
+  box.append(instructions)
+  view = Gtk.CheckButton(label="Move view instead of selection")
+  def change_view(widget):
+    _trackpad_edit_clear_pending()
+    edit["move_selection"] = not widget.get_active()
+  view.connect("toggled", change_view)
+  box.append(view)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  for name, callback in (("Rigid-fit selection", lambda *_: _trackpad_edit_rigid_fit()),
+                         ("Reset", lambda *_: _trackpad_edit_reset()),
+                         ("Apply", lambda *_: _trackpad_edit_finish(True, keep_open=True)),
+                         ("Close", lambda *_: _trackpad_edit_finish(False))):
+    button = Gtk.Button(label=name)
+    button.connect("clicked", callback)
+    if name == "Rigid-fit selection":
+      edit["rigid_fit_button"] = button
+      button.set_tooltip_text("Fit the stored selection to the selected refinement map. Apply or reset manual movement first.")
+    buttons.append(button)
+  box.append(buttons)
+  window.set_child(box)
+  window.connect("close-request", lambda *_: _trackpad_edit_finish(False) or True)
+  window.trackpad_edit_widgets = {"view": view, "buttons": buttons, "rigid_fit": edit["rigid_fit_button"]}
+  _trackpad_edit_update_buttons(edit)
+  window.present()
+  return window
+
+
+def _trackpad_pick_native_range():
+  """Let Coot record the range itself, observing real picks for our markers."""
+  if coot.refinement_already_ongoing_p():
+    add_status_bar_text("Accept or cancel the current intermediate atoms first.")
+    return None
+  _cancel_script_clicks()
+  _clear_annotation_range_pick()
+  coot.clear_pending_picks()
+  widgets = _trackpad_native_widgets()
+  toggle = widgets.get("select_residue_range_toggle_button")
+  if toggle is None or not callable(getattr(coot, "select_atom_under_pointer_py", None)):
+    info_dialog("This Coot build cannot expose native range picking for trackpad movement.")
+    return None
+  token, picks, markers, handlers = object(), [], [], []
+  def cleanup():
+    for widget, handler in handlers:
+      widget.disconnect(handler)
+    handlers.clear()
+    toggle.set_active(False)
+    while markers:
+      coot.close_generic_object(markers.pop())
+    coot.graphics_draw()
+  def clicked(controller, n_press, _x, _y):
+    if _SCRIPT_CLICK_STATE.get("token") is not token or n_press != 1 or controller.get_current_button() != 1:
+      return
+    # This handler runs AFTER Coot has picked/stored the endpoint. Unlike the
+    # user-defined-click callback, this API returns an explicit molecule ID.
+    selected = coot.select_atom_under_pointer_py()
+    if not selected:
+      return
+    model, atom = selected
+    spec = [model, *atom[-5:]]
+    try:
+      spec = _resolve_script_click(spec)
+      picks.append(spec)
+      _mark_register_endpoint(spec, "cyan" if len(picks) == 1 else "orange", markers, "Trackpad range endpoint")
+      add_status_bar_text(_navigation_status_bar_label(model, _click_spec_chain_id(spec),
+        _click_spec_res_no(spec), _click_spec_ins_code(spec)).replace("Current residue:", "Clicked residue:", 1)
+        + (" | Click the end residue." if len(picks) == 1 else " | Range selected."))
+      if len(picks) == 2:
+        specs = _clicked_residue_specs(*picks)
+        if not specs:
+          _cancel_script_clicks()
+          return
+        native_specs = [tuple(s) for s in _tq_chain_residue_specs(model, specs[0][0])
+                        if specs[0][1] <= s[1] <= specs[-1][1]]
+        # Native range selection includes all insertion codes at its endpoints.
+        if set(native_specs) != set(map(tuple, specs)):
+          raise ValueError("Native range movement cannot reliably isolate insertion-coded endpoints; use residue or chain movement.")
+        _SCRIPT_CLICK_STATE.clear()
+        cleanup()
+        if specs:
+          _start_trackpad_edit(model, specs, f"#{model} | {specs[0][0]}:{specs[0][1]}-{specs[-1][1]}",
+                               scope="residue_range", range_valid=True)
+    except Exception as error:
+      _cancel_script_clicks()
+      info_dialog(f"Could not select a movement range.\n\n{error}")
+  try:
+    for area in _trackpad_model_areas():
+      controllers = area.observe_controllers()
+      for i in range(controllers.get_n_items()):
+        controller = controllers.get_item(i)
+        if isinstance(controller, Gtk.GestureClick) and controller.get_button() in (0, 1):
+          handlers.append((controller, controller.connect_after("pressed", clicked)))
+    if not handlers:
+      raise RuntimeError("Could not find Coot's native atom-picking controller.")
+    toggle.set_active(False)
+    toggle.set_active(True)
+    _SCRIPT_CLICK_STATE.update(token=token, picking=False, cleanup=cleanup)
+    add_status_bar_text("Trackpad movement: click the start and end residues. Tab cancels.")
+    return token
+  except Exception as error:
+    cleanup()
+    info_dialog(str(error))
+    return None
+
+
+def _start_trackpad_edit(mol_id, specs, label, scope="residue", range_valid=False):
+  global _TRACKPAD_EDIT_STATE
+  if _TRACKPAD_EDIT_STATE is not None:
+    _TRACKPAD_EDIT_STATE["window"].present()
+    add_status_bar_text("Close the current movement panel before choosing a different selection.")
+    return None
+  edit = None
+  was_enabled = _TRACKPAD_STATE["enabled"]
+  try:
+    if coot.refinement_already_ongoing_p():
+      raise RuntimeError("Accept or cancel the current refinement/Rotate-Translate operation first.")
+    if coot.backup_state(mol_id) != 1:
+      raise RuntimeError("Enable Coot backups for this model so Apply can be undone.")
+    specs = [tuple(spec) for spec in specs]
+    original = _atom_snapshot_for_specs(mol_id, specs)
+    if not set_custom_trackpad_controls(True):
+      raise RuntimeError("Custom trackpad controls could not be enabled.")
+    _trackpad_edit_clear_pending()
+    edit = {"source": mol_id, "specs": specs, "scope": scope, "range_valid": range_valid,
+            "move_selection": True, "adjustments": [], "was_enabled": was_enabled, "window": None, "label": label,
+            "idle": True, "dirty": False, "owns_native": False, "original": original, "fit_busy": False}
+    _TRACKPAD_EDIT_STATE = edit
+    if scope == "residue_range":
+      toggle = _trackpad_native_widgets()["select_residue_range_toggle_button"]
+      def range_changed(widget):
+        if widget.get_active():
+          edit["range_valid"] = False
+      edit["range_watch"] = (toggle, toggle.connect("toggled", range_changed))
+    _trackpad_edit_panel(edit)
+    add_status_bar_text("Move selection: swipe rotates; Ctrl moves X/Y; Shift-Ctrl moves Z. Apply keeps the panel open.")
+    return edit
+  except Exception as error:
+    if edit is not None:
+      _trackpad_edit_finish(False)
+    else:
+      if not was_enabled and _TRACKPAD_STATE["enabled"]:
+        set_custom_trackpad_controls(False)
+    info_dialog(f"Trackpad movement could not start.\n\n{error}")
+    return None
+
+
+def trackpad_rotate_translate(scope="residue"):
+  if _TRACKPAD_EDIT_STATE is not None:
+    _TRACKPAD_EDIT_STATE["window"].present()
+    add_status_bar_text("Close the current movement panel before choosing a different selection.")
+    return None
+  if scope == "range":
+    return _trackpad_pick_native_range()
+  active = _active_residue_or_status()
+  if not active:
+    return None
+  mol_id, chain, number, ins = active[:4]
+  if scope == "residue":
+    specs, label = [(chain, number, ins)], f"#{mol_id} | Residue {chain}:{number}{ins}"
+  elif scope == "chain":
+    specs, label = _tq_chain_residue_specs(mol_id, chain), f"#{mol_id} | Chain {chain}"
+  elif scope == "molecule":
+    specs, label = _all_residue_specs_for_colouring(mol_id), f"Molecule #{mol_id}"
+  else:
+    raise ValueError("Choose residue, range, chain or molecule.")
+  return _start_trackpad_edit(mol_id, specs, label, scope=scope)
 
 
 def custom_trackpad_controls_dialog():
@@ -20958,6 +21492,12 @@ def _build_custom_user_colour_menu(submenu_colour):
 
 
 def _build_custom_fit_menu(submenu_fit):
+  trackpad_menu = Gio.Menu.new()
+  for scope, label in (("residue", "Active residue..."), ("range", "Clicked residue range..."),
+                       ("chain", "Active chain..."), ("molecule", "Active molecule...")):
+    add_simple_coot_menu_menuitem(trackpad_menu, label,
+                                 lambda _item, choice=scope: trackpad_rotate_translate(choice))
+  submenu_fit.append_submenu("Trackpad Rotate/Translate", trackpad_menu)
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (click range)...", lambda func: cylinder_refine())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (alpha helix)...", lambda func: cylinder_refine_alpha_helix())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (beta strand)...", lambda func: cylinder_refine_beta_strand())
