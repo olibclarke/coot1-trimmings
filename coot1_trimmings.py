@@ -11955,6 +11955,29 @@ def style_resampled_em_map(map_id):
   }
 
 
+def _map_appearance_map_label():
+  label = Gtk.Label(label="")
+  label.set_xalign(0.0)
+  label.set_hexpand(True)
+  label.set_ellipsize(_coot_gui_repository_module("Pango").EllipsizeMode.MIDDLE)
+  label.set_max_width_chars(44)
+  return label
+
+
+def _update_map_appearance_map_label(label, map_id):
+  if map_id is None:
+    label.set_text("No active map")
+    label.set_tooltip_text(None)
+    return
+  try:
+    name = molecule_name(map_id)
+  except Exception:
+    name = "map"
+  text = f"Active map: {name} ({map_id})"
+  label.set_text(text)
+  label.set_tooltip_text(text)
+
+
 def show_active_map_brightness_slider():
   """Open a non-modal slider that live-updates the current active map's ambient brightness."""
   initial_map = _scrollable_map_or_status()
@@ -11971,8 +11994,7 @@ def show_active_map_brightness_slider():
   vbox.set_margin_start(12)
   vbox.set_margin_end(12)
 
-  map_label = Gtk.Label(label="")
-  map_label.set_halign(Gtk.Align.START)
+  map_label = _map_appearance_map_label()
   value_label = Gtk.Label(label="100%")
   value_label.set_width_chars(5)
 
@@ -12001,14 +12023,7 @@ def show_active_map_brightness_slider():
     return displayed[0] if displayed else None
 
   def update_map_label(map_id):
-    if map_id is None:
-      map_label.set_text("No active map")
-      return
-    try:
-      name = molecule_name(map_id)
-    except Exception:
-      name = "map"
-    map_label.set_text("Active map: {} ({})".format(name, map_id))
+    _update_map_appearance_map_label(map_label, map_id)
 
   def apply_brightness(scale):
     percent = float(scale.get_value())
@@ -12063,8 +12078,7 @@ def show_active_map_colour_slider():
   vbox.set_margin_start(12)
   vbox.set_margin_end(12)
 
-  map_label = Gtk.Label(label="")
-  map_label.set_halign(Gtk.Align.START)
+  map_label = _map_appearance_map_label()
   value_label = Gtk.Label(label="")
   value_label.set_width_chars(5)
 
@@ -12093,14 +12107,7 @@ def show_active_map_colour_slider():
     return displayed[0] if displayed else None
 
   def update_map_label(map_id):
-    if map_id is None:
-      map_label.set_text("No active map")
-      return
-    try:
-      name = molecule_name(map_id)
-    except Exception:
-      name = "map"
-    map_label.set_text("Active map: {} ({})".format(name, map_id))
+    _update_map_appearance_map_label(map_label, map_id)
 
   def sync_to_map(map_id):
     if map_id is None or map_id == state["map_id"]:
@@ -15685,6 +15692,1137 @@ def delete_active_segment():
     return None
   with _grouped_model_edit(segment_context["mol_id"]):
     _delete_residue_specs(segment_context["mol_id"], segment_context["segment_specs"])
+
+
+# Random-start rigid fitting and candidate inspection.
+_GLOBAL_FIT_STATE = None
+
+
+def _global_fit_read_grid(path, np):
+  """Read Coot's own float CCP4 export, including axis order and non-orthogonal cells."""
+  with open(path, "rb") as handle:
+    header = handle.read(1024)
+  if len(header) != 1024:
+    raise ValueError("Incomplete exported map header.")
+  for endian in ("<", ">"):
+    fields = struct.unpack(endian + "256i", header)
+    shape = fields[:3]
+    axes = fields[16:19]
+    if fields[3] == 2 and all(2 <= n <= 100000 for n in shape) and sorted(axes) == [1, 2, 3]:
+      break
+  else:
+    raise ValueError("Unsupported Coot map export (expected a float CCP4 grid).")
+  sampling = np.asarray(fields[7:10], dtype=float)
+  cell_values = struct.unpack(endian + "6f", header[40:64])
+  a, b, c = cell_values[:3]
+  alpha, beta, gamma = map(math.radians, cell_values[3:])
+  if min(a, b, c, *sampling) <= 0 or not all(0 < v < math.pi for v in (alpha, beta, gamma)):
+    raise ValueError("Invalid exported map cell.")
+  cy = c*(math.cos(alpha)-math.cos(beta)*math.cos(gamma))/math.sin(gamma)
+  cz_sq = c*c-(c*math.cos(beta))**2-cy*cy
+  if cz_sq <= 0:
+    raise ValueError("Degenerate exported map cell.")
+  cell = np.asarray(((a, b*math.cos(gamma), c*math.cos(beta)),
+                     (0., b*math.sin(gamma), cy), (0., 0., math.sqrt(cz_sq))))
+  transform = (np.diag(sampling) @ np.linalg.inv(cell))[np.asarray(axes)-1]
+  offset = 1024 + fields[23]
+  if fields[23] < 0 or os.path.getsize(path) < offset + math.prod(shape)*4:
+    raise ValueError("Incomplete exported map data.")
+  data = np.memmap(path, dtype=endian + "f4", mode="r", offset=offset, shape=tuple(reversed(shape)))
+  periods = sampling[np.asarray(axes)-1].astype(int)
+  # Crystallographic exports can span a complete period including duplicate end planes.
+  periodic = fields[22] > 1 and all(n >= p for n, p in zip(shape, periods))
+  return {"np": np, "data": data, "shape": np.asarray(shape), "transform": transform, "spacegroup": fields[22],
+          "starts": np.asarray(fields[4:7], dtype=float), "periodic": periodic, "periods": periods,
+          "origin": np.asarray(struct.unpack(endian + "3f", header[196:208]), dtype=float)}
+
+
+def _global_fit_grid_values(grid, points, gradients=False):
+  np = grid["np"]
+  q = (points-grid["origin"]) @ grid["transform"].T - grid["starts"]
+  valid = np.isfinite(q).all(axis=1)
+  if grid["periodic"]:
+    q = np.mod(q, grid["periods"])
+  else:
+    valid &= ((q >= 0) & (q <= grid["shape"]-1)).all(axis=1)
+  q = np.where(valid[:, None], q, 0.)
+  lower = np.floor(q).astype(int)
+  if not grid["periodic"]:
+    lower = np.minimum(lower, grid["shape"]-2)
+  fx, fy, fz = (q-lower).T
+  if grid["periodic"]:
+    # Tiny negative coordinates can round to the exact period after modulo.
+    lower %= grid["periods"]
+  x0, y0, z0 = lower.T
+  x1, y1, z1 = (lower+1).T
+  if grid["periodic"]:
+    x1 = x1 % grid["periods"][0]
+    y1 = y1 % grid["periods"][1]
+    z1 = z1 % grid["periods"][2]
+  data = np.asarray(grid["data"])
+  a = data[z0, y0, x0].astype(float, copy=False)
+  b = data[z0, y0, x1].astype(float, copy=False)
+  c = data[z0, y1, x0].astype(float, copy=False)
+  d = data[z0, y1, x1].astype(float, copy=False)
+  e = data[z1, y0, x0].astype(float, copy=False)
+  f = data[z1, y0, x1].astype(float, copy=False)
+  g = data[z1, y1, x0].astype(float, copy=False)
+  h = data[z1, y1, x1].astype(float, copy=False)
+  # Nested interpolation reuses the same eight corners for values and gradients.
+  dx00, dx10, dx01, dx11 = b-a, d-c, f-e, h-g
+  x00, x10 = a+fx*dx00, c+fx*dx10
+  x01, x11 = e+fx*dx01, g+fx*dx11
+  dy0, dy1 = x10-x00, x11-x01
+  y_low, y_high = x00+fy*dy0, x01+fy*dy1
+  values = y_low+fz*(y_high-y_low)
+  values[~valid] = 0.
+  if not np.isfinite(values).all():
+    raise ValueError("The fitting map contains non-finite density values.")
+  if gradients:
+    gx0, gx1 = dx00+fy*(dx10-dx00), dx01+fy*(dx11-dx01)
+    derivative = np.column_stack((gx0+fz*(gx1-gx0), dy0+fz*(dy1-dy0), y_high-y_low))
+    derivative[~valid] = 0.
+    derivative = derivative @ grid["transform"]
+  else:
+    derivative = None
+  return values, derivative, valid
+
+
+def _global_fit_load_grid(map_id, original, radius):
+  np = _tq_numpy_module()
+  if np is None:
+    raise RuntimeError("Global fitting needs NumPy in Coot's Python environment.")
+  owner = tempfile.TemporaryDirectory(prefix="coot-global-fit-")
+  grid = None
+  try:
+    path = os.path.join(owner.name, "target.map")
+    if not coot.export_map(map_id, path):
+      raise RuntimeError("Coot could not export the active map for fitting.")
+    grid = _global_fit_read_grid(path, np)
+    parameters = getattr(coot, "map_parameters_py", lambda _m: None)(map_id)
+    # Coot returns a five-item list even for EM maps, with empty MTZ fields.
+    crystal = grid["spacegroup"] > 1 or bool(isinstance(parameters, (list, tuple)) and
+                                            len(parameters) >= 3 and all(parameters[:3]))
+    if crystal and all(n >= p for n, p in zip(grid["shape"], grid["periods"])):
+      grid["periodic"] = True
+    points = np.asarray(list(original.values()), dtype=float)
+    if not np.isfinite(points).all():
+      raise ValueError("The selection has non-finite coordinates.")
+    _values, _gradient, inside = _global_fit_grid_values(grid, points)
+    if crystal and not grid["periodic"]:
+      # CCP4's crystallographic exporter can write only an asymmetric unit.
+      # Ask Coot to expand a Cartesian box, preserving the exact map samples.
+      centre = points.mean(axis=0)
+      extent = float(np.linalg.norm(points-centre, axis=1).max()) + radius + 25.
+      sizes = 2*np.ceil(extent*np.linalg.norm(grid["transform"], axis=1)) + 3
+      if math.prod(map(int, sizes)) > 128000000:
+        raise ValueError("The fitting box would exceed 512 MB. Coarsen the map or choose a smaller selection first.")
+      grid["data"]._mmap.close()
+      grid = None
+      if not coot.export_map_fragment(map_id, *map(float, centre), extent, path):
+        raise ValueError("Coot could not expand the fitting map region.")
+      grid = _global_fit_read_grid(path, np)
+    grid["owner"] = owner
+    # Verify header/coordinate interpretation at grid nodes against Coot itself.
+    if inside.any():
+      available = points[inside]
+      probe = available[np.linspace(0, len(available)-1, min(12, len(available)), dtype=int)]
+      index = np.rint((probe-grid["origin"]) @ grid["transform"].T-grid["starts"])
+    else:
+      index = np.asarray(list(product((.25, .75), repeat=3)))*(grid["shape"]-1)
+      index = np.rint(index)
+    probe = (index+grid["starts"]) @ np.linalg.inv(grid["transform"]).T + grid["origin"]
+    values, _gradient, inside = _global_fit_grid_values(grid, probe)
+    for p, value, valid in zip(probe, values, inside):
+      if not valid:
+        raise ValueError("The selection lies outside the exported map bounds; use a boxed map covering the selection.")
+      expected = float(coot.density_at_point(map_id, *map(float, p)))
+      if not math.isfinite(expected) or abs(expected-value) > .002*max(1., abs(expected)):
+        raise ValueError("Exported map coordinates do not match Coot; no search was started.")
+    return grid
+  except Exception:
+    if grid is not None:
+      _global_fit_close_grid(grid)
+    owner.cleanup()
+    raise
+
+
+def _global_fit_close_grid(grid):
+  if grid is not None:
+    mapping = getattr(grid.get("data"), "_mmap", None)
+    if mapping is not None:
+      mapping.close()
+    pool = grid.get("worker_pool")
+    if pool is not None:
+      _global_fit_workers_stop(pool)
+    owner = grid.get("owner")
+    if owner is not None:
+      if pool is not None and not pool["reaped"].is_set():
+        import threading
+        def cleanup():
+          pool["reaped"].wait()
+          owner.cleanup()
+        threading.Thread(target=cleanup, daemon=True).start()
+      else:
+        owner.cleanup()
+
+
+def _global_fit_optimize_iter(snapshot, grid, deadline=None, return_transform=False):
+  """Independent rigid gradient ascent on mean trilinearly interpolated atom density."""
+  np = grid["np"]
+  all_points = np.asarray(snapshot if isinstance(snapshot, np.ndarray) else list(snapshot.values()), dtype=float)
+  centre0 = all_points.mean(axis=0)
+  centre = centre0.copy()
+  # Keep the optimisation cost bounded for large structures; score the complete pose.
+  indices = np.linspace(0, len(all_points)-1, min(3000, len(all_points)), dtype=int)
+  points = all_points[indices].copy()
+  rotation = np.eye(3)
+  step = .5
+  values, gradients, valid = _global_fit_grid_values(grid, points, gradients=True)
+  score = float(values.mean())
+  if deadline is None:
+    deadline = time.monotonic() + .020
+  for _iteration in range(2000):
+    if time.monotonic() >= deadline:
+      yield _iteration
+      deadline = time.monotonic() + .020
+    if step < .01:
+      break
+    proposals = []
+    direction = gradients.mean(axis=0)
+    norm = np.linalg.norm(grid["transform"] @ direction)
+    if norm > 1e-15:
+      shift = direction*(step/norm)
+      proposed = points+shift
+      v, proposed_gradient, _valid = _global_fit_grid_values(grid, proposed, gradients=True)
+      proposals.append((float(v.mean()), proposed, shift, None, proposed_gradient))
+    offsets = points-centre
+    torque = np.cross(offsets, gradients).sum(axis=0)
+    torque_norm = np.linalg.norm(torque)
+    if torque_norm > 1e-15:
+      axis = torque/torque_norm
+      lever = float(np.linalg.norm(np.cross(axis, offsets) @ grid["transform"].T, axis=1).max())
+      if lever > 1e-12:
+        angle = min(step/lever, math.radians(10.))
+        x, y, z = axis
+        skew = np.asarray(((0., -z, y), (z, 0., -x), (-y, x, 0.)))
+        delta = np.eye(3) + math.sin(angle)*skew + (1-math.cos(angle))*(skew @ skew)
+        proposed = offsets @ delta.T+centre
+        v, proposed_gradient, _valid = _global_fit_grid_values(grid, proposed, gradients=True)
+        proposals.append((float(v.mean()), proposed, None, delta, proposed_gradient))
+    best = max(proposals, key=lambda p: p[0], default=None)
+    if best is None or best[0] <= score + 1e-10*max(1., abs(score)):
+      step *= .5
+      continue
+    score, points, shift, delta, gradients = best
+    if shift is not None:
+      centre += shift
+    else:
+      rotation = delta @ rotation
+    step = min(.5, step*1.1)
+  fitted = (all_points-centre0) @ rotation.T+centre
+  values, _gradient, valid = _global_fit_grid_values(grid, fitted)
+  if not valid.any():
+    return None, None
+  if return_transform:
+    return (rotation, centre-centre0 @ rotation.T), float(values.mean())
+  return dict(zip(snapshot, map(tuple, fitted))), float(values.mean())
+
+
+def _global_fit_optimize(snapshot, grid):
+  """Synchronous numerical entry point; the GUI advances the iterator in short slices."""
+  iterator = _global_fit_optimize_iter(snapshot, grid)
+  while True:
+    try:
+      next(iterator)
+    except StopIteration as result:
+      return result.value
+
+
+def _global_fit_random_pose(radius, rng):
+  """Uniform orientation and uniform-volume displacement of the selection centre."""
+  q = [rng.gauss(0.0, 1.0) for _ in range(4)]
+  length = math.sqrt(sum(v*v for v in q))
+  if length < 1e-12:
+    q, length = [1.0, 0.0, 0.0, 0.0], 1.0
+  w, x, y, z = [v/length for v in q]
+  rotation = ((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)),
+              (2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)),
+              (2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)))
+  direction = [rng.gauss(0.0, 1.0) for _ in range(3)]
+  norm = math.sqrt(sum(v*v for v in direction))
+  distance = radius * rng.random()**(1.0/3.0)
+  shift = [v*distance/norm if norm > 1e-12 else 0.0 for v in direction]
+  return rotation, shift
+
+
+def _global_fit_random_start(original, radius, rng):
+  """Uniform orientations and uniform-volume translations about the original centroid."""
+  rotation, shift = _global_fit_random_pose(radius, rng)
+  centre = [sum(p[i] for p in original.values())/len(original) for i in range(3)]
+  return {key: tuple(centre[i] + shift[i] + sum(rotation[i][j]*(p[j]-centre[j]) for j in range(3))
+                     for i in range(3)) for key, p in original.items()}
+
+
+def _global_fit_worker_count():
+  count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+  if callable(getattr(os, "sched_getaffinity", None)):
+    try:
+      count = min(count, len(os.sched_getaffinity(0)))
+    except OSError:
+      pass
+  return max(1, min(8, count-1))
+
+
+def _global_fit_worker_python():
+  version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+  candidates = [os.path.join(prefix, "bin", name) for prefix in (sys.prefix, sys.base_prefix)
+                for name in (version, "python3")]
+  candidates.extend((os.path.join(sys.prefix, "python.exe"), shutil.which(version), shutil.which("python3")))
+  for path in candidates:
+    if path and os.path.isfile(path) and os.access(path, os.X_OK):
+      return path
+  raise RuntimeError("No standalone Python interpreter found; using one fitting worker.")
+
+
+def _global_fit_worker_main():
+  """Pure numerical subprocess entry point. No Coot or GTK imports or calls."""
+  import json
+  import os
+  import sys
+  import traceback
+  import numpy as np
+  try:
+    with open(sys.argv[1]) as handle:
+      config = json.load(handle)
+    data = np.memmap(config.pop("path"), dtype=config.pop("dtype"), mode="r",
+                     offset=config.pop("offset"), shape=tuple(config.pop("data_shape")))
+    original = np.load(config.pop("original"), mmap_mode="r")
+    grid = dict(config, np=np, data=data)
+    for key in ("shape", "transform", "starts", "periods", "origin"):
+      grid[key] = np.asarray(grid[key])
+    centre = original.mean(axis=0)
+    parent = os.getppid()
+    print(json.dumps({"ready": True}), flush=True)
+    for line in sys.stdin:
+      job = json.loads(line)
+      rotation = np.asarray(job["rotation"])
+      shift = np.asarray(job["shift"])
+      translation = centre+shift-centre @ rotation.T
+      points = original @ rotation.T+translation
+      iterator = _global_fit_optimize_iter(points, grid, return_transform=True)
+      last_progress = 0.
+      while True:
+        if os.getppid() != parent:
+          return
+        try:
+          iteration = next(iterator)
+          if time.monotonic()-last_progress >= .1:
+            print(json.dumps({"trial": job["trial"], "iteration": iteration}), flush=True)
+            last_progress = time.monotonic()
+        except StopIteration as result:
+          transform, score = result.value
+          if transform is None:
+            response = {"trial": job["trial"], "score": None}
+          else:
+            local_rotation, local_translation = transform
+            response = {"trial": job["trial"], "score": score,
+                        "rotation": (local_rotation @ rotation).tolist(),
+                        "translation": (translation @ local_rotation.T+local_translation).tolist()}
+          print(json.dumps(response, allow_nan=False), flush=True)
+          break
+  except BrokenPipeError:
+    return
+  except Exception as error:
+    traceback.print_exc(file=sys.stderr)
+    print(json.dumps({"fatal": str(error)}), flush=True)
+
+
+def _global_fit_worker_source():
+  import inspect
+  functions = (_global_fit_grid_values, _global_fit_optimize_iter, _global_fit_worker_main)
+  return "import math, time\n" + "\n".join(inspect.getsource(f) for f in functions) + "\n_global_fit_worker_main()\n"
+
+
+def _global_fit_workers_stop(pool):
+  if pool.get("stopped"):
+    return
+  import threading
+  pool["stopped"] = True
+  for worker in pool["workers"]:
+    process = worker["process"]
+    try:
+      process.stdin.close()
+    except (OSError, ValueError):
+      pass
+    try:
+      if process.poll() is None:
+        process.terminate()
+    except OSError:
+      pass
+  def reap():
+    try:
+      for worker in pool["workers"]:
+        process = worker["process"]
+        try:
+          process.wait(timeout=1.)
+        except Exception:
+          try:
+            process.kill()
+            process.wait()
+          except OSError:
+            pass
+        try:
+          process.stdout.close()
+        except (OSError, ValueError):
+          pass
+    finally:
+      pool["reaped"].set()
+  threading.Thread(target=reap, daemon=True).start()
+
+
+def _global_fit_workers_read(pool):
+  for worker in pool["workers"]:
+    process = worker["process"]
+    try:
+      data = os.read(process.stdout.fileno(), 65536)
+    except BlockingIOError:
+      data = None
+    if data:
+      worker["buffer"] += data
+      while b"\n" in worker["buffer"]:
+        line, worker["buffer"] = worker["buffer"].split(b"\n", 1)
+        message = json.loads(line)
+        if "fatal" in message:
+          raise RuntimeError("Fitting worker failed: " + message["fatal"])
+        pool["events"].append((worker, message))
+    elif data == b"" or process.poll() is not None:
+      raise RuntimeError("A fitting worker exited unexpectedly. Reset and restart the search.")
+
+
+def _global_fit_workers_prepare(state):
+  import subprocess
+  import threading
+  from collections import deque
+  grid = state["grid"]
+  np = grid["np"]
+  directory = grid["owner"].name
+  original = np.asarray(list(state["original"].values()), dtype=float)
+  original_path = os.path.join(directory, "original.npy")
+  np.save(original_path, original)
+  config = {key: grid[key].tolist() for key in ("shape", "transform", "starts", "periods", "origin")}
+  config.update(periodic=grid["periodic"], path=str(grid["data"].filename),
+                dtype=grid["data"].dtype.str, offset=int(grid["data"].offset),
+                data_shape=list(grid["data"].shape), original=original_path)
+  config_path = os.path.join(directory, "workers.json")
+  with open(config_path, "w") as handle:
+    json.dump(config, handle)
+  source, python = _global_fit_worker_source(), _global_fit_worker_python()
+  env = os.environ.copy()
+  for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "DYLD_INSERT_LIBRARIES"):
+    env.pop(key, None)
+  for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"):
+    env[key] = "1"
+  pool = dict(workers=[], events=deque(), reaped=threading.Event(), next=0,
+              original=original, centre=original.mean(axis=0), keys=tuple(state["original"]))
+  offsets = original-pool["centre"]
+  pool["covariance"] = offsets.T @ offsets/len(offsets)
+  grid["worker_pool"] = state["pool"] = pool
+  for index in range(state["workers"]):
+    state["message"] = f"Starting fitting workers: {index+1}/{state['workers']}..."
+    yield
+    with open(os.path.join(directory, f"worker-{index}.log"), "wb") as log:
+      process = subprocess.Popen([python, "-E", "-u", "-c", source, config_path],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, env=env, cwd=directory)
+    worker = dict(process=process, buffer=b"", ready=False, job=None)
+    pool["workers"].append(worker)
+    os.set_blocking(process.stdout.fileno(), False)
+  deadline = time.monotonic()+30.
+  while not all(w["ready"] for w in pool["workers"]):
+    _global_fit_workers_read(pool)
+    while pool["events"]:
+      worker, message = pool["events"].popleft()
+      if message.get("ready") is not True:
+        raise RuntimeError("Unexpected fitting-worker startup response.")
+      worker["ready"] = True
+    if time.monotonic() > deadline:
+      raise RuntimeError("Fitting workers did not start in time; using one worker.")
+    ready = sum(w["ready"] for w in pool["workers"])
+    state["message"] = f"Starting fitting workers: {ready}/{state['workers']} ready..."
+    yield
+
+
+def _global_fit_workers_step(state):
+  pool, np = state["pool"], state["grid"]["np"]
+  _global_fit_workers_read(pool)
+  if pool["events"]:
+    worker, result = pool["events"].popleft()
+    if result.get("trial") != worker["job"]:
+      raise RuntimeError("Unexpected fitting-worker trial identifier.")
+    if "iteration" in result:
+      worker["iteration"] = state["iteration"] = int(result["iteration"])
+    else:
+      score = result["score"]
+      if score is None:
+        state["failed"] += 1
+      else:
+        rotation = np.asarray(result["rotation"], dtype=float)
+        translation = np.asarray(result["translation"], dtype=float)
+        if (rotation.shape != (3, 3) or translation.shape != (3,) or
+            not np.isfinite(rotation).all() or not np.isfinite(translation).all() or not math.isfinite(score) or
+            not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6, rtol=0.) or
+            abs(float(np.linalg.det(rotation))-1.) > 1e-6):
+          raise RuntimeError("Invalid rigid transform from a fitting worker.")
+        _global_fit_insert_transform(state, rotation, translation, float(score))
+      worker["job"] = None
+      worker["iteration"] = 0
+      state["done"] += 1
+      state["iteration"] = 0
+  for worker in pool["workers"]:
+    if worker["job"] is None and pool["next"] < state["trials"]:
+      trial = pool["next"]
+      if trial == 0:
+        rotation, shift = ((1., 0., 0.), (0., 1., 0.), (0., 0., 1.)), (0., 0., 0.)
+      else:
+        rotation, shift = _global_fit_random_pose(state["radius"], state["rng"])
+      process = worker["process"]
+      process.stdin.write((json.dumps(dict(trial=trial, rotation=rotation, shift=shift))+"\n").encode())
+      process.stdin.flush()
+      worker["job"] = trial
+      worker["iteration"] = 0
+      pool["next"] += 1
+  state["parallel_fraction"] = sum(min(.99, w.get("iteration", 0)/2000)
+                                   for w in pool["workers"] if w["job"] is not None)
+  if state["done"] >= state["trials"]:
+    _global_fit_workers_stop(pool)
+    state.update(phase="score", scored=0, iteration=0,
+                 message=f"Finished {state['done']} trials; {state['failed']} without a fit.")
+
+
+def _global_fit_rmsd(first, second, cutoff=None):
+  # No superposition: two copies with the same shape at different placements are distinct.
+  total = 0.0
+  limit = float("inf") if cutoff is None else len(first)*cutoff*cutoff
+  for key, p in first.items():
+    total += sum((p[i]-second[key][i])**2 for i in range(3))
+    if total > limit:
+      return cutoff+1.0
+  return math.sqrt(total/len(first))
+
+
+def _global_fit_insert_transform(state, rotation, translation, score):
+  """Cluster rigid placements exactly from second moments, without rebuilding all atoms."""
+  pool, np = state["pool"], state["grid"]["np"]
+  centre = pool["centre"] @ rotation.T+translation
+  match = None
+  for candidate in state["candidates"]:
+    delta = rotation-candidate["rotation"]
+    mse = float(np.sum((delta @ pool["covariance"])*delta) + np.sum((centre-candidate["centre"])**2))
+    if max(0., mse) < 1.:
+      match = candidate
+      break
+  pose = dict(rotation=rotation, translation=translation, centre=centre,
+              coordinates=None, score=score, cc=None)
+  if match is None:
+    state["candidates"].append(dict(pose, hits=1))
+  else:
+    match["hits"] += 1
+    if score > match["score"]:
+      match.update(pose)
+  state["candidates"].sort(key=lambda c: c["score"], reverse=True)
+  del state["candidates"][20:]
+
+
+def _global_fit_candidate_coordinates(state, candidate):
+  if candidate["coordinates"] is None:
+    pool = state["pool"]
+    points = pool["original"] @ candidate["rotation"].T+candidate["translation"]
+    candidate["coordinates"] = dict(zip(pool["keys"], map(tuple, points)))
+  return candidate["coordinates"]
+
+
+def _global_fit_write_coordinates(model, snapshot):
+  attributes = []
+  for key, xyz in snapshot.items():
+    if len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+      raise ValueError("Invalid fitting coordinates.")
+    chain, number, ins, _name, atom, alt, _properties = key
+    for axis, value in zip(("x", "y", "z"), xyz):
+      attributes.append([model, chain, number, ins, atom, alt, axis, float(value)])
+  # This API returns zero even on success; verify coordinates at acceptance instead.
+  coot.set_atom_attributes_py(attributes)
+
+
+def _global_fit_insert_candidate(state, snapshot, score):
+  if not math.isfinite(score):
+    raise RuntimeError("Map density is unavailable for this placement.")
+  match = next((c for c in state["candidates"] if _global_fit_rmsd(snapshot, c["coordinates"], cutoff=1.0) < 1.0), None)
+  if match is not None:
+    match["hits"] += 1
+    if score > match["score"]:
+      match.update(coordinates=snapshot, score=score, cc=None)
+  else:
+    state["candidates"].append({"coordinates": snapshot, "score": score, "cc": None, "hits": 1})
+  state["candidates"].sort(key=lambda c: c["score"], reverse=True)
+  del state["candidates"][20:]
+
+
+def _global_fit_preview_owned(state, key="preview"):
+  model = state.get(key)
+  return (model is not None and valid_model_molecule_qm(model) and
+          coot.molecule_name(model) == state.get(key + "_name"))
+
+
+def _global_fit_release(state):
+  for key in ("preparation", "trial"):
+    iterator = state.pop(key, None)
+    if iterator is not None:
+      iterator.close()
+  for key in ("preview", "scorer"):
+    if _global_fit_preview_owned(state, key):
+      coot.close_molecule(state[key])
+    state[key] = None
+  _global_fit_close_grid(state.get("grid"))
+  state["grid"] = None
+  state["pool"] = None
+
+
+def _global_fit_prepare(state):
+  fitting_map = state["map"]
+  blurred = None
+  blur_name = None
+  try:
+    if state["blur_b"]:
+      state["message"] = f"Preparing fitting map: B-factor blur {state['blur_b']:g} A^2..."
+      yield
+      existing = set(map_molecule_list())
+      model = coot.sharpen_blur_map(fitting_map, state["blur_b"])
+      if model in existing or not coot.is_valid_map_molecule(model):
+        raise RuntimeError("Could not create a temporary blurred map; target map unchanged.")
+      blurred = model
+      blur_name = f"Global fit blurred map (temporary) #{model}"
+      try:
+        coot.set_molecule_name(model, blur_name)
+      except Exception:
+        coot.close_molecule(model)
+        blurred = None
+        raise
+      coot.set_map_displayed(model, 0)
+      fitting_map = model
+    state["message"] = "Caching the fitting map..."
+    yield
+    state["grid"] = _global_fit_load_grid(fitting_map, state["original"], state["radius"])
+  finally:
+    if (blurred is not None and coot.is_valid_map_molecule(blurred) and
+        coot.molecule_name(blurred) == blur_name):
+      coot.close_molecule(blurred)
+  state["message"] = "Preparing the preview..."
+  yield
+  for key in ("preview", "scorer"):
+    model = _copy_residue_specs_verified(state["source"], state["specs"])
+    name = f"Global fit {key} (temporary) #{model}"
+    try:
+      coot.set_molecule_name(model, name)
+    except Exception:
+      coot.close_molecule(model)
+      raise
+    state[key], state[key + "_name"] = model, name
+    coot.set_mol_displayed(model, 0)
+    coot.set_mol_active(model, 0)
+    coot.turn_off_backup(model)
+  if not state.get("hidden_original") and coot.mol_is_displayed(state["source"]):
+    coot.set_mol_displayed(state["source"], 0)
+    state["hidden_original"] = True
+  _global_fit_choose(state)
+  if state["workers"] > 1:
+    try:
+      yield from _global_fit_workers_prepare(state)
+    except Exception as error:
+      pool = state.pop("pool", None)
+      if pool is not None:
+        _global_fit_workers_stop(pool)
+      state["workers"] = 1
+      state["worker_note"] = f"Parallel workers unavailable: {error} Using one worker."
+      state["message"] = state["worker_note"]
+      print("Global fit:", state["message"])
+      yield
+
+
+def _global_fit_schedule(state):
+  if state["running"] and not state["closed"]:
+    # One-shot, low-priority work gives GTK time to paint between fitting slices.
+    glib = _coot_gui_repository_module("GLib")
+    state["timer"] = glib.timeout_add(16, _global_fit_dispatch, state,
+                                    priority=glib.PRIORITY_DEFAULT_IDLE)
+
+
+def _global_fit_dispatch(state):
+  state["timer"] = None
+  if state["closed"] or not state["running"]:
+    return False
+  state["work_deadline"] = time.monotonic() + .020
+  try:
+    while _global_fit_step(state, update=False):
+      # Batch only completed short trials, within the same 20 ms work budget.
+      if (state["phase"] != "search" or state.get("trial") is not None or
+          (state.get("pool") is not None and not state["pool"]["events"]) or
+          time.monotonic() >= state["work_deadline"]):
+        break
+  finally:
+    state.pop("work_deadline", None)
+    state["update"]()
+  if state["running"]:
+    _global_fit_schedule(state)
+  return False
+
+
+def _global_fit_complete(state):
+  if _global_fit_preview_owned(state, "scorer"):
+    coot.close_molecule(state["scorer"])
+  state["scorer"] = None
+  _global_fit_close_grid(state.get("grid"))
+  state["grid"] = None
+  state["pool"] = None
+  state.update(running=False, phase="ready")
+  if state["candidates"]:
+    _global_fit_choose(state, state["candidates"][0])
+
+
+def _global_fit_choose(state, candidate=None):
+  if state["closed"] or state.get("preview") is None:
+    return
+  preview = state["preview"]
+  if not _global_fit_preview_owned(state):
+    raise RuntimeError("The fitting preview was closed. Close and restart the search.")
+  _global_fit_write_coordinates(preview, state["original"] if candidate is None else candidate["coordinates"])
+  coot.set_mol_displayed(preview, 1)
+  state["selected"] = candidate
+
+
+def _global_fit_stop(state, message=None):
+  if not state["running"] or state.get("phase") == "score":
+    return
+  if state["timer"] is not None:
+    _coot_gui_repository_module("GLib").source_remove(state["timer"])
+    state["timer"] = None
+  state["message"] = message or f"Stopped after {state['done']}/{state['trials']} trials."
+  if state.get("pool") is not None:
+    _global_fit_workers_stop(state["pool"])
+  iterator = state.pop("trial", None)
+  if iterator is not None:
+    iterator.close()
+  if state.get("phase") == "prepare":
+    _global_fit_release(state)
+    state.update(running=False, phase="ready")
+    if state.get("hidden_original") and valid_model_molecule_qm(state["source"]):
+      coot.set_mol_displayed(state["source"], 1)
+      state["hidden_original"] = False
+  else:
+    state.update(phase="score", scored=0)
+    _global_fit_schedule(state)
+  state["update"]()
+
+
+def _global_fit_step(state, update=True):
+  if state["closed"] or not state["running"]:
+    return False
+  try:
+    if not valid_model_molecule_qm(state["source"]):
+      raise RuntimeError("The source model was closed.")
+    if state["phase"] != "prepare" and not _global_fit_preview_owned(state):
+      raise RuntimeError("The source or preview was closed.")
+    if not coot.is_valid_map_molecule(state["map"]):
+      raise RuntimeError("The fitting map was closed.")
+    if coot.refinement_already_ongoing_p():
+      raise RuntimeError("Another refinement started. Accept or cancel it before restarting the search.")
+    if state["phase"] == "prepare":
+      try:
+        next(state["preparation"])
+      except StopIteration:
+        state.pop("preparation")
+        state.update(phase="search", message=state.get("worker_note", ""))
+    elif state["phase"] == "score":
+      if state["scored"] < len(state["candidates"]):
+        if not _global_fit_preview_owned(state, "scorer"):
+          raise RuntimeError("The temporary scoring model was closed.")
+        candidate = state["candidates"][state["scored"]]
+        _global_fit_write_coordinates(state["scorer"], _global_fit_candidate_coordinates(state, candidate))
+        # Score once against the original target, never against the fitting blur.
+        try:
+          cc = float(coot.map_to_model_correlation_py(state["scorer"],
+                     [list(s) for s in state["specs"]], [], 0, state["map"]))
+          if math.isfinite(cc) and -1.0001 <= cc <= 1.0001:
+            candidate["cc"] = cc
+        except Exception as error:
+          print("Global fit: additional CC unavailable:", error)
+        state["scored"] += 1
+      else:
+        _global_fit_complete(state)
+    elif state.get("pool") is not None:
+      _global_fit_workers_step(state)
+    else:
+      if state.get("trial") is None:
+        coordinates = (state["original"] if state["done"] == 0 else
+                       _global_fit_random_start(state["original"], state["radius"], state["rng"]))
+        state["trial"] = _global_fit_optimize_iter(coordinates, state["grid"], deadline=state.get("work_deadline"))
+      try:
+        state["iteration"] = next(state["trial"])
+      except StopIteration as result:
+        state.pop("trial")
+        snapshot, score = result.value
+        if snapshot is not None and snapshot.keys() != state["original"].keys():
+          raise RuntimeError("Rigid fitting changed atom identities.")
+        if snapshot is not None and math.isfinite(score):
+          _global_fit_insert_candidate(state, snapshot, score)
+        else:
+          state["failed"] += 1
+        state["done"] += 1
+        state["iteration"] = 0
+        if state["done"] >= state["trials"]:
+          state.update(phase="score", scored=0,
+                       message=f"Finished {state['done']} trials; {state['failed']} without a fit.")
+  except Exception as error:
+    state.update(message=str(error), running=False, phase="error", selected=None)
+    _global_fit_release(state)
+    if state.get("hidden_original") and valid_model_molecule_qm(state["source"]):
+      coot.set_mol_displayed(state["source"], 1)
+      state["hidden_original"] = False
+    print("Global fit stopped:", error)
+  if update:
+    state["update"]()
+  return state["running"]
+
+
+def _global_fit_move_to_center(state):
+  if state["closed"] or state["running"] or state.get("phase", "idle") != "idle":
+    raise ValueError("Reset the search before moving the molecule.")
+  source = state["source"]
+  if not valid_model_molecule_qm(source):
+    raise ValueError("The source model was closed.")
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept or cancel the current intermediate atoms first.")
+  centre = [float(coot.molecule_centre_internal(source, i)) for i in range(3)]
+  target = [float(coot.rotation_centre_position(i)) for i in range(3)]
+  if not all(math.isfinite(v) for v in centre + target):
+    raise ValueError("Cannot determine the molecule or view centre.")
+  shift = [t-c for t, c in zip(target, centre)]
+  if any(abs(v) > 1e-6 for v in shift):
+    with _grouped_model_edit(source):
+      coot.translate_molecule_by(source, *shift)
+  state["message"] = f"Molecule #{source} moved to screen center. Search will start from this position."
+  state["update"]()
+
+
+def _global_fit_reset(state):
+  if state["closed"] or state["running"]:
+    raise ValueError("Stop the search and wait for scoring to finish before resetting.")
+  if state["timer"] is not None:
+    _coot_gui_repository_module("GLib").source_remove(state["timer"])
+    state["timer"] = None
+  _global_fit_release(state)
+  if state.get("hidden_original") and valid_model_molecule_qm(state["source"]):
+    coot.set_mol_displayed(state["source"], 1)
+  state.update(phase="idle", candidates=[], selected=None, hidden_original=False, done=0,
+               scored=0, iteration=0, message="Search cleared. Reposition the molecule or start another search.")
+  state["update"]()
+
+
+def _global_fit_start(state, scope, trials, radius, blur_b=0):
+  import random
+  if state["running"] or state["closed"]:
+    return
+  trials, radius, blur_b = int(trials), float(radius), float(blur_b)
+  if not 1 <= trials <= 10000 or not math.isfinite(radius) or not 0 <= radius <= 1000:
+    raise ValueError("Use 1-10000 trials and a radius between 0 and 1000 A.")
+  if not math.isfinite(blur_b) or not 0 <= blur_b <= 100000:
+    raise ValueError("Use a blur B-factor between 0 and 100000 A^2 (0 means no blur).")
+  if blur_b and not callable(getattr(coot, "sharpen_blur_map", None)):
+    raise ValueError("This Coot build cannot create a temporary blurred map.")
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept or cancel the current intermediate atoms first.")
+  if not coot.is_valid_map_molecule(state["map"]):
+    raise ValueError("The chosen map is no longer available.")
+  source, active = state["source"], state["active"]
+  if scope not in ("molecule", "chain", "residue"):
+    raise ValueError("Choose molecule, chain or residue.")
+  specs = [tuple(s) for s in _all_residue_specs_for_colouring(source)
+           if scope == "molecule" or (s[0] == active[0] and (scope == "chain" or tuple(s) == active))]
+  original = _atom_snapshot_for_specs(source, specs)
+  _global_fit_release(state)
+  state.update(preview=None, grid=None, original=original, specs=specs, scope=scope,
+               trials=trials, radius=radius, rng=random.Random(), done=0, failed=0,
+               candidates=[], selected=None, message="Preparing the search...", running=True,
+               phase="prepare", blur_b=blur_b, scored=0, iteration=0,
+               workers=min(trials, _global_fit_worker_count()), pool=None, worker_note="")
+  state["preparation"] = _global_fit_prepare(state)
+  _global_fit_schedule(state)
+  state["update"]()
+
+
+def _global_fit_finish(state, accept=False):
+  global _GLOBAL_FIT_STATE
+  if state["closed"]:
+    return
+  if accept:
+    if state["running"] or state["selected"] is None:
+      raise ValueError("Stop the search and select a solution first.")
+    if coot.refinement_already_ongoing_p():
+      raise ValueError("Accept or cancel other intermediate atoms first.")
+    source = state["source"]
+    if not valid_model_molecule_qm(source) or _atom_snapshot_for_specs(source, state["specs"]) != state["original"]:
+      raise ValueError("The selected source atoms changed. Close and restart; no fit was applied.")
+    current_specs = {tuple(s) for s in _all_residue_specs_for_colouring(source)
+                     if state["scope"] == "molecule" or
+                     (s[0] == state["active"][0] and (state["scope"] == "chain" or tuple(s) == state["active"]))}
+    if current_specs != set(state["specs"]):
+      raise ValueError("The source selection changed. Close and restart; no fit was applied.")
+    if coot.backup_state(source) != 1:
+      raise ValueError("Enable Coot backups for this model so accepting the fit can be undone.")
+    snapshot = state["selected"]["coordinates"]
+    with _grouped_model_edit(source):
+      _global_fit_write_coordinates(source, snapshot)
+    actual = _atom_snapshot_for_specs(source, state["specs"])
+    if actual.keys() != snapshot.keys() or _global_fit_rmsd(actual, snapshot) > 0.002:
+      raise RuntimeError("The coordinate update could not be verified. Use Coot Undo to restore the original.")
+    add_status_bar_text(f"Global fit accepted (mean density {state['selected']['score']:.4g}); one Undo restores the original.")
+  if state["timer"] is not None:
+    _coot_gui_repository_module("GLib").source_remove(state["timer"])
+    state["timer"] = None
+  state.update(closed=True, running=False)
+  _global_fit_release(state)
+  if state.get("hidden_original") and valid_model_molecule_qm(state["source"]):
+    coot.set_mol_displayed(state["source"], 1)
+  state["window"].destroy()
+  if _GLOBAL_FIT_STATE is state:
+    _GLOBAL_FIT_STATE = None
+
+
+def global_fit_map(scope="molecule"):
+  """Random-start rigid fitting, with an unchanged source and a non-modal solution browser."""
+  global _GLOBAL_FIT_STATE
+  if _GLOBAL_FIT_STATE is not None:
+    _GLOBAL_FIT_STATE["window"].present()
+    return _GLOBAL_FIT_STATE
+  active = _active_residue_or_status()
+  map_id = _scrollable_map_or_status()
+  if not active or map_id is None:
+    return None
+  required = ("export_map", "density_at_point", "map_to_model_correlation_py", "set_atom_attributes_py")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    info_dialog("This Coot build does not provide the fitting/coordinate APIs needed for global fitting.")
+    return None
+  window = Gtk.Window(title="Global fit to map")
+  window.set_default_size(540, 440)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_" + side)(12)
+  model_name = str(coot.molecule_name(active[0]) or "Unnamed model")
+  map_name = str(coot.molecule_name(map_id) or "Unnamed map")
+  label = Gtk.Label(label=f"Model #{active[0]}: {os.path.basename(model_name)} | Map #{map_id}: {os.path.basename(map_name)}\n"
+                          f"Active residue {active[1]}:{active[2]}{active[3]}")
+  label.set_xalign(0)
+  label.set_wrap(True)
+  label.set_wrap_mode(_coot_gui_repository_module("Pango").WrapMode.WORD_CHAR)
+  label.set_max_width_chars(72)
+  label.set_tooltip_text(f"Model #{active[0]}: {model_name}\nMap #{map_id}: {map_name}")
+  box.append(label)
+  controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  selection = Gtk.ComboBoxText()
+  for value in ("molecule", "chain", "residue"):
+    selection.append(value, value.capitalize())
+  selection.set_active_id(scope if scope in ("molecule", "chain", "residue") else "molecule")
+  controls.append(selection)
+  fields = []
+  for text, value, width in (("Trials", "100", 5), ("Radius (A)", "5", 5)):
+    controls.append(Gtk.Label(label=text))
+    entry = Gtk.Entry()
+    entry.set_text(value)
+    entry.set_width_chars(width)
+    entry.set_max_width_chars(width)
+    controls.append(entry)
+    fields.append(entry)
+  controls.set_tooltip_text("Random orientations; starting centres within this radius of the original centre. Local fitting can move farther. The first trial fits the original placement.")
+  box.append(controls)
+  blur_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  blur = Gtk.CheckButton(label="Blur fitting map")
+  blur_b = Gtk.Entry()
+  blur_b.set_text("100")
+  blur_b.set_width_chars(6)
+  blur_b.set_max_width_chars(6)
+  blur_b.set_sensitive(False)
+  blur.connect("toggled", lambda *_: blur_b.set_sensitive(blur.get_active()))
+  blur_controls.append(blur)
+  blur_controls.append(Gtk.Label(label="B (A^2)"))
+  blur_controls.append(blur_b)
+  blur_controls.set_tooltip_text("Optional positive B-factor blur for fitting only. CC is always calculated against the original target map; temporary maps are removed automatically.")
+  box.append(blur_controls)
+  positioning = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+  move_button = Gtk.Button(label="Move molecule to screen center")
+  move_button.set_tooltip_text(f"Translate the whole molecule #{active[0]} to the current view center, preserving its orientation. Available before searching; use Reset search to try another starting point.")
+  reset_button = Gtk.Button(label="Reset search")
+  reset_button.set_tooltip_text("Discard the search hits without applying a fit, so you can reposition the molecule and search again.")
+  positioning.append(move_button)
+  positioning.append(reset_button)
+  box.append(positioning)
+  progress = Gtk.ProgressBar(show_text=True)
+  box.append(progress)
+  rows = Gtk.ListBox()
+  rows.set_selection_mode(Gtk.SelectionMode.SINGLE)
+  rows.set_focusable(True)
+  groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
+  def table_row(values):
+    row = Gtk.ListBoxRow()
+    grid = Gtk.Grid(column_spacing=12)
+    cells = []
+    for index, value in enumerate(values):
+      cell = Gtk.Label(label=value)
+      cell.set_xalign(1)
+      cell.set_width_chars((4, 13, 11, 6)[index])
+      cell.add_css_class("monospace")
+      groups[index].add_widget(cell)
+      grid.attach(cell, index, 0, 1, 1)
+      cells.append(cell)
+    row.set_child(grid)
+    row.global_fit_cells = cells
+    return row
+  header = Gtk.ListBox()
+  header.set_selection_mode(Gtk.SelectionMode.NONE)
+  heading = table_row(("Rank", "Mean density", "CC [-1,1]", "Hits"))
+  heading.set_selectable(False)
+  heading.set_activatable(False)
+  heading.global_fit_cells[1].set_tooltip_text("Mean atom density on the fitting map (blurred if enabled). Solutions are ranked by this value.")
+  heading.global_fit_cells[2].set_tooltip_text("Pearson correlation against the original target map, from -1 to +1. A dash means unavailable.")
+  heading.global_fit_cells[3].set_tooltip_text("Number of trials assigned to this solution cluster; not a confidence estimate.")
+  header.append(heading)
+  box.append(header)
+  scroll = Gtk.ScrolledWindow()
+  scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+  scroll.set_vexpand(True)
+  scroll.set_child(rows)
+  box.append(scroll)
+  status = Gtk.Label(label="Rigid-body search; no flexible refinement. Nearby model atoms are not used to reject fits.")
+  status.set_xalign(0)
+  status.set_wrap(True)
+  box.append(status)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+  actions = {}
+  for key, text in (("start", "Search"), ("stop", "Stop"), ("previous", "Previous"), ("next", "Next"),
+                    ("original", "Original"), ("accept", "Accept"), ("close", "Close")):
+    button = Gtk.Button(label=text)
+    buttons.append(button)
+    actions[key] = button
+  actions.update(move=move_button, reset=reset_button)
+  box.append(buttons)
+  state = {"window": window, "source": active[0], "active": tuple(active[1:4]), "map": map_id,
+           "closed": False, "running": False, "timer": None, "grid": None, "preview": None,
+           "selected": None, "candidates": [], "hidden_original": False, "done": 0, "trials": 100,
+           "message": "", "rendering": False, "phase": "idle", "rows_signature": None}
+  def attempt(function, *args):
+    try:
+      function(*args)
+    except Exception as error:
+      status.set_text(str(error))
+      print("Global fit:", error)
+  def update():
+    state["rendering"] = True
+    try:
+      displayed_candidates = [] if state["running"] else state["candidates"]
+      signature = tuple((id(c), c["score"], c["cc"], c["hits"]) for c in displayed_candidates)
+      if signature != state["rows_signature"]:
+        while rows.get_first_child() is not None:
+          rows.remove(rows.get_first_child())
+        for index, candidate in enumerate(displayed_candidates):
+          cc_text = f"{candidate['cc']:.3f}" if candidate["cc"] is not None else "-"
+          row = table_row((str(index+1), f"{candidate['score']:.4g}", cc_text, str(candidate["hits"])))
+          row.global_fit_candidate = candidate
+          rows.append(row)
+        state["rows_signature"] = signature
+      selected_row = next((rows.get_row_at_index(i) for i, c in enumerate(displayed_candidates)
+                           if c is state["selected"]), None)
+      rows.select_row(selected_row)
+      running = state["running"]
+      available = bool(state["candidates"]) and state.get("preview") is not None
+      for control in (selection, *fields, blur):
+        control.set_sensitive(not running)
+      blur_b.set_sensitive(not running and blur.get_active())
+      for key in ("previous", "next"):
+        actions[key].set_sensitive(available and not running)
+      actions["accept"].set_sensitive(state["selected"] is not None and not running)
+      actions["original"].set_sensitive(state["preview"] is not None and not running)
+      actions["start"].set_sensitive(not running)
+      actions["stop"].set_sensitive(running and state["phase"] != "score")
+      rows.set_sensitive(available and not running)
+      phase = state["phase"]
+      actions["move"].set_sensitive(not running and phase == "idle" and valid_model_molecule_qm(state["source"]))
+      actions["reset"].set_sensitive(not running and phase != "idle")
+      partial = (state.get("parallel_fraction", 0.) if state.get("pool") is not None else
+                 min(.99, state.get("iteration", 0)/2000))
+      fraction = .9*(state["done"]+partial)/state["trials"]
+      text = f"{state['done']}/{state['trials']} trials | {len(state['candidates'])} distinct solutions"
+      if phase == "search":
+        text += f" | {state['workers']} worker{'s' if state['workers'] != 1 else ''}"
+      if phase == "prepare":
+        fraction, text = 0., "Preparing the search..."
+      elif phase == "search" and state.get("iteration"):
+        text += f" | step {state['iteration']}"
+      elif phase == "score":
+        fraction = .9 + .1*state["scored"]/max(1, len(state["candidates"]))
+        text = f"Scoring solutions: {state['scored']}/{len(state['candidates'])} (original map)"
+      elif phase == "ready":
+        fraction = 1. if state["done"] else 0.
+      progress.set_fraction(fraction)
+      progress.set_text(text)
+      status.set_text(state["message"] or "Ranked by mean fitting-map density. CC: original map, -1 to +1.")
+    finally:
+      state["rendering"] = False
+  def choose(_rows, row):
+    if row is not None and not state["rendering"]:
+      attempt(_global_fit_choose, state, row.global_fit_candidate)
+      update()
+  def navigate(direction):
+    candidates = state["candidates"]
+    if candidates:
+      index = next((i for i, c in enumerate(candidates) if c is state["selected"]), -1 if direction > 0 else 0)
+      attempt(_global_fit_choose, state, candidates[(index+direction) % len(candidates)])
+      update()
+  def start(*_args):
+    attempt(_global_fit_start, state, selection.get_active_id(), fields[0].get_text(), fields[1].get_text(),
+            blur_b.get_text() if blur.get_active() else 0)
+  def original(*_args):
+    attempt(_global_fit_choose, state)
+    update()
+  state["update"] = update
+  def on_result_key(_controller, keyval, _keycode, _modifiers):
+    if keyval in (65362, 65364) and not state["running"] and rows.get_selected_row() is not None:
+      navigate(-1 if keyval == 65362 else 1)
+      row = rows.get_selected_row()
+      if row is not None:
+        row.grab_focus()
+      return True
+    return False
+  keys = Gtk.EventControllerKey()
+  keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+  keys.connect("key-pressed", on_result_key)
+  rows.add_controller(keys)
+  rows.connect("row-selected", choose)
+  actions["start"].connect("clicked", start)
+  actions["move"].connect("clicked", lambda *_: attempt(_global_fit_move_to_center, state))
+  actions["reset"].connect("clicked", lambda *_: attempt(_global_fit_reset, state))
+  actions["stop"].connect("clicked", lambda *_: attempt(_global_fit_stop, state))
+  actions["previous"].connect("clicked", lambda *_: navigate(-1))
+  actions["next"].connect("clicked", lambda *_: navigate(1))
+  actions["original"].connect("clicked", original)
+  actions["accept"].connect("clicked", lambda *_: attempt(_global_fit_finish, state, True))
+  actions["close"].connect("clicked", lambda *_: attempt(_global_fit_finish, state))
+  window.connect("close-request", lambda *_: attempt(_global_fit_finish, state) or True)
+  window.set_child(box)
+  state["widgets"] = dict(actions, rows=rows, scope=selection, trials=fields[0], radius=fields[1],
+                          progress=progress, blur=blur, blur_b=blur_b, heading=heading, keys=keys, identifier=label)
+  _GLOBAL_FIT_STATE = state
+  update()
+  status.set_text("Uses the active scroll-wheel map, captured when this panel opens. Coarsen it first if desired.")
+  window.present()
+  return state
 
 
 #Jiggle-fits active chain to map
@@ -21508,6 +22646,7 @@ def _build_custom_fit_menu(submenu_fit):
   )
   add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", lambda func: rigid_fit_all_chains())
   add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", lambda func: rigid_fit_active_chain())
+  add_simple_coot_menu_menuitem(submenu_fit, "Global fit to map...", lambda func: global_fit_map())
   add_simple_coot_menu_menuitem(
     submenu_fit,
     "Jiggle-fit current chain to map (Slow!)",
