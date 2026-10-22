@@ -4873,10 +4873,26 @@ def _trackpad_adjust_clipping(dy, sensitivity):
       coot.set_clipping_back(back)
 
 
+def _trackpad_adjust_proportional_radius(dy):
+  if dy == 0:
+    return
+  state = _TRACKPAD_STATE
+  step = _proportional_editing_radius_step_size()
+  delta = state.get("radius_remainder", 0.0) - dy * 0.1
+  steps = math.trunc(round(delta / step, 9))
+  state["radius_remainder"] = delta - steps * step
+  if steps:
+    target = min(1000.0, max(0.0, PROPORTIONAL_EDITING_RADIUS + steps * step))
+    _set_proportional_editing_radius_value(target)
+
+
 def _trackpad_apply_motion(mode, value, area):
   edit = globals().get("_TRACKPAD_EDIT_STATE")
   if edit is not None and edit["move_selection"] and mode in ("rotate", "translate", "slab_translate"):
     _trackpad_edit_motion(edit, mode, value, area)
+    return
+  if mode == "radius":
+    _trackpad_adjust_proportional_radius(value[1])
     return
   sensitivity = _TRACKPAD_STATE["sensitivity"]["clipping" if mode == "slab_translate" else mode]
   if mode == "zoom":
@@ -5043,12 +5059,18 @@ def _trackpad_scroll(controller, dx, dy, area):
     # Keep a continuous gesture captured even if GTK reports a wheel unit for
     # one sample; otherwise native Shift-scroll can insert a fixed zoom step.
     slab_translate = bool(modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.CONTROL_MASK)
+    radius = bool(modifiers & gdk.ModifierType.CONTROL_MASK and modifiers & gdk.ModifierType.ALT_MASK)
     # Reserve this chord even outside scroll-begin/end: wheel-unit samples
     # otherwise reach Coot's native Shift-Ctrl representation cycling.
-    if not slab_translate and controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
+    edit = globals().get("_TRACKPAD_EDIT_STATE")
+    moving_selection = edit is not None and edit["move_selection"]
+    # Some Mac swipe samples arrive as wheel events after a native dialog.
+    # During selection movement, do not fall through to native contouring.
+    if not (slab_translate or radius or moving_selection) and controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
       return False
     direction = -1.0 if state["reverse"] else 1.0
-    mode = ("slab_translate" if slab_translate else
+    mode = ("radius" if radius else
+            "slab_translate" if slab_translate else
             "contour" if modifiers & gdk.ModifierType.ALT_MASK else
             "translate" if modifiers & gdk.ModifierType.CONTROL_MASK else
             "clipping" if modifiers & gdk.ModifierType.SHIFT_MASK else "rotate")
@@ -5118,6 +5140,7 @@ def set_custom_trackpad_controls(enabled=True):
       _coot_gui_repository_module("GLib").source_remove(state["source"])
       state["source"] = None
     state["pending"].clear()
+    state["radius_remainder"] = 0.0
     state["pinch"].clear()
     state["scroll_active"].clear()
     state["claimed_scroll"].clear()
@@ -5181,7 +5204,7 @@ def set_custom_trackpad_controls(enabled=True):
       area.add_controller(pinch)
       state["bindings"].append((area, pinch))
     state["enabled"] = True
-    add_status_bar_text("Trackpad: pinch zoom; swipe rotate; Ctrl pan; Option contour; Shift slab width; Shift-Ctrl slab Z")
+    add_status_bar_text("Trackpad: pinch zoom; swipe rotate; Ctrl pan; Option contour; Ctrl-Option editing radius; Shift slab width; Shift-Ctrl slab Z")
     return True
   except Exception as error:
     set_custom_trackpad_controls(False)
@@ -5213,6 +5236,26 @@ def _trackpad_native_widgets():
       pending.append(child)
       child = child.get_next_sibling()
   return found
+
+
+def _trackpad_native_close_requested(dialog):
+  """Keep Coot's reusable dialog alive and cancel its abandoned preview."""
+  edit = globals().get("_TRACKPAD_EDIT_STATE")
+  if edit is not None and edit.get("owns_native") and edit.get("native") is dialog:
+    _trackpad_edit_reset()
+  else:
+    coot.clear_up_moving_atoms()
+    coot.rot_trans_reset_previous()
+  dialog.set_visible(False)
+  coot.normal_cursor()
+  return True
+
+
+def _install_trackpad_native_close_guard(widgets=None):
+  widgets = _trackpad_native_widgets() if widgets is None else widgets
+  dialog = widgets.get("rotate_translate_obj_dialog")
+  if dialog is not None and not getattr(dialog, "coot_trimmings_close_guard", None):
+    dialog.coot_trimmings_close_guard = dialog.connect("close-request", _trackpad_native_close_requested)
 
 
 def _trackpad_edit_update_buttons(edit):
@@ -5250,6 +5293,7 @@ def _trackpad_edit_begin_native(edit):
     # Coot exposes a setter but no getter for this native rotation preference.
     coot.set_rotate_translate_zone_rotates_about_zone_centre(1)
     action.activate(None)
+    edit["owns_native"] = True
   finally:
     coot.set_view_from_json(json.dumps(view))
     for model, active, displayed in picking:
@@ -5257,11 +5301,12 @@ def _trackpad_edit_begin_native(edit):
         coot.set_mol_active(model, active)
         coot.set_mol_displayed(model, displayed)
   widgets = _trackpad_native_widgets()
+  _install_trackpad_native_close_guard(widgets)
   dialog = widgets.get("rotate_translate_obj_dialog")
-  if dialog is None or not dialog.get_visible() or not coot.refinement_already_ongoing_p():
-    raise RuntimeError("Coot could not create the native movement preview.")
-  edit["owns_native"] = True
   edit["native"] = dialog
+  if dialog is None or not dialog.get_visible() or not coot.refinement_already_ongoing_p():
+    _trackpad_edit_discard_native(edit)
+    raise RuntimeError("Coot could not create the native movement preview.")
   edit["adjustments"] = [widgets["rotate_translate_obj_" + name + "_hscale"].get_adjustment()
                          for name in ("xtrans", "ytrans", "ztrans", "xrot", "yrot", "zrot")]
   dialog.set_visible(False)
@@ -5486,7 +5531,7 @@ def _trackpad_edit_panel(edit):
   label = Gtk.Label(label=edit["label"] + "\nPivot: selection centre")
   label.set_xalign(0)
   box.append(label)
-  instructions = Gtk.Label(label="Swipe: rotate | Ctrl: X/Y | Shift-Ctrl: Z\nPinch: zoom | Option: contour\nApply, then rigid fit or swipe again. Close discards unapplied moves.")
+  instructions = Gtk.Label(label="Swipe: rotate | Ctrl: X/Y | Shift-Ctrl: Z\nPinch: zoom | Option: contour | Ctrl-Option: editing radius\nApply, then rigid fit or swipe again. Close discards unapplied moves.")
   instructions.set_xalign(0)
   box.append(instructions)
   view = Gtk.CheckButton(label="Move view instead of selection")
@@ -5677,7 +5722,7 @@ def custom_trackpad_controls_dialog():
   startup = Gtk.CheckButton(label="Enable automatically on startup")
   startup.set_active(state["startup"])
   box.append(startup)
-  label = Gtk.Label(label="Pinch: zoom   |   Swipe: rotate\nCtrl + swipe: translate   |   Option + swipe: contour\nShift + swipe: slab width   |   Shift + Ctrl + swipe: slab Z")
+  label = Gtk.Label(label="Pinch: zoom   |   Swipe: rotate\nCtrl + swipe: translate   |   Option + swipe: contour\nCtrl + Option + swipe: proportional editing radius\nShift + swipe: slab width   |   Shift + Ctrl + swipe: slab Z")
   label.set_xalign(0)
   box.append(label)
   grid = Gtk.Grid(column_spacing=12, row_spacing=6)
@@ -16633,7 +16678,7 @@ def global_fit_map(scope="molecule"):
   selection.set_active_id(scope if scope in ("molecule", "chain", "residue") else "molecule")
   controls.append(selection)
   fields = []
-  for text, value, width in (("Trials", "100", 5), ("Radius (A)", "5", 5)):
+  for text, value, width in (("Trials", "300", 5), ("Radius (A)", "5", 5)):
     controls.append(Gtk.Label(label=text))
     entry = Gtk.Entry()
     entry.set_text(value)
@@ -16715,7 +16760,7 @@ def global_fit_map(scope="molecule"):
   box.append(buttons)
   state = {"window": window, "source": active[0], "active": tuple(active[1:4]), "map": map_id,
            "closed": False, "running": False, "timer": None, "grid": None, "preview": None,
-           "selected": None, "candidates": [], "hidden_original": False, "done": 0, "trials": 100,
+           "selected": None, "candidates": [], "hidden_original": False, "done": 0, "trials": 300,
            "message": "", "rendering": False, "phase": "idle", "rows_signature": None}
   def attempt(function, *args):
     try:
@@ -24407,6 +24452,10 @@ if _coot_gui_module() is not None:
   except Exception:
     print("coot_trimmings direct menu build failed")
     traceback.print_exc()
+  try:
+    _install_trackpad_native_close_guard()
+  except Exception as error:
+    print("Native Rotate/Translate close guard unavailable:", error)
 
 _initialize_trackpad_preferences()
 
