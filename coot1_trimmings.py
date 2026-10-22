@@ -551,6 +551,7 @@ SMART_COPY_TEMPLATE_IMOL = None
 SMART_COPY_SOURCE_CENTRE = None
 SMART_COPY_RESIDUE_NAME = None
 MODEL_AMBIENT_LIGHTING_ENABLED = False
+REFINEMENT_RAMACHANDRAN_OVERLAY_ENABLED = globals().get("REFINEMENT_RAMACHANDRAN_OVERLAY_ENABLED", True)
 MODEL_PRE_HIGH_CONTRAST_GL_LIGHTING_STATE = None
 MODEL_PRE_HIGH_CONTRAST_BOND_THICKNESS = None
 MODEL_HIGH_CONTRAST_MOLECULES = set()
@@ -4685,7 +4686,9 @@ def _display_preferences_path():
 
 def _load_display_defaults():
   """Load display-default booleans from the companion Python preferences file."""
-  defaults = {"high_contrast_models": False, "ambient_maps": False, "black_background": False}
+  defaults = {"high_contrast_models": False, "ambient_maps": False, "black_background": False,
+              "refinement_ramachandran_overlay": True, "refinement_validation_spheres": None,
+              "refinement_contact_dots": None}
   path = _display_preferences_path()
   namespace = {}
   try:
@@ -4695,6 +4698,11 @@ def _load_display_defaults():
     defaults["high_contrast_models"] = bool(namespace.get("DEFAULT_HIGH_CONTRAST_MODELS", False))
     defaults["ambient_maps"] = bool(namespace.get("DEFAULT_AMBIENT_MAPS", False))
     defaults["black_background"] = bool(namespace.get("DEFAULT_BLACK_BACKGROUND", False))
+    defaults["refinement_ramachandran_overlay"] = bool(namespace.get("DEFAULT_REFINEMENT_RAMACHANDRAN_OVERLAY", True))
+    for name in ("refinement_validation_spheres", "refinement_contact_dots"):
+      value = namespace.get("DEFAULT_" + name.upper())
+      if value is not None:
+        defaults[name] = bool(value)
   except FileNotFoundError:
     pass
   except Exception as error:
@@ -4712,7 +4720,11 @@ def _save_display_default(name, enabled=True):
     f'DEFAULT_HIGH_CONTRAST_MODELS = {defaults["high_contrast_models"]!r}\n'
     f'DEFAULT_AMBIENT_MAPS = {defaults["ambient_maps"]!r}\n'
     f'DEFAULT_BLACK_BACKGROUND = {defaults["black_background"]!r}\n'
+    f'DEFAULT_REFINEMENT_RAMACHANDRAN_OVERLAY = {defaults["refinement_ramachandran_overlay"]!r}\n'
   )
+  for key in ("refinement_validation_spheres", "refinement_contact_dots"):
+    if defaults[key] is not None:
+      source += f'DEFAULT_{key.upper()} = {defaults[key]!r}\n'
   try:
     # Atomic replacement avoids leaving a partial preferences file if writing fails.
     directory = os.path.dirname(path) or "."
@@ -4772,6 +4784,89 @@ def default_background_to_black():
     return False
   add_status_bar_text("Black background enabled for this and future Coot sessions")
   return True
+
+
+def _set_refinement_ramachandran_overlay(enabled, show_dialog=True):
+  """Apply and track the plot visibility; silently skip unsupported startup APIs."""
+  global REFINEMENT_RAMACHANDRAN_OVERLAY_ENABLED
+  setter = getattr(coot, "set_draw_gl_ramachandran_plot_during_refinement", None)
+  if not callable(setter):
+    if show_dialog:
+      info_dialog("This Coot build cannot toggle the Ramachandran overlay during refinement.")
+    return False
+  try:
+    setter(int(bool(enabled)))
+  except Exception as error:
+    if show_dialog:
+      info_dialog(f"Could not change the refinement Ramachandran overlay.\n\n{error}")
+    else:
+      print(f"WARNING:: could not restore refinement Ramachandran overlay: {error}")
+    return False
+  REFINEMENT_RAMACHANDRAN_OVERLAY_ENABLED = bool(enabled)
+  return True
+
+
+def _refinement_validation_display_controls(name):
+  """Return native getters/setters for the requested refinement-only display."""
+  if name == "refinement_validation_spheres":
+    label = "Refinement Rama/rotamer spheres"
+    functions = [("get_draw_moving_atoms_rama_markup_state", "set_draw_moving_atoms_rama_markup"),
+                 ("get_draw_moving_atoms_rota_markup_state", "set_draw_moving_atoms_rota_markup")]
+  elif name == "refinement_contact_dots":
+    label = "Refinement contact dots"
+    functions = [("get_do_coot_probe_dots_during_refine", "set_do_coot_probe_dots_during_refine")]
+  else:
+    raise ValueError("Unknown refinement display setting: " + name)
+  controls = [(getattr(coot, getter, None), getattr(coot, setter, None)) for getter, setter in functions]
+  if not all(callable(function) for pair in controls for function in pair):
+    raise RuntimeError(label + " cannot be toggled in this Coot build.")
+  return label, controls
+
+
+def _set_refinement_validation_display(name, enabled, show_dialog=True):
+  """Restore saved display flags without changing refinement restraints."""
+  previous = []
+  try:
+    _label, controls = _refinement_validation_display_controls(name)
+    previous = [(setter, int(bool(getter()))) for getter, setter in controls]
+    for _getter, setter in controls:
+      setter(int(bool(enabled)))
+  except Exception as error:
+    for setter, value in previous:
+      try:
+        setter(value)
+      except Exception as restore_error:
+        print(f"WARNING:: could not restore refinement display flag: {restore_error}")
+    if show_dialog:
+      info_dialog(f"Could not change refinement display.\n\n{error}")
+    return False
+  return True
+
+
+def _toggle_refinement_validation_display(name):
+  try:
+    label, controls = _refinement_validation_display_controls(name)
+    # A mixed Rama/rotamer state switches both off; the next click enables both.
+    enabled = not any(bool(getter()) for getter, _setter in controls)
+  except Exception as error:
+    info_dialog(f"Could not change refinement display.\n\n{error}")
+    return None
+  if not _set_refinement_validation_display(name, enabled):
+    return None
+  saved = _save_display_default(name, enabled)
+  add_status_bar_text(label + ": " + ("on" if enabled else "off") +
+                      (" (saved for future sessions)" if saved else " (this session only; could not save)"))
+  return enabled
+
+
+def toggle_refinement_validation_spheres():
+  return _toggle_refinement_validation_display("refinement_validation_spheres")
+
+
+def toggle_refinement_contact_dots():
+  # Temporarily disabled pending Coot's contact-dot display fix. Keep saved choices.
+  add_status_bar_text("Refinement contact-dot toggle is temporarily disabled pending a Coot fix")
+  return None
 
 
 def _trackpad_preferences_path():
@@ -6022,6 +6117,11 @@ def _apply_persistent_display_defaults():
     _set_native_ambient_map_defaults(show_dialog=False)
   if defaults.get("black_background"):
     _set_black_background(show_dialog=False)
+  _set_refinement_ramachandran_overlay(defaults.get("refinement_ramachandran_overlay", True), show_dialog=False)
+  # Do not reapply contact-dot preferences while its native display is broken.
+  for name in ("refinement_validation_spheres",):
+    if defaults.get(name) is not None:
+      _set_refinement_validation_display(name, defaults[name], show_dialog=False)
   return False
 
 
@@ -22636,6 +22736,18 @@ def user_defined_add_arbitrary_length_bond_restraint(bond_length=2.0):
     lambda text, stay_open_qm: make_restr(text, stay_open_qm))
 
 
+def toggle_refinement_ramachandran_overlay():
+  """Persist plot visibility without changing Ramachandran restraints."""
+  # No native getter exists; track our changes from Coot's enabled default.
+  enabled = not REFINEMENT_RAMACHANDRAN_OVERLAY_ENABLED
+  if not _set_refinement_ramachandran_overlay(enabled):
+    return None
+  saved = _save_display_default("refinement_ramachandran_overlay", enabled)
+  add_status_bar_text("Refinement Ramachandran overlay: " + ("on" if enabled else "off") +
+                      (" (saved for future sessions)" if saved else " (this session only; could not save)"))
+  return enabled
+
+
 def _build_custom_display_menu(submenu_display):
   """Populate the Display submenu in normal Python rather than exec'd text."""
   add_simple_coot_menu_menuitem(
@@ -22681,6 +22793,16 @@ def _build_custom_display_menu(submenu_display):
     submenu_display,
     "Toggle high-contrast model lighting",
     lambda func: toggle_high_contrast_mode(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Toggle Ramachandran overlay during refinement",
+    lambda func: toggle_refinement_ramachandran_overlay(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Toggle Rama/rotamer spheres during refinement",
+    lambda func: toggle_refinement_validation_spheres(),
   )
   add_simple_coot_menu_menuitem(
     submenu_display,
