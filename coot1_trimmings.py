@@ -4153,8 +4153,95 @@ def _custom_key_binding_label(key):
     return "Ctrl+" + key[len("Control_"):] if key.startswith("Control_") else key
   named = {65289: "Tab", 65293: "Return", 65307: "Escape", 65361: "Left",
            65362: "Up", 65363: "Right", 65364: "Down", 65288: "BackSpace",
-           65535: "Delete", 32: "Space"}
+           65535: "Delete", 32: "Space", 65421: "Keypad Enter", 65451: "Keypad +", 65453: "Keypad -"}
+  if 65470 <= key <= 65504:
+    return f"F{key - 65469}"
+  if 65456 <= key <= 65465:
+    return f"Keypad {key - 65456}"
   return named.get(key, chr(key) if 33 <= key <= 126 else f"Key {key}")
+
+
+def _parse_native_key_bindings(text, keyval_from_name):
+  bindings = {}
+  for line in text.splitlines():
+    match = re.match(r"^binding:\s*(Ctrl\s+)?(\S+)\s+->\s*(.*?)\s+BUILT_IN\s*$", line)
+    if not match:
+      continue
+    ctrl, symbol, name = match.groups()
+    if symbol.startswith("gdk-symbol-") and symbol[11:].isdigit():
+      key_id = int(symbol[11:])
+    elif len(symbol) == 1:
+      key_id = ord(symbol)
+    else:
+      key_id = keyval_from_name({"KP_plus": "KP_Add", "KP_minus": "KP_Subtract"}.get(symbol, symbol))
+    if not key_id or key_id == 0xffffff or not name:
+      continue
+    identity = (int(bool(ctrl)), key_id)
+    if identity in REGISTERED_KEYBINDINGS:
+      continue
+    key = _custom_key_binding_label(key_id)
+    bindings[identity] = {"key": "Ctrl+" + key if ctrl else key, "name": name, "source": "Coot"}
+  return list(bindings.values())
+
+
+def _read_native_key_bindings():
+  """Read the live native table only when the reference panel is opened."""
+  printer = getattr(coot, "print_key_bindings", None)
+  if not callable(printer):
+    return [], "Native shortcuts are unavailable in this Coot build."
+  try:
+    gdk = _coot_gui_repository_module("Gdk")
+    # The API writes C++ std::cout, so redirect_stdout cannot capture it.
+    # Its lines are flushed with std::endl; restore fd 1 even on API failure.
+    sys.stdout.flush()
+    with tempfile.TemporaryFile() as output:
+      previous = os.dup(1)
+      try:
+        os.dup2(output.fileno(), 1)
+        printer()
+      finally:
+        os.dup2(previous, 1)
+        os.close(previous)
+      output.seek(0)
+      text = output.read().decode("utf-8", errors="replace")
+    for line in text.splitlines():
+      if not line.startswith("binding:"):
+        print(line)
+    return _parse_native_key_bindings(text, gdk.keyval_from_name), None
+  except Exception as error:
+    print(f"Could not read native key bindings: {error}")
+    return [], "Native shortcuts could not be read; showing Custom shortcuts only."
+
+
+def _key_binding_reference_groups(native, query=""):
+  groups = {name: [] for name in ("Build / Edit", "Refinement", "Maps", "Navigation / Display", "Other")}
+  items = [{"key": _custom_key_binding_label(key), "name": name, "source": "Custom"}
+           for key, name in REGISTERED_KEYBINDINGS.values()] + native
+  terms = query.strip().casefold().split()
+  for item in items:
+    key, action, source = item["key"], item["name"], item["source"]
+    if not all(source.casefold() == term if term in ("custom", "coot") else
+               term in f"{key} {action}".casefold() for term in terms):
+      continue
+    group = _key_binding_category(action)
+    groups[group].append((key, action, source))
+  return [(name, rows) for name, rows in groups.items() if rows]
+
+
+def _key_binding_category(action):
+  lower = action.casefold()
+  if any(word in lower for word in ("map", "density", "contour", "sigma", "surface")):
+    return "Maps"
+  if any(word in lower for word in ("representation", "display", "symmetry", "clipping", "ncs",
+                                   "distances", "measure", "pending picks", "residue in chain",
+                                   "zoom", "move forward", "move backward", "label", "focus command")):
+    return "Navigation / Display"
+  if any(word in lower for word in ("refine", "fit", "restraint")):
+    return "Refinement"
+  if any(word in lower for word in ("place", "copy", "paste", "delete", "sidechain", "water", "mutate",
+                                   "terminal", "terminus", "peptide", "rotamer", "undo", "redo", "save")):
+    return "Build / Edit"
+  return "Other"
 
 
 def _custom_key_binding_groups(query=""):
@@ -4164,44 +4251,37 @@ def _custom_key_binding_groups(query=""):
     key = _custom_key_binding_label(key)
     if query and query not in f"{key} {action}".casefold():
       continue
-    lower = action.casefold()
-    if any(word in lower for word in ("map", "density", "contour", "sigma", "surface")):
-      group = "Maps"
-    elif any(word in lower for word in ("representation", "display", "symmetry", "clipping", "ncs",
-                                       "distances", "measure", "pending picks", "residue in chain")):
-      group = "Navigation / Display"
-    elif any(word in lower for word in ("refine", "fit", "restraint")):
-      group = "Refinement"
-    elif any(word in lower for word in ("place", "copy", "paste", "delete", "sidechain", "water",
-                                       "terminal", "terminus", "peptide", "rotamer", "undo", "redo", "save")):
-      group = "Build / Edit"
-    else:
-      group = "Other"
+    group = _key_binding_category(action)
     groups[group].append((key, action))
   return [(name, rows) for name, rows in groups.items() if rows]
 
 
 def custom_key_bindings_dialog():
-  """A read-only reference to the shortcuts successfully registered by this script."""
+  """A read-only reference to Custom shortcuts and remaining native bindings."""
   global _CUSTOM_KEY_BINDINGS_WINDOW
   if Gtk is None:
     info_dialog(_gui_unavailable_message("Custom Key Bindings"))
     return None
   if _CUSTOM_KEY_BINDINGS_WINDOW is not None and _CUSTOM_KEY_BINDINGS_WINDOW.get_visible():
-    _CUSTOM_KEY_BINDINGS_WINDOW.key_bindings_widgets["refresh"]()
+    _CUSTOM_KEY_BINDINGS_WINDOW.key_bindings_widgets["reload"]()
     _CUSTOM_KEY_BINDINGS_WINDOW.present()
     return _CUSTOM_KEY_BINDINGS_WINDOW
-  window = Gtk.Window(title="Custom Key Bindings")
+  window = Gtk.Window(title="Key Bindings: Custom and Coot")
   window.set_default_size(600, 500)
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for edge in ("start", "end", "top", "bottom"):
     getattr(box, "set_margin_" + edge)(12)
-  hint = Gtk.Label(label="Keys are case-sensitive; uppercase letters require Shift.\nUse shortcuts with focus in the model view.")
+  hint = Gtk.Label(label="Keys are case-sensitive; uppercase letters require Shift.\nUse shortcuts with focus in the model view. Overridden native keys are omitted.")
   hint.set_xalign(0)
   hint.set_wrap(True)
   box.append(hint)
+  availability = Gtk.Label()
+  availability.set_xalign(0)
+  availability.set_wrap(True)
+  availability.add_css_class("dim-label")
+  box.append(availability)
   search = Gtk.SearchEntry()
-  search.set_placeholder_text("Find a key or action")
+  search.set_placeholder_text("Find a key or action; filter with custom / coot")
   box.append(search)
   scroll = Gtk.ScrolledWindow()
   scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -4219,13 +4299,15 @@ def custom_key_bindings_dialog():
   footer.append(close)
   box.append(footer)
   rows = []
+  entries, native = [], []
   def refresh(*_args):
     child = content.get_first_child()
     while child is not None:
       content.remove(child)
       child = content.get_first_child()
     rows.clear()
-    groups = _custom_key_binding_groups(search.get_text())
+    entries.clear()
+    groups = _key_binding_reference_groups(native, search.get_text())
     for title, bindings in groups:
       section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
       heading = Gtk.Label(label=title)
@@ -4233,7 +4315,7 @@ def custom_key_bindings_dialog():
       heading.add_css_class("heading")
       section.append(heading)
       grid = Gtk.Grid(column_spacing=16, row_spacing=4)
-      for index, (key, action) in enumerate(bindings):
+      for index, (key, action, source) in enumerate(bindings):
         key_label = Gtk.Label(label=key)
         key_label.add_css_class("monospace")
         key_label.set_xalign(0)
@@ -4246,13 +4328,24 @@ def custom_key_bindings_dialog():
         action_label.set_selectable(True)
         grid.attach(key_label, 0, index, 1, 1)
         grid.attach(action_label, 1, index, 1, 1)
+        source_label = Gtk.Label(label=source)
+        source_label.add_css_class("dim-label")
+        source_label.set_xalign(0)
+        grid.attach(source_label, 2, index, 1, 1)
         rows.append((key, action))
+        entries.append((key, action, source))
       section.append(grid)
       content.append(section)
-    total = len(REGISTERED_KEYBINDINGS)
+    total = len(REGISTERED_KEYBINDINGS) + len(native)
     count.set_text(f"{len(rows)} / {total} shortcuts" if search.get_text().strip() else f"{total} shortcuts")
     if not rows:
       content.append(Gtk.Label(label="No matching shortcuts." if total else "No custom shortcuts registered in this build."))
+  def reload():
+    bindings, note = _read_native_key_bindings()
+    native[:] = bindings
+    availability.set_text(note or "")
+    availability.set_visible(bool(note))
+    refresh()
   def close_window(*_args):
     global _CUSTOM_KEY_BINDINGS_WINDOW
     _CUSTOM_KEY_BINDINGS_WINDOW = None
@@ -4263,9 +4356,10 @@ def custom_key_bindings_dialog():
   window.connect("close-request", close_window)
   window.set_child(box)
   window.key_bindings_widgets = {"search": search, "content": content, "count": count,
-                                "close": close, "rows": rows, "refresh": refresh}
+                                "close": close, "rows": rows, "entries": entries, "native": native,
+                                "availability": availability, "refresh": refresh, "reload": reload}
   _CUSTOM_KEY_BINDINGS_WINDOW = window
-  refresh()
+  reload()
   window.present()
   return window
 
@@ -22999,8 +23093,79 @@ def _custom_menu_search_matches(menu, query):
                                          item["path"].casefold(), item["label"].casefold()))
 
 
+def _menu_search_items(custom_menu, native_menu=None):
+  """Combine live menus for search without changing the toolbar's Custom catalog."""
+  custom = _custom_menu_search_items(custom_menu)
+  def identity(item):
+    target = item["target"]
+    return item["action"], None if target is None else (target.get_type_string(), target.print_(True))
+  custom_actions = {identity(item) for item in custom}
+  items = [dict(item, source="Custom") for item in custom]
+  if native_menu is not None:
+    items.extend(dict(item, source="Coot") for item in _custom_menu_search_items(native_menu)
+                 if identity(item) not in custom_actions)
+  return items
+
+
+def _menu_search_matches(items, query):
+  terms = query.casefold().split()
+  if not terms:
+    return []
+  phrase = " ".join(terms)
+  return sorted((item for item in items if all(
+    item["source"].casefold() == term if term in ("custom", "coot") else
+    term in (item["path"] + " " + item["label"]).casefold() for term in terms)),
+    key=lambda item: (not item["label"].casefold().startswith(phrase), item["source"] != "Custom",
+                      item["path"].casefold(), item["label"].casefold()))
+
+
+def _native_menu_action_bridge():
+  bridge = globals().get("_NATIVE_MENU_ACTION_BRIDGE")
+  if bridge is None:
+    import ctypes
+    # Use the already loaded libraries, never a second GTK from another prefix.
+    # Unlike GI/CDLL, PyDLL retains the GIL while Coot's C++ action re-enters Python.
+    bridge = ctypes.PyDLL(None)
+    pointer = ctypes.c_void_p
+    signatures = {
+      "PyCapsule_GetPointer": ([ctypes.py_object, ctypes.c_char_p], pointer),
+      "gtk_widget_activate_action_variant": ([pointer, ctypes.c_char_p, pointer], ctypes.c_int),
+      "g_variant_type_new": ([ctypes.c_char_p], pointer),
+      "g_variant_type_free": ([pointer], None),
+      "g_variant_parse": ([pointer, ctypes.c_char_p, pointer, pointer, pointer], pointer),
+      "g_variant_take_ref": ([pointer], pointer),
+      "g_variant_unref": ([pointer], None),
+    }
+    for name, (arguments, result) in signatures.items():
+      function = getattr(bridge, name)
+      function.argtypes, function.restype = arguments, result
+    globals()["_NATIVE_MENU_ACTION_BRIDGE"] = bridge
+  return bridge
+
+
+def _activate_native_menu_action(widget, name, target=None):
+  bridge = _native_menu_action_bridge()
+  widget_pointer = bridge.PyCapsule_GetPointer(widget.__gpointer__, None)
+  parameter = None
+  if target is not None:
+    # Reconstruct through the public GVariant API, not a private boxed-object layout.
+    variant_type = bridge.g_variant_type_new(target.get_type_string().encode("ascii"))
+    try:
+      parameter = bridge.g_variant_parse(variant_type, target.print_(True).encode("utf-8"), None, None, None)
+    finally:
+      bridge.g_variant_type_free(variant_type)
+    if not parameter:
+      raise ValueError("The native menu action's parameter could not be converted safely.")
+    bridge.g_variant_take_ref(parameter)
+  try:
+    return bool(bridge.gtk_widget_activate_action_variant(widget_pointer, name.encode("utf-8"), parameter))
+  finally:
+    if parameter:
+      bridge.g_variant_unref(parameter)
+
+
 def _install_custom_menu_search(menu):
-  """Add a search entry inside the existing Custom popover; keep its native menus."""
+  """Search Custom and Coot actions inside the existing Custom popover."""
   gui = _coot_gui_module()
   api = getattr(gui, "coot_gui_api", None)
   glib = _coot_gui_repository_module("GLib")
@@ -23030,7 +23195,7 @@ def _install_custom_menu_search(menu):
   for side in ("start", "end", "top", "bottom"):
     getattr(header, "set_margin_" + side)(6)
   search = Gtk.SearchEntry()
-  search.set_placeholder_text("Search Custom menu...")
+  search.set_placeholder_text("Search Custom and Coot menus...")
   search.set_size_request(340, -1)
   if hasattr(search, "set_search_delay"):
     search.set_search_delay(0)
@@ -23051,9 +23216,16 @@ def _install_custom_menu_search(menu):
   header.append(empty)
   state = {"search": search, "results": results, "body": body, "root": root, "popover": popover,
            "rows": [], "launching": False, "filtering": None}
+  def live_items():
+    get_native = getattr(api, "main_menumodel", None)
+    native = get_native() if callable(get_native) else None
+    return _menu_search_items(menu, native)
   def enabled(item):
-    action = app.lookup_action(item["action"][4:]) if item["action"].startswith("app.") else None
-    return bool(action and action.get_enabled()) if item["action"].startswith("app.") else True
+    prefix, _dot, name = item["action"].partition(".")
+    group = app if prefix == "app" else toolbar.get_root() if prefix == "win" else None
+    lookup = getattr(group, "lookup_action", None)
+    action = lookup(name) if callable(lookup) else None
+    return bool(action and action.get_enabled())
   def refresh(*_args):
     child = results.get_first_child()
     while child is not None:
@@ -23067,13 +23239,13 @@ def _install_custom_menu_search(menu):
         body.append_section(None, menu)
       state["filtering"] = bool(query)
     if query:
-      for item in _custom_menu_search_matches(menu, query):
+      for item in _menu_search_matches(live_items(), query):
         row = Gtk.ListBoxRow()
         row.set_sensitive(enabled(item))
         labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         labels.set_margin_top(5)
         labels.set_margin_bottom(5)
-        for text, dim in ((item["label"], False), (item["path"] or "Custom", True)):
+        for text, dim in ((item["label"], False), (item["path"] or item["source"], True)):
           label = Gtk.Label(label=text)
           label.set_xalign(0)
           label.set_wrap(True)
@@ -23081,8 +23253,17 @@ def _install_custom_menu_search(menu):
           if dim:
             label.add_css_class("dim-label")
           labels.append(label)
-        row.set_child(labels)
-        row.set_tooltip_text(" > ".join(part for part in (item["path"], item["label"]) if part))
+        labels.set_hexpand(True)
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        content.append(labels)
+        badge = Gtk.Label(label=item["source"])
+        badge.add_css_class("dim-label")
+        badge.set_valign(Gtk.Align.START)
+        badge.set_margin_top(5)
+        badge.set_tooltip_text("Coot-native menu action" if item["source"] == "Coot" else "coot_trimmings command")
+        content.append(badge)
+        row.set_child(content)
+        row.set_tooltip_text(" > ".join(part for part in (item["source"], item["path"], item["label"]) if part))
         results.append(row)
         state["rows"].append((row, item))
       first = next((row for row, item in state["rows"] if row.get_sensitive()), None)
@@ -23098,23 +23279,25 @@ def _install_custom_menu_search(menu):
       return
     # Recent-file action names are reused. Never dispatch a result whose label
     # or target no longer matches the live menu entry behind that action name.
-    if item not in _custom_menu_search_items(menu):
+    if item not in live_items():
       refresh()
-      add_status_bar_text("Custom menu changed; please select the search result again.")
+      add_status_bar_text("Menu changed; please select the search result again.")
       return
     state["launching"] = True
     popover.popdown()
     def run():
       state["launching"] = False
       try:
-        if not enabled(item) or item not in _custom_menu_search_items(menu):
-          add_status_bar_text("Custom menu changed; please select the search result again.")
+        if not enabled(item) or item not in live_items():
+          add_status_bar_text("Menu changed; please select the search result again.")
           return False
-        if not button.activate_action(item["action"], item["target"]):
+        activated = (_activate_native_menu_action(button, item["action"], item["target"])
+                     if item["source"] == "Coot" else button.activate_action(item["action"], item["target"]))
+        if not activated:
           info_dialog("This menu action is no longer available.")
       except Exception as error:
         traceback.print_exc()
-        info_dialog(f"Custom menu action failed: {error}")
+        info_dialog(f"Menu action failed: {error}")
       return False
     glib.idle_add(run)
   def key_pressed(_controller, keyval, _keycode, _modifiers):
