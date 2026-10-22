@@ -5476,9 +5476,11 @@ def _trackpad_native_close_requested(dialog):
 
 def _install_trackpad_native_close_guard(widgets=None):
   widgets = _trackpad_native_widgets() if widgets is None else widgets
-  dialog = widgets.get("rotate_translate_obj_dialog")
-  if dialog is not None and not getattr(dialog, "coot_trimmings_close_guard", None):
-    dialog.coot_trimmings_close_guard = dialog.connect("close-request", _trackpad_native_close_requested)
+  for name, callback in (("rotate_translate_obj_dialog", _trackpad_native_close_requested),
+                         ("edit_chi_angles_dialog", _trackpad_chi_native_close_requested)):
+    dialog = widgets.get(name)
+    if dialog is not None and not getattr(dialog, "coot_trimmings_close_guard", None):
+      dialog.coot_trimmings_close_guard = dialog.connect("close-request", callback)
 
 
 def _trackpad_edit_update_buttons(edit):
@@ -5991,6 +5993,34 @@ def _trackpad_chi_check(edit, check_coordinates=True):
     raise RuntimeError("The selected residue changed outside this panel. Close and reopen it.")
 
 
+def _trackpad_chi_sync_bond_list(edit):
+  listing = edit.get("bond_list")
+  if listing is None:
+    return
+  edit["syncing_bonds"] = True
+  try:
+    signature = tuple(edit["bonds"])
+    if signature != edit.get("bond_list_signature"):
+      child = listing.get_first_child()
+      while child is not None:
+        listing.remove(child)
+        child = listing.get_first_child()
+      for number, (_index, a, b, name) in enumerate(signature, 1):
+        label = Gtk.Label(label=f"{number:2d}  {a} -- {b}")
+        label.set_xalign(0)
+        label.add_css_class("monospace")
+        row = Gtk.ListBoxRow()
+        row.set_child(label)
+        row.set_tooltip_text(name)
+        listing.append(row)
+      edit["bond_list_signature"] = signature
+    row = listing.get_row_at_index(edit["selected"])
+    if listing.get_selected_row() != row:
+      listing.select_row(row)
+  finally:
+    edit["syncing_bonds"] = False
+
+
 def _trackpad_chi_refresh(edit, positions=None):
   positions = _trackpad_chi_positions(edit) if positions is None else positions
   index, a, b, _name = edit["bonds"][edit["selected"]]
@@ -6012,6 +6042,25 @@ def _trackpad_chi_refresh(edit, positions=None):
     coot.graphics_draw()
   if edit.get("bond_label") is not None:
     edit["bond_label"].set_text(f"Bond {edit['selected']+1}/{len(edit['bonds'])}: {a} -- {b}")
+  _trackpad_chi_sync_bond_list(edit)
+
+
+def _trackpad_chi_native_close_requested(dialog):
+  """Cancel a visible native chi editor without destroying its reusable controls."""
+  # A queued native close must not cancel a preview our panel has since taken over.
+  if not dialog.get_visible():
+    return True
+  edit = globals().get("_TRACKPAD_CHI_STATE")
+  if edit is not None and edit.get("native") is dialog:
+    edit["owns_native"] = False
+    _trackpad_chi_finish(False)
+  coot.clear_up_moving_atoms()
+  coot.set_graphics_edit_current_chi(0)
+  coot.unset_moving_atom_move_chis()
+  coot.set_show_chi_angle_bond(0)
+  dialog.set_visible(False)
+  coot.normal_cursor()
+  return True
 
 
 def _trackpad_chi_begin_native(edit):
@@ -6021,6 +6070,7 @@ def _trackpad_chi_begin_native(edit):
     raise RuntimeError("Coot could not start chi-angle editing for this residue.")
   edit["owns_native"] = True
   widgets = _trackpad_native_widgets()
+  _install_trackpad_native_close_guard(widgets)
   edit["native"] = widgets.get("edit_chi_angles_dialog")
   box = widgets.get("edit_chi_angles_vbox")
   if edit["native"] is not None:
@@ -6205,6 +6255,23 @@ def _trackpad_chi_panel(edit):
       function(*args)
     except Exception as error:
       add_status_bar_text(str(error))
+  listing = Gtk.ListBox()
+  listing.set_selection_mode(Gtk.SelectionMode.SINGLE)
+  listing.add_css_class("boxed-list")
+  edit["bond_list"] = listing
+  def select_bond(_listing, row):
+    if row is None or edit.get("syncing_bonds") or row.get_index() == edit["selected"]:
+      return
+    attempt(_trackpad_chi_choose, edit, row.get_index()-edit["selected"])
+    if globals().get("_TRACKPAD_CHI_STATE") is edit:
+      _trackpad_chi_sync_bond_list(edit)
+  listing.connect("row-selected", select_bond)
+  scroller = Gtk.ScrolledWindow()
+  scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+  scroller.set_propagate_natural_height(True)
+  scroller.set_max_content_height(180)
+  scroller.set_child(listing)
+  box.insert_child_after(scroller, bond)
   view = Gtk.CheckButton(label="Move view instead of bond")
   def change_view(widget):
     if _trackpad_chi_drain(edit):
@@ -6220,7 +6287,7 @@ def _trackpad_chi_panel(edit):
   reverse.connect("toggled", change_reverse)
   box.append(reverse)
   buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-  widgets = {"view": view, "reverse": reverse, "bond": bond}
+  widgets = {"view": view, "reverse": reverse, "bond": bond, "bonds": listing}
   for name, callback in (("Previous", lambda: _trackpad_chi_choose(edit, -1)),
                          ("Next", lambda: _trackpad_chi_choose(edit, 1)),
                          ("Reset", lambda: _trackpad_chi_reset(edit)),
@@ -6284,7 +6351,7 @@ def trackpad_edit_chi_angles():
     _trackpad_chi_begin_native(edit)
     _trackpad_chi_panel(edit)
     edit["watch"] = _coot_gui_repository_module("GLib").timeout_add(100, _trackpad_chi_watch, edit)
-    add_status_bar_text("Swipe to rotate the highlighted bond; Previous/Next changes bonds. Close discards unapplied edits.")
+    add_status_bar_text("Swipe to rotate the highlighted bond; click a bond or use Previous/Next to select. Close discards unapplied edits.")
     return edit
   except Exception as error:
     if edit is not None:
@@ -14120,6 +14187,7 @@ class RefinementStage:
     weight: float
     repeats: int = 1
     autofit_rotamers: bool = False
+    b_factor: float = 0.0
 
     def __post_init__(self):
         if type(self.map_id) is not int or self.map_id < 0:
@@ -14130,6 +14198,8 @@ class RefinementStage:
             raise ValueError("Stage repeats must be a positive integer.")
         if type(self.autofit_rotamers) is not bool:
             raise ValueError("Autofit rotamers must be True or False.")
+        if not math.isfinite(self.b_factor):
+            raise ValueError("Stage B-factor must be finite (positive blurs; negative sharpens).")
 
 
 @dataclass(frozen=True)
@@ -14512,6 +14582,61 @@ class CootRefinementBackend:
         self._anchor_keys = {}
         self._polymer_order = {}
         self._priority_enabled = False
+        self._stage_maps = {}
+
+    def _release_stage_map(self, key):
+        map_id, name, _source_name = self._stage_maps[key]
+        if self.api.is_valid_map_molecule(map_id) and self.api.molecule_name(map_id) == name:
+            self.api.close_molecule(map_id)
+        del self._stage_maps[key]
+
+    def release_stage_maps(self):
+        """Remove only maps created by this backend, not maps reused at their IDs."""
+        errors = []
+        for key in list(self._stage_maps):
+            try:
+                self._release_stage_map(key)
+            except Exception as error:
+                errors.append(str(error))
+        if errors:
+            raise RuntimeError("Temporary map cleanup failed: " + "; ".join(errors))
+
+    def stage_map(self, stage):
+        """Lazily cache one hidden native map per source/B-factor pair for this run."""
+        api = self.api
+        if not api.is_valid_map_molecule(stage.map_id):
+            raise ValueError("Stage source map has been closed.")
+        if not stage.b_factor:
+            return stage.map_id
+        key = (stage.map_id, stage.b_factor)
+        source_name = api.molecule_name(stage.map_id)
+        cached = self._stage_maps.get(key)
+        if cached is not None:
+            map_id, name, original_name = cached
+            if (api.is_valid_map_molecule(map_id) and api.molecule_name(map_id) == name
+                    and source_name == original_name):
+                return map_id
+            self._release_stage_map(key)
+        existing = {i for i in range(api.graphics_n_molecules()) if api.is_valid_map_molecule(i)}
+        previous_map = api.imol_refinement_map()
+        try:
+            map_id = api.sharpen_blur_map(stage.map_id, stage.b_factor)
+            if map_id in existing or not api.is_valid_map_molecule(map_id):
+                raise RuntimeError("Could not create the temporary stage map; source map unchanged.")
+            name = "Multimap temporary map %s #%d: source #%d, B %+g" % (
+                id(self), map_id, stage.map_id, stage.b_factor)
+            try:
+                api.set_molecule_name(map_id, name)
+                api.set_map_displayed(map_id, 0)
+            except Exception:
+                api.close_molecule(map_id)
+                raise
+            self._stage_maps[key] = (map_id, name, source_name)
+            return map_id
+        finally:
+            if api.is_valid_map_molecule(previous_map) and api.imol_refinement_map() != previous_map:
+                if api.set_imol_refinement_map(previous_map) != previous_map:
+                    raise RuntimeError("Could not restore the refinement map after stage-map preparation.")
 
     def snapshot(self, imol):
         if not self.api.is_valid_model_molecule(imol):
@@ -14710,6 +14835,11 @@ class CootRefinementBackend:
         for stage in stages:
             if not self.api.is_valid_map_molecule(stage.map_id):
                 raise ValueError("Map #%s has been closed or is not a map." % stage.map_id)
+        if any(stage.b_factor for stage in stages):
+            for name in ("sharpen_blur_map", "graphics_n_molecules", "set_molecule_name",
+                         "molecule_name", "set_map_displayed", "close_molecule"):
+                if not callable(getattr(self.api, name, None)):
+                    raise RuntimeError("Stage B-factors require " + name + "; use B = 0 on this build.")
         if options.auto_pause and not callable(getattr(self.api, "map_to_model_correlation_per_residue_py", None)):
             raise RuntimeError("CC guard is unavailable in this Coot build.")
         if options.prioritize_misfits:
@@ -14814,7 +14944,8 @@ class CootRefinementBackend:
         amino_acids = {"ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "HIS", "ILE", "LEU",
                       "LYS", "MET", "MSE", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"}
         try:
-            if api.set_imol_refinement_map(stage.map_id) != stage.map_id:
+            map_id = self.stage_map(stage)
+            if api.set_imol_refinement_map(map_id) != map_id:
                 raise RuntimeError("Could not set rotamer-fitting map.")
             api.set_rotamer_auto_fit_do_post_refine(0)
             for spec in seed:
@@ -14825,7 +14956,7 @@ class CootRefinementBackend:
                 if not any(float(a[1][0]) > 0 for a in atoms):
                     continue
                 for alt in alts or [""]:
-                    score = api.auto_fit_best_rotamer(imol, *spec, alt, stage.map_id, 1, 0.3)
+                    score = api.auto_fit_best_rotamer(imol, *spec, alt, map_id, 1, 0.3)
                     report["attempted"] += 1
                     if not isinstance(score, (int, float)) or not math.isfinite(score) or score <= -99.89:
                         report["failed"].append(tuple(spec) + (alt,))
@@ -14890,7 +15021,8 @@ class CootRefinementBackend:
                         raise RuntimeError("Could not add temporary H-bond restraint.")
                     owned.append(["bond", a, b])
                     existing.add(key)
-            if api.set_imol_refinement_map(stage.map_id) != stage.map_id:
+            map_id = self.stage_map(stage)
+            if api.set_imol_refinement_map(map_id) != map_id:
                 raise RuntimeError("Could not set refinement map.")
             api.set_matrix(stage.weight)
             api.set_refinement_immediate_replacement(1)
@@ -15111,6 +15243,12 @@ class MultimapRefinementJob:
         self.state, self.message = state, message
         if _MULTIMAP_RUNNING is self:
             _MULTIMAP_RUNNING = None
+        cleanup = getattr(self.backend, "release_stage_maps", None)
+        if state != "paused" and callable(cleanup):
+            try:
+                cleanup()
+            except Exception as error:
+                self.message += " | " + str(error)
         self._notify()
 
     def pause(self):
@@ -15158,6 +15296,8 @@ class MultimapRefinementJob:
             self.message = "Refining %d/%d | %s:%d%s-%d%s | Stage %d/%d, map #%d, weight %g | Repeat %d/%d" % (
                 self.index+1, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
                 si+1, len(self.stages), stage.map_id, stage.weight, repeat+1, stage.repeats)
+            if stage.b_factor:
+                self.message += " | B %+g A^2 (cached stage map)" % stage.b_factor
             if stage.autofit_rotamers:
                 self.message += " | Autofit rotamers, then refine"
             if self.options.prioritize_misfits:
@@ -15200,6 +15340,8 @@ class MultimapRefinementJob:
             self.message = "%d/%d | %s:%d%s-%d%s | Map #%d, weight %g | %d moving" % (
                 self.index, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
                 stage.map_id, stage.weight, len(moving))
+            if stage.b_factor:
+                self.message += " | B %+g A^2" % stage.b_factor
             if rotamers:
                 self.message += " | Rotamers %d/%d fitted" % (
                     rotamers["attempted"] - len(rotamers["failed"]), rotamers["attempted"])
@@ -15411,11 +15553,11 @@ def multimap_refinement_gui():
         else:
             for widget in stage_grid.get_children():
                 stage_grid.remove(widget)
-        for column, text in enumerate(("", "Map", "Weight", "Repeats", "Autofit\nrotamers", "")):
+        for column, text in enumerate(("", "Map", "B (A^2)", "Weight", "Repeats", "Autofit\nrotamers", "")):
             stage_grid.attach(label(text), column, 0, 1, 1)
         for index, row in enumerate(stage_rows):
             stage_grid.attach(label(str(index+1)), 0, index+1, 1, 1)
-            for column, key in enumerate(("map", "weight", "repeats", "autofit_rotamers"), 1):
+            for column, key in enumerate(("map", "b_factor", "weight", "repeats", "autofit_rotamers"), 1):
                 stage_grid.attach(row[key], column, index+1, 1, 1)
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
             for text, change, tooltip in (("^", -1, "Move stage earlier"),
@@ -15434,7 +15576,7 @@ def multimap_refinement_gui():
                     redraw_stages()
                 button.connect("clicked", edit)
                 append(actions, button)
-            stage_grid.attach(actions, 5, index+1, 1, 1)
+            stage_grid.attach(actions, 6, index+1, 1, 1)
         if not gtk4:
             stage_grid.show_all()
 
@@ -15454,8 +15596,10 @@ def multimap_refinement_gui():
         autofit = Gtk.CheckButton()
         autofit.set_tooltip_text("Autofit this range's protein sidechains against this map before each refinement. Uses current rotamer/backrub mode.")
         autofit.set_halign(Gtk.Align.CENTER)
+        b_factor = spin(0, -5000, 5000, 10, 1)
+        b_factor.set_tooltip_text("Applied B-factor: positive blurs, negative sharpens, 0 uses the original map.\nHidden maps are cached per map/B pair until completion or stop. CC uses the original last-stage map.")
         stage_rows.append({"map": combo, "weight": spin(weight, 0.01, 100000, 1, 2),
-                           "repeats": spin(1, 1, 100), "autofit_rotamers": autofit})
+                           "b_factor": b_factor, "repeats": spin(1, 1, 100), "autofit_rotamers": autofit})
         redraw_stages()
 
     def refresh_maps(_button=None):
@@ -15603,9 +15747,11 @@ def multimap_refinement_gui():
                         raise ValueError("Choose an available map for stage %d." % (index+1))
                     row["weight"].update()
                     row["repeats"].update()
+                    row["b_factor"].update()
                     stages.append(RefinementStage(int(map_id), row["weight"].get_value(),
                                                   row["repeats"].get_value_as_int(),
-                                                  autofit_rotamers=row["autofit_rotamers"].get_active()))
+                                                  autofit_rotamers=row["autofit_rotamers"].get_active(),
+                                                  b_factor=row["b_factor"].get_value()))
                 for field in (size, step, radius, padding, limit, min_cc, cc_drop, geometry, priority_cc, priority_density):
                     field.update()
                 contact = radius.get_value()
@@ -25902,7 +26048,7 @@ if _coot_gui_module() is not None:
   try:
     _install_trackpad_native_close_guard()
   except Exception as error:
-    print("Native Rotate/Translate close guard unavailable:", error)
+    print("Native editing-dialog close guards unavailable:", error)
 
 _initialize_trackpad_preferences()
 
