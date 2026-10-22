@@ -20543,13 +20543,33 @@ def _install_recent_files_tracking(models_menu, maps_menu):
 @lru_cache(maxsize=1)
 def _ccp4_monomer_library_roots():
   roots = []
-  for candidate in (
+  candidates = [
     os.environ.get("CLIBD_MON"),
     os.path.join(os.environ.get("CCP4", ""), "lib", "data", "monomers") if os.environ.get("CCP4") else "",
+  ]
+  # Prefer the running Coot's data directory over another installed suite.
+  # This also follows Homebrew upgrades without querying brew at runtime.
+  package_data = getattr(coot, "get_pkgdatadir_py", None)
+  if callable(package_data):
+    try:
+      data_dir = os.fspath(package_data())
+      if data_dir:
+        candidates.append(os.path.join(data_dir, "lib", "data", "monomers"))
+    except Exception:
+      pass
+  for prefix in (os.environ.get("HOMEBREW_PREFIX"), "/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"):
+    if prefix:
+      candidates.append(os.path.join(prefix, "opt", "coot", "share", "coot", "lib", "data", "monomers"))
+  candidates.append(
     "/Applications/CCP4/ccp4-9/lib/data/monomers",
-  ):
-    if candidate and os.path.isdir(candidate) and candidate not in roots:
-      roots.append(candidate)
+  )
+  seen = set()
+  for candidate in candidates:
+    if candidate and os.path.isdir(candidate):
+      resolved = os.path.realpath(candidate)
+      if resolved not in seen:
+        seen.add(resolved)
+        roots.append(candidate)
   return roots
 
 
@@ -22104,6 +22124,66 @@ def import_phenix_metal_edits(imol, file_name):
   return _review_phenix_metal_links(imol, prepared, warnings_to_review)
 
 
+def _links_containing_residue(imol, residue_spec):
+  """Read LINK endpoints without counting ordinary dictionary-defined bonds."""
+  spec = tuple(residue_spec)
+  return [link for link in coot.link_info_py(imol) or []
+          if any(tuple(atom[-5:-2]) == spec for atom in link[1:3])]
+
+
+def remove_links_for_active_residue():
+  residue = _active_residue_or_status()
+  if not residue:
+    return None
+  imol, chain, number, ins = residue[:4]
+  spec = [chain, number, ins]
+  if not all(callable(getattr(coot, name, None)) for name in (
+      "link_info_py", "delete_links_containing_residue_py")):
+    info_dialog("This Coot build cannot inspect and remove residue links.")
+    return None
+  try:
+    if coot.n_models(imol) != 1:
+      raise ValueError("Please split multi-model structures before removing residue links.")
+    name = residue_name(imol, *spec)
+    links = _links_containing_residue(imol, spec)
+  except Exception as error:
+    info_dialog(f"Could not inspect residue links.\n\n{error}")
+    return None
+  label = f"{chain or '(blank)'}:{number}{ins} {name}"
+  if not links:
+    add_status_bar_text(f"No LINK records involve {label}")
+    return None
+
+  def remove_confirmed():
+    try:
+      if (not coot.is_valid_model_molecule(imol) or coot.n_models(imol) != 1 or
+          residue_name(imol, *spec) != name or _links_containing_residue(imol, spec) != links):
+        info_dialog("The model or residue links changed. Please reopen Remove links to review them.")
+        return None
+      with _grouped_model_edit(imol):
+        remaining = links
+        while remaining:
+          # Native deletion can skip links when its loop compacts the LINK list.
+          coot.delete_links_containing_residue_py(imol, spec)
+          after = _links_containing_residue(imol, spec)
+          if len(after) >= len(remaining):
+            raise RuntimeError("Coot did not remove all links. Some links may have been removed; use Coot Undo if needed.")
+          remaining = after
+    except Exception as error:
+      info_dialog(f"Could not finish removing residue links.\n\n{error}")
+      return None
+    add_status_bar_text(f"Removed {len(links)} LINK record(s) involving {label}")
+    return len(links)
+
+  return generic_confirm_dialog(
+    "Remove links for active residue",
+    f"{_molecule_id_name_label(imol)}\n{label}\n\n"
+    f"Remove all {len(links)} LINK record(s) involving this residue?\n"
+    "This includes coordination and covalent links. Atoms and ordinary residue bonds are unchanged.",
+    "Cancel", lambda: None, "Remove links", remove_confirmed,
+  )
+
+
 def import_phenix_metal_edits_dialog():
   imol = _active_molecule_or_status()
   if imol is None:
@@ -23096,6 +23176,10 @@ def _build_custom_build_menu(
   add_simple_coot_menu_menuitem(
     submenu_coordination_links, "Import Phenix metal edits...",
     lambda *_args: import_phenix_metal_edits_dialog(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_coordination_links, "Remove links for active residue...",
+    lambda *_args: remove_links_for_active_residue(),
   )
 
   submenu_build.append_submenu("Covalent modifications", submenu_covalent_modifications)
