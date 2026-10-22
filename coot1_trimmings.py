@@ -6061,17 +6061,28 @@ def smart_copy_active_non_polymer_residue():
   copied_imol = -1
   try:
     set_recentre_on_read_pdb(0)
+    source_centre = residue_centre_py(mol_id, ch_id, resno, ins_code)
+    source_name = residue_name(mol_id, ch_id, resno, ins_code)
+    if not source_name or not isinstance(source_centre, (list, tuple)) or len(source_centre) != 3:
+      raise ValueError("Copied residue information is unavailable")
+    source_centre = tuple(float(value) for value in source_centre)
+    if not all(math.isfinite(value) for value in source_centre):
+      raise ValueError("Copied residue centre is invalid")
     copied_imol = new_molecule_by_atom_selection(mol_id, atom_selection)
+    if copied_imol == -1 or coot.n_residues(copied_imol) != 1:
+      raise ValueError("Unable to copy active residue")
+  except Exception as error:
+    if copied_imol != -1 and copied_imol in molecule_number_list():
+      close_molecule(copied_imol)
+    add_status_bar_text("Smart copy failed; previous copy retained: {0}".format(error))
+    return None
   finally:
     set_recentre_on_read_pdb(recentre_state)
     _restore_view_state(view_state)
-  if copied_imol == -1:
-    add_status_bar_text("Unable to copy active residue")
-    return None
   _close_smart_copy_template()
   _set_smart_copy_template(copied_imol)
-  SMART_COPY_SOURCE_CENTRE = residue_centre_py(mol_id, ch_id, resno, ins_code)
-  SMART_COPY_RESIDUE_NAME = residue_name(mol_id, ch_id, resno, ins_code)
+  SMART_COPY_SOURCE_CENTRE = source_centre
+  SMART_COPY_RESIDUE_NAME = source_name
   add_status_bar_text("Copied {resname} for smart paste".format(resname=SMART_COPY_RESIDUE_NAME))
 
 
@@ -6087,12 +6098,6 @@ def _smart_paste_target_molecule():
 
 def _smart_paste_target_label(target_mol_id):
   return _molecule_id_name_label(target_mol_id)
-
-
-def _merge_molecules_explicitly_failed(merge_result):
-  if not isinstance(merge_result, (list, tuple)) or not merge_result:
-    return False
-  return merge_result[0] in (0, False, None)
 
 
 def _prepare_smart_paste_molecule():
@@ -6121,7 +6126,7 @@ def _smart_paste_new_molecule():
   set_mol_displayed(paste_imol, 1)
   set_mol_active(paste_imol, 1)
   add_status_bar_text(
-    "Pasted {resname} as a new molecule ({target})".format(
+    "Pasted {resname} as a new molecule ({target}); ready to paste again".format(
       resname=(SMART_COPY_RESIDUE_NAME or "copied residue"),
       target=_smart_paste_target_label(paste_imol),
     )
@@ -6134,15 +6139,23 @@ def _smart_paste_into_molecule(target_mol_id):
   if paste_imol is None:
     return None
   try:
-    merge_result = merge_molecules_py([paste_imol], target_mol_id)
-    if _merge_molecules_explicitly_failed(merge_result):
-      add_status_bar_text("Unable to merge pasted residue into active model")
+    before = coot.n_residues(target_mol_id)
+    added = coot.n_residues(paste_imol)
+    if before < 0 or added != 1:
+      add_status_bar_text("Unable to merge pasted residue; copy retained")
+      return None
+    # Coot's homogeneous-residue merge can add a residue but return [0].
+    # n_atoms() excludes HETATM records, so verify the residue count instead.
+    merge_molecules_py([paste_imol], target_mol_id)
+    if coot.n_residues(target_mol_id) != before + added:
+      add_status_bar_text("Unable to confirm pasted residue in active model; copy retained")
       return None
   finally:
     if paste_imol in molecule_number_list():
       close_molecule(paste_imol)
+  _mark_model_changed(target_mol_id)
   add_status_bar_text(
-    "Pasted {resname} at pointer in {target}".format(
+    "Pasted {resname} at pointer in {target}; ready to paste again".format(
       resname=(SMART_COPY_RESIDUE_NAME or "copied residue"),
       target=_smart_paste_target_label(target_mol_id),
     )
