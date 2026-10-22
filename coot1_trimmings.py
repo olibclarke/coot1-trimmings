@@ -539,6 +539,7 @@ REGISTERED_KEYBINDING_ACTIONS = {}
 _CUSTOM_KEY_BINDINGS_WINDOW = None
 _CUSTOM_TOOLBAR_STATE = {}
 _TRACKPAD_EDIT_STATE = None
+_TRACKPAD_CHI_STATE = None
 _TRACKPAD_STATE = {"enabled": False, "bindings": [], "native_zoom": [], "native_scroll": [], "claimed_scroll": {}, "pending": {}, "source": None,
                    "pinch": {}, "scroll_active": {}, "window": None, "reverse": True, "startup": False,
                    "save_source": None, "startup_source": None, "startup_attempts": 0,
@@ -5095,6 +5096,10 @@ def _trackpad_adjust_map_radius(dy):
 
 
 def _trackpad_apply_motion(mode, value, area):
+  chi = globals().get("_TRACKPAD_CHI_STATE")
+  if chi is not None and chi["edit_bond"] and mode == "rotate":
+    _trackpad_chi_motion(chi, value)
+    return
   edit = globals().get("_TRACKPAD_EDIT_STATE")
   if edit is not None and edit["move_selection"] and mode in ("rotate", "translate", "slab_translate"):
     _trackpad_edit_motion(edit, mode, value, area)
@@ -5163,6 +5168,8 @@ def _trackpad_flush():
     for (mode, area), value in pending.items():
       _trackpad_apply_motion(mode, value, area)
   except Exception as error:
+    if globals().get("_TRACKPAD_CHI_STATE") is not None:
+      _trackpad_chi_finish(False)
     if globals().get("_TRACKPAD_EDIT_STATE") is not None:
       _trackpad_edit_finish(False)
     set_custom_trackpad_controls(False)
@@ -5276,7 +5283,8 @@ def _trackpad_scroll(controller, dx, dy, area):
     # Reserve this chord even outside scroll-begin/end: wheel-unit samples
     # otherwise reach Coot's native Shift-Ctrl representation cycling.
     edit = globals().get("_TRACKPAD_EDIT_STATE")
-    moving_selection = edit is not None and edit["move_selection"]
+    chi = globals().get("_TRACKPAD_CHI_STATE")
+    moving_selection = (edit is not None and edit["move_selection"]) or (chi is not None and chi["edit_bond"])
     # Some Mac swipe samples arrive as wheel events after a native dialog.
     # During selection movement, do not fall through to native contouring.
     if not (slab_translate or radius or map_radius or moving_selection) and controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
@@ -5854,6 +5862,10 @@ def _trackpad_pick_native_range():
 
 def _start_trackpad_edit(mol_id, specs, label, scope="residue", range_valid=False):
   global _TRACKPAD_EDIT_STATE
+  if globals().get("_TRACKPAD_CHI_STATE") is not None:
+    _TRACKPAD_CHI_STATE["window"].present()
+    add_status_bar_text("Close the chi-angle panel before starting Rotate/Translate.")
+    return None
   if _TRACKPAD_EDIT_STATE is not None:
     _TRACKPAD_EDIT_STATE["window"].present()
     add_status_bar_text("Close the current movement panel before choosing a different selection.")
@@ -5894,6 +5906,10 @@ def _start_trackpad_edit(mol_id, specs, label, scope="residue", range_valid=Fals
 
 
 def trackpad_rotate_translate(scope="residue"):
+  if globals().get("_TRACKPAD_CHI_STATE") is not None:
+    _TRACKPAD_CHI_STATE["window"].present()
+    add_status_bar_text("Close the chi-angle panel before starting Rotate/Translate.")
+    return None
   if _TRACKPAD_EDIT_STATE is not None:
     _TRACKPAD_EDIT_STATE["window"].present()
     add_status_bar_text("Close the current movement panel before choosing a different selection.")
@@ -5913,6 +5929,370 @@ def trackpad_rotate_translate(scope="residue"):
   else:
     raise ValueError("Choose residue, range, chain or molecule.")
   return _start_trackpad_edit(mol_id, specs, label, scope=scope)
+
+
+def _trackpad_chi_positions(edit):
+  if not edit["owns_native"]:
+    atoms = coot.residue_info_py(edit["source"], *edit["spec"]) or []
+    return {(a[0][0].strip(), a[0][1]): tuple(a[2]) for a in atoms
+            if a[0][1] in ("", edit["alt"])}
+  data = coot.get_intermediate_atoms_bonds_representation()
+  positions = {}
+  if isinstance(data, (list, tuple)) and len(data) > 1 and data[0] == "atom-positions":
+    for group in data[1]:
+      for xyz, _hydrogen, spec, _index in group:
+        # Intermediate specs carry -1 as their model ID; the stored source is authoritative.
+        if isinstance(spec, (list, tuple)) and len(spec) >= 5:
+          if tuple(spec[-5:-2]) != edit["spec"]:
+            raise RuntimeError("Another intermediate-atom operation replaced the chi-angle preview.")
+          if spec[-1] not in ("", edit["alt"]):
+            raise RuntimeError("Coot started a different alternate conformer than the selected one.")
+          positions[(spec[-2].strip(), spec[-1])] = tuple(xyz)
+  if not positions:
+    raise RuntimeError("The chi-angle preview ended or its residue/conformer changed.")
+  if edit["alt"] and not any(alt == edit["alt"] for _name, alt in positions):
+    raise RuntimeError("Coot did not include the requested alternate conformer in its chi-angle preview.")
+  return positions
+
+
+def _trackpad_chi_bonds(box, positions, alt):
+  bonds, seen = [], set()
+  child, index = box.get_first_child(), 0
+  while child is not None:
+    label = child.get_label() if callable(getattr(child, "get_label", None)) else ""
+    match = re.match(r"^\s*(\S+)\s+(\S+)\s*<-->\s*(\S+)\s+ref:", label or "")
+    if match:
+      index += 1
+      name, a, b = match.groups()
+      pair = frozenset((a, b))
+      if pair not in seen and all((atom, alt) in positions or (atom, "") in positions for atom in (a, b)):
+        # Keep Coot's 1-based torsion index even when missing/duplicate bonds are skipped.
+        bonds.append((index, a, b, name))
+        seen.add(pair)
+    child = child.get_next_sibling()
+  return bonds
+
+
+def _trackpad_chi_check(edit, check_coordinates=True):
+  if not valid_model_molecule_qm(edit["source"]):
+    raise RuntimeError("The selected model was closed.")
+  if edit["owns_native"] and not coot.refinement_already_ongoing_p():
+    edit["owns_native"] = False
+    raise RuntimeError("The chi-angle preview was accepted or cancelled outside this panel.")
+  if edit["owns_native"]:
+    try:
+      if edit.get("native") is not None and edit["native"].get_visible():
+        raise RuntimeError("Coot's native chi-angle editor was opened.")
+      _trackpad_chi_positions(edit)
+    except RuntimeError:
+      edit["owns_native"] = False
+      raise
+  if check_coordinates and _atom_snapshot_for_specs(edit["source"], [edit["spec"]]) != edit["original"]:
+    raise RuntimeError("The selected residue changed outside this panel. Close and reopen it.")
+
+
+def _trackpad_chi_refresh(edit, positions=None):
+  positions = _trackpad_chi_positions(edit) if positions is None else positions
+  index, a, b, _name = edit["bonds"][edit["selected"]]
+  endpoints = tuple(positions[(name, edit["alt"])] if (name, edit["alt"]) in positions
+                    else positions[(name, "")] for name in (a, b))
+  signature = (index, endpoints)
+  if signature != edit.get("marker_signature"):
+    obj = edit.get("marker")
+    if obj is None:
+      obj = coot.new_generic_object_number("Trackpad chi: active bond")
+      edit["marker"] = obj
+    else:
+      coot.generic_object_clear(obj)
+    coot.to_generic_object_add_cylinder(obj, "yellow", 0.15, 12, *endpoints[0], *endpoints[1], True, True)
+    for colour, xyz in zip(("cyan", "orange"), endpoints):
+      coot.to_generic_object_add_point(obj, colour, 7, *xyz)
+    coot.set_display_generic_object(obj, 1)
+    edit["marker_signature"] = signature
+    coot.graphics_draw()
+  if edit.get("bond_label") is not None:
+    edit["bond_label"].set_text(f"Bond {edit['selected']+1}/{len(edit['bonds'])}: {a} -- {b}")
+
+
+def _trackpad_chi_begin_native(edit):
+  if coot.refinement_already_ongoing_p():
+    raise RuntimeError("Accept or cancel the current intermediate atoms first.")
+  if not coot.edit_chi_angles(edit["source"], *edit["spec"], edit["alt"]):
+    raise RuntimeError("Coot could not start chi-angle editing for this residue.")
+  edit["owns_native"] = True
+  widgets = _trackpad_native_widgets()
+  edit["native"] = widgets.get("edit_chi_angles_dialog")
+  box = widgets.get("edit_chi_angles_vbox")
+  if edit["native"] is not None:
+    edit["native"].set_visible(False)
+  if box is None or edit["native"] is None or not coot.refinement_already_ongoing_p():
+    raise RuntimeError("This Coot build could not expose its chi-angle editing controls.")
+  positions = _trackpad_chi_positions(edit)
+  bonds = _trackpad_chi_bonds(box, positions, edit["alt"])
+  if not bonds:
+    raise RuntimeError("No rotatable bonds have both atoms in the selected conformer. Check the residue dictionary and alternate conformer.")
+  edit["bonds"] = bonds
+  edit["selected"] %= len(bonds)
+  edit["preview_initial"] = positions
+  edit["dirty"] = False
+  coot.unset_moving_atom_move_chis()
+  coot.set_graphics_edit_current_chi(bonds[edit["selected"]][0])
+  coot.set_show_chi_angle_bond(0)
+  coot.set_edit_chi_angles_reverse_fragment_state(int(edit["reverse_fragment"]))
+
+
+def _trackpad_chi_discard_native(edit):
+  if edit["owns_native"] and edit.get("bonds"):
+    try:
+      if edit.get("native") is not None and edit["native"].get_visible():
+        raise RuntimeError("Native editor replaced our preview.")
+      if coot.refinement_already_ongoing_p():
+        _trackpad_chi_positions(edit)
+    except RuntimeError:
+      edit["owns_native"] = False
+  if edit["owns_native"]:
+    coot.clear_up_moving_atoms()
+    coot.set_graphics_edit_current_chi(0)
+    coot.unset_moving_atom_move_chis()
+    coot.set_show_chi_angle_bond(0)
+    if edit.get("native") is not None:
+      edit["native"].set_visible(False)
+  edit["owns_native"] = False
+
+
+def _trackpad_chi_drain(edit):
+  if _TRACKPAD_STATE["pending"]:
+    if _TRACKPAD_STATE["source"] is not None:
+      _coot_gui_repository_module("GLib").source_remove(_TRACKPAD_STATE["source"])
+    _trackpad_flush()
+  return globals().get("_TRACKPAD_CHI_STATE") is edit
+
+
+def _trackpad_chi_choose(edit, direction):
+  if not _trackpad_chi_drain(edit):
+    return
+  _trackpad_chi_check(edit)
+  edit["selected"] = (edit["selected"]+direction) % len(edit["bonds"])
+  if edit["owns_native"]:
+    coot.set_graphics_edit_current_chi(edit["bonds"][edit["selected"]][0])
+    coot.set_show_chi_angle_bond(0)
+  _trackpad_chi_refresh(edit)
+  _index, a, b, _name = edit["bonds"][edit["selected"]]
+  add_status_bar_text(f"Chi bond {edit['selected']+1}/{len(edit['bonds'])}: {a} -- {b} | Swipe to rotate.")
+
+
+def _trackpad_chi_motion(edit, value):
+  _trackpad_chi_check(edit, check_coordinates=False)
+  dx, dy = value
+  if not all(math.isfinite(v) for v in (dx, dy)) or max(abs(dx), abs(dy)) > 100000:
+    raise ValueError("Invalid trackpad movement.")
+  if not edit["owns_native"]:
+    _trackpad_chi_check(edit)
+    _trackpad_chi_begin_native(edit)
+  before = _trackpad_chi_positions(edit)
+  delta = dx if abs(dx) >= abs(dy) else -dy
+  coot.set_graphics_edit_current_chi(edit["bonds"][edit["selected"]][0])
+  coot.set_show_chi_angle_bond(0)
+  # rotate_chi(am) supplies (am, am); Coot converts their sum to am/3 degrees.
+  coot.rotate_chi(delta * 1.5 * _TRACKPAD_STATE["sensitivity"]["rotate"])
+  after = _trackpad_chi_positions(edit)
+  changed = any(math.dist(before[k], after[k]) > 1e-7 for k in before.keys() & after.keys())
+  edit["dirty"] = edit["dirty"] or changed
+  _trackpad_chi_refresh(edit, after)
+  if delta and not changed:
+    add_status_bar_text("Coot could not rotate this bond; it may be in a ring or have missing torsion atoms.")
+
+
+def _trackpad_chi_reset(edit):
+  _trackpad_edit_clear_pending()
+  _trackpad_chi_check(edit)
+  _trackpad_chi_discard_native(edit)
+  _trackpad_chi_begin_native(edit)
+  _trackpad_chi_refresh(edit)
+  add_status_bar_text("Unapplied chi-angle changes discarded.")
+
+
+def _trackpad_chi_finish(accept=False, keep_open=False):
+  global _TRACKPAD_CHI_STATE
+  edit = _TRACKPAD_CHI_STATE
+  if edit is None:
+    return False
+  if accept:
+    if not _trackpad_chi_drain(edit):
+      return False
+    try:
+      _trackpad_chi_check(edit)
+      if edit["owns_native"]:
+        if _trackpad_chi_positions(edit) != edit["preview_initial"]:
+          with _grouped_model_edit(edit["source"]):
+            coot.accept_regularizement()
+        _trackpad_chi_discard_native(edit)
+      edit["original"] = _atom_snapshot_for_specs(edit["source"], [edit["spec"]])
+      if keep_open:
+        _trackpad_chi_refresh(edit)
+        add_status_bar_text("Chi angles applied; one Undo restores them. Swipe to edit again.")
+        return True
+    except Exception as error:
+      add_status_bar_text(f"Could not apply chi-angle changes: {error}")
+      return False
+  _trackpad_edit_clear_pending()
+  _TRACKPAD_CHI_STATE = None
+  try:
+    _trackpad_chi_discard_native(edit)
+  finally:
+    if edit.get("watch") is not None:
+      _coot_gui_repository_module("GLib").source_remove(edit["watch"])
+    if edit.get("marker") is not None:
+      coot.close_generic_object(edit["marker"])
+      coot.graphics_draw()
+    if edit.get("window") is not None:
+      edit["window"].destroy()
+    if not edit["was_enabled"]:
+      set_custom_trackpad_controls(False)
+  add_status_bar_text("Chi-angle panel closed; unapplied changes discarded.")
+  return True
+
+
+def _trackpad_chi_watch(edit):
+  if globals().get("_TRACKPAD_CHI_STATE") is not edit:
+    return False
+  try:
+    if not _TRACKPAD_STATE["enabled"]:
+      raise RuntimeError("Custom trackpad controls were disabled.")
+    if edit.get("native") is not None and edit["native"].get_visible():
+      edit["owns_native"] = False
+      raise RuntimeError("Coot's native chi-angle editor was opened.")
+    _trackpad_chi_check(edit)
+    _trackpad_chi_refresh(edit)
+    return True
+  except Exception as error:
+    edit["watch"] = None
+    # Do not cancel a replacement operation started outside this panel.
+    if edit["owns_native"] and valid_model_molecule_qm(edit["source"]):
+      try:
+        _trackpad_chi_positions(edit)
+      except RuntimeError:
+        edit["owns_native"] = False
+    elif not valid_model_molecule_qm(edit["source"]):
+      edit["owns_native"] = False
+    _trackpad_chi_finish(False)
+    add_status_bar_text(f"Chi-angle editing ended: {error}")
+    return False
+
+
+def _trackpad_chi_panel(edit):
+  window = Gtk.Window(title="Trackpad Edit Chi Angles")
+  edit["window"] = window
+  parent = _coot_gui_module().coot_gui_api.main_toolbar().get_root()
+  if isinstance(parent, Gtk.Window):
+    window.set_transient_for(parent)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for edge in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_"+edge)(12)
+  label = Gtk.Label(label=edit["label"])
+  label.set_xalign(0)
+  box.append(label)
+  bond = Gtk.Label()
+  bond.set_xalign(0)
+  bond.add_css_class("monospace")
+  edit["bond_label"] = bond
+  box.append(bond)
+  instructions = Gtk.Label(label="Swipe: rotate bond | Ctrl: pan | Pinch: zoom\nOption: contour | Apply keeps this panel open")
+  instructions.set_xalign(0)
+  box.append(instructions)
+  def attempt(function, *args):
+    try:
+      function(*args)
+    except Exception as error:
+      add_status_bar_text(str(error))
+  view = Gtk.CheckButton(label="Move view instead of bond")
+  def change_view(widget):
+    if _trackpad_chi_drain(edit):
+      edit["edit_bond"] = not widget.get_active()
+  view.connect("toggled", change_view)
+  box.append(view)
+  reverse = Gtk.CheckButton(label="Rotate other side of bond")
+  def change_reverse(widget):
+    if _trackpad_chi_drain(edit):
+      edit["reverse_fragment"] = widget.get_active()
+      if edit["owns_native"]:
+        coot.set_edit_chi_angles_reverse_fragment_state(int(edit["reverse_fragment"]))
+  reverse.connect("toggled", change_reverse)
+  box.append(reverse)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+  widgets = {"view": view, "reverse": reverse, "bond": bond}
+  for name, callback in (("Previous", lambda: _trackpad_chi_choose(edit, -1)),
+                         ("Next", lambda: _trackpad_chi_choose(edit, 1)),
+                         ("Reset", lambda: _trackpad_chi_reset(edit)),
+                         ("Apply", lambda: _trackpad_chi_finish(True, keep_open=True)),
+                         ("Close", lambda: _trackpad_chi_finish(False))):
+    button = Gtk.Button(label=name)
+    button.connect("clicked", lambda _button, action=callback: attempt(action))
+    if name in ("Previous", "Next"):
+      button.set_sensitive(len(edit["bonds"]) > 1)
+    buttons.append(button)
+    widgets[name.lower()] = button
+  box.append(buttons)
+  window.set_child(box)
+  window.connect("close-request", lambda *_: _trackpad_chi_finish(False) or True)
+  window.trackpad_chi_widgets = widgets
+  _trackpad_chi_refresh(edit)
+  window.present()
+
+
+def trackpad_edit_chi_angles():
+  """Edit the active residue with native intermediate atoms and live bond markers."""
+  global _TRACKPAD_CHI_STATE
+  for name in ("_TRACKPAD_CHI_STATE", "_TRACKPAD_EDIT_STATE"):
+    current = globals().get(name)
+    if current is not None:
+      current["window"].present()
+      add_status_bar_text("Close the current trackpad editing panel before choosing a new selection.")
+      return None
+  active = _active_residue_or_status()
+  if not active:
+    return None
+  edit, was_enabled = None, _TRACKPAD_STATE["enabled"]
+  try:
+    required = ("edit_chi_angles", "rotate_chi", "set_graphics_edit_current_chi",
+                "get_intermediate_atoms_bonds_representation", "set_show_chi_angle_bond",
+                "set_edit_chi_angles_reverse_fragment_state", "unset_moving_atom_move_chis",
+                "new_generic_object_number", "generic_object_clear", "to_generic_object_add_point",
+                "to_generic_object_add_cylinder", "set_display_generic_object", "close_generic_object")
+    if any(not callable(getattr(coot, name, None)) for name in required):
+      raise RuntimeError("This Coot build does not expose the native chi-angle/marker APIs needed.")
+    if coot.refinement_already_ongoing_p():
+      raise RuntimeError("Accept or cancel the current intermediate atoms first.")
+    model, chain, number, ins = active[:4]
+    if coot.backup_state(model) != 1:
+      raise RuntimeError("Enable Coot backups for this model so Apply can be undone.")
+    name = coot.residue_name(model, chain, number, ins)
+    if name in ("ALA", "GLY"):
+      raise RuntimeError(f"{name} has no side-chain chi angles.")
+    original = _atom_snapshot_for_specs(model, [(chain, number, ins)])
+    _cancel_script_clicks()
+    coot.clear_pending_picks()
+    if not set_custom_trackpad_controls(True):
+      raise RuntimeError("Custom trackpad controls could not be enabled.")
+    _trackpad_edit_clear_pending()
+    alt = active[5] if len(active) > 5 else ""
+    edit = dict(source=model, spec=(chain, number, ins), alt=alt, original=original, bonds=[], selected=0,
+                owns_native=False, dirty=False, edit_bond=True, reverse_fragment=False,
+                window=None, native=None, marker=None, was_enabled=was_enabled,
+                label=f"#{model} | {chain}:{number}{ins} {name}"+(f" | Alt {alt}" if alt else ""))
+    _TRACKPAD_CHI_STATE = edit
+    _trackpad_chi_begin_native(edit)
+    _trackpad_chi_panel(edit)
+    edit["watch"] = _coot_gui_repository_module("GLib").timeout_add(100, _trackpad_chi_watch, edit)
+    add_status_bar_text("Swipe to rotate the highlighted bond; Previous/Next changes bonds. Close discards unapplied edits.")
+    return edit
+  except Exception as error:
+    if edit is not None:
+      _trackpad_chi_finish(False)
+    elif not was_enabled and _TRACKPAD_STATE["enabled"]:
+      set_custom_trackpad_controls(False)
+    add_status_bar_text(f"Chi-angle editing could not start: {error}")
+    return None
 
 
 def custom_trackpad_controls_dialog():
@@ -16850,6 +17230,113 @@ def _global_fit_preview_owned(state, key="preview"):
           coot.molecule_name(model) == state.get(key + "_name"))
 
 
+def _global_fit_scoring_grid_supported(grid):
+  if not grid or grid.get("spacegroup") != 1:
+    return False
+  np = grid["np"]
+  transform = grid["transform"]
+  axes = np.argmax(np.abs(transform), axis=1)
+  scale = transform[np.arange(3), axes]
+  expected = np.zeros((3, 3))
+  expected[np.arange(3), axes] = scale
+  return (len(set(axes)) == 3 and bool((scale > 0).all()) and
+          np.allclose(transform, expected, rtol=0., atol=1e-12) and
+          bool((grid["shape"] >= grid["periods"]).all()))
+
+
+def _global_fit_score_box(grid, coordinates):
+  """Copy original grid samples into a smaller P1 cell, without interpolation or tapering."""
+  if not _global_fit_scoring_grid_supported(grid):
+    return None
+  np = grid["np"]
+  transform = grid["transform"]
+  axes = np.argmax(np.abs(transform), axis=1)
+  scale = transform[np.arange(3), axes]
+  points = np.asarray(list(coordinates.values()), dtype=float)
+  if not len(points) or not np.isfinite(points).all():
+    return None
+  q = (points-grid["origin"]) @ transform.T-grid["starts"]
+  # Keep periodic copies beyond Coot's 3.1 A selection border and 2.5 A EDcalc radius.
+  lower = np.floor(q.min(axis=0)-8.*scale).astype(int)
+  upper = np.ceil(q.max(axis=0)+8.*scale).astype(int)+1
+  shape = upper-lower
+  voxels = math.prod(map(int, shape))
+  if ((shape < 2).any() or (shape >= grid["periods"]).any() or
+      voxels > 4000000 or voxels > math.prod(map(int, grid["periods"]))/4):
+    return None
+  index = [np.arange(a, b) % period for a, b, period in zip(lower, upper, grid["periods"])]
+  data = np.asarray(grid["data"])[np.ix_(*reversed(index))].astype("<f4")
+  if not np.isfinite(data).all():
+    raise ValueError("The scoring region contains non-finite density values.")
+  order = np.argsort(axes)
+  fields = [0]*256
+  fields[:4] = [*map(int, shape), 2]
+  fields[7:10] = list(map(int, shape[order]))
+  fields[16:19] = list(map(int, axes+1))
+  fields[22] = 1
+  header = bytearray(struct.pack("<256i", *fields))
+  struct.pack_into("<6f", header, 40, *((shape/scale)[order]), 90., 90., 90.)
+  struct.pack_into("<3f", header, 76, float(data.min()), float(data.max()), float(data.mean()))
+  header[208:212] = b"MAP "
+  header[212:216] = b"DA\x00\x00"
+  path = os.path.join(grid["owner"].name, "score-box.map")
+  with open(path, "wb") as handle:
+    handle.write(header)
+    handle.write(data.tobytes())
+  shift = grid["origin"]+(lower+grid["starts"]) @ np.linalg.inv(transform).T
+  return path, shift
+
+
+def _global_fit_candidate_cc(state, candidate):
+  coordinates = _global_fit_candidate_coordinates(state, candidate)
+  specs = [list(s) for s in state["specs"]]
+  def full_cc():
+    _global_fit_write_coordinates(state["scorer"], coordinates)
+    return float(coot.map_to_model_correlation_py(state["scorer"], specs, [], 0, state["map"]))
+  if state.get("score_grid") is not None and not state.get("score_box_disabled"):
+    boxed = None
+    old_scroll = None
+    try:
+      box = _global_fit_score_box(state["score_grid"], coordinates)
+      if box is not None:
+        if callable(getattr(coot, "scroll_wheel_map", None)):
+          old_scroll = coot.scroll_wheel_map()
+        path, shift = box
+        model = coot.handle_read_ccp4_map(path, 0)
+        if not coot.is_valid_map_molecule(model) or model == state["map"]:
+          raise RuntimeError("Could not load the temporary scoring box.")
+        boxed = model
+        coot.set_map_displayed(boxed, 0)
+        moved = {key: tuple(float(p[i]-shift[i]) for i in range(3)) for key, p in coordinates.items()}
+        _global_fit_write_coordinates(state["scorer"], moved)
+        cc = float(coot.map_to_model_correlation_py(state["scorer"], specs, [], 0, boxed))
+        if not math.isfinite(cc) or not -1.0001 <= cc <= 1.0001:
+          raise ValueError("Scoring box returned an invalid CC.")
+        if not state.get("score_box_checked"):
+          reference = full_cc()
+          if not math.isfinite(reference) or abs(reference-cc) > 5e-5:
+            raise ValueError("Scoring box did not reproduce the original-map CC.")
+          state["score_box_checked"] = True
+          return reference
+        return cc
+    except Exception as error:
+      state["score_box_disabled"] = True
+      print("Global fit: using full-map CC:", error)
+    finally:
+      if boxed is not None and coot.is_valid_map_molecule(boxed):
+        coot.close_molecule(boxed)
+      if old_scroll is not None and coot.is_valid_map_molecule(old_scroll):
+        if coot.scroll_wheel_map() != old_scroll:
+          coot.set_scroll_wheel_map(old_scroll)
+  return full_cc()
+
+
+def _global_fit_release_scoring_grid(state):
+  grid = state.pop("score_grid", None)
+  if grid is not None and grid is not state.get("grid"):
+    _global_fit_close_grid(grid)
+
+
 def _global_fit_release(state):
   for key in ("preparation", "trial"):
     iterator = state.pop(key, None)
@@ -16859,6 +17346,7 @@ def _global_fit_release(state):
     if _global_fit_preview_owned(state, key):
       coot.close_molecule(state[key])
     state[key] = None
+  _global_fit_release_scoring_grid(state)
   _global_fit_close_grid(state.get("grid"))
   state["grid"] = None
   state["pool"] = None
@@ -16893,6 +17381,15 @@ def _global_fit_prepare(state):
     if (blurred is not None and coot.is_valid_map_molecule(blurred) and
         coot.molecule_name(blurred) == blur_name):
       coot.close_molecule(blurred)
+  if (callable(getattr(coot, "handle_read_ccp4_map", None)) and
+      _global_fit_scoring_grid_supported(state["grid"])):
+    state["message"] = "Caching the original map for scoring..."
+    yield
+    try:
+      state["score_grid"] = (state["grid"] if not state["blur_b"] else
+                             _global_fit_load_grid(state["map"], state["original"], state["radius"]))
+    except Exception as error:
+      print("Global fit: using full-map CC:", error)
   state["message"] = "Preparing the preview..."
   yield
   for key in ("preview", "scorer"):
@@ -16957,6 +17454,7 @@ def _global_fit_complete(state):
   if _global_fit_preview_owned(state, "scorer"):
     coot.close_molecule(state["scorer"])
   state["scorer"] = None
+  _global_fit_release_scoring_grid(state)
   _global_fit_close_grid(state.get("grid"))
   state["grid"] = None
   state["pool"] = None
@@ -17023,11 +17521,9 @@ def _global_fit_step(state, update=True):
         if not _global_fit_preview_owned(state, "scorer"):
           raise RuntimeError("The temporary scoring model was closed.")
         candidate = state["candidates"][state["scored"]]
-        _global_fit_write_coordinates(state["scorer"], _global_fit_candidate_coordinates(state, candidate))
         # Score once against the original target, never against the fitting blur.
         try:
-          cc = float(coot.map_to_model_correlation_py(state["scorer"],
-                     [list(s) for s in state["specs"]], [], 0, state["map"]))
+          cc = _global_fit_candidate_cc(state, candidate)
           if math.isfinite(cc) and -1.0001 <= cc <= 1.0001:
             candidate["cc"] = cc
         except Exception as error:
@@ -17130,6 +17626,7 @@ def _global_fit_start(state, scope, trials, radius, blur_b=0):
                trials=trials, radius=radius, rng=random.Random(), done=0, failed=0,
                candidates=[], selected=None, message="Preparing the search...", running=True,
                phase="prepare", blur_b=blur_b, scored=0, iteration=0,
+               score_box_checked=False, score_box_disabled=False,
                workers=min(trials, _global_fit_worker_count()), pool=None, worker_note="")
   state["preparation"] = _global_fit_prepare(state)
   _global_fit_schedule(state)
@@ -17175,14 +17672,17 @@ def _global_fit_finish(state, accept=False):
 
 
 def global_fit_map(scope="molecule"):
-  """Random-start rigid fitting, with an unchanged source and a non-modal solution browser."""
+  """Random-start rigid fitting to the refinement map, with a non-modal solution browser."""
   global _GLOBAL_FIT_STATE
   if _GLOBAL_FIT_STATE is not None:
     _GLOBAL_FIT_STATE["window"].present()
     return _GLOBAL_FIT_STATE
   active = _active_residue_or_status()
-  map_id = _scrollable_map_or_status()
-  if not active or map_id is None:
+  if not active:
+    return None
+  map_id = coot.imol_refinement_map()
+  if map_id is None or not coot.is_valid_map_molecule(map_id):
+    add_status_bar_text("Select a refinement map before global fitting.")
     return None
   required = ("export_map", "density_at_point", "map_to_model_correlation_py", "set_atom_attributes_py")
   if any(not callable(getattr(coot, name, None)) for name in required):
@@ -23315,6 +23815,7 @@ def _build_custom_fit_menu(submenu_fit):
     add_simple_coot_menu_menuitem(trackpad_menu, label,
                                  lambda _item, choice=scope: trackpad_rotate_translate(choice))
   submenu_fit.append_submenu("Trackpad Rotate/Translate", trackpad_menu)
+  add_simple_coot_menu_menuitem(submenu_fit, "Trackpad Edit Chi Angles...", lambda _item: trackpad_edit_chi_angles())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (click range)...", lambda func: cylinder_refine())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (alpha helix)...", lambda func: cylinder_refine_alpha_helix())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (beta strand)...", lambda func: cylinder_refine_beta_strand())
@@ -23637,17 +24138,106 @@ def _custom_menu_search_matches(menu, query):
                                          item["path"].casefold(), item["label"].casefold()))
 
 
-def _menu_search_items(custom_menu, native_menu=None):
+def _menu_search_widget_label(widget):
+  getter = getattr(widget, "get_label", None)
+  label = getter() if callable(getter) else None
+  label_widget = widget
+  if not label:
+    parent = widget.get_parent()
+    if isinstance(parent, Gtk.Grid):
+      column, row, width, _height = parent.query_child(widget)
+      for neighbour_column in (column-1, column+width):
+        neighbour = parent.get_child_at(neighbour_column, row)
+        if isinstance(neighbour, Gtk.Label):
+          label = neighbour.get_text()
+          label_widget = neighbour
+          break
+    elif parent is not None:
+      child = parent.get_first_child()
+      labels = []
+      while child is not None:
+        if isinstance(child, Gtk.Label):
+          labels.append(child.get_text())
+        child = child.get_next_sibling()
+      if len(labels) == 1:
+        label = labels[0]
+        label_widget = None
+  if not label:
+    label = widget.get_tooltip_text() or ""
+  get_mnemonics = getattr(label_widget, "get_use_underline", None)
+  if callable(get_mnemonics) and get_mnemonics():
+    label = label.replace("__", "\0").replace("_", "").replace("\0", "_")
+  return label.strip()
+
+
+def _menu_search_popover_items(popover, path):
+  """Read hand-built popover buttons/toggles (e.g. Refine), without emitting signals."""
+  items, pending = [], [popover]
+  while pending:
+    widget = pending.pop()
+    if widget is not popover and not widget.get_visible():
+      continue
+    kind = next((name for name, cls in (("switch", Gtk.Switch), ("check", Gtk.CheckButton),
+                 ("toggle", Gtk.ToggleButton), ("button", Gtk.Button)) if isinstance(widget, cls)), None)
+    if kind:
+      label = _menu_search_widget_label(widget)
+      if label and widget.get_visible():
+        items.append(dict(label=label, path=" > ".join(path), action=None, target=None, widget=widget, kind=kind))
+      continue
+    child = widget.get_first_child()
+    children = []
+    while child is not None:
+      children.append(child)
+      child = child.get_next_sibling()
+    pending.extend(reversed(children))
+  return items
+
+
+def _menu_search_toolbar_items(toolbar, exclude_button=None):
+  """Discover loaded module menus on demand, never by opening or constructing them."""
+  items, pending = [], [toolbar]
+  while pending:
+    widget = pending.pop()
+    if isinstance(widget, Gtk.MenuButton):
+      if widget == exclude_button or not widget.get_visible():
+        continue
+      popover = widget.get_popover()
+      label = widget.get_label() or widget.get_tooltip_text() or "Module"
+      if callable(getattr(widget, "get_use_underline", None)) and widget.get_use_underline():
+        label = label.replace("__", "\0").replace("_", "").replace("\0", "_")
+      get_model = getattr(popover, "get_menu_model", None)
+      model = get_model() if callable(get_model) else None
+      if model is not None:
+        items.extend(dict(item, context=widget) for item in _custom_menu_search_items(model, (label,)))
+      elif popover is not None:
+        items.extend(_menu_search_popover_items(popover, (label,)))
+      continue
+    child = widget.get_first_child()
+    children = []
+    while child is not None:
+      children.append(child)
+      child = child.get_next_sibling()
+    pending.extend(reversed(children))
+  return items
+
+
+def _menu_search_items(custom_menu, native_menu=None, module_items=()):
   """Combine live menus for search without changing the toolbar's Custom catalog."""
   custom = _custom_menu_search_items(custom_menu)
   def identity(item):
+    if item.get("widget") is not None:
+      return ("widget", item["widget"])
     target = item["target"]
     return item["action"], None if target is None else (target.get_type_string(), target.print_(True))
   custom_actions = {identity(item) for item in custom}
   items = [dict(item, source="Custom") for item in custom]
-  if native_menu is not None:
-    items.extend(dict(item, source="Coot") for item in _custom_menu_search_items(native_menu)
-                 if identity(item) not in custom_actions)
+  native = _custom_menu_search_items(native_menu) if native_menu is not None else []
+  seen = set()
+  for item in (*native, *module_items):
+    key = (identity(item), item["label"], item["path"])
+    if identity(item) not in custom_actions and key not in seen:
+      items.append(dict(item, source="Coot"))
+      seen.add(key)
   return items
 
 
@@ -23665,11 +24255,11 @@ def _menu_search_matches(items, query):
 
 def _native_menu_action_bridge():
   bridge = globals().get("_NATIVE_MENU_ACTION_BRIDGE")
-  if bridge is None:
+  if bridge is None or globals().get("_NATIVE_MENU_ACTION_BRIDGE_VERSION") != 2:
     import ctypes
     # Use the already loaded libraries, never a second GTK from another prefix.
     # Unlike GI/CDLL, PyDLL retains the GIL while Coot's C++ action re-enters Python.
-    bridge = ctypes.PyDLL(None)
+    bridge = bridge if bridge is not None else ctypes.PyDLL(None)
     pointer = ctypes.c_void_p
     signatures = {
       "PyCapsule_GetPointer": ([ctypes.py_object, ctypes.c_char_p], pointer),
@@ -23679,11 +24269,16 @@ def _native_menu_action_bridge():
       "g_variant_parse": ([pointer, ctypes.c_char_p, pointer, pointer, pointer], pointer),
       "g_variant_take_ref": ([pointer], pointer),
       "g_variant_unref": ([pointer], None),
+      "gtk_switch_set_active": ([pointer, ctypes.c_int], None),
+      "gtk_check_button_set_active": ([pointer, ctypes.c_int], None),
+      "gtk_toggle_button_set_active": ([pointer, ctypes.c_int], None),
+      "g_signal_emit_by_name": ([pointer, ctypes.c_char_p], None),
     }
     for name, (arguments, result) in signatures.items():
       function = getattr(bridge, name)
       function.argtypes, function.restype = arguments, result
     globals()["_NATIVE_MENU_ACTION_BRIDGE"] = bridge
+    globals()["_NATIVE_MENU_ACTION_BRIDGE_VERSION"] = 2
   return bridge
 
 
@@ -23706,6 +24301,22 @@ def _activate_native_menu_action(widget, name, target=None):
   finally:
     if parameter:
       bridge.g_variant_unref(parameter)
+
+
+def _activate_native_menu_widget(widget, kind):
+  """Keep the GIL while native widget callbacks may re-enter Coot's Python helpers."""
+  bridge = _native_menu_action_bridge()
+  pointer = bridge.PyCapsule_GetPointer(widget.__gpointer__, None)
+  setter = {"switch": "gtk_switch_set_active", "check": "gtk_check_button_set_active",
+            "toggle": "gtk_toggle_button_set_active"}.get(kind)
+  if setter:
+    getattr(bridge, setter)(pointer, int(not widget.get_active()))
+  elif kind == "button":
+    # GtkButton.activate() can defer its click until after the GIL-holding call returns.
+    bridge.g_signal_emit_by_name(pointer, b"clicked")
+  else:
+    raise ValueError("Unsupported native menu control.")
+  return True
 
 
 def _install_custom_menu_search(menu):
@@ -23763,8 +24374,12 @@ def _install_custom_menu_search(menu):
   def live_items():
     get_native = getattr(api, "main_menumodel", None)
     native = get_native() if callable(get_native) else None
-    return _menu_search_items(menu, native)
+    return _menu_search_items(menu, native, _menu_search_toolbar_items(toolbar, button))
   def enabled(item):
+    if item.get("widget") is not None:
+      return item["widget"].is_sensitive()
+    if item.get("context") is not None and not item["context"].is_sensitive():
+      return False
     prefix, _dot, name = item["action"].partition(".")
     group = app if prefix == "app" else toolbar.get_root() if prefix == "win" else None
     lookup = getattr(group, "lookup_action", None)
@@ -23789,7 +24404,10 @@ def _install_custom_menu_search(menu):
         labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         labels.set_margin_top(5)
         labels.set_margin_bottom(5)
-        for text, dim in ((item["label"], False), (item["path"] or item["source"], True)):
+        caption = item["label"]
+        if item.get("kind") in ("switch", "check", "toggle"):
+          caption += " (On)" if item["widget"].get_active() else " (Off)"
+        for text, dim in ((caption, False), (item["path"] or item["source"], True)):
           label = Gtk.Label(label=text)
           label.set_xalign(0)
           label.set_wrap(True)
@@ -23835,8 +24453,12 @@ def _install_custom_menu_search(menu):
         if not enabled(item) or item not in live_items():
           add_status_bar_text("Menu changed; please select the search result again.")
           return False
-        activated = (_activate_native_menu_action(button, item["action"], item["target"])
-                     if item["source"] == "Coot" else button.activate_action(item["action"], item["target"]))
+        if item.get("widget") is not None:
+          activated = _activate_native_menu_widget(item["widget"], item["kind"])
+        elif item["source"] == "Coot":
+          activated = _activate_native_menu_action(item.get("context", button), item["action"], item["target"])
+        else:
+          activated = button.activate_action(item["action"], item["target"])
         if not activated:
           info_dialog("This menu action is no longer available.")
       except Exception as error:
