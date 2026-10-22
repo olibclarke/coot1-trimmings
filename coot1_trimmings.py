@@ -24221,10 +24221,95 @@ def _menu_search_toolbar_items(toolbar, exclude_button=None):
   return items
 
 
+def _menu_search_builtin_catalog():
+  """Cache only installed GMenu definitions; never instantiate Coot's windows or modules."""
+  from pathlib import Path
+  import xml.etree.ElementTree as ET
+  get_data = getattr(coot, "get_pkgdatadir_py", None)
+  if not callable(get_data):
+    return []
+  try:
+    data = Path(get_data())
+    path = next((data / name for name in ("ui/coot.ui", "ui/coot-gtk4.ui", "glade/coot-gtk4.ui", "coot.ui")
+                 if (data / name).is_file()), None)
+    if path is None:
+      return []
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+  except (OSError, TypeError, ValueError):
+    return []
+  cache = globals().get("_MENU_SEARCH_BUILTIN_CACHE")
+  if cache is not None and cache[0] == key:
+    return cache[1]
+  items = []
+  try:
+    original = ET.parse(path).getroot()
+    definitions = original.findall("menu")
+    # Supplying only <menu> nodes to GtkBuilder avoids creating widgets,
+    # connecting callbacks or applying any of the UI file's other properties.
+    root = ET.Element("interface", original.attrib)
+    root.extend(definitions)
+    builder = Gtk.Builder()
+    builder.add_from_string(ET.tostring(root, encoding="unicode"))
+    modules = builder.get_object("modules-menu")
+    if modules is not None:
+      def normalized(text):
+        return "".join(c for c in text.casefold() if c.isalnum())
+      menus = {normalized(node.get("id", "").removesuffix("-menu")): node.get("id") for node in definitions}
+      for module in _custom_menu_search_items(modules):
+        action = module["action"].removeprefix("app.add_").removesuffix("_module_action")
+        menu_id = menus.get(normalized(action))
+        if menu_id:
+          model = builder.get_object(menu_id)
+          if model is not None:
+            items.extend(_custom_menu_search_items(model, (module["label"],)))
+  except Exception as error:
+    print("Menu search: built-in menu definitions unavailable:", error)
+  globals()["_MENU_SEARCH_BUILTIN_CACHE"] = (key, items)
+  return items
+
+
+def _menu_search_module_items(toolbar, exclude_button, app):
+  live = _menu_search_toolbar_items(toolbar, exclude_button)
+  extra = list(_menu_search_builtin_catalog())
+  # These native modules construct their controls in C++, not in the UI file.
+  if app.lookup_action("add_refine_module_action") is not None:
+    for label, getter, setter in (
+        ("Intermediate Atoms Contact Dots", "get_do_coot_probe_dots_during_refine", "set_do_coot_probe_dots_during_refine"),
+        ("Intermediate Atoms GM Restraints", "get_draw_moving_atoms_restraints", "set_draw_moving_atoms_restraints"),
+        ("Ramachandran Probability Spheres", "get_draw_moving_atoms_rama_markup_state", "set_draw_moving_atoms_rama_markup"),
+        ("Rotamer Probability Dodecahedra", "get_draw_moving_atoms_rota_markup_state", "set_draw_moving_atoms_rota_markup")):
+      if all(callable(getattr(coot, name, None)) for name in (getter, setter)):
+        extra.append(dict(label=label, path="Refine", action=None, target=None, kind="setting", setting=(getter, setter)))
+  if app.lookup_action("add_views_module_action") is not None:
+    for label in ("Add View", "Play Views", "Save View"):
+      extra.append(dict(label=label, path="Views", action=None, target=None,
+                        module_action="app.add_views_module_action"))
+  live_labels = {(item["path"], item["label"]) for item in live}
+  return live + [item for item in extra if (item["path"], item["label"]) not in live_labels]
+
+
+def _activate_menu_search_module_item(item, toolbar):
+  # A hand-built module is created only when its command is selected, never
+  # while indexing. Dispatch through the actual native control afterwards.
+  if not _activate_native_menu_action(toolbar, item["module_action"]):
+    raise RuntimeError("This Coot module is no longer available.")
+  control = next((entry for entry in _menu_search_toolbar_items(toolbar)
+                  if entry.get("widget") is not None and entry["path"] == item["path"]
+                  and entry["label"] == item["label"]), None)
+  if control is None or not control["widget"].is_sensitive():
+    raise RuntimeError("The requested module control is not available.")
+  return _activate_native_menu_widget(control["widget"], control["kind"])
+
+
 def _menu_search_items(custom_menu, native_menu=None, module_items=()):
   """Combine live menus for search without changing the toolbar's Custom catalog."""
   custom = _custom_menu_search_items(custom_menu)
   def identity(item):
+    if item.get("setting") is not None:
+      return ("setting", item["setting"])
+    if item.get("module_action") is not None:
+      return ("module", item["module_action"], item["label"])
     if item.get("widget") is not None:
       return ("widget", item["widget"])
     target = item["target"]
@@ -24374,8 +24459,13 @@ def _install_custom_menu_search(menu):
   def live_items():
     get_native = getattr(api, "main_menumodel", None)
     native = get_native() if callable(get_native) else None
-    return _menu_search_items(menu, native, _menu_search_toolbar_items(toolbar, button))
+    return _menu_search_items(menu, native, _menu_search_module_items(toolbar, button, app))
   def enabled(item):
+    if item.get("setting") is not None:
+      return all(callable(getattr(coot, name, None)) for name in item["setting"])
+    if item.get("module_action") is not None:
+      action = app.lookup_action(item["module_action"].removeprefix("app."))
+      return bool(action and action.get_enabled())
     if item.get("widget") is not None:
       return item["widget"].is_sensitive()
     if item.get("context") is not None and not item["context"].is_sensitive():
@@ -24405,7 +24495,9 @@ def _install_custom_menu_search(menu):
         labels.set_margin_top(5)
         labels.set_margin_bottom(5)
         caption = item["label"]
-        if item.get("kind") in ("switch", "check", "toggle"):
+        if item.get("setting") is not None:
+          caption += " (On)" if getattr(coot, item["setting"][0])() else " (Off)"
+        elif item.get("kind") in ("switch", "check", "toggle"):
           caption += " (On)" if item["widget"].get_active() else " (Off)"
         for text, dim in ((caption, False), (item["path"] or item["source"], True)):
           label = Gtk.Label(label=text)
@@ -24453,7 +24545,13 @@ def _install_custom_menu_search(menu):
         if not enabled(item) or item not in live_items():
           add_status_bar_text("Menu changed; please select the search result again.")
           return False
-        if item.get("widget") is not None:
+        if item.get("setting") is not None:
+          getter, setter = item["setting"]
+          getattr(coot, setter)(int(not getattr(coot, getter)()))
+          activated = True
+        elif item.get("module_action") is not None:
+          activated = _activate_menu_search_module_item(item, toolbar)
+        elif item.get("widget") is not None:
           activated = _activate_native_menu_widget(item["widget"], item["kind"])
         elif item["source"] == "Coot":
           activated = _activate_native_menu_action(item.get("context", button), item["action"], item["target"])
