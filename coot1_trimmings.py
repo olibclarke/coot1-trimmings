@@ -4980,6 +4980,25 @@ def _trackpad_adjust_proportional_radius(dy):
     _set_proportional_editing_radius_value(target)
 
 
+def _trackpad_adjust_map_radius(dy):
+  if dy == 0:
+    return
+  map_id = coot.scroll_wheel_map()
+  if not coot.is_valid_map_molecule(map_id):
+    return
+  state = _TRACKPAD_STATE
+  # Rebuilding map meshes is expensive; accumulate small swipes into 2 A steps.
+  delta = state.get("map_radius_remainder", 0.0) - dy * 0.1
+  steps = math.trunc(round(delta / 2.0, 9))
+  state["map_radius_remainder"] = delta - steps * 2.0
+  if steps:
+    current = float(_current_map_radius(map_id))
+    target = max(2.0, current + steps * 2.0)
+    if target != current:
+      _set_map_radius_both(target, map_id)
+      add_status_bar_text(f"Map radius: {target:g} A")
+
+
 def _trackpad_apply_motion(mode, value, area):
   edit = globals().get("_TRACKPAD_EDIT_STATE")
   if edit is not None and edit["move_selection"] and mode in ("rotate", "translate", "slab_translate"):
@@ -4987,6 +5006,9 @@ def _trackpad_apply_motion(mode, value, area):
     return
   if mode == "radius":
     _trackpad_adjust_proportional_radius(value[1])
+    return
+  if mode == "map_radius":
+    _trackpad_adjust_map_radius(value[1])
     return
   sensitivity = _TRACKPAD_STATE["sensitivity"]["clipping" if mode == "slab_translate" else mode]
   if mode == "zoom":
@@ -5142,7 +5164,8 @@ def _trackpad_scroll(controller, dx, dy, area):
     buttons = gdk.ModifierType.BUTTON1_MASK | gdk.ModifierType.BUTTON2_MASK | gdk.ModifierType.BUTTON3_MASK
     if modifiers & (buttons | gdk.ModifierType.META_MASK):
       return False
-    if modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.ALT_MASK:
+    if (modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.ALT_MASK
+        and modifiers & gdk.ModifierType.CONTROL_MASK):
       return False
     dx, dy = float(dx), float(dy)
     # A zero-delta stop event must not reach Coot: native Shift-scroll treats
@@ -5154,16 +5177,18 @@ def _trackpad_scroll(controller, dx, dy, area):
     # one sample; otherwise native Shift-scroll can insert a fixed zoom step.
     slab_translate = bool(modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.CONTROL_MASK)
     radius = bool(modifiers & gdk.ModifierType.CONTROL_MASK and modifiers & gdk.ModifierType.ALT_MASK)
+    map_radius = bool(modifiers & gdk.ModifierType.SHIFT_MASK and modifiers & gdk.ModifierType.ALT_MASK)
     # Reserve this chord even outside scroll-begin/end: wheel-unit samples
     # otherwise reach Coot's native Shift-Ctrl representation cycling.
     edit = globals().get("_TRACKPAD_EDIT_STATE")
     moving_selection = edit is not None and edit["move_selection"]
     # Some Mac swipe samples arrive as wheel events after a native dialog.
     # During selection movement, do not fall through to native contouring.
-    if not (slab_translate or radius or moving_selection) and controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
+    if not (slab_translate or radius or map_radius or moving_selection) and controller.get_unit() != gdk.ScrollUnit.SURFACE and area not in state["scroll_active"]:
       return False
     direction = -1.0 if state["reverse"] else 1.0
-    mode = ("radius" if radius else
+    mode = ("map_radius" if map_radius else
+            "radius" if radius else
             "slab_translate" if slab_translate else
             "contour" if modifiers & gdk.ModifierType.ALT_MASK else
             "translate" if modifiers & gdk.ModifierType.CONTROL_MASK else
@@ -5235,6 +5260,7 @@ def set_custom_trackpad_controls(enabled=True):
       state["source"] = None
     state["pending"].clear()
     state["radius_remainder"] = 0.0
+    state["map_radius_remainder"] = 0.0
     state["pinch"].clear()
     state["scroll_active"].clear()
     state["claimed_scroll"].clear()
@@ -5816,7 +5842,7 @@ def custom_trackpad_controls_dialog():
   startup = Gtk.CheckButton(label="Enable automatically on startup")
   startup.set_active(state["startup"])
   box.append(startup)
-  label = Gtk.Label(label="Pinch: zoom   |   Swipe: rotate\nCtrl + swipe: translate   |   Option + swipe: contour\nCtrl + Option + swipe: proportional editing radius\nShift + swipe: slab width   |   Shift + Ctrl + swipe: slab Z")
+  label = Gtk.Label(label="Pinch: zoom   |   Swipe: rotate\nCtrl + swipe: translate   |   Option + swipe: contour\nCtrl + Option + swipe: proportional editing radius\nShift + Option + swipe: map radius (2 A steps)\nShift + swipe: slab width   |   Shift + Ctrl + swipe: slab Z")
   label.set_xalign(0)
   box.append(label)
   grid = Gtk.Grid(column_spacing=12, row_spacing=6)
