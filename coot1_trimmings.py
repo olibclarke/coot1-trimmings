@@ -13710,8 +13710,11 @@ Native edits are main-thread only; Pause/Stop take effect between refinement cal
 """
 
 import math
+import heapq
 import traceback
 from dataclasses import dataclass
+from itertools import product
+from statistics import median
 
 
 _POLYMER_RESIDUE_NAMES = set("""A C G U T DA DC DG DT DU
@@ -13765,6 +13768,9 @@ class RefinementOptions:
     maximum_geometry: float = 5.0
     order: str = "window"
     follow_refinement: bool = True
+    prioritize_misfits: bool = False
+    priority_max_cc: float = 0.5
+    priority_min_density: float = 2.0
 
     def __post_init__(self):
         for name in ("window_size", "step_size"):
@@ -13786,6 +13792,14 @@ class RefinementOptions:
             raise ValueError("Minimum CC must be between -1 and 1.")
         if self.order not in ("window", "stage"):
             raise ValueError("Order must be 'window' or 'stage'.")
+        if type(self.prioritize_misfits) is not bool:
+            raise ValueError("Prioritize misfits must be True or False.")
+        if not math.isfinite(self.priority_max_cc) or not -1 <= self.priority_max_cc <= 1:
+            raise ValueError("Priority CC cutoff must be between -1 and 1.")
+        if not math.isfinite(self.priority_min_density) or self.priority_min_density <= 0:
+            raise ValueError("Priority density cutoff must be finite and positive.")
+        if self.prioritize_misfits and self.order != "window":
+            raise ValueError("Misfit prioritization requires window-major stage order.")
 
     @property
     def moving_residue_limit(self):
@@ -13829,6 +13843,27 @@ def refinement_windows(specs, window_size, step_size):
         chains.setdefault(spec[0], []).append(spec)
     return [window for chain in chains.values()
             for window in residue_windows(chain, window_size, step_size)]
+
+
+_PRIORITY_DENSITY_BATCH = 32
+_PRIORITY_DIRECTIONS = tuple(
+    tuple(v / math.sqrt(sum(c*c for c in direction)) for v in direction)
+    for direction in product((-1, 0, 1), repeat=3)
+    if sum(c != 0 for c in direction) in (1, 3))
+
+
+def window_priority(window, correlations, density, options):
+    """Density is an eligibility filter, never a multiplier of poor CC."""
+    valid_cc = [correlations.get(s) for s in window]
+    valid_density = [density.get(s) for s in window]
+    cc = [v for v in valid_cc if v is not None and math.isfinite(v) and -1 <= v <= 1]
+    signal = [v for v in valid_density if v is not None and math.isfinite(v)]
+    mean_cc = sum(cc) / len(cc) if cc else None
+    contrast = median(signal) if signal else None
+    eligible = (len(cc) >= math.ceil(0.75 * len(window)) and
+                len(signal) >= math.ceil(0.75 * len(window)) and
+                mean_cc < options.priority_max_cc and contrast >= options.priority_min_density)
+    return {"eligible": eligible, "cc": mean_cc, "density": contrast}
 
 
 def _atom_key(spec):
@@ -14092,6 +14127,11 @@ class CootRefinementBackend:
         self._grid_radius = None
         self._grid = {}
         self._grid_keys = {}
+        self.anchors = {}
+        self._anchor_grid = {}
+        self._anchor_keys = {}
+        self._polymer_order = {}
+        self._priority_enabled = False
 
     def snapshot(self, imol):
         if not self.api.is_valid_model_molecule(imol):
@@ -14109,6 +14149,10 @@ class CootRefinementBackend:
         self._grid_radius = None
         self._grid = {}
         self._grid_keys = {}
+        self.anchors = {}
+        self._anchor_grid = {}
+        self._anchor_keys = {}
+        self._polymer_order = {}
         for chain, residues in models[0]:
             for number, ins, name, atoms in residues:
                 spec = (str(chain), int(number), str(ins or ""))
@@ -14122,6 +14166,10 @@ class CootRefinementBackend:
                 self.chain_specs.setdefault(spec[0], []).append(spec)
         for specs in self.chain_specs.values():
             specs.sort()
+            if self._priority_enabled:
+                for index, spec in enumerate(s for s in specs if s in self.polymer_specs):
+                    self._polymer_order[spec] = index
+                    self._update_anchor(spec, records[spec]["atoms"])
         return records
 
     def colour_changes(self, imol, records, values, metric):
@@ -14179,7 +14227,10 @@ class CootRefinementBackend:
 
     def _refresh_positions(self, imol, specs):
         for spec in specs:
-            self.positions[spec] = self._positions(self.api.residue_info_py(imol, *spec) or [])
+            atoms = self.api.residue_info_py(imol, *spec) or []
+            self.positions[spec] = self._positions(atoms)
+            if self._priority_enabled and spec in self.polymer_specs:
+                self._update_anchor(spec, atoms)
             if self._grid_radius is not None:
                 for key in self._grid_keys.get(spec, ()):
                     bucket = self._grid[key]
@@ -14188,8 +14239,89 @@ class CootRefinementBackend:
                         del self._grid[key]
                 self._index_positions(spec)
 
+    def _update_anchor(self, spec, atoms):
+        old_key = self._anchor_keys.pop(spec, None)
+        if old_key is not None:
+            bucket = self._anchor_grid[old_key]
+            bucket.pop(spec, None)
+            if not bucket:
+                del self._anchor_grid[old_key]
+        self.anchors.pop(spec, None)
+        for name in ("CA", "C4'", "C4*"):
+            choices = [atom for atom in atoms if atom[0][0].strip() == name and float(atom[1][0]) > 0]
+            if choices:
+                atom = max(choices, key=lambda value: float(value[1][0]))
+                point = tuple(float(v) for v in atom[2])
+                if len(point) == 3 and all(math.isfinite(v) for v in point):
+                    self.anchors[spec] = point
+                    key = tuple(math.floor(v / 4.0) for v in point)
+                    self._anchor_grid.setdefault(key, {})[spec] = point
+                    self._anchor_keys[spec] = key
+                break
+
+    def _priority_point_owned(self, spec, point, radius):
+        """Reject core samples clearly closer to a non-local polymer backbone."""
+        key = tuple(math.floor(v / 4.0) for v in point)
+        limit_sq = max(0.0, radius - 0.5)**2
+        for delta in product((-1, 0, 1), repeat=3):
+            bucket = self._anchor_grid.get(tuple(a+b for a, b in zip(key, delta)), {})
+            for other, anchor in bucket.items():
+                if other == spec or (other[0] == spec[0] and
+                        abs(self._polymer_order.get(other, -100) - self._polymer_order.get(spec, 100)) <= 2):
+                    continue
+                if sum((a-b)**2 for a, b in zip(point, anchor)) < limit_sq:
+                    return False
+        return True
+
+    def priority_correlations(self, imol, specs, map_id):
+        self._check_idle()
+        if not self.api.is_valid_model_molecule(imol) or not self.api.is_valid_map_molecule(map_id):
+            raise ValueError("Priority scoring model or reference map has been closed.")
+        # One call per scan, not per overlapping window. Native CC can build
+        # full-map work arrays, so splitting this into tiny batches is costly.
+        rows = self.api.map_to_model_correlation_per_residue_py(imol, [list(s) for s in specs], 0, map_id)
+        scores = dict.fromkeys(specs)
+        for spec, value in rows or []:
+            spec, value = _residue_spec(spec), float(value)
+            if spec in scores and math.isfinite(value) and -1 <= value <= 1:
+                scores[spec] = value
+        return scores
+
+    def priority_density(self, imol, specs, map_id):
+        self._check_idle()
+        if not self.api.is_valid_model_molecule(imol) or not self.api.is_valid_map_molecule(map_id):
+            raise ValueError("Priority scoring model or reference map has been closed.")
+        sigma_api = getattr(self.api, "map_sigma_py", None) or getattr(self.api, "map_sigma", None)
+        sigma = float(sigma_api(map_id))
+        if not math.isfinite(sigma) or sigma <= 0:
+            raise ValueError("Priority scoring requires a reference map with finite, nonzero variance.")
+        scores = {}
+        for spec in specs:
+            anchor = self.anchors.get(spec)
+            scores[spec] = None
+            if anchor is None:
+                continue
+            core, shell = [], []
+            for radius, values in ((0.0, core), (1.25, core), (2.5, core), (6.0, shell)):
+                directions = ((0, 0, 0),) if radius == 0 else _PRIORITY_DIRECTIONS
+                for direction in directions:
+                    point = tuple(a + radius*b for a, b in zip(anchor, direction))
+                    if values is core and not self._priority_point_owned(spec, point, radius):
+                        continue
+                    value = float(self.api.density_at_point(map_id, *point))
+                    if math.isfinite(value):
+                        values.append(value)
+            if len(core) < 8 or len(shell) < 8:
+                continue
+            background = median(shell)
+            spread = max(1.4826 * median(abs(v-background) for v in shell), 0.25*sigma)
+            upper = sorted(core)[-max(2, math.ceil(len(core)*0.2)):]
+            scores[spec] = max(0.0, (sum(upper)/len(upper) - background) / spread)
+        return scores
+
     def validate(self, imol, stages, options, specs):
         self._check_idle()
+        self._priority_enabled = options.prioritize_misfits
         records = self.snapshot(imol)
         if not self.api.is_valid_map_molecule(self.api.imol_refinement_map()):
             raise ValueError("Select a refinement map in Coot before starting (needed for state restoration).")
@@ -14200,6 +14332,12 @@ class CootRefinementBackend:
                 raise ValueError("Map #%s has been closed or is not a map." % stage.map_id)
         if options.auto_pause and not callable(getattr(self.api, "map_to_model_correlation_per_residue_py", None)):
             raise RuntimeError("CC guard is unavailable in this Coot build.")
+        if options.prioritize_misfits:
+            for name in ("map_to_model_correlation_per_residue_py", "density_at_point"):
+                if not callable(getattr(self.api, name, None)):
+                    raise RuntimeError("Misfit prioritization requires " + name + "; choose Chain order on this build.")
+            if not any(callable(getattr(self.api, name, None)) for name in ("map_sigma_py", "map_sigma")):
+                raise RuntimeError("Misfit prioritization requires map sigma; choose Chain order on this build.")
         if options.hydrogen_bonds:
             for name in ("add_extra_bond_restraint", "delete_extra_restraint_py", "list_extra_restraints_py"):
                 if not callable(getattr(self.api, name, None)):
@@ -14430,6 +14568,7 @@ class MultimapRefinementJob:
         self.backend = backend or CootRefinementBackend()
         self.backend.validate(imol, self.stages, self.options, self.specs)
         stage_steps = [(i, r) for i, s in enumerate(self.stages) for r in range(s.repeats)]
+        self._stage_steps = stage_steps
         if self.options.order == "window":
             self.tasks = [(w, i, r) for w in range(len(self.windows)) for i, r in stage_steps]
         else:
@@ -14444,6 +14583,102 @@ class MultimapRefinementJob:
         self._requested = None
         self._prepared_index = None
         self.initial_coordinates = None
+        self.priority_correlations = {}
+        self.priority_density = {}
+        self.window_priorities = {}
+        self.priority_phase = None
+        self.priority_done = self.priority_total = 0
+        self._priority_targets = None
+        self._priority_scan_initial = True
+        self._priority_heap = []
+        self._priority_versions = {}
+        self._remaining_windows = set(range(len(self.windows)))
+        self._active_window = None
+        self._dirty_priority_specs = set()
+        self._windows_for_spec = {}
+        if self.options.prioritize_misfits:
+            for index, window in enumerate(self.windows):
+                for spec in window:
+                    self._windows_for_spec.setdefault(spec, set()).add(index)
+
+    def _queue_priority_scan(self, specs, initial=False):
+        targets = tuple(sorted(set(specs)))
+        if not targets:
+            return
+        self._priority_targets = targets
+        self._priority_scan_initial = initial
+        self.priority_phase = "cc"
+        self.priority_done, self.priority_total = 0, len(targets)
+        self._prepared_index = None
+
+    def _update_window_priorities(self, targets):
+        affected = set()
+        for spec in targets:
+            affected.update(self._windows_for_spec.get(spec, ()))
+        for w in affected & self._remaining_windows:
+            info = window_priority(self.windows[w], self.priority_correlations, self.priority_density, self.options)
+            self.window_priorities[w] = info
+            version = self._priority_versions[w] = self._priority_versions.get(w, 0) + 1
+            heapq.heappush(self._priority_heap,
+                          (0 if info["eligible"] else 1, info["cc"] if info["eligible"] else 0, w, version))
+        # Bound stale heap entries during long runs with heavily overlapping windows.
+        if len(self._priority_heap) > max(64, 3*len(self._remaining_windows)):
+            self._priority_heap = [entry for entry in self._priority_heap
+                                   if entry[2] in self._remaining_windows and
+                                   entry[3] == self._priority_versions.get(entry[2])]
+            heapq.heapify(self._priority_heap)
+
+    def _score_priority_tick(self):
+        targets = self._priority_targets
+        reference = self.stages[-1].map_id
+        if self.priority_phase == "cc":
+            values = self.backend.priority_correlations(self.imol, targets, reference)
+            self.priority_correlations.update({spec: values.get(spec) for spec in targets})
+            self.priority_phase = "density"
+            self.message = "Scoring local density: 0/%d residues | Map #%d." % (len(targets), reference)
+        else:
+            batch = targets[self.priority_done:self.priority_done + _PRIORITY_DENSITY_BATCH]
+            values = self.backend.priority_density(self.imol, batch, reference)
+            self.priority_density.update({spec: values.get(spec) for spec in batch})
+            self.priority_done += len(batch)
+            self.message = "Scoring local density: %d/%d residues | Map #%d." % (
+                self.priority_done, len(targets), reference)
+            if self.priority_done == len(targets):
+                self._update_window_priorities(targets)
+                self._priority_targets = None
+                self.priority_phase = None
+                eligible = sum(info["eligible"] for w, info in self.window_priorities.items()
+                               if w in self._remaining_windows)
+                self.message = "Priorities ready: %d/%d remaining windows have strong density and low CC." % (
+                    eligible, len(self._remaining_windows))
+        self._prepared_index = None
+        if self._requested:
+            self._settle(self._requested, self._requested.capitalize() + "; completed edits retained.")
+        else:
+            self._notify()
+
+    def _choose_priority_window(self):
+        while self._priority_heap:
+            tier, cc, w, version = heapq.heappop(self._priority_heap)
+            if w not in self._remaining_windows or version != self._priority_versions.get(w):
+                continue
+            self._active_window = w
+            self._remaining_windows.remove(w)
+            self.tasks[self.index:self.index+len(self._stage_steps)] = [(w, i, r) for i, r in self._stage_steps]
+            return
+        raise RuntimeError("No remaining scored window; cannot safely continue the priority schedule.")
+
+    def _queue_priority_refresh(self, moving):
+        self._dirty_priority_specs.update(spec for spec in moving if spec in self._windows_for_spec)
+        if self.index % len(self._stage_steps):
+            return
+        self._active_window = None
+        affected = set()
+        for spec in self._dirty_priority_specs:
+            affected.update(self._windows_for_spec.get(spec, ()))
+        targets = {spec for w in affected & self._remaining_windows for spec in self.windows[w]}
+        self._dirty_priority_specs.clear()
+        self._queue_priority_scan(targets)
 
     def _notify(self):
         print("Multimap refinement: " + self.message)
@@ -14464,6 +14699,13 @@ class MultimapRefinementJob:
             snapshot = getattr(self.backend, "snapshot", None)
             if callable(snapshot):
                 self.initial_coordinates = _comparison_coordinates(snapshot(self.imol))
+        if self.options.prioritize_misfits:
+            # A paused run may have been repaired manually. Refresh unfinished
+            # priorities on resume without replaying any accepted stage.
+            pending = set(self._remaining_windows)
+            if self._active_window is not None:
+                pending.add(self._active_window)
+            self._queue_priority_scan({spec for w in pending for spec in self.windows[w]}, initial=self.index == 0)
         _MULTIMAP_RUNNING = self
         self.state, self._requested = "running", None
         self._prepared_index = None
@@ -14509,9 +14751,25 @@ class MultimapRefinementJob:
         """Publish the working region before a separate callback runs native work."""
         if self.state != "running" or self._busy:
             return False
-        if self._prepared_index == self.index:
-            return True
         try:
+            if self._priority_targets is not None:
+                key = (self.index, self.priority_phase, self.priority_done)
+                if self._prepared_index == key:
+                    return True
+                self._prepared_index = key
+                if self.priority_phase == "cc":
+                    self.message = "%s model-map CC for %d residues | Map #%d (native call)." % (
+                        "Scoring initial" if self._priority_scan_initial else "Refreshing",
+                        self.priority_total, self.stages[-1].map_id)
+                else:
+                    self.message = "Scoring local density: %d/%d residues | Map #%d." % (
+                        self.priority_done, self.priority_total, self.stages[-1].map_id)
+                self._notify()
+                return self.state == "running"
+            if self._prepared_index == self.index:
+                return True
+            if self.options.prioritize_misfits and self._active_window is None:
+                self._choose_priority_window()
             w, si, repeat = self.tasks[self.index]
             seed, stage = self.windows[w], self.stages[si]
             navigate = getattr(self.backend, "navigate", None)
@@ -14522,6 +14780,11 @@ class MultimapRefinementJob:
                 si+1, len(self.stages), stage.map_id, stage.weight, repeat+1, stage.repeats)
             if stage.autofit_rotamers:
                 self.message += " | Autofit rotamers, then refine"
+            if self.options.prioritize_misfits:
+                info = self.window_priorities.get(w, {})
+                if info.get("cc") is not None:
+                    self.message += " | Priority CC %.3f" % info["cc"]
+                self.message += " | Strong-density misfit" if info.get("eligible") else " | Coverage pass"
             self._prepared_index = self.index
             self._notify()
         except Exception as error:
@@ -14534,6 +14797,9 @@ class MultimapRefinementJob:
             return False
         self._busy = True
         try:
+            if self._priority_targets is not None:
+                self._score_priority_tick()
+                return self.state == "running"
             w, si, repeat = self.tasks[self.index]
             seed, stage = self.windows[w], self.stages[si]
             reference = self.stages[-1].map_id
@@ -14544,8 +14810,12 @@ class MultimapRefinementJob:
             self.index += 1  # Acceptance succeeded; never silently rerun an accepted step.
             self.processed_residues.update(seed)
             self.processed_residues.update(_residue_spec(spec) for spec in moving)
+            if self.options.prioritize_misfits:
+                self._queue_priority_refresh(set(seed) | {_residue_spec(spec) for spec in moving})
             entry = {"window": w, "stage": si, "repeat": repeat, "moving": len(moving),
                      "hbonds": hbonds, "result": result, "cc_before": before, "rotamers": rotamers}
+            if self.options.prioritize_misfits:
+                entry["priority"] = dict(self.window_priorities.get(w, {}))
             self.history.append(entry)
             self.message = "%d/%d | %s:%d%s-%d%s | Map #%d, weight %g | %d moving" % (
                 self.index, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
@@ -14721,6 +14991,16 @@ def multimap_refinement_gui():
     scope_grid.attach(size, 1, 1, 1, 1)
     scope_grid.attach(label("Step size"), 2, 1, 1, 1)
     scope_grid.attach(step, 3, 1, 1, 1)
+    priority_order = Gtk.ComboBoxText()
+    priority_order.append("misfits", "Prioritize misfits")
+    priority_order.append("chain", "Chain order")
+    supported = (all(callable(getattr(api, name, None)) for name in
+                     ("map_to_model_correlation_per_residue_py", "density_at_point")) and
+                 any(callable(getattr(api, name, None)) for name in ("map_sigma_py", "map_sigma")))
+    priority_order.set_active_id("misfits" if supported else "chain")
+    priority_order.set_tooltip_text("Strong nearby density + poor CC first; all other windows are still refined. Uses the last-stage map.")
+    scope_grid.attach(label("Window order"), 0, 2, 1, 1)
+    scope_grid.attach(priority_order, 1, 2, 3, 1)
     append(outer, scope_grid)
     controls.append(scope_grid)
 
@@ -14822,14 +15102,24 @@ def multimap_refinement_gui():
     radius, padding, limit = spin(4, 0, 30, 0.5, 1), spin(1, 0, 10), spin(0, 0, 10000)
     limit.set_tooltip_text("0 = automatic: at least 500 residues or 5 times the window size. A positive value sets an explicit cap.")
     min_cc, cc_drop, geometry = spin(0.2, -1, 1, 0.05, 2), spin(0.1, 0, 2, 0.05, 2), spin(5, 0.1, 100, 0.5, 1)
+    priority_cc, priority_density = spin(0.5, -1, 1, 0.05, 2), spin(2.0, 0.1, 50, 0.25, 2)
+    priority_cc.set_tooltip_text("Prioritize windows with mean CC below this value, provided nearby density is strong.")
+    priority_density.set_tooltip_text("Minimum local density contrast, normalized by surrounding density variation with a map-sigma floor. Independent of contour level.")
     for index, (text, field) in enumerate((("Contact shell (A)", radius), ("Neighbour padding", padding),
                                           ("Moving limit (0 = auto)", limit), ("Minimum mean CC", min_cc),
-                                          ("Maximum CC drop", cc_drop), ("Maximum geometry distortion", geometry))):
+                                          ("Maximum CC drop", cc_drop), ("Maximum geometry distortion", geometry),
+                                          ("Priority: CC below", priority_cc), ("Priority: density contrast", priority_density))):
         advanced_box.attach(label(text), 0, index, 1, 1)
         advanced_box.attach(field, 1, index, 1, 1)
     controls.append(advanced_box)
     append(outer, advanced)
-    append(outer, label("Each range: all stages top to bottom, then the next range.\nCC uses the last map. Pause/Stop act between steps; completed edits remain."))
+    def priority_changed(_combo=None):
+        enabled = priority_order.get_active_id() == "misfits"
+        priority_cc.set_sensitive(enabled)
+        priority_density.set_sensitive(enabled)
+    priority_order.connect("changed", priority_changed)
+    priority_changed()
+    append(outer, label("Each range: all stages top to bottom, then the next range.\nPriority scoring and CC use the last map. Pause/Stop act between native calls; completed edits remain."))
     changes = Gtk.Expander(label="Changes from starting model")
     changes.set_sensitive(False)
     changes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -14894,8 +15184,15 @@ def multimap_refinement_gui():
     show_changes.connect("clicked", visualize)
 
     def update(job):
-        progress.set_fraction(job.index / len(job.tasks))
-        progress.set_text("%d / %d steps complete" % (job.index, len(job.tasks)))
+        if job.priority_phase == "cc":
+            progress.pulse()
+            progress.set_text("Calculating model-map CC...")
+        elif job.priority_phase == "density":
+            progress.set_fraction(job.priority_done / job.priority_total)
+            progress.set_text("Scoring density: %d / %d residues" % (job.priority_done, job.priority_total))
+        else:
+            progress.set_fraction(job.index / len(job.tasks))
+            progress.set_text("%d / %d steps complete" % (job.index, len(job.tasks)))
         status.set_text(job.message)
         busy = job.state in ("running", "paused")
         for control in controls:
@@ -14929,7 +15226,7 @@ def multimap_refinement_gui():
                     stages.append(RefinementStage(int(map_id), row["weight"].get_value(),
                                                   row["repeats"].get_value_as_int(),
                                                   autofit_rotamers=row["autofit_rotamers"].get_active()))
-                for field in (size, step, radius, padding, limit, min_cc, cc_drop, geometry):
+                for field in (size, step, radius, padding, limit, min_cc, cc_drop, geometry, priority_cc, priority_density):
                     field.update()
                 contact = radius.get_value()
                 options = RefinementOptions(window_size=size.get_value_as_int(), step_size=step.get_value_as_int(),
@@ -14938,7 +15235,8 @@ def multimap_refinement_gui():
                                             hydrogen_bonds=hb.get_active(), auto_pause=guard.get_active(),
                                             minimum_mean_cc=min_cc.get_value(), maximum_cc_drop=cc_drop.get_value(),
                                             maximum_geometry=geometry.get_value(),
-                                            order="window")
+                                            order="window", prioritize_misfits=priority_order.get_active_id() == "misfits",
+                                            priority_max_cc=priority_cc.get_value(), priority_min_density=priority_density.get_value())
                 refinement_windows(specs, options.window_size, options.step_size)
                 backend._check_idle()
                 if not api.is_valid_map_molecule(api.imol_refinement_map()):
@@ -14974,6 +15272,7 @@ def multimap_refinement_gui():
     stop_button.set_sensitive(False)
     # Retain references for native widget smoke tests and interactive inspection.
     window.multimap_widgets = {"scope": scope, "stages": stage_rows, "add_stage": add_stage,
+                               "priority_order": priority_order, "priority_cc": priority_cc, "priority_density": priority_density,
                                "refresh_maps": refresh_maps, "start": run_button, "status": status,
                                "progress": progress, "pause": pause_button,
                                "stop": stop_button, "changes": changes, "change_metric": change_metric,
