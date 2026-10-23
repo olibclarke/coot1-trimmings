@@ -432,6 +432,7 @@ STARTUP_ROTAMER_SEARCH_MODE = ROTAMERSEARCHLOWRES
 STARTUP_MAP_SAMPLING_RATE = 3.0
 STARTUP_ADD_TERMINAL_PHI_PSI_TRIALS = 1000
 STARTUP_REFINEMENT_WEIGHT = 20.0
+STARTUP_REFINEMENT_STEPS_PER_UPDATE = 5
 STARTUP_SMOOTH_SCROLL = 0
 STARTUP_ACTIVE_MAP_DRAG = 0
 STARTUP_SHOW_ENVIRONMENT_DISTANCES = 0
@@ -469,7 +470,7 @@ RESIDUE_ANNOTATION_DEFAULT_AUTHOR = (
   or os.environ.get("USERNAME")
   or ""
 )
-RESIDUE_ANNOTATION_SCHEMA_VERSION = "4"
+RESIDUE_ANNOTATION_SCHEMA_VERSION = "5"
 RESIDUE_ANNOTATION_NEARBY_RADIUS = 6.0
 RESIDUE_ANNOTATION_POLL_INTERVAL_MS = 300
 
@@ -571,6 +572,7 @@ RESIDUE_ANNOTATION_RANGE_FIELDS = (
 )
 RESIDUE_ANNOTATION_REGION_HIGHLIGHTS = {}
 RESIDUE_ANNOTATION_RANGE_PICK_STATE = {}
+RESIDUE_ANNOTATION_POSITION_MARKER = None
 
 
 @lru_cache(maxsize=1)
@@ -1275,6 +1277,7 @@ def _apply_startup_settings():
   allow_duplicate_sequence_numbers()
   set_add_terminal_residue_n_phi_psi_trials(STARTUP_ADD_TERMINAL_PHI_PSI_TRIALS)
   set_matrix(STARTUP_REFINEMENT_WEIGHT)
+  _call_optional_coot_api("set_dragged_refinement_steps_per_frame", STARTUP_REFINEMENT_STEPS_PER_UPDATE)
   set_smooth_scroll_flag(STARTUP_SMOOTH_SCROLL)
   set_active_map_drag_flag(STARTUP_ACTIVE_MAP_DRAG)
   set_show_environment_distances(STARTUP_SHOW_ENVIRONMENT_DISTANCES)
@@ -4113,6 +4116,103 @@ else:
     return None
 
 
+def _window_cycle_state():
+  return globals().setdefault("_WINDOW_CYCLE_STATE", {
+    "model": None, "handler": None, "last": None, "source": None})
+
+
+def _window_cycle_targets(windows):
+  """Exclude hidden dialogs and windows blocked by a modal confirmation."""
+  visible = [window for window in windows if window.get_visible()]
+  modals = [window for window in visible if window.get_modal()]
+  if not modals:
+    return visible
+  def descends_from(window, ancestor):
+    parent, visited = window, set()
+    while parent is not None and parent not in visited:
+      if parent == ancestor:
+        return True
+      visited.add(parent)
+      parent = parent.get_transient_for()
+    return False
+  unblocked = [window for window in modals if not any(
+    other != window and descends_from(other, window) for other in modals)]
+  modal = next((window for window in unblocked if window.is_active()), unblocked[-1])
+  return [window for window in visible if descends_from(window, modal)]
+
+
+def cycle_coot_windows(backward=False, source=None):
+  """Raise the next visible GTK window without altering model/view state."""
+  if Gtk is None:
+    return False
+  import weakref
+  model = Gtk.Window.get_toplevels()
+  windows = _window_cycle_targets([model.get_item(i) for i in range(model.get_n_items())])
+  if not windows:
+    return False
+  state = _window_cycle_state()
+  if source is None:
+    source = next((window for window in windows if window.is_active()), None)
+    if source is None and state["last"] is not None:
+      source = state["last"]()
+  if source in windows:
+    target = windows[(windows.index(source) + (-1 if backward else 1)) % len(windows)]
+  else:
+    target = windows[-1 if backward else 0]
+  target.present()
+  state["last"] = weakref.ref(target)
+  add_status_bar_text("Window: " + (target.get_title() or "Coot"))
+  return True
+
+
+def _window_cycle_key_pressed(controller, keyval, _keycode, modifiers):
+  gdk = _coot_gui_repository_module("Gdk")
+  relevant = modifiers & Gtk.accelerator_get_default_mod_mask()
+  control, shift = gdk.ModifierType.CONTROL_MASK, gdk.ModifierType.SHIFT_MASK
+  if keyval not in (ord("`"), ord("~")) or relevant not in (control, control | shift):
+    return False
+  if keyval == ord("~") and not relevant & shift:
+    return False
+  cycle_coot_windows(bool(relevant & shift), controller.get_widget())
+  return True
+
+
+def _window_cycle_attach(model, *_unused):
+  for index in range(model.get_n_items()):
+    window = model.get_item(index)
+    if getattr(window, "coot_trimmings_window_cycle", None) is not None:
+      continue
+    controller = Gtk.EventControllerKey()
+    controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    controller.connect("key-pressed", _window_cycle_key_pressed)
+    window.add_controller(controller)
+    window.coot_trimmings_window_cycle = controller
+
+
+def _window_cycle_windows_changed(model, *_unused):
+  state = _window_cycle_state()
+  if state["source"] is None:
+    def attach_after_construction():
+      state["source"] = None
+      _window_cycle_attach(model)
+      return False
+    # Older PyGObject emits items-changed before the final Python wrapper exists.
+    state["source"] = _coot_gui_repository_module("GLib").idle_add(attach_after_construction)
+
+
+def _install_window_cycle_shortcuts():
+  """Watch window creation, not a timer; support native and custom dialogs."""
+  if (Gtk is None or _coot_gui_repository_module("Gdk") is None or
+      _coot_gui_repository_module("GLib") is None):
+    return False
+  state = _window_cycle_state()
+  if state["model"] is None:
+    state["model"] = Gtk.Window.get_toplevels()
+    state["handler"] = state["model"].connect("items-changed", _window_cycle_windows_changed)
+  _window_cycle_attach(state["model"])
+  return True
+
+
 def add_key_binding(name, key, thunk):
   if not hasattr(coot, "add_key_binding_gtk4_py"):
     _show_startup_diagnostic_once(
@@ -4152,6 +4252,8 @@ def add_key_binding(name, key, thunk):
 
 def _custom_key_binding_label(key):
   if isinstance(key, str):
+    if key == "Control_~":
+      return "Ctrl+Shift+`"
     return "Ctrl+" + key[len("Control_"):] if key.startswith("Control_") else key
   named = {65289: "Tab", 65293: "Return", 65307: "Escape", 65361: "Left",
            65362: "Up", 65363: "Right", 65364: "Down", 65288: "BackSpace",
@@ -4236,7 +4338,7 @@ def _key_binding_category(action):
     return "Maps"
   if any(word in lower for word in ("representation", "display", "symmetry", "clipping", "ncs",
                                    "distances", "measure", "pending picks", "residue in chain",
-                                   "zoom", "move forward", "move backward", "label", "focus command")):
+                                   "zoom", "move forward", "move backward", "label", "focus command", "windows")):
     return "Navigation / Display"
   if any(word in lower for word in ("refine", "fit", "restraint")):
     return "Refinement"
@@ -4273,7 +4375,7 @@ def custom_key_bindings_dialog():
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for edge in ("start", "end", "top", "bottom"):
     getattr(box, "set_margin_" + edge)(12)
-  hint = Gtk.Label(label="Keys are case-sensitive; uppercase letters require Shift.\nUse shortcuts with focus in the model view. Overridden native keys are omitted.")
+  hint = Gtk.Label(label="Keys are case-sensitive; uppercase letters require Shift.\nUse shortcuts in the model view; window cycling also works in dialogs.\nOverridden native keys are omitted.")
   hint.set_xalign(0)
   hint.set_wrap(True)
   box.append(hint)
@@ -4379,6 +4481,13 @@ _apply_startup_settings()
 # rather than at the very top so they can refer directly to the helpers they
 # call.
 #
+
+# Window cycling also works while a native or custom GTK dialog has focus.
+add_key_binding("Cycle Coot windows forward", "Control_`",
+lambda: cycle_coot_windows())
+
+add_key_binding("Cycle Coot windows backward", "Control_~",
+lambda: cycle_coot_windows(backward=True))
 
 #place helix with prosmart alpha helix restraints and depict in rainbow
 add_key_binding("Place helix here","h",
@@ -6979,8 +7088,13 @@ def _virtual_torsion_point(ring_frame, bond_length, angle_degrees):
 
 def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
                                        step_degrees=EMRINGER_HELPER_STEP_DEGREES,
-                                       fine_step_degrees=EMRINGER_HELPER_FINE_STEP_DEGREES):
+                                       fine_step_degrees=EMRINGER_HELPER_FINE_STEP_DEGREES,
+                                       density_cache=None):
   """Find the strongest density peak along a virtual sidechain torsion sweep."""
+  if density_cache is not None and step_degrees == EMRINGER_HELPER_STEP_DEGREES and fine_step_degrees == EMRINGER_HELPER_FINE_STEP_DEGREES:
+    cached = density_cache.get('ring_peaks', {}).get((id(ring_frame), bond_length))
+    if cached is not None:
+      return dict(cached)
   if step_degrees <= 0.0:
     step_degrees = EMRINGER_HELPER_STEP_DEGREES
 
@@ -6990,10 +7104,9 @@ def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
   coarse_density_sum = 0.0
   coarse_density_count = 0
   n_steps = max(1, int(round(360.0 / step_degrees)))
-  for step_index in range(n_steps):
-    angle_degrees = (360.0 * step_index) / n_steps
-    sample_point = _virtual_torsion_point(ring_frame, bond_length, angle_degrees)
-    density_value = density_at_point(map_id, sample_point[0], sample_point[1], sample_point[2])
+  angles = [(360.0 * step_index) / n_steps for step_index in range(n_steps)]
+  points = [_virtual_torsion_point(ring_frame, bond_length, angle) for angle in angles]
+  for angle_degrees, sample_point, density_value in zip(angles, points, _analysis_density_values(map_id, points, density_cache)):
     coarse_density_sum += density_value
     coarse_density_count += 1
     if best_density is None or density_value > best_density:
@@ -7009,10 +7122,9 @@ def _sample_virtual_stage_density_peak(map_id, ring_frame, bond_length,
     search_start = best_angle - step_degrees
     search_stop = best_angle + step_degrees
     n_fine_steps = max(1, int(round((search_stop - search_start) / fine_step_degrees)))
-    for step_index in range(n_fine_steps + 1):
-      angle_degrees = search_start + step_index * fine_step_degrees
-      sample_point = _virtual_torsion_point(ring_frame, bond_length, angle_degrees)
-      density_value = density_at_point(map_id, sample_point[0], sample_point[1], sample_point[2])
+    angles = [search_start + step_index * fine_step_degrees for step_index in range(n_fine_steps + 1)]
+    points = [_virtual_torsion_point(ring_frame, bond_length, angle) for angle in angles]
+    for angle_degrees, sample_point, density_value in zip(angles, points, _analysis_density_values(map_id, points, density_cache)):
       if density_value > best_density:
         best_density = density_value
         best_angle = angle_degrees
@@ -7177,17 +7289,13 @@ def _nearest_stage_blocker(stage_spec, peak_point):
   return nearest_blocker_name, nearest_distance_sq
 
 
-def _mean_density_at_atoms(map_id, atom_records):
+def _mean_density_at_atoms(map_id, atom_records, density_cache=None):
   """Average map density at the current placed stage atoms, if any exist."""
   if not atom_records:
     return None
 
-  density_sum = 0.0
-  density_count = 0
-  for atom in atom_records:
-    xyz = atom["xyz"]
-    density_sum += density_at_point(map_id, xyz[0], xyz[1], xyz[2])
-    density_count += 1
+  values = _analysis_density_values(map_id, [atom["xyz"] for atom in atom_records], density_cache)
+  density_sum, density_count = sum(values), len(values)
   if density_count == 0:
     return None
   return density_sum / float(density_count)
@@ -7202,15 +7310,15 @@ def _backbone_support_positions(atom_xyz):
   return [atom_xyz[atom_name] for atom_name in atom_names if atom_name in atom_xyz]
 
 
-def _backbone_density_support(map_id, atom_xyz, density_threshold):
+def _backbone_density_support(map_id, atom_xyz, density_threshold, density_cache=None):
   """Return the fraction of backbone support points that are above threshold."""
   backbone_positions = _backbone_support_positions(atom_xyz)
   if not backbone_positions:
     return 0.0, 0, 0
 
   supported_points = 0
-  for position in backbone_positions:
-    if density_at_point(map_id, position[0], position[1], position[2]) >= density_threshold:
+  for value in _analysis_density_values(map_id, backbone_positions, density_cache):
+    if value >= density_threshold:
       supported_points += 1
   total_points = len(backbone_positions)
   return (float(supported_points) / total_points), supported_points, total_points
@@ -7228,9 +7336,9 @@ def _residue_display_point(atom_records, atom_xyz):
   return None
 
 
-def _evaluate_emringer_stage(map_id, stage_spec):
+def _evaluate_emringer_stage(map_id, stage_spec, density_cache=None):
   """Evaluate one torsion stage and return its peak/current-density summary."""
-  peak = _sample_virtual_stage_density_peak(map_id, stage_spec["ring_frame"], stage_spec["bond_length"])
+  peak = _sample_virtual_stage_density_peak(map_id, stage_spec["ring_frame"], stage_spec["bond_length"], density_cache=density_cache)
   if peak is None:
     return None
 
@@ -7245,13 +7353,13 @@ def _evaluate_emringer_stage(map_id, stage_spec):
         stage_spec["bond_length"],
         peak_angle + angle_offset,
       )
-      support_density = density_at_point(map_id, support_point[0], support_point[1], support_point[2])
+      support_density = _analysis_density_values(map_id, [support_point], density_cache)[0]
       if max_local_support_density is None or support_density > max_local_support_density:
         max_local_support_density = support_density
       support_density_sum += support_density
       support_density_count += 1
 
-  current_stage_density = _mean_density_at_atoms(map_id, stage_spec["blocker_atoms"])
+  current_stage_density = _mean_density_at_atoms(map_id, stage_spec["blocker_atoms"], density_cache)
   nearest_blocker_name, nearest_distance_sq = _nearest_stage_blocker(stage_spec, peak["point"])
   density_gain = peak["density"] - current_stage_density if current_stage_density is not None else peak["density"]
   ring_prominence = peak["density"] - peak["ring_mean_density"]
@@ -7271,7 +7379,7 @@ def _evaluate_emringer_stage(map_id, stage_spec):
   }
 
 
-def _weak_stage_inset_peak_density(map_id, stage_result, inset_buffer=EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER):
+def _weak_stage_inset_peak_density(map_id, stage_result, inset_buffer=EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER, density_cache=None):
   """Sample a slightly inset torsion ring to avoid flagging borderline weak cases."""
   inset_bond_length = stage_result["bond_length"] - inset_buffer
   if inset_bond_length <= 0.0:
@@ -7280,13 +7388,14 @@ def _weak_stage_inset_peak_density(map_id, stage_result, inset_buffer=EMRINGER_H
     map_id,
     stage_result["ring_frame"],
     inset_bond_length,
+    density_cache=density_cache,
   )
   if inset_peak is None:
     return stage_result["peak"]["density"]
   return max(stage_result["peak"]["density"], inset_peak["density"])
 
 
-def _heavy_atom_density_summary(map_id, atom_records, density_threshold=None):
+def _heavy_atom_density_summary(map_id, atom_records, density_threshold=None, density_cache=None):
   """Sample heavy-atom density once and return the summary statistics."""
   heavy_atoms = []
   max_density = None
@@ -7294,12 +7403,10 @@ def _heavy_atom_density_summary(map_id, atom_records, density_threshold=None):
   density_sum = 0.0
   outside_count = 0
 
-  for atom in atom_records:
-    if atom["element"] in ("H", "D"):
-      continue
+  atoms = [atom for atom in atom_records if atom["element"] not in ("H", "D")]
+  values = _analysis_density_values(map_id, [atom["xyz"] for atom in atoms], density_cache)
+  for atom, density_value in zip(atoms, values):
     heavy_atoms.append(atom)
-    x, y, z = atom["xyz"]
-    density_value = density_at_point(map_id, x, y, z)
     density_sum += density_value
     if max_density is None or density_value > max_density:
       max_density = density_value
@@ -7535,7 +7642,7 @@ def _possible_misfit_detail_label(residue_id, residue_name_here, stage_result, p
 
 
 def _scan_polymer_stages(map_id, residue_id, residue_name_here, stage_specs, peak_threshold,
-                         misfit_peak_threshold, misfit_gain_threshold, occupied_distance_sq):
+                         misfit_peak_threshold, misfit_gain_threshold, occupied_distance_sq, density_cache=None):
   """Evaluate all torsion stages for one polymer residue."""
   best_stage_result = None
   strongest_current_density = None
@@ -7544,7 +7651,7 @@ def _scan_polymer_stages(map_id, residue_id, residue_name_here, stage_specs, pea
   possible_misfits = []
 
   for stage_index, stage_spec in enumerate(stage_specs):
-    stage_result = _evaluate_emringer_stage(map_id, stage_spec)
+    stage_result = _evaluate_emringer_stage(map_id, stage_spec, density_cache)
     if stage_result is None:
       continue
 
@@ -7557,7 +7664,7 @@ def _scan_polymer_stages(map_id, residue_id, residue_name_here, stage_specs, pea
     ):
       strongest_current_density = current_stage_density
 
-    buffered_peak_density = _weak_stage_inset_peak_density(map_id, stage_result)
+    buffered_peak_density = _weak_stage_inset_peak_density(map_id, stage_result, density_cache=density_cache)
     if strongest_buffered_peak_density is None or buffered_peak_density > strongest_buffered_peak_density:
       strongest_buffered_peak_density = buffered_peak_density
 
@@ -7906,6 +8013,15 @@ def _chain_residue_count_text(records):
 
 
 def _iter_odd_residue_dialog_data():
+  caches = []
+  try:
+    return (yield from _iter_odd_residue_dialog_data_cached(caches))
+  finally:
+    for cache in caches:
+      _analysis_density_close(cache)
+
+
+def _iter_odd_residue_dialog_data_cached(density_caches):
   """Build the current Odd residues dialog payload from the active model/map."""
   map_id = _active_analysis_map_or_status()
   if map_id is None:
@@ -7925,6 +8041,10 @@ def _iter_odd_residue_dialog_data():
   categorized_entries = {category_name: [] for category_name in ODD_RESIDUE_CATEGORY_ORDER}
   missing_atom_residue_keys = _missing_atom_residue_keys(mol_id)
   snapshot = _model_coordinate_snapshot(mol_id)
+  yield (0, len(snapshot))
+  density_cache = _analysis_density_open(map_id, (atom[2] for record in snapshot.values() for atom in record["atoms"]),
+                                         expected_samples=len(snapshot)*256)
+  density_caches.append(density_cache)
   chain_records = {}
   for spec, record in snapshot.items():
     chain_records.setdefault(spec[0], []).append((spec, record))
@@ -7933,6 +8053,7 @@ def _iter_odd_residue_dialog_data():
 
   for chain_index, (chain_id, records) in enumerate(chain_records.items()):
     backbone_records = []
+    prepared_density = {}
     for serial_number, (spec, record) in enumerate(records):
       if processed % 8 == 0:
         yield (processed, len(snapshot))
@@ -7944,8 +8065,15 @@ def _iter_odd_residue_dialog_data():
       processed += 1
       residue_name_here = record["name"]
       _chain, resno, ins_code = spec
-
-      atom_records, atom_xyz = _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code, snapshot=snapshot)
+      if density_cache is not None and serial_number % 8 == 0:
+        prepared_density = _analysis_odd_prefetch(map_id, mol_id, records[serial_number:serial_number+8],
+                                                  snapshot, peak_threshold, density_cache)
+        if density_cache.get('prefer_native_odd'):
+          _analysis_density_close(density_cache)
+          density_cache = None
+      prepared = prepared_density.get(spec)
+      atom_records, atom_xyz = (prepared[:2] if prepared is not None else
+                               _residue_atom_records_and_xyz(mol_id, chain_id, resno, ins_code, snapshot=snapshot))
       backbone_records.append({"name": residue_name_here, "xyz": atom_xyz, "resno": resno,
                                "ins": ins_code, "serial": serial_number,
                                "backbone_support": None,
@@ -7972,7 +8100,7 @@ def _iter_odd_residue_dialog_data():
         )
 
       if residue_name_here not in POLYMER_RESIDUE_NAMES:
-        density_summary = _heavy_atom_density_summary(map_id, atom_records, peak_threshold)
+        density_summary = _heavy_atom_density_summary(map_id, atom_records, peak_threshold, density_cache)
         if density_summary["count"] == 0:
           continue
         if residue_name_here in WATER_RESIDUE_NAMES or density_summary["count"] == 1:
@@ -8004,7 +8132,7 @@ def _iter_odd_residue_dialog_data():
           {name: atom_xyz[name] for name in ("N", "CA", "C")})
         if cb_direction is not None:
           cb_point = [atom_xyz["CA"][axis] + 1.53 * cb_direction[axis] for axis in range(3)]
-          cb_density = density_at_point(map_id, *cb_point)
+          cb_density = _analysis_density_values(map_id, [cb_point], density_cache)[0]
           if math.isfinite(cb_density) and cb_density >= peak_threshold:
             _append_odd_residue_entry(
               categorized_entries, "Possible Misfits",
@@ -8016,7 +8144,7 @@ def _iter_odd_residue_dialog_data():
               navigation_metadata,
             )
 
-      support_fraction, supported_points, total_points = _backbone_density_support(map_id, atom_xyz, peak_threshold)
+      support_fraction, supported_points, total_points = _backbone_density_support(map_id, atom_xyz, peak_threshold, density_cache)
       if total_points:
         backbone_records[-1]["backbone_support"] = support_fraction
       if total_points == 0 or support_fraction < EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION:
@@ -8032,7 +8160,7 @@ def _iter_odd_residue_dialog_data():
       if residue_name_here == "GLY":
         continue
 
-      stage_specs = _emringer_stage_specs(atom_xyz, atom_records, residue_name_here)
+      stage_specs = prepared[2] if prepared is not None else _emringer_stage_specs(atom_xyz, atom_records, residue_name_here)
       if not stage_specs:
         continue
 
@@ -8045,6 +8173,7 @@ def _iter_odd_residue_dialog_data():
         misfit_peak_threshold,
         misfit_gain_threshold,
         occupied_distance_sq,
+        density_cache,
       )
 
       for stage_index, stage_result in stage_scan["possible_misfits"]:
@@ -8307,6 +8436,17 @@ def _annotation_label_seq_text(value):
   return _annotation_text_or_empty(value).strip()
 
 
+def _annotation_position_xyz(entry):
+  try:
+    values = [entry["position_" + axis] for axis in ("x", "y", "z")]
+    if any(isinstance(value, bool) for value in values):
+      return None
+    xyz = tuple(float(value) for value in values)
+    return xyz if all(math.isfinite(value) for value in xyz) else None
+  except (KeyError, TypeError, ValueError, OverflowError):
+    return None
+
+
 def _annotation_encode_text(value):
   text = _annotation_text_or_empty(value)
   encoded = base64.b64encode(text.encode("utf-8"))
@@ -8429,6 +8569,18 @@ def _annotation_target_for_active_residue(expected_mol_id=None):
 
 
 def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
+  if target.get("target_kind") == "position":
+    xyz = _annotation_position_xyz(target)
+    if xyz is None:
+      raise ValueError("A positional note needs a finite view centre.")
+    return {"id": int(entry_id), "target_kind": "position",
+            "label_comp_id": "", "label_asym_id": "", "label_seq_id": "",
+            "auth_asym_id": "", "auth_seq_id": None, "pdbx_PDB_ins_code": "",
+            "title": _annotation_optional_text(title_text),
+            "author": _annotation_text_or_empty(author_text).strip() or _annotation_default_author(),
+            "modified_utc": _annotation_now_utc(),
+            "note": _annotation_text_or_empty(note_text).strip(),
+            **dict(zip(("position_x", "position_y", "position_z"), xyz))}
   entry = {
     "id": int(entry_id),
     "label_comp_id": target["residue_name"],
@@ -8454,10 +8606,11 @@ def _new_annotation_entry(target, title_text, author_text, note_text, entry_id):
 
 
 def _annotation_normalize_entry(raw_entry, fallback_id=None):
+  kind = _annotation_text_or_empty(raw_entry.get("target_kind")).strip() or "residue"
   label_comp_id = _annotation_text_or_empty(raw_entry.get("label_comp_id")).strip() or "?"
   auth_asym_id = _annotation_text_or_empty(raw_entry.get("auth_asym_id")).strip()
   auth_seq_id = _annotation_safe_int(raw_entry.get("auth_seq_id"), default=None)
-  if not auth_asym_id or auth_seq_id is None:
+  if kind != "position" and (not auth_asym_id or auth_seq_id is None):
     return None
   entry_id = _annotation_safe_int(raw_entry.get("id"), default=fallback_id)
   if entry_id is None:
@@ -8477,10 +8630,16 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
   }
   if not normalized_entry["note"] and not normalized_entry["title"]:
     return None
-  kind = _annotation_text_or_empty(raw_entry.get("target_kind")).strip() or "residue"
-  if kind not in ("residue", "region"):
+  if kind not in ("residue", "region", "position"):
     return None
   normalized_entry["target_kind"] = kind
+  if kind == "position":
+    xyz = _annotation_position_xyz(raw_entry)
+    if xyz is None:
+      return None
+    normalized_entry.update(label_comp_id="", label_asym_id="", label_seq_id="",
+                            auth_asym_id="", auth_seq_id=None, pdbx_PDB_ins_code="")
+    normalized_entry.update(zip(("position_x", "position_y", "position_z"), xyz))
   if kind == "region":
     for field in RESIDUE_ANNOTATION_RANGE_FIELDS[1:]:
       normalized_entry[field] = _annotation_text_or_empty(raw_entry.get(field)).strip()
@@ -8495,6 +8654,8 @@ def _annotation_normalize_entry(raw_entry, fallback_id=None):
 
 
 def _annotation_entry_group_key(entry):
+  if entry.get("target_kind") == "position":
+    return ("position", *_annotation_position_xyz(entry))
   key = _annotation_residue_key(entry["auth_asym_id"], entry["auth_seq_id"],
                                 entry.get("pdbx_PDB_ins_code", ""), entry.get("label_comp_id", ""))
   if entry.get("target_kind") == "region":
@@ -8504,6 +8665,8 @@ def _annotation_entry_group_key(entry):
 
 
 def _annotation_entry_label(entry):
+  if entry.get("target_kind") == "position":
+    return "Position ({:.3f}, {:.3f}, {:.3f})".format(*_annotation_position_xyz(entry))
   if entry.get("target_kind") == "region":
     return (f"{entry['auth_asym_id']}:{entry['auth_seq_id']}{entry.get('pdbx_PDB_ins_code', '')}"
             f"-{entry['end_auth_seq_id']}{entry.get('end_pdbx_PDB_ins_code', '')}")
@@ -8512,6 +8675,8 @@ def _annotation_entry_label(entry):
 
 
 def _annotation_region_specs(mol_id, entry, all_specs=None):
+  if entry.get("target_kind") == "position":
+    return []
   if entry.get("target_kind") != "region":
     return [(entry["auth_asym_id"], entry["auth_seq_id"], entry.get("pdbx_PDB_ins_code", ""))]
   specs = [tuple(s) for s in (_all_residue_specs_for_colouring(mol_id) if all_specs is None else all_specs)
@@ -8539,7 +8704,9 @@ def _annotation_entry_display_title(entry, fallback_from_note=True, max_length=N
 
 def _annotation_group_sort_key(group):
   first_entry = group["entries"][0]
-  return (group["key"][0], group["key"][1], group["key"][2], first_entry.get("id", 0))
+  if first_entry.get("target_kind") == "position":
+    return (1, *_annotation_position_xyz(first_entry), first_entry.get("id", 0))
+  return (0, group["key"][0], group["key"][1], group["key"][2], first_entry.get("id", 0))
 
 
 def _annotation_entry_sort_key(entry):
@@ -8647,7 +8814,7 @@ def _annotation_note_expander_label(entry, entry_index, total_entries, max_lengt
 def _annotation_render_group_detail_widgets(detail_box, group):
   _annotation_clear_box_children(detail_box)
   if not group:
-    return _annotation_set_detail_placeholder(detail_box, "Select a residue annotation thread to view its notes.")
+    return _annotation_set_detail_placeholder(detail_box, "Select an annotation thread to view its notes.")
   if not hasattr(Gtk, "Expander"):
     fallback_label = _annotation_detail_label(_annotation_group_detail_text(group), selectable=True)
     fallback_label.set_margin_top(8)
@@ -8719,6 +8886,8 @@ def _annotation_export_entry_maps(entity_records):
 
 
 def _annotation_export_label_fields(entry, polymer_residue_map=None, nonpoly_residue_map=None):
+  if entry.get("target_kind") == "position":
+    return "?", "?", "."
   label_comp_id = _annotation_text_or_empty(entry.get("label_comp_id")).strip() or "?"
   label_asym_id = _annotation_text_or_empty(entry.get("label_asym_id")).strip()
   label_seq_id = _annotation_label_seq_text(entry.get("label_seq_id"))
@@ -8759,7 +8928,7 @@ def _annotation_mmcif_rows(mol_id, entity_records=None):
         label_asym_id or (_annotation_text_or_empty(entry.get("auth_asym_id")) or "?"),
         label_seq_id or ".",
         _annotation_text_or_empty(entry.get("auth_asym_id")) or "?",
-        str(entry.get("auth_seq_id", "")),
+        "?" if entry.get("target_kind") == "position" else str(entry.get("auth_seq_id", "")),
         _annotation_text_or_empty(entry.get("pdbx_PDB_ins_code")) or "?",
         _annotation_text_or_empty(entry.get("title")),
         _annotation_text_or_empty(entry.get("author")),
@@ -8778,6 +8947,8 @@ def _annotation_mmcif_rows(mol_id, entity_records=None):
                     _annotation_text_or_empty(entry.get("end_auth_asym_id")) or "?",
                     _annotation_text_or_empty(entry.get("end_auth_seq_id")) or "?",
                     _annotation_text_or_empty(entry.get("end_pdbx_PDB_ins_code")) or "?"])
+    xyz = _annotation_position_xyz(entry) if entry.get("target_kind") == "position" else None
+    rows[-1].extend([repr(value) for value in xyz] if xyz is not None else ["?", "?", "?"])
   return rows
 
 
@@ -8798,11 +8969,11 @@ def _annotation_markdown_cell(value):
 def _annotation_markdown_table_text(mol_id):
   source_display_name = _annotation_source_display_name(mol_id) or "Unknown source"
   lines = [
-    f"# Residue annotations for molecule #{mol_id}",
+    f"# Annotations for molecule #{mol_id}",
     "",
     f"Source: `{source_display_name}`",
     "",
-    "| Residue | Title | Author | Timestamp | Note |",
+    "| Target | Title | Author | Timestamp | Note |",
     "| --- | --- | --- | --- | --- |",
   ]
   for group in _annotation_groups_for_molecule(mol_id):
@@ -8894,7 +9065,7 @@ def _load_annotations_from_mmcif_file(file_path):
     identity = {name: loop_text_field(row_index, RESIDUE_ANNOTATION_CATEGORY_PREFIX + name)
                 for name in ("id", "label_comp_id", "label_asym_id", "label_seq_id",
                              "auth_asym_id", "auth_seq_id", "pdbx_PDB_ins_code", "modified_utc",
-                             *RESIDUE_ANNOTATION_RANGE_FIELDS)}
+                             *RESIDUE_ANNOTATION_RANGE_FIELDS, "position_x", "position_y", "position_z")}
     normalized_entry = _annotation_normalize_entry(
       {
         **identity,
@@ -8942,13 +9113,15 @@ def _annotation_write_entries_to_mmcif_block(block, entries):
         "author",
         "modified_utc",
         "note",
-      ] + list(RESIDUE_ANNOTATION_RANGE_FIELDS),
+      ] + list(RESIDUE_ANNOTATION_RANGE_FIELDS) + ["position_x", "position_y", "position_z"],
     )
     for row in entries:
       if len(row) == 11:
         row = list(row) + ["residue", "?", "?", ".", "?", "?", "?"]
+      if len(row) == 18:
+        row = list(row) + ["?", "?", "?"]
       # Gemmi loop values are CIF tokens, not unquoted application strings.
-      loop.add_row([value if index in (3, 6, 12, 13, 14, 15, 16, 17) and value in (".", "?")
+      loop.add_row([value if index in (1, 2, 3, 4, 5, 6, 12, 13, 14, 15, 16, 17, 18, 19, 20) and value in (".", "?")
                     else gemmi.cif.quote(str(value)) for index, value in enumerate(row)])
 
 
@@ -9465,7 +9638,7 @@ def _annotation_active_molecule_or_status():
   mol_id = _annotation_active_molecule()
   if mol_id is not None:
     return mol_id
-  info_dialog("You need an active model molecule for residue annotations.")
+  info_dialog("You need an active model molecule for annotations.")
   return None
 
 
@@ -9483,13 +9656,17 @@ def _append_annotation_for_target(target, title_text, author_text, note_text, re
   if mol_id not in model_molecule_list():
     info_dialog("The annotation model is no longer available.")
     return 0
-  annotation_entry = _new_annotation_entry(
-    target,
-    normalized_title,
-    normalized_author,
-    normalized_note,
-    _annotation_next_id(mol_id),
-  )
+  try:
+    annotation_entry = _new_annotation_entry(
+      target,
+      normalized_title,
+      normalized_author,
+      normalized_note,
+      _annotation_next_id(mol_id),
+    )
+  except ValueError as error:
+    info_dialog(str(error))
+    return 0
   if annotation_entry["target_kind"] == "region":
     if not _annotation_region_specs(mol_id, annotation_entry):
       info_dialog("The region endpoints are no longer available or are ambiguous.")
@@ -9526,6 +9703,32 @@ def prompt_add_annotation_for_active_residue(mol_id=None, refresh_function=None)
       refresh_function,
     ),
   )
+  return 1
+
+
+def prompt_add_annotation_at_view_centre(mol_id=None, refresh_function=None):
+  if mol_id is None:
+    mol_id = _annotation_active_molecule_or_status()
+  if mol_id is None:
+    return 0
+  if mol_id not in model_molecule_list():
+    info_dialog("The annotation model is no longer available.")
+    return 0
+  _ensure_residue_annotations_loaded(mol_id)
+  target = {"mol_id": mol_id, "target_kind": "position"}
+  try:
+    target.update(zip(("position_x", "position_y", "position_z"), _rotation_centre_xyz()))
+  except (TypeError, ValueError):
+    pass
+  xyz = _annotation_position_xyz(target)
+  if xyz is None:
+    info_dialog("Could not determine the view centre for this note.")
+    return 0
+  label = "Model #{} | Position ({:.3f}, {:.3f}, {:.3f})".format(mol_id, *xyz)
+  generic_title_author_note_entry(
+    "Add note at view centre", label, "", _annotation_default_author(), "", "Add note",
+    lambda title, author, note: _append_annotation_for_target(
+      target, title, author, note, refresh_function))
   return 1
 
 
@@ -9759,7 +9962,7 @@ def _update_annotation_entry(annotation_entry, title_text, author_text, note_tex
   annotation_entry["modified_utc"] = _annotation_now_utc()
   if callable(refresh_function):
     refresh_function()
-  add_status_bar_text("Updated residue annotation")
+  add_status_bar_text("Updated annotation")
   return 1
 
 
@@ -9768,17 +9971,17 @@ def _delete_annotation_entry(mol_id, annotation_entry, refresh_function=None):
   try:
     entries.remove(annotation_entry)
   except ValueError:
-    info_dialog("That residue annotation is no longer present.")
+    info_dialog("That annotation is no longer present.")
     return 0
   if callable(refresh_function):
     refresh_function()
-  add_status_bar_text("Deleted residue annotation")
+  add_status_bar_text("Deleted annotation")
   return 1
 
 
 def _prompt_edit_annotation_entry(group, annotation_entry, refresh_function=None):
   generic_title_author_note_entry(
-    "Edit residue annotation",
+    "Edit annotation",
     group["dialog_label"],
     _annotation_text_or_empty(annotation_entry.get("title")),
     _annotation_text_or_empty(annotation_entry.get("author")) or _annotation_default_author(),
@@ -9798,7 +10001,7 @@ def _prompt_edit_annotation_entry(group, annotation_entry, refresh_function=None
 def _choose_annotation_entry_action(group, action_name, action_function):
   entries = list(group.get("entries") or [])
   if not entries:
-    info_dialog("No note is selected for this residue.")
+    info_dialog("No note is selected for this target.")
     return 0
   if len(entries) == 1:
     return action_function(entries[0])
@@ -9814,8 +10017,49 @@ def _choose_annotation_entry_action(group, action_name, action_function):
   return 1
 
 
+def _clear_annotation_position_marker():
+  global RESIDUE_ANNOTATION_POSITION_MARKER
+  obj = RESIDUE_ANNOTATION_POSITION_MARKER
+  RESIDUE_ANNOTATION_POSITION_MARKER = None
+  if obj is not None:
+    try:
+      coot.close_generic_object(obj)
+      coot.graphics_draw()
+    except Exception as error:
+      print("Could not clear positional note marker:", error)
+
+
+def _show_annotation_position_marker(xyz):
+  global RESIDUE_ANNOTATION_POSITION_MARKER
+  _clear_annotation_position_marker()
+  required = ("new_generic_object_number", "to_generic_object_add_point",
+              "set_display_generic_object", "close_generic_object")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    return
+  try:
+    obj = coot.new_generic_object_number("Selected positional note")
+    RESIDUE_ANNOTATION_POSITION_MARKER = obj
+    coot.to_generic_object_add_point(obj, "cyan", 10, *xyz)
+    coot.set_display_generic_object(obj, 1)
+    coot.graphics_draw()
+  except Exception as error:
+    _clear_annotation_position_marker()
+    print("Could not draw positional note marker:", error)
+
+
 def _annotation_jump_to_group(mol_id, group):
+  _clear_annotation_position_marker()
   entry = group["entries"][0]
+  if entry.get("target_kind") == "position":
+    xyz = _annotation_position_xyz(entry)
+    if xyz is None:
+      info_dialog("This positional note has invalid coordinates.")
+      return 0
+    _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
+    set_rotation_centre(*xyz)
+    _show_annotation_position_marker(xyz)
+    add_status_bar_text(f"{group['dialog_label']} - {_annotation_entry_display_title(entry)}")
+    return 1
   if entry.get("target_kind") == "region":
     specs = _annotation_region_specs(mol_id, entry)
     if not specs:
@@ -9873,13 +10117,18 @@ def _annotation_groups_near_point(mol_id, point_xyz, radius, groups=None, positi
     all_specs = list(positions) if positions is not None else _all_residue_specs_for_colouring(mol_id)
   for group in groups:
     entry = group.get("entries", [{}])[0]
-    if entry.get("target_kind") == "region":
+    if entry.get("target_kind") == "position":
+      xyz = _annotation_position_xyz(entry)
+      distances = [_distance_sq(point_xyz, xyz)] if xyz is not None else []
+      specs = []
+    elif entry.get("target_kind") == "region":
       specs = group.get("region_specs")
       if specs is None:
         specs = _annotation_region_specs(mol_id, entry, all_specs)
+      distances = []
     else:
       specs = [group["key"][:3]]
-    distances = []
+      distances = []
     for spec in specs:
       point = residue_centre_py(mol_id, *spec) if positions is None else positions.get(tuple(spec))
       if isinstance(point, (list, tuple)) and len(point) == 3:
@@ -9912,10 +10161,10 @@ def _annotation_browser_title(mol_id):
   source_display_name = _annotation_source_display_name(mol_id)
   if source_display_name:
     return (
-      f"Residue annotations for molecule #{mol_id}\n"
+      f"Annotations for molecule #{mol_id}\n"
       f"Source: {source_display_name}; use the widget to export an annotated mmCIF"
     )
-  return f"Residue annotations for molecule #{mol_id}\n(No accessible source file path)"
+  return f"Annotations for molecule #{mol_id}\n(No accessible source file path)"
 
 
 def _annotation_nearby_browser_title(mol_id, radius):
@@ -9923,11 +10172,11 @@ def _annotation_nearby_browser_title(mol_id, radius):
   radius_text = f"{float(radius):.1f} A"
   if source_display_name:
     return (
-      f"Nearby residue annotations within {radius_text} of the rotation centre for molecule #{mol_id}\n"
+      f"Nearby annotations within {radius_text} of the rotation centre for molecule #{mol_id}\n"
       f"Source: {source_display_name}"
     )
   return (
-    f"Nearby residue annotations within {radius_text} of the rotation centre for molecule #{mol_id}\n"
+    f"Nearby annotations within {radius_text} of the rotation centre for molecule #{mol_id}\n"
     "(No accessible source file path)"
   )
 
@@ -9966,6 +10215,7 @@ def residue_annotations_gui():
   window.set_default_size(640, 620)
 
   outer_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
   action_row_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
   action_row_bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
   navigation_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -9976,8 +10226,9 @@ def residue_annotations_gui():
   detail_header = Gtk.Label(label="Selected notes: none")
   detail_scrolled = Gtk.ScrolledWindow()
   detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-  add_button = Gtk.Button(label="Add note for active residue")
+  add_button = Gtk.Button(label="Add residue note")
   add_region_button = Gtk.Button(label="Add region note...")
+  add_position_button = Gtk.Button(label="Add note at view centre")
   edit_button = Gtk.Button(label="Edit selected note...")
   delete_button = Gtk.Button(label="Delete selected note...")
   export_button = Gtk.Button(label="Export annotated mmCIF...")
@@ -10025,6 +10276,9 @@ def residue_annotations_gui():
   detail_box.set_valign(Gtk.Align.START)
   detail_scrolled.set_child(detail_box)
   action_row_top.set_halign(Gtk.Align.CENTER)
+  add_row.set_halign(Gtk.Align.CENTER)
+  add_row.set_margin_start(12)
+  add_row.set_margin_end(12)
   action_row_top.set_margin_start(12)
   action_row_top.set_margin_end(12)
   action_row_top.set_margin_bottom(4)
@@ -10065,6 +10319,7 @@ def residue_annotations_gui():
 
     def stop_polling(self):
       _clear_annotation_range_pick()
+      _clear_annotation_position_marker()
       _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
       if glib_module is not None and self.active_residue_timer_id is not None:
         try:
@@ -10108,7 +10363,7 @@ def residue_annotations_gui():
     def selected_group_or_dialog(self):
       selected_group = self.selected_group()
       if selected_group is None:
-        info_dialog("Select a residue annotation first.")
+        info_dialog("Select an annotation first.")
       return selected_group
 
     def set_selected_button(self, button):
@@ -10143,11 +10398,12 @@ def residue_annotations_gui():
       return None
 
     def clear_selected_group(self):
+      _clear_annotation_position_marker()
       _clear_odd_helical_feature_highlights(RESIDUE_ANNOTATION_REGION_HIGHLIGHTS)
       self.current_index = None
       self.selected_group_key = None
       detail_header.set_text("Selected notes: none")
-      _annotation_set_detail_placeholder(detail_box, "Select a residue annotation thread to view its notes.")
+      _annotation_set_detail_placeholder(detail_box, "Select an annotation thread to view its notes.")
       self.set_selected_button(None)
       self.update_selection_button_state()
 
@@ -10165,6 +10421,8 @@ def residue_annotations_gui():
       self.update_selection_button_state()
       if jump_to_residue:
         _annotation_jump_to_group(self.mol_id(), group)
+      elif group["entries"][0].get("target_kind") == "position":
+        _show_annotation_position_marker(_annotation_position_xyz(group["entries"][0]))
       return group
 
     def activate_prev(self, *_args):
@@ -10192,7 +10450,7 @@ def residue_annotations_gui():
       self.set_active_residue_header_text(_annotation_active_residue_header_text(self.mol_id()))
 
       if not self.grouped_annotations:
-        empty_label = Gtk.Label(label="No residue annotations for this molecule.")
+        empty_label = Gtk.Label(label="No annotations for this molecule.")
         empty_label.set_xalign(0.0)
         list_box.append(empty_label)
         prev_button.set_sensitive(False)
@@ -10249,6 +10507,11 @@ def residue_annotations_gui():
       if mol_id is not None:
         return prompt_add_annotation_for_region(mol_id, self.refresh_groups)
 
+    def add_position_note(self, *_args):
+      mol_id = self.current_mol_id_or_dialog()
+      if mol_id is not None:
+        return prompt_add_annotation_at_view_centre(mol_id, self.refresh_groups)
+
     def edit_selected_note(self, *_args):
       if self.current_mol_id_or_dialog() is None:
         return None
@@ -10276,8 +10539,8 @@ def residue_annotations_gui():
         selected_group,
         "Delete note",
         lambda annotation_entry: generic_confirm_dialog(
-          "Delete residue annotation",
-          "Delete the selected note from this residue thread?",
+          "Delete annotation",
+          "Delete the selected note from this annotation thread?",
           "Cancel",
           lambda: None,
           "Delete note",
@@ -10321,7 +10584,7 @@ def residue_annotations_gui():
       _annotation_entries_for_molecule(target_mol_id).clear()
       if target_mol_id == self.mol_id():
         self.refresh_groups()
-      add_status_bar_text("Cleared all residue annotations for the current molecule")
+      add_status_bar_text("Cleared all annotations for the current molecule")
       return None
 
     def clear_all_notes(self, *_args):
@@ -10329,11 +10592,11 @@ def residue_annotations_gui():
       if selected_mol_id is None:
         return None
       if not _annotation_entries_for_molecule(selected_mol_id):
-        info_dialog("No residue annotations are currently stored for this molecule.")
+        info_dialog("No annotations are currently stored for this molecule.")
         return None
       generic_confirm_dialog(
-        "Clear all residue annotations",
-        "Delete all residue annotations for the current molecule?\n"
+        "Clear all annotations",
+        "Delete all annotations for the current molecule?\n"
         "This only affects the in-memory/browser state until you export an annotated mmCIF.",
         "Cancel",
         lambda: None,
@@ -10346,6 +10609,7 @@ def residue_annotations_gui():
 
   add_button.connect("clicked", browser.add_note)
   add_region_button.connect("clicked", browser.add_region_note)
+  add_position_button.connect("clicked", browser.add_position_note)
   edit_button.connect("clicked", browser.edit_selected_note)
   delete_button.connect("clicked", browser.delete_selected_note)
   export_button.connect("clicked", browser.export_annotated_mmcif)
@@ -10361,18 +10625,20 @@ def residue_annotations_gui():
   browser.render_groups()
   browser.start_polling()
 
-  action_row_top.append(add_button)
-  action_row_top.append(add_region_button)
+  add_row.append(add_button)
+  add_row.append(add_region_button)
+  add_row.append(add_position_button)
   action_row_top.append(edit_button)
   action_row_top.append(delete_button)
+  action_row_top.append(refresh_button)
   action_row_bottom.append(export_button)
   action_row_bottom.append(export_markdown_button)
   action_row_bottom.append(clear_button)
-  action_row_bottom.append(refresh_button)
   navigation_row.append(prev_button)
   navigation_row.append(next_button)
 
   outer_vbox.append(title_label)
+  outer_vbox.append(add_row)
   outer_vbox.append(action_row_top)
   outer_vbox.append(action_row_bottom)
   outer_vbox.append(list_scrolled)
@@ -10407,7 +10673,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
     if labels:
       message += "\n\n" + "\n".join(labels)
     else:
-      message += "\n\nNo residue annotations are currently near the rotation centre."
+      message += "\n\nNo annotations are currently near the rotation centre."
     info_dialog(message)
     return len(groups)
 
@@ -10426,6 +10692,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
   detail_scrolled = Gtk.ScrolledWindow()
   detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
   refresh_button = Gtk.Button(label="Refresh nearby notes")
+  add_position_button = Gtk.Button(label="Add note at view centre")
   prev_button = Gtk.Button(label="<--Prev")
   next_button = Gtk.Button(label="Next-->")
   close_button = Gtk.Button(label="Close")
@@ -10510,6 +10777,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       return self.current_mol_id
 
     def stop_polling(self):
+      _clear_annotation_position_marker()
       if glib_module is not None and self.timer_id is not None:
         try:
           glib_module.source_remove(self.timer_id)
@@ -10559,26 +10827,27 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       return self.grouped_annotations[group_index]
 
     def clear_selected_group(self):
+      _clear_annotation_position_marker()
       self.current_index = None
       self.selected_group_key = None
       detail_header.set_text("Nearby notes: none")
-      _annotation_set_detail_placeholder(detail_box, "No nearby residue annotation thread is selected.")
+      _annotation_set_detail_placeholder(detail_box, "No nearby annotation thread is selected.")
       self.set_selected_button(None)
 
     def update_context_text(self):
       count = len(self.grouped_annotations)
       if count == 0:
         context_label.set_text(
-          f"No residue annotation threads are currently within {self.radius:.1f} A of the rotation centre."
+          f"No annotation threads are currently within {self.radius:.1f} A of the rotation centre."
         )
       else:
         context_label.set_text(
-          f"{count} residue annotation {'thread' if count == 1 else 'threads'} within "
+          f"{count} annotation {'thread' if count == 1 else 'threads'} within "
           f"{self.radius:.1f} A of the rotation centre."
         )
       return None
 
-    def show_group(self, entry_index):
+    def show_group(self, entry_index, navigate=False):
       if not self.grouped_annotations:
         return None
       entry_index = entry_index % len(self.grouped_annotations)
@@ -10589,21 +10858,27 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       _annotation_render_group_detail_widgets(detail_box, group)
       button = self.row_buttons[entry_index] if entry_index < len(self.row_buttons) else None
       self.set_selected_button(button)
+      _clear_annotation_position_marker()
+      if group["entries"][0].get("target_kind") == "position":
+        if navigate:
+          _annotation_jump_to_group(self.mol_id(), group)
+        else:
+          _show_annotation_position_marker(_annotation_position_xyz(group["entries"][0]))
       return group
 
     def activate_prev(self, *_args):
       if not self.grouped_annotations:
         return None
       if self.current_index is None:
-        return self.show_group(len(self.grouped_annotations) - 1)
-      return self.show_group(self.current_index - 1)
+        return self.show_group(len(self.grouped_annotations) - 1, navigate=True)
+      return self.show_group(self.current_index - 1, navigate=True)
 
     def activate_next(self, *_args):
       if not self.grouped_annotations:
         return None
       if self.current_index is None:
-        return self.show_group(0)
-      return self.show_group(self.current_index + 1)
+        return self.show_group(0, navigate=True)
+      return self.show_group(self.current_index + 1, navigate=True)
 
     def render_groups(self, groups, preferred_key=None):
       self.grouped_annotations[:] = list(groups or [])
@@ -10614,7 +10889,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       self.clear_list_box_children()
 
       if not self.grouped_annotations:
-        empty_label = Gtk.Label(label="No residue annotations are currently near the rotation centre.")
+        empty_label = Gtk.Label(label="No annotations are currently near the rotation centre.")
         empty_label.set_xalign(0.0)
         list_box.append(empty_label)
         prev_button.set_sensitive(False)
@@ -10626,7 +10901,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
       for entry_index, group in enumerate(self.grouped_annotations):
         self.group_index_by_key[group["key"]] = entry_index
         button = Gtk.Button(label=_annotation_group_nearby_preview_text(group))
-        button.connect("clicked", lambda _button, idx=entry_index: self.show_group(idx))
+        button.connect("clicked", lambda _button, idx=entry_index: self.show_group(idx, navigate=True))
         self.row_buttons.append(button)
         list_box.append(button)
         if preferred_key is not None and group["key"] == preferred_key:
@@ -10658,7 +10933,7 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
         list_box.append(empty_label)
         prev_button.set_sensitive(False)
         next_button.set_sensitive(False)
-        context_label.set_text("No active model molecule is available for nearby residue annotations.")
+        context_label.set_text("No active model molecule is available for nearby annotations.")
         return None
 
       if target_mol_id != self.mol_id():
@@ -10680,12 +10955,16 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
         positions = {}
         has_regions = any(group.get("entries") and group["entries"][0].get("target_kind") == "region"
                           for group in self.cached_annotation_groups)
+        residue_group_count = sum(group["entries"][0].get("target_kind") != "position"
+                                  for group in self.cached_annotation_groups)
         bulk_centres = (_coordinate_snapshot_centres(_model_coordinate_snapshot(target_mol_id))
-                        if len(self.cached_annotation_groups) >= 64 or has_regions else None)
+                        if residue_group_count >= 64 or has_regions else None)
         if has_regions:
           needed = set()
           for group in self.cached_annotation_groups:
             entry = group.get("entries", [{}])[0]
+            if entry.get("target_kind") == "position":
+              continue
             if entry.get("target_kind") == "region":
               group["region_specs"] = _annotation_region_specs(target_mol_id, entry, bulk_centres)
               needed.update(group["region_specs"])
@@ -10693,6 +10972,8 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
               needed.add(group["key"][:3])
           positions.update((spec, point) for spec, point in bulk_centres.items() if spec in needed)
         for group in self.cached_annotation_groups:
+          if group["entries"][0].get("target_kind") == "position":
+            continue
           key = group["key"][:3]
           if key not in positions:
             position = bulk_centres.get(key) if bulk_centres is not None else residue_centre_py(target_mol_id, *key)
@@ -10728,12 +11009,15 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
   browser = NearbyAnnotationBrowserState(initial_mol_id, nearby_radius)
 
   refresh_button.connect("clicked", lambda *_args: browser.refresh_nearby_groups(force=True))
+  add_position_button.connect("clicked", lambda *_args: prompt_add_annotation_at_view_centre(
+    browser.mol_id(), lambda *_unused: browser.refresh_nearby_groups(force=True)))
   prev_button.connect("clicked", browser.activate_prev)
   next_button.connect("clicked", browser.activate_next)
   close_button.connect("clicked", browser.close_window)
   window.connect("close-request", lambda *_args: browser.stop_polling() or False)
 
   action_row.append(refresh_button)
+  action_row.append(add_position_button)
   navigation_row.append(prev_button)
   navigation_row.append(next_button)
 
@@ -11787,7 +12071,7 @@ def _tq_sample_density(map_id, x, y, z):
     ) from error
 
 
-def _tq_residue_point_records_numpy(np, map_id, score_atoms, context_atoms, sigma, radius, spacing):
+def _tq_residue_point_records_numpy(np, map_id, score_atoms, context_atoms, sigma, radius, spacing, density_cache=None):
   indices = _tq_candidate_grid_indices(score_atoms, radius, spacing)
   coordinates = np.asarray([atom["xyz"] for atom in context_atoms], dtype=float)
   occupancies = np.asarray([atom.get("occupancy", 1.0) for atom in context_atoms], dtype=float)
@@ -11809,20 +12093,21 @@ def _tq_residue_point_records_numpy(np, map_id, score_atoms, context_atoms, sigm
     np.exp(distances, out=distances)
     distances *= occupancies
     ideals = distances.sum(axis=1)
-    for point, ideal in zip(points, ideals):
-      x, y, z = (float(value) for value in point)
-      records.append({"experimental_density": _tq_sample_density(map_id, x, y, z),
+    values = (_analysis_density_values(map_id, points, density_cache) if density_cache is not None else
+              [_tq_sample_density(map_id, *map(float, point)) for point in points])
+    for value, ideal in zip(values, ideals):
+      records.append({"experimental_density": value,
                       "ideal_density": float(ideal)})
   return records
 
 
-def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, sigma, sample_radius, grid_spacing):
+def _tq_residue_point_records(map_id, score_atom_records, context_atom_records, sigma, sample_radius, grid_spacing, density_cache=None):
   if not score_atom_records or not context_atom_records:
     return []
   np = _tq_numpy_module()
   if np is not None:
     return _tq_residue_point_records_numpy(np, map_id, score_atom_records, context_atom_records,
-                                            sigma, sample_radius, grid_spacing)
+                                            sigma, sample_radius, grid_spacing, density_cache)
 
   score_atom_keys = {atom_record["atom_key"] for atom_record in score_atom_records}
   context_atom_data = [
@@ -11998,37 +12283,36 @@ def _tq_prepare_scored_residues(
     return None
 
   prepared_residues = []
-  for residue_spec in score_residue_specs:
-    score_atom_records = _tq_score_atom_records(
-      _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True, snapshot=snapshot),
-      backbone_only=backbone_only,
-    )
-    if not score_atom_records:
-      continue
-    residue_context_atoms = _tq_prune_context_atoms(score_atom_records, context_atom_records, sigma, sample_radius)
-    point_records = _tq_residue_point_records(
-      map_id,
-      score_atom_records,
-      residue_context_atoms,
-      sigma,
-      sample_radius,
-      grid_spacing,
-    )
-    if not point_records:
-      continue
-    residue_name_here = score_atom_records[0]["residue_name"]
-    ideal_density_threshold = _tq_ideal_density_threshold(point_records, ideal_enclosed_mass_percent)
-    prepared_residues.append(
-      {
-        "residue_spec": residue_spec,
-        "residue_name": residue_name_here,
-        "label": _tq_residue_label(residue_spec[0], residue_spec[1], residue_spec[2], residue_name_here),
-        "n_atoms": len(score_atom_records),
-        "n_points": len(point_records),
-        "ideal_density_threshold": ideal_density_threshold,
-        "region_sweep_data": _tq_residue_region_sweep_data(point_records, ideal_density_threshold),
-      }
-    )
+  density_cache = _analysis_density_open(map_id, (atom["xyz"] for atom in context_atom_records), padding=sample_radius+4.,
+                                         expected_samples=len(score_residue_specs)*4000)
+  try:
+    for residue_spec in score_residue_specs:
+      score_atom_records = _tq_score_atom_records(
+        _tq_residue_atom_records(mol_id, residue_spec, heavy_atoms_only=True, snapshot=snapshot),
+        backbone_only=backbone_only,
+      )
+      if not score_atom_records:
+        continue
+      residue_context_atoms = _tq_prune_context_atoms(score_atom_records, context_atom_records, sigma, sample_radius)
+      point_records = _tq_residue_point_records(
+        map_id, score_atom_records, residue_context_atoms, sigma, sample_radius, grid_spacing, density_cache)
+      if not point_records:
+        continue
+      residue_name_here = score_atom_records[0]["residue_name"]
+      ideal_density_threshold = _tq_ideal_density_threshold(point_records, ideal_enclosed_mass_percent)
+      prepared_residues.append(
+        {
+          "residue_spec": residue_spec,
+          "residue_name": residue_name_here,
+          "label": _tq_residue_label(residue_spec[0], residue_spec[1], residue_spec[2], residue_name_here),
+          "n_atoms": len(score_atom_records),
+          "n_points": len(point_records),
+          "ideal_density_threshold": ideal_density_threshold,
+          "region_sweep_data": _tq_residue_region_sweep_data(point_records, ideal_density_threshold),
+        }
+      )
+  finally:
+    _analysis_density_close(density_cache)
 
   if not prepared_residues:
     return None
@@ -14800,22 +15084,26 @@ class CootRefinementBackend:
         sigma = float(sigma_api(map_id))
         if not math.isfinite(sigma) or sigma <= 0:
             raise ValueError("Priority scoring requires a reference map with finite, nonzero variance.")
-        scores = {}
+        scores, groups, points = {}, [], []
         for spec in specs:
             anchor = self.anchors.get(spec)
             scores[spec] = None
             if anchor is None:
                 continue
             core, shell = [], []
-            for radius, values in ((0.0, core), (1.25, core), (2.5, core), (6.0, shell)):
+            for radius, indices in ((0.0, core), (1.25, core), (2.5, core), (6.0, shell)):
                 directions = ((0, 0, 0),) if radius == 0 else _PRIORITY_DIRECTIONS
                 for direction in directions:
                     point = tuple(a + radius*b for a, b in zip(anchor, direction))
-                    if values is core and not self._priority_point_owned(spec, point, radius):
+                    if indices is core and not self._priority_point_owned(spec, point, radius):
                         continue
-                    value = float(self.api.density_at_point(map_id, *point))
-                    if math.isfinite(value):
-                        values.append(value)
+                    indices.append(len(points))
+                    points.append(point)
+            groups.append((spec, core, shell))
+        values = self._priority_density_values(map_id, points)
+        for spec, core, shell in groups:
+            core = [values[index] for index in core if math.isfinite(values[index])]
+            shell = [values[index] for index in shell if math.isfinite(values[index])]
             if len(core) < 8 or len(shell) < 8:
                 continue
             background = median(shell)
@@ -14823,6 +15111,13 @@ class CootRefinementBackend:
             upper = sorted(core)[-max(2, math.ceil(len(core)*0.2)):]
             scores[spec] = max(0.0, (sum(upper)/len(upper) - background) / spread)
         return scores
+
+    def _priority_density_values(self, map_id, points):
+        return [float(self.api.density_at_point(map_id, *point)) for point in points]
+
+    def release_analysis_caches(self):
+        """Optional numerical caches supplied by the main-script integration."""
+        pass
 
     def validate(self, imol, stages, options, specs):
         self._check_idle()
@@ -15243,6 +15538,12 @@ class MultimapRefinementJob:
         self.state, self.message = state, message
         if _MULTIMAP_RUNNING is self:
             _MULTIMAP_RUNNING = None
+        release = getattr(self.backend, "release_analysis_caches", None)
+        if callable(release):
+            try:
+                release()
+            except Exception as error:
+                self.message += " | " + str(error)
         cleanup = getattr(self.backend, "release_stage_maps", None)
         if state != "paused" and callable(cleanup):
             try:
@@ -15831,6 +16132,19 @@ def _multimap_refinement_module():
     module._change_colour_table = lambda: _make_multimap_user_defined_colours(module)
 
     class TrimmingsMultimapBackend(module.CootRefinementBackend):
+      def _priority_density_values(self, map_id, points):
+        factory = globals().get("_analysis_density_open")
+        if not callable(factory):
+          return super()._priority_density_values(map_id, points)
+        if not hasattr(self, "_priority_density_cache"):
+          self._priority_density_cache = factory(map_id, self.anchors.values(), expected_samples=len(self.anchors)*400)
+        return _analysis_density_values(map_id, points, self._priority_density_cache)
+
+      def release_analysis_caches(self):
+        cache = self.__dict__.pop("_priority_density_cache", None)
+        if cache is not None:
+          _analysis_density_close(cache)
+
       def validate(self, *args, **kwargs):
         if globals().get("_USER_DEFINED_COLOUR_JOB_ACTIVE"):
           raise RuntimeError("Wait for model colouring to finish before starting refinement.")
@@ -16801,6 +17115,303 @@ def delete_active_segment():
 _GLOBAL_FIT_STATE = None
 
 
+def _analysis_odd_prefetch(map_id, mol_id, records, snapshot, threshold, cache):
+  """Batch both coarse and adaptive fine torsion sweeps for eight residues."""
+  started = time.perf_counter()
+  prepared, jobs = {}, []
+  cache['ring_peaks'] = {}
+  for spec, record in records:
+    atoms, xyz = _residue_atom_records_and_xyz(mol_id, *spec, snapshot=snapshot)
+    stages = []
+    if record['name'] in POLYMER_RESIDUE_NAMES and record['name'] != 'GLY':
+      support, count, _total = _backbone_density_support(map_id, xyz, threshold, cache)
+      if count and support >= EMRINGER_HELPER_MIN_BACKBONE_SUPPORT_FRACTION:
+        stages = _emringer_stage_specs(xyz, atoms, record['name'])
+    prepared[spec] = (atoms, xyz, stages)
+    for stage in stages:
+      for length in (stage['bond_length'], stage['bond_length']-EMRINGER_HELPER_WEAK_STAGE_INSET_BUFFER):
+        if length > 0:
+          jobs.append((stage['ring_frame'], length))
+  step, fine = EMRINGER_HELPER_STEP_DEGREES, EMRINGER_HELPER_FINE_STEP_DEGREES
+  if not jobs:
+    return prepared
+  np = cache['grid']['np']
+  anchors = np.asarray([frame['anchor_xyz'] for frame, _length in jobs])
+  axes = np.asarray([frame['axis_unit'] for frame, _length in jobs])
+  u = np.asarray([frame['ring_u'] for frame, _length in jobs])
+  v = np.asarray([frame['ring_v'] for frame, _length in jobs])
+  lengths = np.asarray([length for _frame, length in jobs])
+  base = anchors+lengths[:, None]/3.*axes
+  radial = lengths*math.sqrt(8./9.)
+  def positions(angle_rows):
+    radians = np.deg2rad(angle_rows)
+    xyz = base[:, None, :]+radial[:, None, None]*(np.cos(radians)[:, :, None]*u[:, None, :]+
+                                                 np.sin(radians)[:, :, None]*v[:, None, :])
+    return xyz.reshape((-1, 3)).tolist()
+  n = max(1, int(round(360./step)))
+  angles = [360.*i/n for i in range(n)]
+  points = positions(np.tile(angles, (len(jobs), 1)))
+  densities = _analysis_density_values(map_id, points, cache)
+  peaks, refinements = [], []
+  for j, (frame, length) in enumerate(jobs):
+    values = densities[j*n:(j+1)*n]
+    best = max(range(n), key=values.__getitem__)
+    peak = dict(density=values[best], angle_degrees=angles[best], point=points[j*n+best],
+                ring_mean_density=sum(values)/n)
+    peaks.append(peak)
+    if 0 < fine < step:
+      count = max(1, int(round(2*step/fine)))
+      for i in range(count+1):
+        angle = angles[best]-step+i*fine
+        refinements.append((j, angle))
+  fine_points = positions(np.asarray([row[1] for row in refinements]).reshape((len(jobs), -1))) if refinements else []
+  values = _analysis_density_values(map_id, fine_points, cache)
+  for (j, angle), point, value in zip(refinements, fine_points, values):
+    if value > peaks[j]['density']:
+      peaks[j].update(density=value, angle_degrees=angle, point=point)
+  for (frame, length), peak in zip(jobs, peaks):
+    peak['angle_degrees'] %= 360.
+    cache['ring_peaks'][(id(frame), length)] = peak
+  if not cache.get('odd_benchmark_done'):
+    elapsed = time.perf_counter()-started
+    started = time.perf_counter()
+    for frame, length in jobs:
+      _sample_virtual_stage_density_peak(map_id, frame, length)
+    cache['prefer_native_odd'] = elapsed > .9*(time.perf_counter()-started)
+    cache['odd_benchmark_done'] = True
+  return prepared
+
+
+def _analysis_density_open(map_id, points, padding=12.0, expected_samples=None, full=False):
+  """Optional analysis-scoped cache; validate off-grid interpolation against Coot."""
+  api = globals().get("coot")
+  if api is None or any(not callable(getattr(api, name, None)) for name in
+                        ("export_map", "density_at_point", "molecule_name", "is_valid_map_molecule")):
+    return None
+  if expected_samples is not None and expected_samples < 250000:
+    return None
+  np = _tq_numpy_module()
+  if np is None:
+    return None
+  points = np.asarray(list(points), dtype=float).reshape((-1, 3))
+  if len(points) < 16 or not np.isfinite(points).all():
+    return None
+  grid, owner = None, None
+  try:
+    if not api.is_valid_map_molecule(map_id):
+      raise ValueError("The analysis map was closed.")
+    # Unmodified file-backed EM maps can be mapped directly. Validate against
+    # Coot below, and reject later file changes rather than sampling stale data.
+    source_path = os.path.abspath(os.path.expanduser(str(api.molecule_name(map_id))))
+    if os.path.isfile(source_path) and source_path.lower().endswith(('.map', '.mrc', '.ccp4')):
+      try:
+        stat = os.stat(source_path)
+        grid = _global_fit_read_grid(source_path, np)
+        grid['analysis_source_file'] = (source_path, stat.st_size, stat.st_mtime_ns)
+      except (OSError, ValueError):
+        grid = None
+    centre = (points.min(axis=0)+points.max(axis=0))/2
+    extent = float(np.linalg.norm(points-centre, axis=1).max()) + padding
+    if grid is None and not full and extent <= 80 and callable(getattr(api, "export_map_fragment", None)):
+      owner = tempfile.TemporaryDirectory(prefix="coot-analysis-density-")
+      path = os.path.join(owner.name, "region.map")
+      if not api.export_map_fragment(map_id, *map(float, centre), extent, path):
+        raise RuntimeError("Could not export the analysis region.")
+      grid = _global_fit_read_grid(path, np)
+      grid["owner"] = owner
+    elif grid is None:
+      grid = _global_fit_load_grid(map_id, dict(enumerate(map(tuple, points))), padding)
+    # The public Coot API takes float coordinates, even on a double-precision Python.
+    offsets = np.asarray(((.173, -.269, .391), (-.317, .113, -.227)))
+    probes = points[np.linspace(0, len(points)-1, min(16, len(points)), dtype=int)]
+    probes = np.concatenate((probes, probes+offsets[0], probes+offsets[1])).astype('f4').astype(float)
+    values, _grad, inside = _global_fit_grid_values(grid, probes)
+    tested = 0
+    for point, value, valid in zip(probes, values, inside):
+      if not valid:
+        continue
+      expected = float(api.density_at_point(map_id, *map(float, point)))
+      if not math.isfinite(expected) or abs(value-expected) > 2e-6*max(1., abs(expected)):
+        raise ValueError("Cached off-grid sampling differs from Coot.")
+      tested += 1
+    if tested < 8:
+      raise ValueError("Too few analysis points lie inside the cached grid.")
+    return dict(map=map_id, name=api.molecule_name(map_id), grid=grid)
+  except Exception as error:
+    if grid is not None:
+      _global_fit_close_grid(grid)
+    elif owner is not None:
+      owner.cleanup()
+    print("Density analysis: using native sampling:", error)
+    return None
+
+
+def _analysis_density_close(cache):
+  if cache is not None:
+    grid = cache.pop("grid", None)
+    _global_fit_close_grid(grid)
+
+
+def _analysis_density_values(map_id, points, cache=None):
+  """Batch cached sampling, with strict native fallback outside the exported region."""
+  points = list(points)
+  if not points:
+    return []
+  grid = cache.get("grid") if cache is not None else None
+  if grid is None or len(points) < 32:
+    native = globals().get("density_at_point") or coot.density_at_point
+    values = [float(native(map_id, *point)) for point in points]
+  else:
+    if (map_id != cache["map"] or not coot.is_valid_map_molecule(map_id)
+        or coot.molecule_name(map_id) != cache["name"]):
+      raise RuntimeError("The cached analysis map was closed or replaced; restart the analysis.")
+    np = grid["np"]
+    source_file = grid.get('analysis_source_file')
+    if source_file is not None:
+      path, size, modified = source_file
+      try:
+        stat = os.stat(path)
+      except OSError as error:
+        raise RuntimeError('The analysis map file is unavailable; restart the analysis.') from error
+      if (stat.st_size, stat.st_mtime_ns) != (size, modified):
+        raise RuntimeError('The analysis map file changed; restart the analysis.')
+    coordinates = np.asarray(points, dtype='f4').astype(float)
+    values, _grad, inside = _global_fit_grid_values(grid, coordinates)
+    for index in np.flatnonzero(~inside):
+      values[index] = float(coot.density_at_point(map_id, *map(float, coordinates[index])))
+    values = values.astype('f4').tolist()
+  if not all(math.isfinite(value) for value in values):
+    raise RuntimeError("Map #%s density sampling returned non-finite values." % map_id)
+  return values
+
+
+def _analysis_cc_open(map_id):
+  return dict(map=map_id, grid=None, work=None, checked=set(), disabled=False, probed=False)
+
+
+def _analysis_cc_clear_work(cache):
+  work = cache.pop("work", None)
+  if work is not None:
+    for key in ("scorer", "box"):
+      number, name = work.get(key, (None, None))
+      valid = (coot.is_valid_model_molecule(number) if key == "scorer" else coot.is_valid_map_molecule(number)) if number is not None else False
+      if valid and coot.molecule_name(number) == name:
+        coot.close_molecule(number)
+
+
+def _analysis_cc_close(cache):
+  if cache is not None:
+    try:
+      _analysis_cc_clear_work(cache)
+    finally:
+      grid = cache.pop("grid", None)
+      if grid is not None:
+        _global_fit_close_grid(grid)
+
+
+def _analysis_cc_residue_scores(cache, fragment, specs, mask):
+  """Native residue CC on exact original-map samples; independently verify each mask."""
+  def full():
+    return coot.map_to_model_correlation_per_residue_py(fragment, specs, mask, cache["map"]) or []
+  if cache["disabled"]:
+    return full()
+  old_scroll = None
+  try:
+    if not callable(getattr(coot, "handle_read_ccp4_map", None)):
+      cache["disabled"] = True
+      return full()
+    reference = None
+    if not cache["probed"]:
+      started = time.perf_counter()
+      reference = full()
+      elapsed = time.perf_counter()-started
+      cache["probed"] = True
+      # A small map's native CC is cheaper than building a box and model copy.
+      # Reuse this result, including for validation if boxing is worthwhile.
+      if elapsed < .05:
+        cache["disabled"] = True
+        return reference
+    coordinates = _atom_snapshot_for_specs(fragment, specs)
+    if cache["grid"] is None:
+      density = _analysis_density_open(cache["map"], coordinates.values(), padding=0, full=True)
+      cache["grid"] = (density.pop('grid') if density is not None else
+                       _global_fit_load_grid(cache["map"], coordinates, 0))
+      if 'owner' not in cache['grid']:
+        cache['grid']['owner'] = tempfile.TemporaryDirectory(prefix='coot-register-score-')
+      if not _global_fit_scoring_grid_supported(cache["grid"]):
+        cache["disabled"] = True
+        _analysis_cc_close(cache)
+        return full()
+    source_file = cache['grid'].get('analysis_source_file')
+    if source_file is not None:
+      path, size, modified = source_file
+      stat = os.stat(path)
+      if (stat.st_size, stat.st_mtime_ns) != (size, modified):
+        raise RuntimeError('The original scoring-map file changed.')
+    signature = (fragment, tuple(coordinates.items()))
+    work = cache.get("work")
+    if work is None or work["signature"] != signature:
+      _analysis_cc_clear_work(cache)
+      box = _global_fit_score_box(cache["grid"], coordinates)
+      if box is None:
+        return full()
+      path, shift = box
+      work = dict(signature=signature)
+      cache["work"] = work
+      if callable(getattr(coot, "scroll_wheel_map", None)):
+        old_scroll = coot.scroll_wheel_map()
+      existing = set(map_molecule_list())
+      boxed = coot.handle_read_ccp4_map(path, 0)
+      if boxed in existing or not coot.is_valid_map_molecule(boxed):
+        raise RuntimeError("Could not create an independent scoring box.")
+      name = coot.molecule_name(boxed)
+      work["box"] = (boxed, name)
+      name = f"Register CC box (temporary) #{boxed}"
+      coot.set_molecule_name(boxed, name)
+      work["box"] = (boxed, name)
+      coot.set_map_displayed(boxed, 0)
+      scorer = _copy_residue_specs_verified(fragment, specs)
+      name = coot.molecule_name(scorer)
+      work["scorer"] = (scorer, name)
+      name = f"Register CC scorer (temporary) #{scorer}"
+      coot.set_molecule_name(scorer, name)
+      work["scorer"] = (scorer, name)
+      coot.set_mol_displayed(scorer, 0)
+      coot.set_mol_active(scorer, 0)
+      coot.turn_off_backup(scorer)
+      _global_fit_write_coordinates(scorer, {key: tuple(float(p[i]-shift[i]) for i in range(3))
+                                             for key, p in coordinates.items()})
+    rows = coot.map_to_model_correlation_per_residue_py(work["scorer"][0], specs, mask, work["box"][0]) or []
+    def scores(items):
+      result = {}
+      for spec, value in items:
+        spec = _coot_residue_spec_from_spec(spec)
+        value = float(value)
+        if spec is None or not math.isfinite(value) or not -1.0001 <= value <= 1.0001:
+          raise ValueError("Invalid boxed residue CC.")
+        result[tuple(spec)] = value
+      return result
+    boxed_scores = scores(rows)
+    if mask not in cache["checked"]:
+      if reference is None:
+        reference = full()
+      expected = scores(reference)
+      if expected.keys() != boxed_scores.keys() or any(abs(expected[s]-boxed_scores[s]) > 5e-5 for s in expected):
+        raise ValueError("Boxed residue CC did not reproduce original-map scores.")
+      cache["checked"].add(mask)
+      return reference
+    return rows
+  except Exception as error:
+    cache["disabled"] = True
+    _analysis_cc_close(cache)
+    print("Register scoring: using original-map CC:", error)
+    return full()
+  finally:
+    if old_scroll is not None and coot.is_valid_map_molecule(old_scroll):
+      if coot.scroll_wheel_map() != old_scroll:
+        coot.set_scroll_wheel_map(old_scroll)
+
+
 def _global_fit_read_grid(path, np):
   """Read Coot's own float CCP4 export, including axis order and non-orthogonal cells."""
   with open(path, "rb") as handle:
@@ -17074,7 +17685,7 @@ def _global_fit_worker_count():
       count = min(count, len(os.sched_getaffinity(0)))
     except OSError:
       pass
-  return max(1, min(8, count-1))
+  return max(1, count-1)
 
 
 def _global_fit_worker_python():
@@ -17815,6 +18426,717 @@ def _global_fit_finish(state, accept=False):
   state["window"].destroy()
   if _GLOBAL_FIT_STATE is state:
     _GLOBAL_FIT_STATE = None
+
+
+_COLLECTIVE_FIT_BUNDLE = (
+  'c-q{(3wPT_mN58N(8-x0Ad!$LTTX@v^R?qR>Fgx7kL`5Nw=xe8NJ0`~5?}z*lA_Un-}|a33M7?I?|!rC8H)hwUAJ!C_r3pYUM-jT'
+  'd{cbNr<cVhUEh5+`s@S!@8#_}uZvY)Zn9-m=a+e%m-BouTNdS_AI+B4{Nv!JX!6K35kV81qP&V0H9Xbnhw?-Dc3Va_#pXI146gI#'
+  'x*t__RIT$ea(kX$ZHwr#u2#{Ds@g>Fq30E})TGg?jGA6o%c8l4S0BoviHfFLW}AEw6=jq~FwmxGHZauaI?oo%ylJ?ZbzRNj;VUS%'
+  '-fm!c@F~jbJSuY-Uz9HjXak4Ib1sY3x~ex&;%c4MP5z;z5iPP!HeY5<1C>>YW>L&Hee+4z{k5q|{jkb5*ZQGqq`ft~T^2Ld)*HJ}'
+  'ljEXPwP~=q-foJedECxqR_4{6`Mt?kYn-Ne0bBUNjOZ$db=6PhcD25P$wcK^#@5V>^<CP)5DVCLDK`Jl@7~urHA98Gt%LDws?FUx'
+  'SLNduy1<*dnl1BHKl(XazsTm-c^{^j)${8<?BNt3qL^pP>Ab4*{)aL;<Ug!)J8kB5elu<Ie9`pPtL^LtV6(bu5*+D=@~?V#Vi@-C'
+  'c{zSxZ*%xa@1k!Jgh$-#{5mVjQPgZ|er`5dy%_=6Z1_1Z7uHjgU*WkJMVsv!mm1%FEU*YP5RIcAkE4f!z;Azr6#^LD-0|Zgzl@gI'
+  'EMLa3+n346OuWuF+q#S{d-wPyrBOYM_<@G>FyIFm&qEaRZ|wOY=^ZrZ*XvDDmCZ=aV_ubuW)xj6t84=UKTr9?<uWTj(uCpVm;A2I'
+  '7RA;o`=yk<$&0J&jd}m<R6fkJa#6r=@<z3ECN1Ub3|2mxRn-#S;sDin@`WmUDkFi7EwP7LwXLT!s5h%hY_V0@f{W1SI{#Dv#4L+d'
+  'u~B`Ts|~^(nNHVLvzZnpK=ib=Gnat2KIV6bZ{nV;TdyDWcvbKhuS3tSg#Q(nQCTr2NQ>qYo6qB`e3NZ9HTBZRc9R70V*7RUHLS#_'
+  'eKP6{G4J2A<u-p=*Hs-u;p1Mk+BTbLhIkmeiC_Z&Z#D%U#I%=~W?)b;9$4xrrQJ^8Jkm&UX<#hoOZ0VghHp#-v$J-s_9&qeejDN}'
+  'yo&hh++VBKta{(m0MxX;8K2RdbTfd7wk3Yr+~jbj4C(8+KUFhu1hC*l@dM2B)SV{-s;+=AwRgntuq8F%4C<AGGQZ+G40_D3;NHPe'
+  'a@)Ejww-5X_s}~I!s7<_eQ_J<M)0E6?HoQ3`<y+l_rGDyh-%6uaCoow@%4Amg)zG%zC1hKJFvG@r3F@ca1MB#ozf`re~32L6^tUz'
+  'Hq}Z&vmo(uoo02N-Np1Vg>#tR_9OlK&ieg(VmAo4X<n35xn!Cc?v(8un#@%POs%|IFJXd!a<8&=bCRuQ#nrajHqd=jEVeliJxt^@'
+  'Kn;|e<y|zdE4Tr&XjWGrVK(a=?t(?0D%wYu912@KMt>PcL;Heit=)6zpuAe<gH^T2mumEpZUXnJ&VSn$HBee=d&_JEAUBRK=GQ6y'
+  'CiDv6U{}02olKljQ6(A?jWOTIn`GzszJn_oXbjv`yiFsRa=9rk3m_SZ65N)}c8yevH9WQSK&yN#)@wM>Fw{vO{$DO78ZEWv4%i+E'
+  '(7j__L)DVa!Fo(`1TPCB(%{6Gi|HntZHdyIO4V5Y(z+#ZrA#v*l&fhrFBWkUxGLbP0-9W1gX%woJ=}r&j2apNT;TXJ9GM>EWt64W'
+  'd>(xhoj!PHD9?b-h5D}md9>!BhS=o46^pc(17raCQWxu(uDPtdi?cLaZh!!ja}1a2hYzQCjYhqsHImS@^ay&;P+pgOY)h!R%IlM&'
+  'Y=GVZQYXUBdv0|=LzglLptf<RaT%}g7Ik$62jg+Qt7=UY1Ml(aZh$MR&|6h5?~+jOIP3e~E1d9)=kzcB^Sbwd7>o8Mg&V!$^+Ir`'
+  'cN+K)8d*`!s}<0vo7`ZBli%~Y8o-`z*I7Bg<F2{}2pCLLEEj_3+M6>;U@MpL?y=xCC`8G;s_I37`{j2`kb^Y>P02w_Gx)b$#6Tg_'
+  '`61v13fY0Uhf#FT4L#WRi5!L!7!x|tF&<IG=r~syD&NdD^a6_%jmLPLF9ySjd3j8?!4959)u3aH>m2hYAN3MK`U~J#d0Q_45GMGJ'
+  '$i1^PX)lX4Qay#hDhZ~9;t3E-(UVbld<ws*)r`$r_OY)d3G8JHpIHd2bK9Vn>O{e;bHVQ#?V+QT`?iI&&6NsEJ+I&{oRZX{iRr59'
+  'GX@?b27~tUE5H`?;9j%8z<q-JID8$z(knRwvjACrH!wFHj0t)tVF&iMgmEK{wXCXjB%G;p+nSnVLHV$bi>ZE%_b`t&*>N%Lpcl9j'
+  'Puki%Ji+D~>}!gFZZm0R<ZP2%c1(5Q8WA*_HV`j`?z8sY1B54VPIUUDSGYFKsWO9cPn!!hyjk{m+V?1T1dZdF;tKA=kRGJia1uUE'
+  'y6iwV0SEu<&XX152T&4%bQ%!2Ku>P2>pZvckRq7WywhIb@bMO^gFu3d*xtb-9$jCi16XDbM9)WPzRt?4yq6^V_63Cq1S35J*WTpF'
+  'x@MZhC1MJ~{@8Fl>_<+)!O*`4)<BQLuJ)ty7Flk+y~SWSDvr-Qe6qeSpb#<3i~I^!s)_kz%(La32%+hsxXu@Kwv4gmF6<f*Ce?P?'
+  'S9V$V6W_-j->gsmny#C}hu%GwJ>x!faJ1ZAoh0oGW-vTG$K!zO4}S({=XAmcU-H|A-VQ^O2m+joVnVbKGI$|sVle!|Y5ogtK7Mv;'
+  'H~%HE-}D4E&QFs)-2tM5R;>O$kKSFA%#-moA!HW!^1b;9NFv0@b#YZJH2Te!zyuU<&saFd2%t#BbqzdJgu_B$ry=-b`xR;w$3yoe'
+  '*Zb9}M-%5+{5nC(Ld_^J*<Yh$SeDji=`{eX%g2=({dIsNjL)4SW4$e~6M&kY>{!$h4#;4D7#j2;1-}3KKVq4nr7O6H$G9r)m(Qag'
+  '%lUG<$fJgVC9i>j%9bZc;n-JU1`Kpo&+Zg4&sTWr_j9@FBS2jvc8gcpZG75~iosdZkD%Gu!H)gt*W<G!5yA(@2R8}tOI*N5Z?&7^'
+  'cO(t4nX}WKyE^<r#xTI~_|2f;7;*a&DNe@QJZu~-{yHA2>e%J+FyT+|7N1W}V9dcbHEE~odd2XzprS-t5R*-eJ6BJV@TE)h-a)?Z'
+  'yAAanL*3ZaMK`(b);Y!@I0T5fTGb{b-Dg8nT(sh-DN0dqLL41`Q<a5&=9kuV7x^YDP=FoxqW9N8FWA>POLB6S<>c8%#F~~ELo+Zv'
+  'i&i2q>DjbJn^bvKMWzu&m&jZ$arSBNm<Q%k-drR=cjMKA5{zXYqs~ih_d#?oRnYx3+a;c_`-j5?Fb9ZRh?PZl-Oyhl?3mx-MmXGu'
+  '&m#7B$vn(Qs@(~MBoE{c=qF1^q!pBpM7<DahKPYR6TD6blcq*A#*1J{#&E%uG&D$&a#t77G2R)mB?XniE6IvApK3mrU$be^R4x#4'
+  'g9diy*ZKV8bd{CGWe$f(ST^;nK#71W8rzV@43ntsZr6(2zb9Q?Tvs<2qi2(36ydLDqY1-Fb%Rqz-EF$8vPBc4Qa0ATF@SFJ+fAG#'
+  '5Blg*he}Wbm$B+jUhR}izWMH3EKlmyYdqBpn#73)S+g4{pa9@?SioAM$`fwKXtjFr<M)Gkwx%Vxsp^lHOSqoYW{JY8AH}zKzxN|8'
+  '@&QCPz06R>oZyu8kc&;ea>opXwi)6enkH?vt3eVOQMO#pmsOL;TmepDKcYTiKFe`>dWyFT{yar#RvVPES);0+O^j?RiN1-T@-vbc'
+  'nj%jo12X|Gv0sgZi`|sj8g6`dxov6GiD+pHz^t?U4%mBKL?GyqhnW{hQ96?UtGrs}oBD2w{}%Hmrgeg8UtZFZx^jdU6^bN3u_9;&'
+  'jh|#FHYYl#K|y^!5TQYIwase0X_#td5nl8uTjFWNLD(_`O|ZDgk#=67nxVA4zj!&o891Aue3vC(@Ca<N7Rmk%nTGFLDoxF*!c`6n'
+  'k-@n|{o}>x3GDp+LxP}k@pOWS0b4v3u)#@B5iD@t_(L=hjh3#v67~ilvoC^bn?VlF1PiNys|`@Pp@RgidnFfiS-|P(!-CdVIWJLc'
+  'H9bt9o_`7GFSdFbrsrqp{Eqv@S7%R#Ez*Y<N6|D0?{Kn~NS9uvB|xD_3bV<8f6OMyfX9)Xq^D1k&^YIvL*=mzVJO~sd4y-D>6fh$'
+  'Zu`+E!L-geWQ#85=9OC!5Lty3Hk??f?@eo)9C>d(dAAK86OXf|hiqQaG68Y4j<<jPbb>^y)f>zNh&Y_$08r4dMZ^jq+KW!F^unIo'
+  'qSz9!|5T|>G%!NBI7Z+jv`0UN6Qrks)}q7UKq+hi?uBW}TVs?71Mb7=k~u{f2w<ls1JeeHkNvrQ9=$G?cTC02H_@+fKR40l8ju;|'
+  'QTUeMLT_II8Y{O&nKLPA*kuIBCT;PadW2s`XX$x>)KG_7t*WXZ<HN&-=lvt2DTFB>MPWCeY_#+#h?E4%;HF`yVrA=vTvihl_E8sD'
+  '3wxc&2-aCq;}FEC39rW_{cW2ABBxLBS^5m_%k5^p-AqvdJ?^2P7aCVrE82V@wSNyAF@p09%ol6{{yIOWBSb&X;O9H~`6c{%!@mSY'
+  'qcP4kA-+>fBnuoM4wgn?-@|a2p(M@$*p5E`_|?6OGeo{E{D+G-3w_y(?5N38Vl-#?7h9t9fuhhE{6ngW;UVpKAPmb5vl!r?U$GTl'
+  'O*%)sb=d@(M>P3Ga_oPbnQwz(>h~^-YJ>qoS|S4$GlCr>iclAk++E|-G|{&b70@@7U7`)@P;@HbPSq6XdoA<rK9%8(<*!9ZkYyoo'
+  'hWRC$!NDeNkc;KVX@j<Ljl9)Q#B#X=#`F0c`X`kmjBGu)EYLInk3DK60G^rPS)vgDKpSAtyha;8XbJuWz78I%x=mrAES-j85xO*('
+  '0F}$@{e1?^CLq5atAzmadlrL1^p&E)7Ho#1jXQgWxF!Yd#c(vy9pb4T3dIhXgOrdmG(jDY7>q^i9Wa=dIy6)GCF662>+uOGP8dZ%'
+  'BicQf4$bI;wo9a;0kZi>2U(*uo_OGZ@dw6$1HEpi6QP#Rq-BjH#=4XLj_zYL%q))=edwY|gwKXI^ek*NmBlY)eH-)LDy`xLNVF)+'
+  'IoN`c>i0yiUmE2B7a@U*Ks4Gl9-GDx*l~b*tp6UN^vF3Gt{{c`N4<_+#?qx@p_ohkw{$?L%syU^0qj-Lp#6(Qo<}cU=<QqO8EQ?J'
+  '*=n}PB8Cq};3IRvW1;whKf+e|x0ae9fCwDdKHByXS4P!5Bta8H=^cJ^F$RC)w&=)D7jObpJ6>5{mqD-#Su>=$d4EW>q>MhRCBROZ'
+  '-;ij><Btr269%c@E+fcK7tyUM`<I5ApE`U`-{*bI0dctm;Zj<cBtiv#JNL!QcE>Gt=V^=GQD+ZWWzF^&`tjy5P07i%TPjMpNchMS'
+  'BzCe&&Zyh$5{Xub3R9&2D^35u_*PR^7H0)qH_4oT{OM)SzjdiGt)s^V443i4kpG-Hf-6!9+0DNH+uO%9`#Rh#AuG6H2*j8HVvLo$'
+  'vQ?Say;pW0N2u(CKUK@^DrbpTlXMB&v<;x3X1HI)h6d00Kz{KMtRo-GV3J7^GN&!Bur<K}QyvNIqYQ~{g!<~y2Dl4c?nzj9h;*H5'
+  'nl1@Z&Z&1tPH$+CtVA;Q2PEavv-2aTwXWr{AlX=Ge;&QOMS)~N#){QyjjRaLPIsh4E~;%qAGGG2$t}E^P@hBQtZdq7%!~yq&F*j|'
+  '3??ROas;>3M`GJP5>@#Tcn<vcDM|-FY5t*$MIoF47(?BsOr>*Ag6d!|<e5&hvd7>-whpm-(FREMIgF+J$g*fvl+G<O@qBR;<4FhF'
+  'WjyB}S))bB&ic*oXV&|fj{#*b+pK$bF$YM_F3OLSwnAA~Ba0?(-=kBg`i!ar)RDp|eRkg0RgcqQ2!8bP*|z<79or@@Fao|Ozg8FL'
+  'aeC?)vT_xLV0w6!!Ocw+bM*Bo6z&<y!n!ZNjt1%J*^Y*qZC#_T1i=y7Gjw&nuv+9v>}m$^!Uj;626JNJtrpY~+R=tSWyUBM7?FyR'
+  'jx8r96I^1hnKeQP5+11M$=Lv@Tww8uY}vE4kJk;qJ07NOS)nr~EOy*OX?2sA&Wd2eJ(pGLVJFyl>;3Vr9a!O3at*~3_FP?qF<C=i'
+  'jkrT5a^~}~rn8tNf;X3pa~TNc^C^?SV*?ZxYbfm~vSv)=5Vxe?!A$$o{kZp4)Jt(^V;K(-slAMNIbI+9A3N``C)_`(`eR;?Y{wPL'
+  'XQdzIxA}Z4qG;d)r>IEllYYRVXwf}xOulFFbc!Bh(<!PsnritekCPOUukF&&RNI>6Qa$5!_7(hpx+c#SvbT*-`}e53!^V@p)DOv5'
+  '%7M&v7%OQaUj^T$D>#9%(+oGN=0XiyMjzJ|-GMX{n&nB4TN>aOuVA|RxG3t_CPvCnMO~GstAbVt7^)_fxBcjEuYZ0y#_q8;;MxEB'
+  '?uY4%=P&;Da_W3J>CMr(t(WZfVx!uxUw!}M53TA|d0AW`CV%nz_510oDbPeOpMUpm+<R)Ha`JEx|34V6aRyA^pi^ahVefu#Fet0R'
+  'Rh_M`fwb<a7sPOF*MnwW7wZkYcZaMCZE`81YhG=$vf`)p-R2rNAo>k=^$HDf`T`}BzHcl5*l=u*^~X0a`}n%rZi4Ugy0+iHd;i_*'
+  'U*3DI&TkfDT)RGQ;n><nxOBIdsK6he`YQ(?E_0MZ&w4%Y)3UmP_q2#@P{OZ-6leBkz+n#C?~5Nwwt$0#!Ykw#7k9m+(~;}#wnRTo'
+  'rH5xF(G4AR0Lg`j?+7u$yc~sWeoJDXm-MG-8R4?q6{+WvfR@a5fTIC34#C0T-kd#kjIb8yT#K^eF_lPH6%4E@i+P+JOBKr+2<>3C'
+  'J8SwKvpetP1<+7gqd&I?O|MflUcgH$w&6Zy!0B6!zx?~lSMR5IV3Lq&kv~|t#nn^-Tf%i_y$>JC9-G8!$mt+wv7x>PVb)XHpsP;I'
+  'EuyfbgDAeFhFBod;POG07q5T%>E(;}KmPsY^zEA$QLl@lcFZI!JvO#@fksH7rY1>uW2mjj5gvPcEem$QvX}`-OS}5>%m4zzk(0%c'
+  '!9U{ktdqsKbdY7bu23Ym!)Dl}G4t$W_;c8uhE7Me$q<D!sXj>_$fkJDmK9orJUc&s@+|3`C$`mP{S+RXLSpGnjRHz+AlXssa=C4;'
+  '<E|0{#m8eBh;3l`T;Yb3m#@D^VRFvyU3s$^z}~G<%MGMKIll&MT>Q@B<mkIfb`RKq&2?@!h<Yr`^KMfCXCj!7)K#nO4sL{ExkOLA'
+  'I!93{P}b0hW(p(N%hbc>EsVDx&o-M1t(Q))zykF@7&QRd=1pWS0WknjD07Z-UPhTmN3skyK>9FHl(IcB9nr;hwQgcn@0jpI0<;Gj'
+  '55-Bcvz^ukYBvad_c$Y^1@XO_yAMg=fH)<^YI4)MR@#?htL{w(*ic<DPrUkapINv6doKC%c8xxS`x^gP;1muSfhRgbjw>Tmu(-Y4'
+  '{iy2(qT}QvA#Te+q0;oQ5LK|E=PxP-N(gZ%e?W1tCEMd?jfsIJqNaK%eo(Emf$DUP{ARJaWBGa?FjigXOFD_DM}ngXS0=pXXbkMY'
+  'KK?RwwMlO%;zzVXjmL&nNJt<6?}OGxi@a>02R2b*v17I*A}4Aj1PCfJQK9VUl2D)wER?O@X6d&*M%JkZ^arT;OLkvDhiVwKSe@0!'
+  '7qTiBp>8J!x9W@yEu=z95R|=eZxcs#0V8Q^9EcxL8#*2g)4p26vHb0;&6tYq=CmoURvD@um00aLAkVWeqU!Rp$zd;-MNa#PLapmu'
+  'SvNQ9Yh;*XfNR)y*pHGtWH-@i`sK4{M|F}a<INnk1`IYQ64605Z7bsA+kONP@;j@2Zdq4^wfoRypW4~6nONs8Scg9S9{i+L{3KmP'
+  'K^YFG;Q^tZ|6<gS*xze3IhH{a*L$6<0V$&@>xqI4rLCFvS-FFXGCVSAlc7mg%nw&}0UW*vgJp$yAIN0oHpaneVE+vmD7ee=ShPLV'
+  '@T4E5|B)mo(mL)Q+d$yQ6xE=Kt7Cy3omFsgp&u3%@9RDRb2o5z7xRMRlaMF`qYe;+utPh-8d{p&T<6PG^x{R@)|G33i-!XNv*ZZP'
+  '&=LNmtE3HyA$fTSG*t@*bLA_*$N48>-j0rlc9F9HLn(oQvS?SL^`qXgb%WBNsruM$1kl}b2`I75$}ve>6Wk2AI8{^><HavJ-ziCZ'
+  'faz$^RJ3uC;`cy&G;mb1OJ3C)D20NeStxDn3d3yx_G96rQp2-2hs<WKSSoGd#C%y?6>P<Nffjp~Jt~es%=DO#RAr}7Xv$;mk)7W~'
+  'kDvu8?1}OeTq^ah*xjqTq<<WXARMZ)C2UWLyLuB8P62#0IWN-1NI7XC(wH{$z(DmJ?7=q0A}7>`tvZyqL44Arqnv`{Rgl*(9v>;t'
+  'F=(fYi7WC((u@kB(5N>N7e#7Yzq6*G7Ay(!qQ>)Bwc$ITaw+So2Oyc+KoZjq;i(}_r|O3Qlr{WD?1v6~ZGkkr-6dUqa7M&93+9KR'
+  'HDc+MH%4!D;=6S2xLi^3?zAF0aJtll!$oOk!s>LMm36`-EQe9e(D~}yMi2dnf_9A05dt?b?|cz($bFlUqJk)MB1YE8gxFf3I{#Jd'
+  'KT8t^gQ5gjC(${BG(cz<#}v@}$DJ^J5V$k;_D@+r7UY&lS|{1Ij#XgGhdZwMrGqupKH<XSO7+;Qs@??!-2zNJfVf5;dazcDX(?+%'
+  'FRb(D*{i{=2KQm}TWyFyeBQ2Nyr>6uBcuV4Mv|kWGeGLMMKeZwPSiPmao!p+E(O%ub*$TLynoOU6k5LOx;gYu;#g9i9k1ceKO!G9'
+  'CI&aWKN<~Td;tM?dxz|uOPFvm`Vwm0_sAxkXJb6wtnNLuAogV;KQBh&%0`nM0L6TKfn81<Bx7%I2$@dI`9}#qk;CyEa2Q?EMmxdQ'
+  'mUxC2`K{2@@OCXci?AxphAYcBcs)m01Vjl~byID!r6C$9=p0O^6^Jg>yF;aiiF@l*$f!6rmL6ov1Ti;D;~mdcxI6NwA4|jhB>U(x'
+  '%MuNb#L(QR9czhQ?%kMqvCPy0RD)nijEneiEHu6<4Jdn-0hxjV`y6nr>J1-`c?%AU#V2vltOn>AFYA1*-&)baY|M)LmTuShA?ERo'
+  'dAxlml-pS5Yt=>5y{Z9nE)-ygHpR%3kT@x~s~oS$*cyrNrJj+qD8u2&Wsf%Np4MV?`gHMN?yY<5;bF=nPS=ZB&-ZtyH5NIKaiUsh'
+  'b+*Fm8kUFDSgmS2Cu28_gg6u&Yj3!|E;ZI0h@&C2oVdtJR&5mW$3&jV3<sB}6;n|IR>;D8-&#>S_t?+qc(G%t+RL?Pk^aa+U7Mg|'
+  'J!TWfv;qf4o0Ow7W!cL3B8(nd=J%`|mY^T7Sbl`cz`-@A0zI&?I#-e!culy?`Ud~cB@PlGJ8>RrP_kH3Bu@-=3bYXO3@0Q!BJTfk'
+  'yIe-B>}Baj+J=~A1xJ#CJ~;gcK!a_G{|MUUK00>gkD^?bsA&+RVTU{@!!paq9T=MWF6|7;T1j>ij_7!pj^W@lNW-~bRu9wr>*8@o'
+  '(%H<z59S{|pbRtr>@n>)t_)U_(54fMzU<m~o_tG<!0qC_<3R6`3uB5*Z}p&xIqf#{sWO{3(bNnI*9NMw>~;?|6{sh;B{78!b8su<'
+  'qM#L>1!*YI(w$_hV-_333X?M_ZHSyqbX3qBjEn7dQbsn{ZOueUvsql%SORP{Mw@%LgxNkS6t(xXT^QB)JK7RsyS&--74yjq3JU<0'
+  '#W0qhidT{_Qy)WC_8*lyj9C))uQ98FjPFMkS4gdoqlIDg8!O;P(G4*3Qy@@gX!XoI4@RcK_>=a=mQ~5;1n1*=;qHeDL$F(B11NFp'
+  'X%W%_)?_TyH<8j~`nS(<iiLKi-~NeQU&9_uFY9bh02ZhJaTLoufNMD6NSeeao0;M|4w)-X|Km6vwrjN5&{f_v*;PKiR9ZVy1(J*T'
+  'iLt#OaW~Pu-P?mr58g{p4=4B3krN?~mxK7AZp@0}hI<a{K@j@kGecH>_-vAlPS2ne4Zt17R5kD6UD5w(>mzem_4e>-RbZnyuD+n7'
+  'G5=9)6r)+`%U?*2Qmkone(Xy$TK$?I`(4qOb-Avfv<Hx)GHd(fO4RI03%zz=9(xJJ^1;S>Mk5>Gjs#8Mp?7q0mUT}%w18ezQ_2<U'
+  'VR6@)OH8qlRrUK;UR)0T6ps-%tY+sTk}y`IT1RUbQW@^Tw~9oWTW($opC4$q^iH*pqDcz4mtEz`W9Tb8ylz&Ki)pURycf}BR@BS8'
+  'R;URYQAp*hSISi+Qot3MgL1`ke12=XxkbYv<cD>p<QJYRqCeCN5%0k(R6(+d8<DW>1KDOOy~8LdhS9^=#r_0JV+JT+25l2H-ni^<'
+  'fGRpUl)iudlyGSryZ(LSu^ZT8r(75h+9&eL8|y$3?4>6r-`Zu)a?BO~ILE%;bL8`f8_;}=_lnqUl4d?13($Bi0}jg<8h5cv^_Y(g'
+  'uW+aUEcB^AM05xB$~M=<<;H2Os}O?L(UBT>n+!5{Om7mFP@)h3Ri5f-(9w~fzAQSd4nRNoH0kgB>Y{d5GLW|j5+=%UBoaYP^bOG~'
+  'xZ}Q<lrKD%)~MqVLXiYDt(X<IXmm0P0XEWl7tYz6gxtj0y~=hQ)AZmZunR3E23=MG)ka{~Y%0`)9CPiO(B+7PYFbtDwk9v!X4BqE'
+  'kqR5dfF>dpo^WMgnmt29#F0<?SfuIDqDPV3(G@)yIFJCf1mk~<x3PrOL2Yed$vq37Ju9O+@D?VxIA`ACXsLSp{yK1dyfspxwTRr;'
+  'I<#$R0wMXb^LbTmY?*mDxUC7H<fzuT5oJctPnJ7?-Z%adnnOG2&TDRSQPgCzd8gy)m-)?C9DRbdb%-79v^->;P#2p`ZW01O-)i6;'
+  'Hk^9`M%nWeF8~&MHOdx1$F(CE^KFLh$ZmG{-CePT)yivKvDk$W31T>Kj#x!|I(9rA^mdLp-%u=%i5|dM{>n|?j4u?>3tMkk8O2Fk'
+  '+y^Ww$GM^bq+~gAo1*3x?X$@tD4iFVsN+pnEBs~e_`Z<EEIOJ(cd;#Juuh0^Xyiy(?CkA_^6J~KR4Wb&Qth~*xHzVN(3i6ftX70A'
+  'p-zc78({1;jM-aludX8uBW1<q`l>q&7r|(rFRY{jh^=jOMrobWd9}Vnt6&W`&isT+M|O;)Hq4rnIX8z9>}$rj_l8R0i30eE)^~Nb'
+  'lDk<a%VO?`Q)98!s~Vi6Vbd}a!-cpKQYsClR8A)Yu`a@$Ew`j|jL%ZC-Sc&@+JXwHx)@8_@pklBEVrkav7C?nYz}X3c)CZ+z#MLY'
+  'POA|>iIo%G_yMM4-obQ;1Zlh*h>@OSRUI`ZyKBc{W6O|Gz*VU``jc)Rw{hLZI@>n6)yQM6ZcpfhEiIJLi6tq#)I4ptxA#CgHK5b7'
+  'NUe}uA8~lI%=2}eo}DLu@&bJxz0GxO=SXbkFrEmJ%;LGMH*QsZa$J>l`~fXL@uMw?l_<sj;J5`NiKo^I@#Zp5o!pv4KzPbt_b;CJ'
+  'yx<2Mbl1d4n9m=4Ev23$jA}M&n;f&K!#6T^H8#xn&DcbkVAt!0c2o?&q=aJt1|6G`U{Ii*8bHg%M5@Czg&Pq25*KzxU*xxuO03~Q'
+  'Vn{!yZg483u4Zo8Vqx$u?(6*@OYD#aeR{V`7}D6D0#^1r<I_T)f)ZNiaJ1#L=DZkfTtsSPktg&HvfOvV?Q265W4JxvZLa+Yi)=Kh'
+  'Nx$d}sGvA7vO1e^;ukhKzsZ+NN<9guDJF*Z#S3WcH2oq8sJFa(IKY+ud8R4{YOg{DE!OUK`-|a#cjywQnx5dc^<Cs@5xUk|n<Gvf'
+  'Z~I+U&_sxe+qdct>5;;Y?Ev1sUn9B;k{4Mp&rAzAuzxBZ=pDV7(Em?){s3TKW^kgEsUXl>4U*0PNZXRwik$N3<v4~+7?w2byTug8'
+  'qn*yg8PlDVi;7Gh6`ZUekK3ar^|q@UP6oYMt^H#khl-#EV42Nx|0D7aNobtPl1Jk^^`oz?gnW)_Ak3DJhH~^7&+0pib&)=BXdQ)x'
+  '*`N@;j&BuK<kMPi#%FDVaPhk8YPP)&G!pEh7sS`F^;fW1jf1i=E=K@qw-+k_9lJ35TV>u?tf1ddqz;p)->oCeMyPCd<r(n4s#N?c'
+  'uPMg|?LZLoK;)kWkG}HE8+VawooJTh(<nEEy+pe;>hOO5c|gXna!LLKe}op^3pu<Q#N34Tr!V{B6|m;o_AKPjU8W5h`R%}ViXZc>'
+  'Dlk9|v6S6anOAH%)KRbqZT5*do6+}L<!?@(*H>Ev<TvysUgR9m0J*^FbWzQx)5NZtW{br%lR9y4z&Q=k%1#m(lBlRpX(`8V48Pk|'
+  'J6r$Zy1XZUxH_`QJrjpg&MvTY^J|QCQ<<aP)c{g*z1?Lvw-6FL^;LslPlGEECoE9F*ki(RPb(&wE>)*fYDTU@@OF+t^6!Q!f4QeJ'
+  '*^~9$aZAnJ6(!eixYuW=d%Cqm)S<r5_RN@+1p68}-?!+5b=vh#ch@Vc0ow-j5C@4kWrHe{4S;8FZ)Gy`8n9(=xCyfUU5|V3J{D^<'
+  '^w+jwbPrQ*GKravU^AHC&6iek_};z^hdX1o%m<q39%!S5j^T6@uRPA@i0UKTFURE6-BiT(N3nKQpXJvX{;HGSKHR}_>z;MwWoa~a'
+  'd-uzmH*a6QdnYa7DMaN6H%Nc5Ni7g?`8)AC#R4fJ1k~BZ^wiF-#=ZqqQYC`3l?OYLpKaIc<sHz>ByzN4(@=|&!-K=9N{W+{T!O%f'
+  'IjVhY3YP_wlsx7<U~P6zPhup>QxOYMdQi45JP~6izl%xJOH@`<WfUWQB4wgKE5Hg_!yMd!ZT7Av;HwrBC&MhypKd9mtdXj4`?TIE'
+  '=2h>y#krdO)qQhLIcd$&qa4DWF^$8KKMc)k7_&Bo;f8HK<!ipc2v-<4Y&s>e)pUxN{&cD$Mq&&qSo}@Qv;egFS^qOHwA9tMNY{6t'
+  'jo9Vuv!4(U7#tWffB5CclVwKCUJYCzY6J_8ii|8*Ud~bCg#lGKyfTH)W9Cu2kx8U0B%bsGMyb~iRr8_5EI?!yvMgqiynkaC;)~im'
+  '7FR%LnMWNI!MwUNzmaP}(%ifNk{XwA`i~!9efRnw+O9}ZPiT<7LCZY~JL$zEV5_3r!5#Z=_t_o$_hQY3Eg}pksbCA}&2@WpKz+(*'
+  '6l#IujUUZ0FGvRe9L*?Dqx{71#_$h)?nm--h%bly*%_iry{A(nXb&j#CWEChi-D376)9Jx5u=0y<gUiEg*xnqW@U2HIlYGY;LElb'
+  'q0y#DkG#U4PNW_#6PdzLv#NhPy_mOOed`4pPe`4uX?j3|<wmI0qu;oje)OB#4eP7&eAf-!a09g<POF6*s|EYB>lPcx*|5pVGhRcr'
+  '?X;9zj9ZE`!Y`O=BC#QaO?Wg$MJ9=5G^EiHZL8}hYM*fxdXG*oobM`X$U(liEaq|y$*MnJ&GN+pcwj^dp~UEJzmLz3zB?;AEYO^@'
+  '0$k|u#=CO0x}!n80LFzhNm<8|l+{h6F1;Kuc$K;o(<A=2&2<<_&V;37Dzb-*?VGAB+9*D$NdQHImhRnLU212oEH-pbbW(dKSgN18'
+  'E0jq?BqbSHg<^qLJZ4-DETl7&>kJd^Y%z!DRVT-DBBtEN$?%;g8EDI%Xj{;V!AwbZLGu`@VD2F=64l3r)B8jpXm00IVj&xB^UT&g'
+  'Y#XtBjd?{HttB$U#5bL3b<`k4_Z}jDl(Q<~1Z^TH<3cliYrV9H#ta%`dANq1uD1yTAaXYHQ;Z0jv4%8QRGBCV#xRIDLh2a*@vvA;'
+  '&Q=N+73F1KGp!aI8c!lmyEy3O?V9P_Kmuu?-oA=vb+NdTKpr~t9vk`tTFPrw5w`L%04X?UEK#VuAu0@mwq-J=*xF={7lOTwCGNC?'
+  '7o^<-@B$_z%;sW+FWJhPNJYZOgQ?&|BMCy{DsppNB<=Jjdc+rnmlxR30zJ09oJe95|IwadW*+@?qYD1`a-uBkx+%)7)3@5@<T_4X'
+  'cBL<r1=ENHFH*Dyl*^imN#G1prPFtn)5a_YzIM|lQ^A4Oh;VIcmU2&%Akgfu+Zq*f?6PP$M!y2=(UqSq%u49&qyzQ02_veHBaW(}'
+  '*52~^wzg1`JKGixl-b#$!^~2@lD~jS<cFhp<;2RSW=9Pe9B-C&N#I;LSul3*bF|p7|L(v<$WEjmGRqLvbTQ&yNyH8(ljXm}TwCuk'
+  '(2#t=)~zqc`iqy?LUk1rT<x~JdsW%lj<e<ZIujvEwjr-i_w=UGi|dNiTV9?~!2O#%GX%=ALRZ!z2;3EbHUTaPXY^>7l?U5Z3$k&g'
+  '1x($#*RUFPT_|Ya7>!7a!Lp(walUgozRzzsnqV1S;<QZ&d1Z#GlO-Iw63RSNL;SLu7>v`mK3o^p2Rq<UlTWQE7fymy33P%g%3`%*'
+  'k%<mdC}|8a?BN`Ze`>LeB|=!G`hf|}D>Mdkt`4g|3j<JWHwt`9V?b6OmTIxgy=1E7Sctx_{zof#DdyHRgw*r*uYZmrqzwM{^8NGo'
+  'KR<$wlBBED=Gky`b~Z8DRPkEp4`-vZXQ(0Jr)Q(HFHEtZ)P)KT&ql*%6R9<PHX52*9<jm>gEr|zb?}Dza*`O_89zDgM^C=&M^B#x'
+  'EP%CTxmkV5MAJzEX)34F^~NF8b!tmkOG^2)a8kQce?`gG`qnU7?lyMV6-n(1gK!X$Rb)5w&>9o4U7TLSJ49BCR!%Gw9FnhHoUIG7'
+  ')ia?#IG@7k@foVR$Jxq(yC^US>R0G#xFyO4#kqh(X((nE*#<yow&gQ*aUlaeBJ(WfZHa!hjJAZn<st5{*@Agt(Z4u(Wtj6Z?J6cb'
+  '?%m=+yTgBeM+F~3kD>6)DD69aU0@~}a%q{G64UivY@XcBqCs2wH=M15$INaSS&q%7B0IK5X&lB6pSs_sA3r+jd;cic{f5P+2yx2_'
+  '(06Ts5bt@GmwHfmAB*hMVH!|cN!4n$XcA76lRd&W^*o$Nkz^$3qRm%1iL3W<@+~%c>haNzguvm1?TDasXH2c&==wB#9=)`s9TaC*'
+  '@)6@TAnnQ_K!)WF?O62u+aLKVMLI&sK+6Ln>A!yS^3}ILJ%2ZS^~=vDx;;iUd;Rm9_RGJ&eDTwd-%fvi{$D@-?0yR-u6Xmm-~a9P'
+  'D-5cS2Y{d6Jb(W;^Yrfh^SAGRd1GGu^6ur^Z=b(=>D)@zB+_-Yj(OFs&`Sa?Ryiw-A+4YBLGS=~^ry;_%%KB-1_EHa3`><%s3!7;'
+  'VnNv+AUBZ4pl)v7AjtbSEm>A5@b9-p7yhf^B$@nKr{v&6Vv%B~2bmh(6k;$FNGiW9ZaJv8>^R%bP?Cl>Z(n}@<9}HmDpH*M;mEOq'
+  'UnD2JSy7&_+8wTXO1BZpFNe$9RZm2O)ndEU=`LU>h^HCn_EZ`V4$0T@-oYi1KrbkUqlP5SN8{=R#W7~@sJ)T5YpIUWC4U@+j1U~s'
+  'f(njy$LxN=&KW2pLE?sSmr~s@L8iPNOoRacEKo-V0A|nzOdwmwN(0-D`-xH<qZblfSY2Kc8vNlG#EEE(s!RxxUjX6`<J@7O-76I5'
+  'NNOvGB7banQ_B~`nD?TEBKFZ5pRK;45OPlJQ#V=|5-+SuQwL$vDsqfv>|G>bnTLt_W`BZEC_mHTx%2eYd2&mhIZs2KjE<m}j~DfF'
+  'Qmr>9nEqo{=Qk%aiiOoX**5hFiO=Yblk?7-g@4li6*Ey|$EYuOW>w}K*r)YfznK^CFF8^5tR!G|<TBj&6m^C~$F6x1h?Ow2L9{~{'
+  'r&6hS8ak+JC;3|2wtK_2&Q_dt)F)r)mNByn<=h*f>n}}V63W@~-OInf`sJse4l;FaXLeDwb;gn5Dd%$uQ7&!H3MY~Bp~jf`U9pwe'
+  '>PxJGy_823U>5frQIf4R1`@RwGQF<&jC`_!yY-{?x^bVt2xy!#=|_8JC0h0P^*h3L{q89EyTe&N8mst9deb<{k}!eyB3mNqEQp0f'
+  '2CufOH^9xjn-_2H2m*gVSZ3s!Mn4J$1pL?#Fk97aN>OamFF9;{8b(vbK0t@py{>Nf-uq$m5&rq9nDs@h1<*>}^jU^8B?%6i@Z;L!'
+  '%RH;6{6q%(<s4X;b%BPJvZ`0hY6e(T)aLq*Qfl<Dm7;u2g+>XaW^mf$9P`2r6+ppF&3y%<TgUF*NTr%7vGDkLs%XAglGPuk$uoVB'
+  'm*8blH|BQKIlg!uwP0I9UJzpB@v6@G;P7{?4m>=un2T=P$B)7whjN4kzoB}vLSrfUyxJ}StH4rOguwc)mCz1d*l^H%1#}ZSA!5Wh'
+  ')(HHP(`Q3O0fjaxk>kbo;Ot56yBX4?Ia8fLSFbSSC7^B-`$SVS;~;6Ogmw~$48TAA2R+0aATL~ZA7z$=!;4~IPk=tab;y?5{)`(U'
+  'F@V?rPBC{@{KY9?;`3+99&lFON@w3zx0v8lk>O)}_u4$Ce}DP*{f{r6|AZ-rGZa8;V@irkgL9|tCi8CGr<_uU_0XmpBa>DepwB%='
+  'V<vN93>X4C$MaEN73H*djLjwS@Juh=EMLkvf5P7}ThCwiekPvj^LvKXhf#E|?n{gzMqu0t*vUim-_Z+FnML<<Hinajk@|f$c|h}S'
+  'OIq4{>z=dE@A;G-*smPv<e_KJi}vUi5WrO#pSC{SApL5gO!Eapj@%RrxaNSTs+;(WGqa~kYf7aRO$c{MT~Tz^L-zY`uiyUof4_e9'
+  'KD6V_yjthd&Wma_tDv#>Xg!}e>6-ES-z*s}Vvg8}pzxf5n4dAnX-`=k_g>i2`CVD}0IiTEvuRE&o3S~y>hu-kVA=)_NHN>~+Bg-p'
+  'TxQJnL|K-`2&q`8i6}eIf?OJDMYjOrrGO?+MT{NO)Gki#HIzaDnv7X3<nECg5cS{j4V&ut<ew9`C^#7iTU4H~^I@VRk<(k5#Y<@F'
+  'E_OdLBwDccH1OSr$50t^vFM%mx~9uT+i<K3s>=vhbvn!He*%`DIc;@e7>yQ=d!wG;yLR0&P1x}!rifbZknUaZPj`j;?d8UE!zC$Q'
+  'QLqtLss%4vn{%FoO8DFJtZOz_w_QbA@U^KlG_?wwk!v551>0GK&dp_yxN@!5>_E(&dtqAFG^Po@BOSh57bSO^Vlr)F6<AF^>_=y('
+  'CY7IEmllyk^Ll|>pY8PxU}HU46F4N(*n`-87lpj#?>g9(azQWsP>DUKK?`5S4zaC2Ugu=N;(n#M7*p(j`dm2;8ZSp2#Lglu;Cjna'
+  'e{v4n)417>!0J17G%#Y!F5|1;y&3<R=WFBC?>YofE4_{;JGLWOY*ST0+^z*rzNa)!5*|q?Lkj${0a7#rqAw>KgYsj8><;@RVBqJw'
+  'H2TMNUdoP>n5qFxfTSk6-B~^j7HDA$9McbI{SA;S$VJVzWLQwt)?@)c-0|qs=oj{*Wf4b(3X+8}`df*+VbD)P--y-@`AZ@toM`!-'
+  '`|}<JA03V*aYMmxG;wUV*s(pWBHq?uZxm!3H-t^QvRe!i!I4U5Ie9K@a2u}huu^g%j?WE@>VlGR$<=7bJe8%7$p0mceyR}8a1F_%'
+  '0oq4>&L;aPnXoY#QBk5gF9p6eLYo3o#-Z^}&JuLyzFTW;&riMr%ajMMz}~l3Z~+z(xWFgVY+)rfVZxniQkRehdITd+Z*mpklT;sH'
+  '5r3sK%u}cx6uM%Ja|E_GLdKm$Z-&v!pOFG@$n@85{W(DaFkzTWpejjO=&m9HdvFzd)>?!JbN$|@%k_sAS^i~v@v(5Cg^1)=EDQfe'
+  '9>2}%7-b;@ZnnromAA;Lx15Ez)r%@>Xp+sg32m@YhqLVhMHl%k#xj9Lk`2{PSZv*CoiG&BnI+@)LyKm8@t4i|bjZSSaiyWhLyP&('
+  '%&lJLItjS?$`>9F2#Y<(Unyw~+wH4Lt_?ITSkY|oI<&qB9WO>YQ-opa;hlPg%xU`S^{bbfn*bVCQJL@PAzuiS?-b$n!0470CV9gP'
+  '8||ood2bh+Ul+>-CpA;nTvt=R-*ZJDzm!LPqi*p~T=fDqtTwrm08?odx8tWlwW^r!;tTC!JGdaLFS~}u%$dYgYEudroHB~uy}(Ez'
+  '_@DfFqXGk-2tMk$ZH0hVeL@eudDBei%dBaTw=63pb@Cuir7BwNw%ppplm|ij^I>50?#EX@{PfbRJ3R!V+_GJuHGFcqqr#^)!5Atg'
+  'aHD1xIKOTsC9BHnvSUYI7>&pcCJV-PfbFB4mP`yA3A58!XiM!+J|eQe9fFCZyu$uK)m$k%n17aXR@73Ta!gHUMCNevov9TqGj8!t'
+  'cpZ45+VGWFQb?;57y{nnU!rMMlbX1uC{ENa)jVW4PO<{#th$f4yI}gHQ?<ZdsY|MFRPfJWQP?lox0-GVuCzq+9sM8?6NgPhn-h+o'
+  ')+fm)i#p#Cr-E-3EkjNe>i15m7Slsm{w@Eac5tore%00o3Y@@#GyIXX_aVe%+Y&Bo9h7MxSM(cdf*WO-LTd9+y<R-JR>atS@L{8W'
+  '?%E<2ax2s~D$peQ>1DNq+epVnr63vh0|{W|&2_O@<fV$-MNBz=3G54JOdt1pn9Al#8sOXr633(!;KWklqlT4&+DT`D4k!o;0;LQ`'
+  '#ST%=lyXacqr}fDijTmSe9Sonti4DoF3XykUNvrEfvvSruPCOu`^vKZ>s%gn{`Fc@O&zmTzd`bZpGgG5L2R{TC)Dya+)7KzX`q_E'
+  '#C*Qi^d-`X44UJ?;jMOA)GNjX{K=#@xPNf6c8LC~x+(KT$ZW^e&5=c<*3O9vfl1;n1q14>EhU@X_iWqTg-wNEy(wrt0(WoHa%Aue'
+  'c)8u}J_PdH^J7D^v1&^YO29RT3$`K#>{u5z^9;w9Z?BV-9(zNfkG+YTVnvB>_RU5L{+ZJW`xzZD9s9s}^I>(hhH_^{jw;&=s3R@w'
+  'iY|zFs1}DvNO*dcmuN#Yt!9`*HEy@!2Oev8<7cl>9b5q=bzRJx>7veVVrP>2=use8$D3Eh2ck$3a&<_jCUl1%1HN70f<0lQam$x@'
+  'r!}%1P~~CVbqw1b*|XD&Bf{hM7FydI+C<iJP3-Xc<P+3|mqH1DoIGpRndYY3aX|oCVBB0%J3DrUmPM>%Fcl<L;vNdlU7(VL7p(L3'
+  'zabYz+0=WY>RlAgdYRpM<y;Deou?^2u<Tgho-fCuOb#l4T}b(}WcPZ)IK&vDbB4ZwfRWLP+S1Z4hK><5<|ViE{OrP~g~(=Q1Uq(}'
+  'KP6eXIPbMxcq(*nEAbxy5=34UCAP!IS{>{iyBNa@SkQ_mOu&U`4;m-0+ur;xE4yOse96U;RAi`4xY83es>0#0|6kJfX9&X#k7ekU'
+  '-+`4h4TAY=;-jgDl9+%Zb6}#PkgSl6rM%nz%^iXw?|}QLvu(Dg&o3^nrGdk7u$V6q^KPw9vp=<VoP6k_ucNbr9F3HB+y-US&4!F#'
+  'wHsl>?q{siRCZl3ik6pAYtpg(hKW7|RoQj7atoQZ+umA2&&v;=y;G;|KGe;_2(u&(FiT?e-_gDJ6h7!lefTV3pl8;k@0bK7T~SK+'
+  '?DL+RAT+UH9391=32Qa+n5Xu2qSJmm^lq*e*SRztYY1-1gZp-z*wBirJJ?BGqx9ltf>g%RrhDpgcO{mUV@Ih$-zfxBNDi5T7iz*q'
+  '1I|j35?L%hI3j?HCEDj#x%2M2x;xToD18T0r#Ap;M6xYdi9=ef&a-9_C@BG2oOI%qKzIYXXfzv^C`-$>f0F?n!?d-}@&D<^=zyc7'
+  '<PZiH)TN^>f#WF|tYMa>QIM+BoNA9;X=+Xzp(wnA?hlHb8KTm9mNluw$(~l_RfUj_A|j#R6o0a-bZZc{2$VHT-;*$c)N*z{u7Nn8'
+  's?-bWQfT0wn3JZ+7_z6mJp`ArjJLQzEi?ea8~)H$N51K??Nih~hLS&5x2ZC?wX@H;44S06|I3(L5JJ40=X4#3!%pA9K+^l0WCF(Z'
+  'lJ!~JewTx$Ur_u-9~CWK@zV%D>=QnvWH3lb8P0e|w&0*?bBM3r5#l^Rqg2}^hpVB0ZDfk8K}UJdr@f9b`3r-gzi<qPlos|qXd~Sv'
+  'AlQ9~@dQk(%S&Qcx8~gLSP&w}-D;hkcMTtiCW~`1t7n_fviA&bZi@9Dlt+_47SfZrLa!E(c1c0@j8|nr^<G=RPP5^-{o0S+YfNi3'
+  'CN@6kxC^wLzC~F%_j%G5e#kN?)+Ap9mSNZ?&pSnP2eqvPc9^Wt&t392G{nXb5^TH!Mb{GS3u7qXTvzCPA_?S|ckq3HW(I89&a+L!'
+  'l#SwKQFbn|dEC{pg<?}U_|~vl+H&|bg?B&gh7~=IP+%=mdW}&x(;yv{ZQ;6ti)yZnQF?qd^&LSdN`+GI{p0!DS3kb`VHEX_tuiVH'
+  'L7TV6G;wNQP$CULM9iZ^`tC;;lLX^>4FmJ1ksiZPqi-oUio#=~2z?!E$(Uk=ZkK#&BrhW~4ImBo+~S^AkfU%|x;qc#EuH92e)_Qq'
+  '9YW`_P3G+ynXf}U_)0ZmP$R$hFUr7R{}oD<R(^*H=o~uEu|h&)%2MVah-4q3ChoJ?oB?cvV22L2q|euEib~l~!V(adkUdb|VUxc8'
+  '$t2?d%Eqn?ACRgeS0ynVNc<F7TxCb#c~nTNcIhv*Nw1q?hUs`(jDqf6QU_5rKVFJ7Y1(g1bq5?j28KfvuN8ICj!Whk&s-U!MOU=U'
+  'rN3!AOseEdZjUM*!3EWu_`&%tFXH=J5!0iHJ+dhW95vvk=X?k=cm5Pjl?!ZlBA)C(ew$_kiCF_N1vuTT<6>*2{|s~=NCm3XZtG?w'
+  '53`kNI7D1F^Ql}nm%aODK6;iuxqRqxmfm(&*B;dw^g{PqzQ#Mty_@VD)tZT<mVlOv?ydWY%1lPbiy+0O#Q=WG!7S5~r2?bm376cD'
+  '{152eH3<=OVnrJFUjJtl*OJI2@vmHAxW)q3JQ~U}B+_80-b;4g(|<YSg0{#3Sh0JAl+ia&9^mc0>>T{I*HPz1p72&i?q`!t{NWy#'
+  '{2{u~a>fY?8gcsJE$Hwt30%)RUBlXi_F1Tfo9#4m3K!3p%VJF)gim&sbIhdipJQ0}4<E`mWJSu^H?0-rjkmL>_waB&IO5qh?hd%O'
+  'bzeh)5VQNtn+~#BnZZ<p=*7OT19!C!MW+$grozY)NT{dLKg1Z$LcS9FC9;hhunt}{4##^qISL1F$i4(!_XQrteb<G3Y<)G{W_~R<'
+  'XdIh>ru%U-M>e%F1h$_z!FsIua!0!}aoMJpcq?O1u}g-)n`x$GOw^`JFrmz0%HwoG`Z@W3$qOG#HnGJ<lklXar}6fP(v6!uJnef^'
+  't-MDZ{EMiO9b}wChA<5^MXj=}uE5+GWTWUTL&#O!q?9E_M`a^wgRC!a=i?#~jW0q(fhbkm^hp3hC<~knmo%vieXU?SexgyVheED8'
+  'Uy`vrpubpV&-}0|z`p17O5~Zbo$S6J1=ud%;G}3M{0#8+v2H_OS7;6>32O?>cxyu8>KKHqBG&g?r?|;lTkShl-S|A=r>t1Y^50ua'
+  'X0N@~&_i2J+eFUg-zN0}tR7VpIw-V_((FaYfEpEQRgbGfM{Ok~tw%t{glIv+Q{fLj*;m`^epvQMrwZlu`jppA&aNOABh&;t?uS>}'
+  'J26Ro8d)!k6>3J7@{*tQZcc*2A1Zusj8En3YVxN#=~M01k6ODvroNJ0EQFsq(RMD?HJ}RxUz%zSFhmNGaZ_5ie2?`ndPbMb&q56Y'
+  'xyR2$1e1PwDPdNd<iVP&L&Y3Kob2$B2#^~(nOxYs$SpM5F@4Ji&ZaX1S^`IM;9QYnsGY})e7VWGL<-hT@5>Y@?uC0Tt9y%X?2i1t'
+  'o_<IIqqh%XJQ(6P8Xd*!rnje^@`1x>1&-T%%yW+Z&85E_n$TG+&hKX_6$9Z*Ji!)frP|kh7#ViRXNVTCbs+B5zE5FM?$K8m9fc~n'
+  'OU~vBmd%tjpBEM&wzL|)HI^m64YVC*6aOrY#vf4$Sji6+bkIH-*l-1O0fniVptqS?BH~&Y?iQK;|3ev#Ye-Iumds<HE}B9Mt%;^N'
+  'T&y2nawDx!SvFMT{-J4Mg56_;NiQqqEA=yb8hl6Z;!T~wWr6DpD==oE4ylT>C8wG6cr>m&r9^aAYwt1ElANNx^8OebFOr4|pkHIZ'
+  't#=Ve`OP(e+|1Ew{IA_=7pi8l#Mjv-x&*2uS3bo5%icYa>BN6X#}goA+Hxey?fMG!*j5r<$+e16&{(ZT-rMU89poA8D5SK{ly_{s'
+  '*8V_GKOL&?L2`{&*XX=`;Gjc;lB&Gk+@X*Uz09-vZm?m$FHhtol~9btn@#$JIb}%2U4NT5YuI&$ix<ydy?FW4?%M2DCc`^m*Kd50'
+  'N2ufHFJ8QS^WN^5T^y)HJmq0v0>b9Tgb?@dj)0d)hayU*g$YmV>Mm~cBHR(mCpv~|yKA@?w$ac8bX7ah!M<7Wm|I&Tc@fCDj0Q>R'
+  'XZdG)Bds`hmg!(fPsP#$mu}g8vmAOop1Q|pr?&i1O*uBCV+#=Q4Lz!Pm+jteMfI@V_-U6zh1Oe_l$?|69BjKRDoKj(Xpiw@L9ux0'
+  'J@6&?r`Hw}3C5@HsSICf>UE!*N#`(z4V=>7^N_^Kaekwgd<QsZReO}>nrzLfN8ez}4rg##vqeU{D$016_M_MuBxcg?A!r<1FL^Mk'
+  '9)3=f<YblIVk93~3?9HF@wKS!ND9dKg?fBAxp&)oU_{*@=Vw(QaWsc%b_LkzAxRqqxLzlcABDN*R*X9}s0(R-f@V7YhPDOf#!$9H'
+  'fnWuX@_eE92ajqg3+z-~K0j{Ho+FZmv9k@Gz3=JjM<QM(ufK*H);ZV1ZR^iri;=(xtaVq(*m2|KZeB11#7z<@9hadB98$p71*sse'
+  '?HH4cteR0zgRY`HcNn|c>XzNLV6|HF30Wv}M3#N_f4VP5uwnV=E)zhm*(HPY@HdIa@#g`hEqgbgHPnV~kqFOpSp7sDsSlsAEAfZV'
+  'CTsxL>oU;{ag02IewRCAhn3(zZ%6gV?WrDPS7nRWCHal(<8Hjy$zy%zNG+f9-4;k~({A^yx^AN64Qura*JWlHWej>UA&pFcu3}$r'
+  'm^+Z<Sk1RaK{CB(`zcC!-<79810cW6vHvE8-N8i4*l5s35Zg)Vo<+Or>rmY1&;qxOqICjDrX4IT6=gj_PB+;0Borq5P;;+cxZRlY'
+  '3XG~GSUf`4ZmGN3JwRbCWzgn6Ujl<dS}H`yJ`pnrlRJCe4%}fJU-qK-UV3_HlCS_G>|DdJs-;8r!Qr?@n`-Swqoyn+Vgj%3Jwj%^'
+  '$%&lJrgtLuLyB<F^XP2dLT9|>FnHPOQL7c7o_GZ81oY;v0k{zr%#irV>z27&SkP!u0!lLD@0xS!gb?Y4SW0{Ad;gF`ZWz!3seyNS'
+  'E+cB~h2+<v5KPCr)j>VNwhN>&md#g|D1zi1<cx_10+=M7B?Bs^S|c$r99e{expfQ^3S83Sc)Ag^uQt|p)Ew|*4?Y)|7sZFgW8$Lk'
+  'b+nQoWn)P;qk_xs@`c1LK8?OsRlgobPfkw{OTZQgn;WgR4U%~9f18^;FD3COG@1621DwKij<`oee%~=dj_uAq8{{zN1gJLNWTC<R'
+  'zc1D8NaScFyYp==scd#gc-`>!Ml&VR$2e&7l@qi%FnKOcCqc)bme9_&=*Dx>e~dpZC+6c!lfW3sVGWO-53904*yO7<qTh7&ae==j'
+  'pUIfg>kLeQ{6Q;~g@<eKpfEjKwtRf1>_LIBCzl2nJ?V)fz<M$3_4P{z%M^<Dd|MyRi`8mi%6S33i^i^!-qgh==aXyYu<#RZ9TLj{'
+  'y%*8)0;p|??Gy6X;QnA@e7h;i7_qcjlTbxHq_vz+sU(Znfp$!rmJx^`09Cc~s@>-YC28I8*ib(wl=`7+heR{#`qe5UInjkmr6Ea8'
+  '+WAwo;Y)&r27F^t-WbkP)@v<Vz^(xcXX~D~RMbed-K@78`J})`(I{MmQc3l7-UNCls95STM(^yIp+|SmkK8uXDg(>fMCD7{VONn%'
+  'c4847k={oqA<GGhd*X-dz}#p1P!mZPwHI#4CWAK_(;?v^%Ai#El1E^{(cZ>YjUzl3uzY=gKEu%@37eEiG-}(9eSd#tHQ;)^aHFl5'
+  '%8zSarPUbd76z7sb+AV#Oz@*8L$wE7+wZ_lyBNwa<S9&bx?gpgEGiQ=^`=Me*YGsj;en^ZPB|H*-cYkLe4Q+c)Gh7QPw(D;_xhLj'
+  '9Y#*`o5dKDvT!meYc_p}0f0eQ8fXT?cLgMpHfw~DR63>`@c9;&2}#Ukzx0tJ{c+%I$vUTmbb<&U<($sZu_=QA2lht-h2yvN6>-^@'
+  '6VY!0ao+*5J=SC4oB@3+=ziY`Ti<Uv#CPR#hQS};kF|#t2vvCmPx3gy5&nk>q*6&jhT&`CA?CkXo7kg|bz$oaGGNJ|a1I_LvnXny'
+  '*ea6nce3U!mQ~kENe)=YdzsKTHAmLQS)h)1gF#d4ZHc_}S3EKfqzVj-G2v{kfsk0<?X{0kXo6xIY9*HU*5Wpo*%hfJWfmv0y&=mm'
+  'Roj~&Hj!?s?fg34ZI?y`x8<@ZKgO$~LDBoP`sm{j4W2v@1|U+a#1wFI#lejHd9torLVb2iCb<O3l!4Fyq!Dw7T4M~6>}a0)N3%dz'
+  '^NLcQmWN(Yp!G-?bJt(Rq2!nq2LT_2%WBe(08Z<xxE+|Vz`LTjDzjz!?#CbAzkK_1hd-~ghVNK@@=uF8c0@UdEr?`1(*`l$z}_rR'
+  'mt@>Rq|l@TTHja5q;pq?E&<st3HTVkSYomx=l)fM<)Z8g*JD#f$S`x>;9@15vm9v)HBow{m{?GxteZ{1?ojO{M;qPi`}ui9c`B|m'
+  '%m_do)IdC}*UJK9$XE4>RLKkBQHTyb;kacdMcL#vuG)aoJfiljNuBY~NRcf5iwdQQ;E4loz2u@pdP@a3lQF-3GST&(O!gsBVc$15'
+  'm6N9!4d|F|uP)tG1(F;dNieu)B0a4Lr{#t~34o+fK9cVkFKzx!*05x-&Kq`dHsL+P_&l8fdek!XJKGKD^wn0k4U%`n<@$4?Qq6Kq'
+  '`GzC#Wq%mimc!+t^-6fu9RHTh5b)Q|sddM&3K#($7%1of5>SQvEVpfem~|W2vw_8;pF2qP?k(FJM)c4P49U?<m}j3|JjkuVxjX7;'
+  'CybbR=yabkBQQ7XC#<U%TD5A?U!l~WyY5n7xzeeuY1=$;+LQlz2D7+qc<B(eB6CW62d=@MJHyV#8b1pE927{k!y>NRD{yDME~CH4'
+  '84-2>hQ45x@1$jspLB-rJtS_0dwY`telq%Fk!Ql4cG!B@L5X(<hk4B04=}n*T1k3an;=<G0~_i9vTJ$YCbxGknzP_R>hM4lMc)P>'
+  ';20p@H-wox<90mu5FV;H(YY%>6&PFtLuYWsu@ZTP3Y+_6S8<caFVF#9H#&W&)U~ymTDZ|Qyw(-98?Cfz`pjl4KBPn8xh?Q`TWN>A'
+  ';FCM(!#&ruos)$&P}}=T^DO<<aARj8HAOk`Dik&JSUZ<xsA*>=QpE)7Jg|bbgMlHnmOGSADA1F5a2`!Z?ETUaqmkHe*RQRWqsQ1#'
+  'S2qJ~&E0QDhumG0CXwx~ssa*(R>GQ*cDEZ0)o`r<28UMGbzL{{KyBA2$<3f*Kr>L0KKbR9{3TGHKDFB?o;uikwf0L}@!WQ=gKgJN'
+  '=g4nKVdqD*<LDlBLwr4SEv#Q!NlydC>64q}+bRX$1|ok7mo;gcX4S3VjFWd=Wm}=Yy9(YEsD*2k$1fq7u_fakJA&@9C-5GN-1`yi'
+  'gD)W;w?yWTXv`L_j~^jv4{=gs`P<jV<zw}uFJgu<|DpJ?%^3fAOh0s%#=ek$92E4AEt&r#y0EnaV^>w6k=j`Q>N`kyY(G4vQ(<1l'
+  '^0%*%;Mfh%GVV@6HFgtH?E+Y2&QP(ZLDn)~8(Y8oVvsoIKYfih$Lfc4W5`eLP_kRw#F{%G%gM$fMpb3}AKX<_G8~>xiHev`QSLdN'
+  '_L#W7YtpQ~`gAcIol%UG3!|e~WFMBvZ;K5&j&FeeMHQ{8cE-k?pY=cUmWJhv>H6-o(Ptm%e{X8Ku_zzj5))OvfaXLEmPRi><@FuE'
+  '!d0c@u#|HXbJUWg7Gue0i<BFKd9BE30gXNM1BR*44=~0LCHa%9<E)c<IPq?4KqEDxktR3!$GDdl*&5a}C(hSaqY9(T%RIo$p`p~P'
+  'Iu)NDvv`YaROU66Eev}`1ev29nxSP-uCdPNh~RLD9Myydn--gV)i@jkZZU;d%Pvk)|DVE66~Nt7GnuKYlRG@PBtOPEpzN$1FdSK|'
+  '``#-`3HF@+?LAQL2kge@2U^h^s88r7&~2NO#1Gz>p_<n@CO)Ho{_8yq1VNYW_Nej@E29r>$Qn;C_(gog%Xy@F1ei}q;)e-`xhWm7'
+  'T#k~i&8LYo2+1o0Pe1`)QYJC}pmwZL8^rQ=*qq=HM&1Ap*?DiCI~H8_S;qp9F{U5$J7@>@ltw4db~qw38M5Q9$Gumr+`JsQX8|B)'
+  'AX{f{#vz!zuDD1PK7_)_0NJ{UZ|{EZbN{4=O-$lEjEG%W>#rt0ai)U-gWTXWWMjka&`$zt>iO|=gU%P*d5!{ya=`6}W@%v)cd{59'
+  'I=hXz`#v(>8RnBaO%pu{F856|%m+_*kMA-t!1mGy6N^W)yXc;J8l}%JAEM`9Sys=Irq>vDs?<eT-atK5S5uYJo8^$AuRx^Hk6d$8'
+  '#(6&#vpNIBuBuU*<*%abQ&q69HQW`wMrlU|H#lpgxfc=npf5A#eQX3OY#FTWslk(yh(hToFb}yPGY>_IKazB4#oq1*+DH^aO1JBE'
+  'UVF^F<TV0J^}|p98*$U~p9opKdHcHeuop#2N?;P{U^Z{PveWfl_lVFZP_1-78up{~3E2VKfvcQon-^AyP3lrYyVVKCYC8`^cVfI+'
+  '2XsSj6sd5nrxTGoTQ4XoTswu78Ry=`Vn;I-q|2I;HCI&fS$%#To!NcP*sc_hqtzHfj&7mvMQaK#gq@D8BjQDLFZdj9C5_xQW~a;8'
+  '2EwAetak2tYm5CG^swvm;lW-HB4NhXT-rIlMBJ#xxv3P8?m0IMrMTp@0=~p5fZB{PDs-r@1+CUSHUBWW=k_1`kO(r7zl?Y6N&wk='
+  'h{+IZ(H2;PH6c?V>lCutiR*2wbUappJOmcxgF&PyuEDr~j6t#Cyj++wEljtX!(mAjq|!x?O=>5Jdr3YffkJ4pm@L;@gaaU&7>Reh'
+  'XQ&aq9Img0&@BRKnC?jhbZDg=kXwwC9}_>t{J18wh@u&vqSo$q>V2c@%3Q6wJ+h9yZ<wZ%z>yv;h3gccb%V!k2YGEMt_M%(FPoz^'
+  'WgL!DqLsE}!Zna_6zBsDovq7W_?ox+&Fi(W&gRv-O?H*H0&U^(BwnAmeDZ;nAxXgAiEjiz_bVeVF&&T<)HE5|&H(v>))Qk%*rdE2'
+  'YVwU~&~5_$LXRCr?cVj=ZL0oqwcgw*lND=4gbDU_i`81CV{WZg%vGisfObrwd63`gQ`BUBIczKIu5za-TI1L|udtMPFaaiBX4#zR'
+  'URh7Gkm^JL8Hb8Mje}x`u9E2xnA+<fip8(ZjLjyqjtoxAw9N=N;ee4gkNPO?nNv7B;~=5<{ez!gLTFh!#H2_jO+2ZM(SiypzFz0$'
+  '4?p329f?62{e(g!zr7deSJ@O<X~PE^GhHh_{i_IrYu=g-`BY>Wpq)t4)OTz7#ChcDBy>zlHRSn~$)55s)J}4PeTF8pr2(y~wP#|Y'
+  'E?X2hDMnBkf-XH#f*X|@)yNlI!euvge{6Ntu^bK)(C%R`_V<v3+eK%JA=#&Y?a}%t_w^B1;3KX<iWI31YO+^I+IeL@Mw}7G;{kst'
+  'Ssrusv6oKJDE#y2T?L#J1`k;yiztK>$C(3&-OkA$AbNq;n{=SD3n2WKfcpdR!`Echbb?mZq-({z*u>MWL3WcyiYlTN5MxpVk;Tq<'
+  'aR);LF^7#Gtr-m*jagqCYCn&@FP0Pt>@F%6fD4Pu0@ii}HDIY{+hV!U3r%d{EWfMDg$!Sr9s72aH(9wcl1lvOxdgM&O3Pg+_yiC!'
+  'z&NNpV>L%OuF5IwwdO1g^K-F8u~3tklT7_!;3bV*m>X(^8NV}l0E4Oyo{Rz(CgLC<GwI@ES%}1p>|mIl!hb`gW$dr`ET4iYAaL7M'
+  'BpaR;^bMqj-NvLHb6t2xwF3QUN{c|vJtSn4iew8d{sDXrk?y?F6!L9et)Tf$e&UO?ppzFb)UX|k3KhrYzQ<pCBPrI8j*bkn3KG43'
+  'SYx3#lhGq+)K={lwYt;-^~Qsn!)erqb{ry=sO_JIV4<LuN(q4Zi3iL+dcY;OXD%yGQQM^h25=9a6wv4+i1P>{LIE>wg((AB#y{y$'
+  'Oj<TlcI2H)RI4v-MloP7rf{KRoly@Iv)h+;0=1M>jMT|yIzC0kXr%}dxf9S4RJz~8WZ|(f6#uu3q=mhueZv$eNR8S&`Fy^9N{+p1'
+  'a3)fY5_w^jL!I>>!->1@`uhA*e<;E!&}7Uq12yi)$^?d|2-6BqJ)WDzRDq{Vq?fmEUPQfP%kTQWM^>hQDUfu1ASm57*R~f80xE`$'
+  'A<%=(Yc{}A?2OnT2*J&dfK7Cg(QTIdw{5ZM1<>^j#``gJ2#Ev}fz6yCuTx_4ct0=;wMsm*$hd+%*n*6`E3N`Y`L64Ml_#LUf2L){'
+  '#u*5{%PHx2Pm?`rV<nfuqiD3p=p~?a!jqsz7;lOSL&Vxj;g`3tK?MR@wv4QB1gnbHjnfMCDMUA3qzK>DC98?axVa?FYhLFi<s1A^'
+  'J_n{Ks|Tz@K%~hCe+4zJmv<<=t<byW3jMswj~o>>i(t(L3mgXei^52_-w&mr^jELnL!rwp>7}8w3K-N?F^7Ve<d6fj)pC(WuZezC'
+  'p}-m?u(-;B<^pj3P+F%HM<tF)mg)4i$x|SF`GVT6l{pCB5kLI$BUxWxF+AgBT}^n_0B$3^hB2oohYw1{`J;Xn)|Df%OjQwUEsL3|'
+  '_Qp}DZ|d!QqaP6~eK5NBt9-R8^iv5yd52(MuBGK>Uaap@Ac$8ePf?Y!ZG%iZG7TGyEnyW!UTRhRuFJx%(X&$sPi6u8pb-3je)qo4'
+  'gGEwODB<pFL0ZMJAME>Ojdm_;a&vI>SZ{N5$U{uKVbb`j#)uq%<nsEY$&jY1wcAd93n-nOd=XH4jowc5;&F6YT4~>#vSR_A6uL~X'
+  '1C&MDAMhOq5omf3O4yo{P76q_byhdIAASMH#L{{S`7zzVX+!vj+w!g#$|+N#rxB7FC822ckb_RrS+%&M#Be5i2#{>p@%P)3;Pkuv'
+  'QtY!+r5mFO3MEi#GnsNdF4uhm!SRaj$*LJwWZHxvHs(Ld1{78kea6?wt6_IPR|~u_aXe!hEudmRE7RhtL?UT?fmBgX{Kznr1?>--'
+  'Xu@l34Z}icCS7O~G?okR!KB~%Xz#<sfKT%=zllF7z`5;5cl`*{I)8F|S_7J_v%5HsPt$%h_#Mh&(v{ya=qNnj;==$n;2ee2qJL_E'
+  '*y*p?yqdweF}*QVy?Y%$Nl<}$y@~!WDbtsT&m6<NVZ~Rof{S91l~?ea<5SpR32;uq?qH}(q|>fabiaen6z&Ho!i)(rVNK$2y{}Q3'
+  'eLiZDf6!WfhiShC>G=`2am;`I%70FtrT$7ug?Kn1igaEzF?Et8C-nE|=u9=mAGjQVs9)~MQS5Xk%lcOfGt!^vg%?yA-Jk(~6ZZ@w'
+  '!T{K?d&)jJudnVzRj91%(Vp6Ur)~h}CH8i$-{Aka|DUt<iwrIpXJcQNIbj<%HbS5_*BWl@`VIyO7)hWWxPD2^i^!2<%sM-a&@`PQ'
+  'bw8aVV{+M#+S#ZOxuK+Nd6_bbBL%93A}xUg79yNDmWt%mE@4{Ab+U`F!?h{qBvz1CE_xbU_a=W0zfRw`-A7D8+*T-4&hAh*{7rN|'
+  'JUbemo;?MCIWRg7V$<?uR^8&9n`nvD9{SK`B{mlQ{H=sz@WZc$0%XP3$S9@WRb6e@oG5+>w|iLLgcLqvi{+9%IC!0KInzavUB&7z'
+  'zo)=On`$|R(>FX#_O+^+yVjy5DW%~$G>T9w{H(YblTn;dLRrL}0iv(rj=Ulw>&-BF`Ln~WIMCD-SF23NXM+&~htM8uKUz@Q0r*Y@'
+  'pFIr-DXsR9KZW%<3<%&TM%PHhRO(m*%~lsofCUGQL!%4*G#!~Y58bT6D9}hNRHGi9?ZQKs5P+Z@-`R5OM61VVy?XSqrQdg%d@2)B'
+  '3N@(tb<38ny*%GyK^4VLWJ&CvRSwGhiY-8Wbv@S6x(KymURQ!h*a}<~Y9(gM<}CXko_P0E3su0uxGkENYR`rvXvZT)5#+LluWILb'
+  '!1au?IFS(~7o*Vt86ad9Ft8d?N1JZ&xWL-fAw0EiNxxj%Ar(v5I}Imj%`2gNL<6U!H(hZAEzc*GG9PmNZZAhEky?&q`nJ^P|4m&1'
+  'Ww9D{UNA~!0yhX!r~S6nug_fB_)B!|Srpr5{AG%n7=TI{KRr)FIu2}Yj@PB+%Wm>3<gYkKcFU`+MpHW!bD%#zc7<j_6z-6^L+o&>'
+  'tY0zGBNIr7Grrt^9DXc0P9JieG81x5=Gc!j%t`7>Rv9f3t-B>#9O9vvCfBcH9UUzRB<OTnAnEXM?>L`F=$^aGIsRH?22kh>p^Nr7'
+  ')n;*zv}5#}g+{HdbXR`6is#qN6lg&#o9$^lpoc-Gya!HXTNXg&NP|Yt(K!<xg~7EVYYpHc6y?mC5N{OuMF2g$rN~Z76dczy(FEmu'
+  'K$Df#6wrk7T&=khYVcw)HaY6@c*pXwz_XorNnW8;8z2)M9e*npDRA5*(Uy-xCtli|ZM`nK@~5hGNz6HEHx0WwX+a>ijK+3PaAa9|'
+  'r<=McCQ`j1w%4|oDOf#S=gHnZen(PiAZ(yFVE)Jpz-TP=ejXAr14ew&9vx238576-KoL7f3NSEzJWTcv_(fHVX#g6bN(7;kY&9#c'
+  'w$)afy4qSfXOzqQ5@m|S!m+*LX`jXg`#m6}0v8bGwIC}_wQqx=6oQ-Rm`nN2%N+WiXOEqXsE=b?PEWQ>KuX|J{0_UNGC%QO3c}|r'
+  'Zh#s^@q+`_0@cuv{rXi9*pWD%SzGZJY)n5M4;40^s~=@2VLMOPRl{cGCH_Q*fV1?#@V83&A!{|SD-xe&(HiNrMa~l9Hd@qc8#{|@'
+  'L08`_JFU3&$!$z4v4TK4iV6d#44D?F91m@Iu~9EON@E=Fs+yr>h(kBH-<>FW*25Gp$ASv?oeJvxJ#6_X8m3>s2EU?T=jUW_N<Yuw'
+  '=R5lOB^pQbuLpk_$#|-fJB93_S6TB>p4s$MeI=O^@j5GSX!ifRP~CCSi~{L?)%irz&5+HF3aKLn%?`E8x?UMneAI2ki@p-od`?8j'
+  'j)Vu{T&aFT08Y4fcnMwKE$Zqj7z4&}Rrl^^qU3q9mUeKo+s>qYvfh$^NTdeQu<8vZsf~B$aJ49A$aS85x?`g-qcqqR7iRa8P{1!d'
+  'p|miFBW@Xb==YuV`}d^F@Pp(U2y3L!c2*cyt&h;(otNXEUt6`U*>bb2<|cN|hYz=>r-)diUJ@DT4c)wt-nlnw?JeVI;`UgRNjF@S'
+  'A*)2e!Z3^pa9iZ$QSZEnTa#na4?Ah`vP`;5BZ5civ)qpAY6POD7^o|7cZw25HdJ3^iY$=4PS?eeYW{?8(W9d?O7^Nc<%C~pcjL;o'
+  'SS&vX_;#gB@sYBsh!6Yf3D#6q_;Ft)ja*eVP45Xrip}nxW&|gzMp_ZU!j%wp+cRWRc}I2^jpTI(@vLiT9YOj6*PCjKcc-t;r}AM)'
+  'l7m{=H7=U14(mpebR|pB7PBn4A^}Yjz7E}r_LmlSrZzQDMSt@v$rc8x$QQqYbLCof%=^~3(3?D0qFuEh7w)(w=_=34m}E4ktwp@N'
+  'Y&a-@)5O4P-m9_14CjI!F!`GiApTa<U+N8?fi1QB@P`FwUrUY>C+!;*WSM~wB`hgW@;3gIu!@TcW@Qso8NU@bJhN5~QRewmC+WOZ'
+  'a^gY{dJ<h{>pYH;4|tO7=p(d!t<O8_TP$>pgG6kLf0cVvV6^S#rlPkLg>CG2V|&(QE$}gXtkN?YR@UH|M2mj)mI6i1cdy*W$bwJ&'
+  ';o*)u%CF|rBA#c1dFH@r0yDli4OTv)+8DAl)-V4GP2kl8&7g#XZfpA<VcHZeJ+7uj-+BC1Ex?ptv^6iVDVr%UgjbvErmeRNoITai'
+  'WYGQb*O1)QE}$gz(A~{-Ud!4$WBHoN{&aXou8Lke7znFj@tvra__qi<d|c8h2TQ25Ww8<~hLlo$ORDN9wEC{9AvXQk^~{S$#n=el'
+  'z0{J^x4gm;w2mFBm^0<ea%xM0H6-}LU`!$GGj`f}Z5(zBbXg^b!7T0b6pA^izv9snvQ+ig5dgeRsbjalnr@3@z+!v)ZukFdtA7$n'
+  '%^K%QyHFsno`0pl0mBZ$p_{W%oy&!c(;tuBSHDUCJFgfL?x^V>rpX`ab?4!39q3=l74|$m@92u)Mbkrocz#WikmjCm3M#Gc9wcnt'
+  'o98S^P%C?|j>=Yfm_tStL}O(q<ijv!=)$Gc)k-bzv?vx5=&&U}Q)D>Nv*lAhk4>$MC!@)Up%)Uk4X11w;DlVI*jn>ku4kKC_^awG'
+  'eLt|@A6tElo=n2CRr_=70LO^cGm|5`TW1mKielLAS_1RdrYFo>hjc)x;rh;xZjR@1O;S&?4Izk)n`JT2Q5g9o>DvSl>cjZklYaC}'
+  'eWOJ^GNe)K03-0WuPSTpZ~&8#!wJ;;h6fgk_Te>vcQKVc!HTWTFvT70O12rf1~mnGK}5@kMiV4?RtE?YMe?M-ZS(qWI?I;JDKQ_h'
+  'ZX6aieU>B!8Ddj`LmNOm6h2~js$*luom3m(1F?oTN*%1$ajkV?&#tzI6E*=)T=^Su>#)_o=XKRgm&M22%-e>$41=jd(X;d<PM@H0'
+  '4|zH1qPC4Kncm>N=mz?xeeo|U*ddqXrBaD+LbAx0WcQ>y49yp&>4(eL0tsX;fMi+$W8ncdHLdBXK5m$w`q*U`_v3hXOdUFIf_=dR'
+  'WI?HT9>cRigU4Yu0h%48&-!{~{(#|#FSE5fZ|-oQ7KLosyps>xuvowVVuFl5ZcjYmy+4vRPgMQHLW;PAt<2H{1;^tkJwK8rm<5xD'
+  '{wjZMJy1y^tEI($7zmRCO7Iasp~;g~@04(6PprRsZB?vlH3`F>`s{-ox;Y}{iHmX|sggwh9>pFCIQ9t-K?zBCFc;V@fXuJ_<A76O'
+  '9{x`Oe~ZNV6JXzZ^)CT>1gNRPga<?W{)1!M-FM1<?MH*o(tqR}$rZ{~`;6x8TU6MWyhW`rAvi`FSXo9+8Fa@euaO+3;=o`XC*?8#'
+  '!;6~YcA#4XIumwIoC8p`0Q78K!PcN$TI?@4`afDE*>;dYUdzPr2+~uHPf^(+C)6=f#G)ZvgXP(XxUVO`u3N=IRcBVw81xw0*dj}O'
+  'xs}zNPuYp(7xlqre&Gl<@i2eZ*Ee>IbcsqO#Jj_SaBVAV%`QcXGNv;QO$_K?+-m1YD04c;d#qvkN^)YD^5hSZ5m?e+6sS4S%W~pL'
+  'MoAQy90mJrqeD-E68>PLNk=mC$1vogxD+=RY(^R!v;;0zq5?Tt5g%zK1Em#?t=3Lj5*^fe@P6aHCJjrzK%3Z-IvS~YXZgtPL^X5N'
+  '>WwY9Z)0KkRd?`TCoXKEHeYsT4J<jZ8e+$edc+L$`H!A0%dZrl&<TZzORS1V-Wpjp8uU#1e=Zqh4F7eEE+Blgq#_6<;|E7F-q+*P'
+  'TyH{WrX{o2n3!6srx&WCUA!;d{k84T&^>PJ_awju3<RYd`(UWy@|ZT_e*&9}M#4=aDh#YJkifYuvclZk!_y<K1_!FeH1n4LyR5cL'
+  'm}O|^Ot<3?(&L~}E6R64_zKy1Hz=Y(Hq8(Ma?ZNR3^ih#(xA`_0W!mPY2cgx9~7v8{rQv)B-03RjPtM1(Ckw#*-i$le1(b7Bs&x)'
+  'kfm^5Eh6Hv7k}FeLK%zn#b7~fuv!Y@4ta#FF~!ccIq4fI9Up~s(XL613FBehH{ARPp40Z@2JX=9e{k^otf7^7#L_JUZR|<h7%*t&'
+  'RPEnk$RUjLq7C&E?GDs5#v=>OYw{(!f?{NV93yd{5wsUZxI$xyPwWl);(3H&!E?tiE5BVsBL(_QNPu=Rit$2U5*@-_82(4SFgoCW'
+  'xAcg%s*64PL}jL`v5TG+SCz~<GZGuOWwlmToooSETcdg#z0EVU6+}%JTgE%w+2*>a7r{DDRGlY&ol7`=lvuo7>8Yyp)UPBXo>kQ{'
+  'W;dER)?@xAdV--dfs@v+zK)*4t0XKA)1(s*{~IWKM%DTG>*!f}o=~LA^ou<$$Yj2W&QoeZp1+R1Filuae^w~@DMl@76p(S$vS$3$'
+  'g|;6TIWW-zl>}=ykzC_nMHDZ*{-n%LH<((F(oCV%s=~nz%%NM~-5Skcp|3<a3E(*wgG`D6L0|F5c`JZ{ZBq10lT-G)O$E4wV!3hL'
+  'SG3gz765mFTS5scoKVRfX}jC}e|iS?nkU<{YLFYv&_rr|o$)rBStz>*PpNF;f!j(v3hDvtVpL=US|)*j<Kd%JATnp{@yM}H7@nS{'
+  'N7$lcKp=sPooewAcnT_cthFG(b1(07>pZ~$|49ZN?_I{!lloxCBu!RznGhSbV-*?&7LKVelqWUNkIVoYwFJqLYLdyx#EX24O|}l;'
+  'b|xs<I)4-}@EL|WEf?dn^VB_wuUTY5&Na&lPh)nQbA*~@g;B%i+Zy9H(^*9+00q;EN;t3_zhGN>j=5st^XEXjI#0^%sR<n{5h&=Y'
+  'B8sHf?b9-*C28Lp3XsLLLSpQ4Cf1Q>X~Ay?{Kq*QeInVId4cs30g-KnL8fe0U@VMNb#cT;=CrTIIryR<Jx$Exml^<Qf8g9<hj_UZ'
+  'qvH6>iRHAw9jMue%@0!P9MU|$f}6eJhYSr1HQx=_`Z`7lZ}!(&!UB<D>KYX}O87np6*X!k92yUV%=7W_qBtIotXQw&twhk+y$ADZ'
+  'OLsQ<5Imt!s_~f^D$Vl(?nt#PxRuFCjDJo}&XVL<=lBUNGwQNx^l{R0f}9ZSyvOAGYVQO#-sd4D-YLAGCXFmSL4wJ8ag23=yhuXZ'
+  'qh0cenlmRB?zih|!QuZfkgUojgMMZx3Ll?)4)u6+D7YVm5;)OP6)jHu3cW*h3=-Hdk`(3z@DIxO%fC-~5XOjimNi9*wirtU)KBso'
+  '5eEJcV*rj~lduC24ca#p5BQ>R{#k1OL^XawEuYxUax4|$E0FgoC`cS;<1ta;$-@vaD-;GQU4q$9;k})-f_8wT$3i3NI<GIMw7n*L'
+  'x&lCjQ!LS|oGVx}9EQ07Ro3FMEs`{xK#hE;EjzI9Llfz~)upD_Q>9q9nlOUsung7qp*E5Jm`zQb$l~%6DZ62Qz9$Q^q^CAxHH@Tb'
+  '&>Ci&^zmFD0F_kBg@;Udh1-e0ZB<UlTvB7_*5IIzJ;O>|d&-uOLiheP5WweQdmrpYR`cs|YlXYwHhN2}xlLXLn8Z3RlD$EpRB@p-'
+  '{1j$(5yXqJ9ZkNv8R0()JRIq=sztiE(L^Ib1Ze?$sqlI92Cauz>#dM@aGOfR2XZdV*MyG&LEuhc+HQ;lL218%`^oE6pV2G2=VE1t'
+  ')K4tDgroywAC~#X@mY!{eCH?vLj_HWm#3;~C#&HgsHC50sdf_2DuTvf1K>hfZq5{j^Eehncf_UP{y8D5Fs|yx_MfUa&754MC@=d8'
+  'YlzTk;>Pe_qKq?)F%;X=Mqqe^)i^u-$~*~z2Uv6?_H8+78!363vi4fG#>)5X*Va<By_?*nx)@O~K^aa<L^lb_^t{2lE2;uCO;L=t'
+  'V`-%=RXoO>FcfAG6EkFvdp`}n{r-n{gKyzp1g4!3^B#*#iO4&?@1foWn(K|CFX7_vU2du+`l97X4dTZo2DTiYKP2hxE-{@sCv<mr'
+  'T+<=bM}3F63*{bhZ=u>az{w73omeI!{*-<hn8tiWR58cYS?9c~)+P^&<6?7-A$oCtx^Z&%-1J?T*8nOr#m+KY2LuN(h}jYeNkmO3'
+  'sdwKx?48f#CRn4}w;Sj5Z_yK6)Lm|P_Sn$Q4`t^LkBlSY1a@&ec$%K~qrnr5?=-}p^bbBhMVU{>?CT0QYSFcG$Mz8Rv@vz|RJ{#v'
+  's<l13VCQOi9egdogMI)of2I{N%M>#h`RzJJz60+L<`V{P1IbBxcAo6=Rg=m0HI%9b`rcT=P2ldj`u!cQLx?XF@CAUJ@aUA?r`nem'
+  'eLZ>d2hK+Oif~S1xYA{vshHuo!gx=U^Ej?_;3gYbgGVNh2YvD+>4L^hzM@!~9H}CGaug2-s!ycsj?>fACtdE7M0}^G&$=QKg>+<U'
+  '`W@rZt8-)~JUl&78nZr!`RSUCL5lvpBVPtM=p)t1F-H|cg81x+zF5nV99hVRL_*J!?gL|B>ffTLr~9zXL1@x6=|Z-|8gl6o-+{k#'
+  'AuLj1IBCT%4-8B0b)jba5nQ=+J;AlA*zO*3iWudTqVM+v>fl8OgyMnfy5M^j-v})PxXA&v^&r7Wz2JwRjXon&-%!lIn1lD0YeqyW'
+  '1Z1{Q0UfKGk_}g)7cbsCMfFXEYGf<W9tygudXd*UB9ayPYMw8bwq^&TR{*7grmocShtKNShtCp>pULrsWz()HvKs6azokeqF-A3`'
+  '9S}hr7vc~q@JXt+gaaQw`%wo2mkCI?L~a0vN3H%p?R^Pz+ent?UqQRV(}V?5q<mDBT&!4GrMA6e%MQt&-WplMfJjI}n<7{QDNFWv'
+  'fBWV;^3DW7*<G`{F%{tw0pxwWeEE*=0b?(&I}lj|7@iOJe)(_@TKKE@zALeuiz&*hNsriD%^;XWhjVR-#5<3ll#q?vCPU=qb99-*'
+  '?AlhIg>d|O@ML%Jvlcb-+lOewyhDPE>9n(h{;Ozu4B*p!ja`Yg5cmp9t4NXtu};BdK^()HQC2rT<3I?E-1}L*n)8Su7A*`LjbYM}'
+  '(W5}atd|HPSjjP!fRwgD8F%f+-9i7<_YQ?M!<dszBmLxDkMqf+{_c}Uw08m4L)?f!<Dd(YV~!dMkYa-c(nWrS&QJtotvRR6$|=G1'
+  'OXT}ITzr;1kbO%nFeR8H093k`oWPu1_^xqL`SmLnAh>SHM9x~Y&^9@|W3UGqKj<j;ZY)355Ry<)`anH$joS)3l3rj@pGWl{SlYPT'
+  '89%T~fMc&azI`yh<&mJ&hFC7p`rnER5CY`xuCqEIe%ouKgCp!VS&X>bq!_hCMt}>@T@(e}%Da5O$5LQC=CCVLKCPj1$x<0n2lYh%'
+  '598=AXV)EQewv<`4#GExQG<((bdd>BC$VOE+3(O&)LUG<02De{K{8+mL<ff(Bibd1k6hFiFR4W}>Ckq6a0jvnNNI8c;5S?A6@Z(@'
+  'beZ;~vD?lc!EQs~H$k)EH#KQUe=?#zL&Dl$z-6Q^WE*K{0sguo;>qI~8aMF*m9Wx&<A-E_aVyTp>9i6o%KWk%b6;wZi2*jAIENF}'
+  'PpZT?o+c}>H^4P0=;C~u&kBn3K`9Z8Q%=JU8j~wZI|CWWoan1yxs|mC^eL0wp}xszh#&6F<{$2Xo(B#N7+ZLPzwnGX>9cl1#}R_B'
+  'YUx1=^?>;ljwXE4t+jT5NQNo_r+iNRX!l2l(n7&<3?PsEt>4%Bb?sC|N;9`BF-rZ=q|}3-pX~1Re*z_k*_^LZj}bv1?vR%%31v;Q'
+  'U&D5KHfN~86PgFyW<b-VESJB@)}O+L=6A;EpZ4A*UHM)PDwZV;mQ8{99|R(5*khFEGP53EdGP+hdrj=$KQcQRRFXO;GFA95Aiw+r'
+  'V~e601rlD_K3Y?!-9hR#<PXzh8H-Zpm09wKvay?1pODoeU{OIipiA~HWJN%<TSgJm{QzHOUNd)y)w;=&bFicb(CE$|T};eQN=?J}'
+  'L-MYi-6j%p(~MDx<N(!jG8kHc=JQMuC@%FC0BTn~v(fj5{xrb%n|_wuihrN`cq<i2sd+bomAV!GJ`bSj_+e|%qUkq~Ui|OAU!9Uo'
+  '+(Me$a2knThV_09r`b8RNxB8<Dd`b&Nq{;ko=-k=KX3Yq_L}~Zw7nq5nU`a*Cdb&yF=$c8#LKa+jzZ-awCu;Zmt$QW7gmlo{kZgU'
+  'tgGXP<dER@(S2%OQQ#eMu&e-_4MC(pK}&c(<7zPj-K)|&lWCJ8inzchH+|8$$;|-&-yh&_SUhK4aT-m!g3_ON#X)x2y`c4uLjkKj'
+  '-#Wi}K-tIibI_+G*b^wD;3VS31t-Dl_yh)Ya!YHy-{nFF;s<`d9Zdmc?{;)4`T=SB{jKxc2NRmO0sS5@sU`j&vuvGze$b&@U3`)1'
+  'G$;QXN!zJ%kPK)oDP?N;fdm+)cb6L5897x6ZfJy%((uUW$H8nA?tC77F8=~3$OUfu3HP%DBiV(gl;%Xf9Kg$g((^7#HlZXV^=i7h'
+  'nt^~q9IG8sERKdKxhsA{LAUfqj9gdzPUZOWNO`4t1Ljm|JOqzN=Zv!QN-zski-PgsWg7PSK}kg*Dp4$AN@k+GW4<m-kP&7C_5$8e'
+  '2g!Ew_I7zGcF#i$l=7;=&_QKQ(exnv7lyYHn`(yY!ccgm(Z#Clq!6NnVCNSr2u?CfAQq1(m4kW~6L7nO$SM#erVEgrqArU3{x%m|'
+  'cl&r*&68#RQKUUT2Ln2BdHGZnR`5<}Lv4gP2}dpw{L}mo9g}1sctU`GXcY+slYsDSSyfY&0Im@j=Y(R2fTp!xmSgq(ssI*_OiV^^'
+  '-@N+$^}*5T=-~L}Z|@IAhkLINjyXUcHGD7GPo5|5lXuB)d&zJ6$#2h--^B0tA7*cl-zP72-Y1V=zfazXe~-lT;PqazBmO-R|6ae`'
+  '6W{j5w|(*cxp@CP`BD6Pz4KhWd!GFM{KIVT)n4-c@L!X?qvy%q@uB$lHrfCEIC=i+z4&)1{{5c3czK+>e07k#I(VPF65n1Qyh~mm'
+  'A0%&Ih<`_KlH-G;<lPJL@91sv?)RhQ-}YXK#tmMH58}n!H_6*~N6G&2n`Hm>LGoG@`1;kqCog_~oBZqk|4R16^WVh#x4%RBed=?s'
+  '7S{_3DIytI3S%atrJ-QX2p%ga`z?eO$CzzHjXf{zr@>%^(_r8_{_W$x0tnrzMoLA<s|g`pqJ(W)UgUtmY?|X(HS@$-?@Xf=M0Wpb'
+  'D7-P;A@w2<SK2bl{Dcw1pb!Yi#nv+vsSw0HCxR^YPc2VE>f#V<LGwMUsR;H5)d5>C4ng418R@ULf<T%S2R^()t%jZSQIW&-5y0JP'
+  'AdopW-i?~k5xeAbF_ShjWJB-7N>(AG=A&}53uigKAZ4}{6k}1$iyUkM39^w}kgt{%3TQbz?JgR1i|>Xt`q_xwR=GGN<2GatD9@HA'
+  'B)Q`@KxWS9wSX;kjh&58ZQ$`g+=K7|5*|OdQ1KHP_Ki(1<$>7%&u{pHrK&ZIWEemUjWmZd1VH<x@t4;WJuEyq!Exbl0Qj`NCAcc&'
+  'TpL5A4A3ypRbW_jTihj~8U-t3eGB#|dm^)|M!-6TPT|UGJ1uhUrER<Zj2*z;iRh>i0K1R+slL;Jna{icfC6mOMw^ghpL64k2<U2?'
+  '4WwZZM?se#9!uhfk)%g#fUS1eqaJHTb&&9RJ^=}nvw<P_Fh^pRBwME75+pwC=nOPMp$&csUq%#kPd8zw_p|vKT}n+7FnFv<h-jQ('
+  'K0;;l^?U@TZlm$oEMQ0V08@;|Bhk>gRfV0x3HAe{D2E9ZLKx#uy!~*GW<s7s=M{$T(;Sd$C`_vgy;v>80{L8wu3!l+gCoVMZbvZe'
+  'c5fcLDa4^{M=ZiI-GFeK2Id{vCtO6NCsJ!l>x<kCZHBENNWavjF@YojQWM;B*f<cl-Hp%$mTu%=@Y1zBB`Aiu#GNKr)X1^H%}qLZ'
+  'Ar(tn5TkOOdd+9AJ|6kxR}-sz<e2D32~{yiYkm+RL1#gmtihV`OXm|tA|;2(i+o<E4Fl=Xh~O}KsoD+Vq0E-ZY|SHRx6@g}Ho2o^'
+  '?Ck&GV)jpm;L46J=l<Q6b1d>sQx{EQN*y%lr`=-}zVe^Y<>7bebChw39M%r4Po;{oOO9-TB&b$yv5_ekgwdAGl-JrW=}!jXjY@U`'
+  '(j7pb3q(Ezzu*sjp!zphimdss94i}o_g5_BuMK<CKUX&7r{1ap5-#A|I4b7|3r&)fq~#=WLvLZ0#=r!gx1X%FZPkaVX3;}mTQcmb'
+  'tumX_;5M5eGQAp@k`~`zOn#)zQioDBJ0iuh9PW(@>R#plkXGTu`bgdtO8p;Ttye6Tx0=zgkIxaFgdV?Pq9}&WTwtp6o6cj9u|7^7'
+  'cqgABlTbCmjhfw-cCC2bMyyjd%IiR6n2e&Qr)iV-jW$$30h~PFp|0{Al&=`Y_g-pw(Qy>@q2R4|9h4vlBnp4QwK|kXOyNVhP26^)'
+  'h(WNO-`wC`Ai`U4bz4Y3FH1;ZR0qyl++a{^0-gXp?wmq1K?GyPHs!gHPL?R;$jsYHrtc@Vd<eXX#d*ETr>fDo+)RTkCmzAmWK!Ws'
+  '5$}>G;OPS_j3peBLLt)M+slQW@z7P-6cq8wQ9>HRu_Z}Qo#Hg%D|~F8jwA5cqTMdTEr5@V=#-kB+FL<iY6%;zoAx!8fhH-i5mgTF'
+  'qyyh(tvTZXX1@~<u8FF^u^YvFR-23o1diSF8s{&=B+Q*QtWwIbT}wvQ9}Dhhym0n3#B{C;sSyH-9TvH`uGOclWMD2#-2f^GAiwQ7'
+  'xAPmVp$yW!D3-x-lEft7rz#p^q&jWzi8RFdci3#lAlfC>+gK2Aa4;eiQ4V2_@eje|0d`$2<_Z3Wz%2fYH<#<V535)0E=Rts7Z!Fk'
+  'BnDP3H9Ze8aai07QC2zphIr>psu2)}L)*<{VQlx2`VcIfNrxIzv&+HxBC~rcRT)Pw-yFSs_xtF#gTrI^`)u#s{tMC7hdb8Smq!Qt'
+  '?_Rz+JXUkZxE}cXI@va?$T0BVgE93aLHfmb4$?o^eyPV)y<^99P{|O;wAhS*k4DnN;X`A?L1nN6`l0%ex0cZn<W}Gzkvy6Tcs8yU'
+  'i-MHRwE<GZ&P4Wx_>Gyf5|}D*%eg4e$|<~|IHG_F3;`)}QmBdTBOWRcxPxwP-`W#M*npWGCMRYaFzS%GDX5{RW-bk>cfvoLb5SkV'
+  'dKy&a;7?{o14SZlGrrekQA_OjHS*q)ewG&m;^`MHTiB|6E>2#-hBUq6Ca_J;<70GL6kkwbp~D5hNx6UxJ!DN?hgw9@AgFOp7Me43'
+  '<?qO{e;pbw@%`S9z)He58p0S#3=$u%?rtThE2ms+-aUulTDX&<5<i`B4YBCTmk;-3SHVb4{)TJj7_Hs7a<tN;0^qHz?5n{!BV6jo'
+  ';+CkFvO{78Foy0TB7K$LCYQuw2|A01LA@FSzSuTFZ=oq(&pWn}2YzCnjzDBd8Rl`ol;JOH&}TH~pxPJYYq2zktp)Cti8tdAP(vhV'
+  'i%$k)>zLuHBo77MXDywP@llW?9!ZC2wEa~E8tgr3(b&$7U=nUISQYHKn=HANhMAbxDi&cPq{X%@c9n@eDK_m*_cmMv99p4|WBkar'
+  'V+h_T18b?)-8{IVY>;P_!llf8d!5=RJeB0LYJDk6H;2K8-GCb)oE7L8lyP-_+o97bIu&04(3u>i(f*5<qrG=;Uc(XhMbi4cqvx<2'
+  'K-dT%Ui;6I{pTd3kx$9~Z~TIvlEVXj!B5Hlzw5;ziab7CSLB=D26m3O8|K*m{n*KI3^{ay=dTVo?$?_GtB&Wd-hXQmFJ2z6E8@`Z'
+  '*vnT3UXFpCWgsfD^1M1|(NH_b@5dW=ZQq*p{e$Gtn)TNQ@75K0Y!!J-MH(d>AFM6mz$)RuDdFvlgAE7b?a`Yy1EDh<9~?Ou-q;K8'
+  '-3vd#z)o@WcEeV_`~7Ic9ANDdT1JrKE7F3!!{-MhF=<CH_bq}j&N<_Lmmt25UdwsggFoWX2X?i$^BDe*PQU1|+)s7w<I9o@c?Gg~'
+  'xanV(34u&fQG&Q(VUQnuhD8xifCb($i;)p;oU-PZ<@UTTx2vn-BHyG`qvQK;UcGsLbj)ZGgP));4-wM&=by-Rq>t}@?BlyWy&K@u'
+  'kND-$PQ)ukr2Cml!qhvQ_h-!Y7~l1u&^s!rkMGE<QypjE<&ZDRx)Q95Hhh-0MXn{${5Gk^<JG(@CYGHvS*Oh^aqSn(%8d9J0{J1C'
+  'qBPhLm)^3lZ?fXPB{=&#+Xl&4ykDF^OgeHboB3cuZ98p9c?o6;z6+KF1E@z-E8)mOf|0}MSArkGGWuAC&8Wx^1B+KNOS!rItgeLA'
+  'pqo^m@R)xm5YPoG=kMxHFN(4SnqZ=8-w@2QA$c1;lGvCk4mZXqC3aA+AahB?SVC*sPDJa$WK^`kiZU<O1Bzx&kzlZa7Ha-GuGN+@'
+  '*Mfb?Q@l&1f3<iWD%Ro;FN?_{pRyxIx@%ygB80QaH=5jRE@tt;nV5}kF8(KeAxJ0v?8D1GeTJ8P`rhR{%0><CG=O8I3BT>$L|9KR'
+  's<`x4p}!baocYI@pqH~9FqFgQV-+Yap<l>to1X^ilUi79SWs1(B`v%_3{DE90~=njj$Y0gNFMyR0GEzgcl!Ql>w6}n-_d~GFxweu'
+  ');bPXTnctNF`kyjhek3bxTUyPpo3=+DUu7bZxNy?W3l`wic#HxO<96PvchM`Clj$^>%t?!u-OW2yssk&6DFy+5H2#<@YN^0EfT)b'
+  '8ARh1=j@VphC_c<xO2QylH3FDgy%@Q;hqWNAGeXIL8(Vbgk+mf4NyH9vQ>s9<S^k5VfXhLPx_S1Mxp7!jQDm0JzfT>{nz9_frNax'
+  '_f>&|&e%}Zke6|8>Eb+H*6X4It{EDKo+?-}8e$@DMk{g5I}}A%)Si-8WOF(?M54iV_1s9q1$TPP=-6VK7=GHAB?U-rQ^*F8FE1t@'
+  '=k((JPy{LTLf;LYrnJlH|6GP{5=!H!gy4C|wg52IfhNOi2xR~WV}a4T1&IokZm~(T8TzGTY@@(_ofe3e3ihFy3ZZBRVZpASFG0a1'
+  '4rfdXzxj;r(2D`O=3~0S=@uw_+7O>mW&$<C_vnO*uLY$~8)2yt-89p|e>%XS6W4nPj6YzQNj@BUq@qPK*cn_E<duQa?*Q{|0QE?q'
+  '3$f&YFQJ-XAOzE;g*Ff5tpCCh=zz8dmViHl6qlgHICAUh>`8}aj-p_qe5%8<NUy|+a%z%p+?XS}4UB5Q=L;1JHb3QfNY@-odEjDX'
+  'zAYAAsdv4~=YR?$wkuqQSQ(F2F`pK&p+I4Hv6|)!zK!&xIl#-=e8o;90J{iX)&vq9F(Q0^FL}*|{-ha^2$Ce<?ZK6f)gbtiaEB*Z'
+  'vRtfY-~bK6z(gECVDdwvRZ?aFRj64kxi79!YL&1H7CNuM88%h-Hq?(om?UN>a}X&nt3?gs*=-=nJ#*MhI8ZUta?d*#&Srt;``O1C'
+  'V3Ba;R1!0;z-!VAgU>;eA5)v?*x&`UwdSk)$qs6gn_DIC!=|ZV!1l75Onh@Z<%hwFX|24FNHwAtUvMkSE&3I9*cUt_q?H>V=bYuF'
+  'Hcz0hsnVK|FWncx>Z=pOP@20FG#tuHzZpB~0u-sCvo)p_H1(J=H&f8{L|WzmweksK>ze|2`;efN@*F!k^&&s$q5`@|)eTBU#}Val'
+  '5xD<Y<%_}{0&f^7b1-BlF(;^SZ$s~hDPa118e$;0Nvd0du{EUWbfo}NDFx>8dO}C?wsF48h>}`o<PPHsB3mf;pp$-&+<5{+p}>&2'
+  'd7)Vor5UXz^MNfktAS<Ghhr;ruU{E+O;2`SL*M2WaG6iR{nyy&+uJ*S^UF+4rWxH7r!}+!r&X3*mW+=rPTaB!6{RGVC(S+O6`!`?'
+  ')7Bu?GvzyVa#@~s`RBAc4Toi>(Zx{9j*<~`HleQ7>ejCBkKBBm4yYb~h|1G#!mak05%VO951ebGAWsTsAG!1g1%`ecZYZBm5Z*E*'
+  ';lQ7Y3ulo7&~QZ??N6;`MuajSD<%-%J7W=#H40kQf)@j#-JLXu0LYjH;`sRqJ=Qq&KS;ITVdV%}2Xt5|0WqoZ2?gHj8;XhHiNl&b'
+  'd=h~7lM|wX3rNZX{YWhl9o<RU>+w{=pjhE*eS|>(gTqzXg6xx(k0SU6gN{BwyRBO<OF^C(V_GpWJ+vPs@2j4H)MhYH0p#XVu=&53'
+  'CQj{prTVso!kl%zst{IvXk=>Wd2zGEo_9_*>7{tYT4ZwWbsG^%=VYUj&1X8xc!1sLgCX`p-Gws^@1wdNh|tvjLg5K+eE3^Mj<n)|'
+  '0D{DoC_YZA;FFK1e1|k%ZK32^#jqBaH2Xfq;zEo@!9TY+-1JVbAFtKFap9|vI+)7CDBx(A^kH8zg#PGwLfBR}Jd{{?r_-7FCek8W'
+  '4{}pOK#9&-H{YTqu)UKC7M*@~)vMHr*#-sd20*FJv+suDQP%d2R~~GJQ#afp$JG=ZcBX)AHj#G@u3=d&!NLS0nHYC+=aO?md3c4N'
+  '<s?}ahi)qP7s|xa-Eu~ZCKgLBAsxK!Kn3`ms?$eCWM|=#K6FHmX8;gOH;CJOM!%jzR4)4YdjaA{`u%31)n-S<1VmQG=wXZGbbPpX'
+  'U)&|`Uv%$Zh(_I)Clq!_up{ahu3IGkza)?81j4d+!Jdcn%1rhQh-)JtBJ}=I0S|?vv6Y-)+i!QpAj}sP*w%<^EnX?in<$=9+mb>M'
+  ';*FLLSu?qW3>|IOvo|d-W-9EQU@gS0dRkQ<S95Z#m*LB>jxH4fax63{MaO(u5?qfLWD^S8dXg_Df~D;}{yCvscoiB?iyR_xN;RDP'
+  'w5$L<S$dqVmJ75q8|?IDWVUIsM5Ni14u1wly!Yb{>LU679L;5<w?C)dQbFsvAa#DI1Y2dsX2BOyu_4}w2al;SRi}>Fh)dUlFKOtA'
+  'T(BtgxPnF?|AvNua&LOQ-k}bKpvRoHCyXP3hb1q%PytAemk5F?WiQX9Yy*^_5QPW~E)j}<Qq3wrq2K8}>2@FX9wvKPvfq8vJw$r7'
+  'zt=tNz7cD7Fz5@qa=}w`%+Uu7$v(g`R10*p1}O{~M8X;_CcR|OG{F@EPC{GJ?;<2Hkxk0S0B&2cSUa<0Wo@i`^`!3hVQUGtJ2S>?'
+  'K`o`?{`|t_O`qd2;i1og8f+CHx!;h5MS%YXR4S?ih38U039UgtqrkV2ewLdv&SOUlj;s!)MZE45<%p`of=|c|)mgBcv2HBR5T4p@'
+  'ZbMJjb_5EHbVe<Y7X5)@j6VI4yux5z^*qOW)EQWOLu?L$%NYaYOd?kBj3Rk~{7-twC-o&k`_e(?n~KY3;j)oUG`e8w4)6v_*mF0@'
+  'HpMH{>U7Qw7KKJ649DJF6ld9*%Ur2rxL|G`AUYGk!kUSHbMbGCk*H{O+@-0Lxg%1V;A?Hn9pF|cw~a|uvd?Ri$)uI&RwcSs&A^UZ'
+  '{KNY=4j8UC(H+5lZcT0=5Y#QGE+)71b4UFAoZ>h(Aaw(4Rm1wP@C@rrq+FFLIBxvPdD&E8GyiE;n^W2JM?48?Qsv*JWYlV4pCoGz'
+  '94Bh2lP<hv27K^6YU_wo#%B3p`BihQ0S=#_!L<7yo3~bDnr5;1Fz%8#q3}{lUndatPL@ue*G&cO6-7;8cYqf|)Ix(mIKY!m198AX'
+  't7EgtvmDG@Ciz^Pl|6BG(%DQiDvsj>SSb+k1K@nM$QQRzi(p6af&qsqy5UTK>qn=Kp2o}401gIrgCK$Pa)@F;8~#STmbz2-3?twx'
+  'fKYc#VCE%C=FInm&VnDr|4rE#I){S%M$q;-LXnNYxTdH9%M7D{fBZ-!pFEV5Pv>ZUOYez%iT9{NDnH|(icjI00~dA(a}F4BONmBN'
+  'EIIf&J(pM2)WkQt%I7*^_+zXxBVl=kt_Mr#!hD*K>8;a@b?F<bD(ew>RFEo9+NN=r)W>{oeu}r7yoE}^qN$OVFNr}h=(mK`5@&{`'
+  'aUnK~r<m0nfZ&EV3F-SU7DUGS8InUga!x8c=ze^(nn8?!C<6Q0s+>-qsv<}QMtz~n5`VEmn_?hn1SXSeC({Ox!+87nV5yfz$Nu&T'
+  'Ah=$Fk}#kE-4yYxaE}Uo6%_K4*k3;*eTx^&-(y9OWUt9NJeWdyn-nvc;)#twqtj8C5wR3yMFv?~6u|cvIt>#jFl#Ut0YPrbg)^d1'
+  '>?4*xyS1P}p6>xKR$ec-F**|KOF6_tQu!5YQAxx>2+yH#;*bf0iF*axq240RHA5LXV^Vt_@G=|)+>q#uz~LP)3e;y~#5Y06&*-qp'
+  '7`8y9K-g4LcwZLfB6;~+?ZvS#V1tF^jcle#{=-f$+_Te<nxz+nKk2>|3kNPyvDYCG1~x2EDm7T?%mkIeH;&YcQnjHh@6<VqSf`?~'
+  'v(-E~&&w&uXPB%!Rb+(<POZT7?s~>&e+FOWpGye%4#p06_q{A96LG6xsRvY#hdQqJZ3P*oB$znMi`C4VLppusy7V9{;(GxbD$(!S'
+  'Vwq9<C~}CHr!z25!>uq00%%Yj3au{~8qREod*QGenK{Lol-VK^{-(D2YDNo1(-WVt;4Q&ks(1&*<Z-#JO}u1SW!Wss?p>uj?a0+y'
+  'N)@>pV<;43bcS}jf~M5c7}cJV_S?F+LEma%9KMv=Ih`bM&=HPfP>*J+vvr3owBn;trpCb}Sjp?MTGfz*r#!&HnWwi;rx@Omax>=M'
+  '2(b8QJGWbUlAWQlKr|>jFRj_vO>fkg-62-{h`)ur7E*t-NYXb2f?g42J~emgYDUstXMY+>-4FL(Gxo1h7(CstlOOI2GRUQg-&yi3'
+  'xxdBY?tqwPLdRE@*rV2J48z9=&J3{eftAm|QVp3zGI6~WO!jRtQJMN{&Ywst)*blP)P**U!v_F$v+0GgP1A4?O=m-%!!Di%VphhN'
+  'oVjf@T?y_SkSv(V!}>uv)}bQo%GMXxV&%hixMG8H13ns-D}^_}QAS{FQ5lM+74nX8X3xYdTvkgyvZ3wH{g@24JYLeefpy$`QOrMJ'
+  '2A$&)4L0Z?$qh#o<$7dqS7{ex;;QxVg7x9vjGBeeb&kmro>_b?Bl8t)7(=ah4g6xBGzna%rea{RFM;+#XXKU8ZacNk;8A)pc>p!Z'
+  'N8zFZ*jtF6{)~oePXq5p^xyZ$4eyZ(-6Yd6-Y6J_$@HTaqo4u7lEMGJmK0Li6e(QUz{P{01MqTyHL?po703Q<Aghl!wwX3oTAS2J'
+  'ts+im(o9-=y68Upr?Ii(Le6B;i6ZDT<{dU_ajBx@6v+tgm_5)0v?50r7Udf#T?2h1sIS4Hvki9H9tQ1psc=z>NV5O%ul(`RU(L^v'
+  'k@oi$Iz>1(tg%hH0W6QHRwVmiw=9Xu<BA5TA_xZWvxi|hN<`67&L+i8(2UTrTE>!98*L=}rg5~ls#+shZ&S9_9F)#X2s)<Xwf1~}'
+  'd`n4AX&%IEf<P>4Z5+p{+)M?~uuV-kDlFY1P}mwd9#?{EQwcG$j9@<tEuU>TGVStH8DPeE*GWS$UBf&KS?yDg2?Lk`6gkW&mz+-%'
+  ')k=p6$ekk-nRnHoWi=9gU5qBk7EK7Xg{>)^jF$WWlHIvnF;w`XsRsKCdFgn4$wCcDg9fpUsvGj_36z!j<Cn%EbAhF`dM!IFW#(Q2'
+  'V^}!R1E=E=L|spCu2-)qJ#TwUd<TLeEhU$L&U_D&&Li9%B||4!mvi;t2GRy>0n6NAfuv<vG@bU!4%qjQxmB|T83+4vB(n`u*9n_G'
+  'rB;NDn0rS%8xs$~v(^r(PB3P&oEoa$15%c>-ak}6YT6zN92+RXuS1Cri+mORM0qU?SO6}rExLdl0&Pc3#P|UXzyrw??CzYNX551a'
+  '0|mS~6h-)^{hyyS9Z11>vv*X7j|C_)!i@QIC)xpTV?z8pRrv!1TM+yDGC8Z3m&tWmd}6OPxRlO{Pf1<_EEsyvWEf5vAxZHwt=zxX'
+  'W^t<;z)Yc>q^^?sQ@I>dyd{Tj@=m63+yFmUO%Vi|H<Yzt9fFQiZ<Xc@iBEeRQt95!I1b2Uk$>uFm|qN_G^POHhVI8@J56V0<!XEy'
+  '2E@P|Z9p)74Ps#21*gJT!QTg)q76cs>E;-`9MDL~oe4F092O<9)NaVr856)t3dfI3-88-1rzMdO+-0%rx1S9r)Vg^zcuPBGL{yzK'
+  'mLWMBG|n@7`tmh(d3=k(_X~sW1pKO<JGA1B;la^oA`$S0mS~2@gRgTEl(vbAHaVL5jzNggdd_vf`-Xd8^nOCx1Lf1_-Z7$TztBCQ'
+  'v0_u)(QFoPXeXViQs*rC6h(I7*=qa|<5BC(juP2VEjm5tf&(sr4zomA8qABdVz{AlO5p8XVj_%1=nS;l+j6*#c8J4bMBC4k=EOTF'
+  'IwkYPr^OjlLyUC7nNLF*num4WaOz=fuFsTu#cOo9e<ingq+}Ei{ICq7%yLW~3P{1dQw!zez8Hn|b-1~L$CwXz!BvG+6Hp;Jad09u'
+  'sTfZ4tFuW?3?&EqQ2^~wPwaqk4$Er;xp(bhi3MQ)9;yi99+Ipoj#4*rg*0u7mSK)?`pCfo0L71beXrIgA&0S^LdQ&-)_6P2JVv6Z'
+  'BqqZo2{BeOsy@w%iM74)eI^ghfV~J{nE|qKL80a$I5ap~fC&QV9~R(WLD6!iX#Xrhu%&;3XJ>Hd5ynf&sQyFx1_K@kllm?|zky%2'
+  'V=@fhNNb^>TT>xC7^va-)|rP;g%gWarYX*_e|=)dJt`9|iHU-RuYZzolJ_EqbObA5e8WbzEQM?~a|Qd`fWQtr#BJ&h`h5V6k0qn!'
+  '0*T0ZZgb~12HWoB-80XHULkzR!9i>+IpZ--*h6tK-ctB8y%p3>FcGqSR!gd!(_NR98($XVkKzkl^zW$Rle~XB<FXAxy#O8yhOa{9'
+  '6kglTi$yVOV`1|{@&-aMK<r*L91^!fvi^c6@VuG|)>p&v_at01gu=;ZBpfnJJ6}zws5kvoEj}g~G`-I7LJE$~XwZQ28!_2cvV;)y'
+  'XXsms4BNP>m($yxCr8mXc4BOn6_2hll_Sww6%9afxhG_J=Eem$MIzv7-U-zPqBfV~We;xRKyo`~C;?lJqo5hEmB>p6Wcitr<2d08'
+  'fD6maBQ*_s=tHxqX#vP{3gcqHs$*Rd>v}3i9U_?450Zn4f_sPYz5jdLAY%PhJ|d&Jkh%a`Lup8ei;SWh(#%U7P$b}cQ3<URRjusq'
+  '+F(<VfdWfmK^q2<l0&4F47oE%=*mfT0oj;+E*6zoSc?*TF`Oa8g_R{2i)uAjP>!hJ%`9)cR`*;wLx(nF9ubi`>)uv_D=auVl<U}y'
+  'F?_N?$r*WYIX;D!7!COpP#{l`)ko|J<X|8_!HWUnuY5xAF!}HV(qRq3>!^xWK^l=h61RSuq0&PNWFWo;ih)BhIU;USW-tw1N#roL'
+  'nf@FwP_gO<KBGh<ota@hqE}%xU^OwJ($U|MGg$0xGh@4%ml4-*#@At&{j^~mY#cx*B`tr)!_ZhpX2}X}%IPl?;t{KmrTv!&JE+ep'
+  'bDfHLphoQaYZ+s3kYhiJ4NkQt8Nsn237RQ-r;yB$x&kG+HyVoNc5PHHUlwtf2xjpo71{>}5#F@k#Bf=G5t&Vl03cY5dz_0K)`Tx0'
+  'gWjW`cAg{;WCmceue-V^<0?aC5v=zEqR4i^2<EE+%&<=<U8rRzGXjFB{yq>T31V>CNaoZn38Ad83PP!(pMu#p8@tWDOIt7m(S=Bi'
+  'fwLR~v9tIvlLxviC127`RtuWo5Yse-%Ng{5$Y=TVwiXNm8cE08ASkxAxUHf^1nSBueF6?b(^5J_z!6u@y7hQb&X)u`rwjq@TkSlr'
+  'tr0^0B<Em{id6!e!dgWH3P^XGc&4ZejT6ho2-q01L8B<Y(r__sDYu5x(w{^2o^5;pIE<ESdMW0XG|m(i41<sX_tBXZ#YFV=oFYRm'
+  '3%1`Rm6GQ%0Dv;eXVwJFH9~{6G5G_gN7RF$l4ODfQ18_Yf+?eQcI}7DCF|*u-4UV?e$C_C;878?4HcvJ!~MF^I`j$y6(;wSh!=w#'
+  'Im@~_)Txl~wQ2L<SiqC$Gi0i7xL2BX*-^hk>7nT)RxX-`nKr$)jjesr>vu7qh?-E4tBdr(QRboAMuOdfRwC;&h_s$mGj_v*TeY{Y'
+  '<wn<G=@mcJ(0aOFw74{@%SYPE4rxERSmgw8y_)6Md5H}m1+`^5675GIFn!~~+MpjQ7L__v{_M$L6YbVr1A-+MOEuX?AX&0}ZCDJZ'
+  'W0u&mEt?-2PxFpyT}0bk3a#lW5Oyqc(@q*I<??p2s4jq}0Nj1^D#<64QE{_e<d}G*9N*=#m=?=|6R2-$06<{mek5b9KX>(LheF2R'
+  'G5q&EG7_WVKqth^j26{0M;M*WX*rS_DC11jFAHLCZ+aN1B$EnsjM7J4Sw=RJa`b6$F6hr5`Xg#i!lSpe#2@CE8~m`rvAG<lU>7QK'
+  'VGEIFgL%rQz<%G3IKybZ#;TOlrHuN351m$|`)}fQRbOrsFv9kNbUeWADwi{k<*b;q^KwxyUGEnTqFp01C$_20>lOf*?Zm!hHWu+6'
+  '*#rdAh4(z8<FGp4>6eNcC^2*hDO{{^4E>OtiPNF_Bx-q!J|bFZ1wnhnHA^gTq&RiYEf?cLD;OWTp~480ikw}it82{^*6cA<h#Q14'
+  'W<7Tz*fJ*Ey%zQi0G=NjilDPcX1vM*4jnQTh~B<@4GVxAgAKMGXtW29SQ_{PL3%vy*@GlB2zC>qM(*v6hQ5#S&<2=9cfcpQBUVvF'
+  '(Wnt64U?yqz(rsQ71v8f#C4>rRDmdXr%RB}M)e=UYRyTzsMiSI`<r8N#Qu}jqj45C%+h+j%_oX@sGTfs{Tvg1ta+4-O(jtYCTPH-'
+  '-kz2hh&P$nvJ8`u$XANQQA5(88<UKQ9`X<gkH5?@Oiqkzttuz#%Hhh-ShPx5_N4-ywp~TI*z{|BbIR`SMjfD7S50GT+JbQ#BC}eO'
+  'FA1ce4IL#tG|@z&Ws^@7g198Pv!cAXJVTpYu_h2ntK5oy+!~zv0bJBvCci35&gY=KfS}g8jW;I(e5unDukQDaQ-vcgz`HHIr0!3i'
+  'l3rZ=N_)u~F9r;GIRiKEntWXuR!qt>s3b8FZ=^^HwP2Ign3Agvf*W$1M+T(`YwGP-qm}XC89(_;*Z9yhplKS>4RJwh1T9TgkS!%F'
+  '_Q*}j8W;`;Gu0IHO^Q%CFomWBnvFucnGuVrnvFlho}_I}Lce^C8}x5rF1j0b_M=!-Lush?T`j1;x52dFs=HK(70$7ot%=?jwHc2D'
+  'PHfgMF*FGbo)a~3x?JN`YKA|&i%Tg@JNlC@Z`<|Tid@(s!wOs!TLkLmH~lmVuul!Hsookyj0ST7Haf00c?T*{Q9ILx{}QW{(3Wm%'
+  'V-hwliJOz4)2DAuV%nml>+MIvrYrKK#I)%2pfUb85-g4ptpUrSYuEkBwsAm`EW2aWl^HdKh_GNkDW!6~1+|w^fVpT~;Yr|j8-Zy0'
+  'TS>QRKEFH24lipP?o~7v{bCl(1>}qICB}<dtj-LuWk=1_q#xP{z^TE^=DQ(1y_RM*3Q?xnq-Jv{9z#mR8CnUY0+vWEkxuTe+HzD{'
+  'E<yxiWg<1qmw=wL1P#V65R4D^2u2JZPfiUQkzbXwYLt&lVhA|ad?q8rXNih!!tvZQ8Mi%4RG<@%p`OXm=$VXn9u?bhbn{HcB+q1M'
+  '@hnjRQy7*ylL5Um8Mr%>@wu}^#Z%#E+Fx5CERpt7L#5#k4C2<rz+@!a)nA5O>gKRXqUeMdT31R4Nx7DKP^Y~X63$LP-B|R&y^J1}'
+  'lB1Aug5{;$ST&o6uV6;<E^bAbpQ4&FGyDbl1&R*Mm=Lzd0|$;a+#3wvhOZ5r;_SBLXK-rR+<w^zn2H^NP6Bm~iJ59Pr-9K5iqSik'
+  'Pb^}LOS=aQ0sk=OpNiDt#3B`^$<{C#G<p=3bva{*<eIF3I%pz=LzOD>@0bsgc@3;b?2ce`yFdTj`|0NfL5ymjBwQ*|95MfrZ3Jd9'
+  'OT!RVRK_}psvzzpiFf`+`%)dLS2>Ao6LrtW86<U30=UbUTE5fsx8wP0HfDT*#RVJiwcOrfpv|YYft5QAR1AtV&ZYKcTGk)10$>TI'
+  '7;{KF;zomMg|XFeh<JE94`6r#3wINA&Xx$BO(>mfwL5ph=$z%(<%MU}1HucB3Ean+p`dI~K|t9^H4ti}T9nGgTCBCtRdwa#b1KB8'
+  'sF|#PQhc*FsA@bor^Sf0;gc5ddrKn}+&AZwm4)2X*ud8!B)${@M1Haq%YQB3by|>OOkjtcOr_#QDH60r@ovnMS`M$Hd}!GRxRlHx'
+  '>Yyv>=9`HbAgZ*YPX(A*s-P9ZMl~L<=4CPAsazCb=_b(yz;%O!T^9=VP92c6u%#r&Z$Gy}c0fJ)J@7lwDC41;Tkzo0AKsDetm~Nt'
+  '=KwSvulQ7J=K<Hg2DyN25%Ha?2!@vtEwHkUf;4N?zL3NngHRigu?$E%kYx^PW@8t~7LFYM?_4fHcon@_W`vGw1OSll+Trwf(!1O&'
+  'fgJslE|zE!?;IJ5YxL3A{qw!84UUV}d%mbX7c<a)bqEYa&|-jb0bV~#>{mdD)Ag!Qkrc^`7|)oMj$Uggr;ORcs;3Y4pw-qb)8gw{'
+  '5gClCh3nsz(wp-6jFfyNb!t>O2L~m$#^Wq)aE4&1uN>!ZacU@T<jo{vEhRYvF)|O%v}%UNWeMSnmhRh-VY}_hA!_|4DkyJp@fM9W'
+  'u!UXAs4(1#+6F47wOk7sPWx#jj~wLyw#Waa5($eg#Dx(=-k9Egg4@tCCbn2Z^g3?nWs|g!1Fn6w<G@jxpqkNI)=1C&G3D~gn#dTb'
+  'F6FC;6IWy$!II1xOmQ<X#<PQmANqxY-+<uO>usgDP5q(vZNBbi?iDh0Q)XXa<`J>_!nr`}F24yJ4u^HDgt=$f{zihPapjabZ494='
+  'vrj)eacUsbHp&s?df~KzBgYSrY%bzp=$}p+hN5?2cuX1}$e}sEp!fosPWlKWJ{G8bBTo4DTssKW;FpB2N2|HD2;$36?`i~nZni(P'
+  '(_l@Z<$@o)!LuRH!!n;AVD~~Ky~VA%#A94NG<_ulB=d4#KTYZtqF_pK5%`@0?DuLmD;7O}#6-?fRI-#SSId(Qxh_TQiKTD_m=HF-'
+  'W)21y1o9`uo}pi6te!1dQ5%A6h=l}K)hre2*yn+nb#O`|p>_f&z`#w@(>5ZrJnBOFCrXy=DQ+WSvU9XPRn|$E>|#@ntUG%B{?)se'
+  'ulL@Lj@}<0zC3)c9F}!}I2mX`2Z{Ti)tMC_4lo_gz_CxPFAfc3oM+%{xGcvXpK6jV7SmFR0l-9dS<SbxW$R<Z`S(lh<c2}xG8tEh'
+  'pTxDAY_+_Qa!6XCJTUzdf1EE|s5Ya8Q&5irTQPZFa}qzDL>7*w+~qX9%-A6<@F27Ku+Lo3=__Q3F~NvRI)be+ImDRxk_l2LQ`}j#'
+  '75QaHcQdm_igO9x{Bz-afw+J8-mQq|N>n6&iSY@>B<w`8_LTdh6p^a2u^W*Y^JA8U>@+lx2ra-!rV#^0qim+KTE<lO2<4|vPs1U`'
+  'WEIAf9|lYg7~|2yWs*kKi&%@vmwEk>n*AwDbjv^KX0ZXBno=Vwv~tX##u&{GusTiE1qxf=40n{|MX~R1i6w=6K|aK@P`E1U8l*Bq'
+  'j8HC8?1B{|SCf&Iqp{va+e~8)vq{QYkUQ!{;=3%t5%ktMsYxI!!<wsGMkIuSB1b@1<ZpMuoUQ8HSiCyzC>oBjKp{j#L*#%45&=am'
+  'b1*N`Ld#&nAd*oqdW7So9ZJLGLHceL%>~Ub!H%@KRTI({*e{pW5@DJ9QFmq%Db&#c<YWL(G~%K1E}2eR47nUw7dnMtBI{`A3_1&e'
+  'Kh~5NR!?m6c&^&O?OYd}JJPX9xqxw1-D?Q+A)7H0+jzuAUuLUaa@ESal0yV=8-2nmd$-%{B0|X;T|?Z~`!K86=@jKH*eu({O6)K&'
+  'vNIQgfn<l+D!3|!xI@hb>!rmfxHQIH25iOnH0M0QNOLXLF#l@1jQQ8PZ6|JSV~^Ha8!wCPJEEi9th6P4@&Q6Ua=}v|3pTY0=jW!M'
+  'SHyffJkBz&wCInlAPcC~seoj~vJL+d+taSNdv;!l2HV}dwYI{^r_-!~5NBc9YqLEed4e~zq9R-x=aqvBPejWHg^|>ZGDbe)pnU>>'
+  'AaNUU3`T%p{?UW~&sX(jCqPactqeMS67!x{Cm-$=)AFJ`1E2d-y5J5n`3V;BX;V_MT15-F#i`}B^9(^+1phHDu(=6n<>1(wP%sQY'
+  'XMmf1O~6zl$u)$_^l|J=8xQT<;r164)u2;;@+eClKG2E0b>vC@BWDpb_ZAl@{Zg)3R?1ek9ANqYWr&-;F2+B!TE#yH{u0Z2NT8Ap'
+  'Ye&}U-uU(6DbH_%V`&i-G$%4hr?`!J8dFVA!-Uo}pp=+ora-<v=?+f4h@eWx?~qqXUqe9{R2$?4Ck`jsqbm<LG1E;8ZTes_lInc{'
+  '+P3ROe+bdfuZ@N4^Mk38>ow#t?Z*uJMwqUgYd7he_SeaOCWJaNF_?FG5QO_3xWgd$qdqZD{4;Ggz+Y~eIA#Zj$ME;r-n;!5ryEV4'
+  'iD$_3hV5xPYn*?R3B&T6r;B<>X7iXlz1wWr=JMWj#X^4B{KWc64elwr1q`k1>tNn}=ECP!HoQG-a*Z*pfbckiRkOP41P&?WFX%W^'
+  'l-Fy#blzM`e8t#(Y9QdT&YKJ1t-ii3<aL|o{!03-@@a6HUxTf{0**;}Ed+`ERB-?M`_YwQj*D?651oS>-hGv;yShUM4^r@mkjPUy'
+  'Y3Anbjm7aJm;-U?>7)`_r2^b)Q^pC-ysmvnOuRA@w*ffNT)YPWGSTagdhZ=zpDs(Wjsj<)8~VHiFXQpp<a@+O8T?o^j~uDqO482P'
+  'L3RKj>9~TwtYH$<*7$kh`|hW(p3P}dZ-FuCMRhUZ)`^xy?dqRfdKDTnuJp7)6y_#AZNA+FrTT}Jv8#}Yk%FzKGO$japBI3S&O?RD'
+  'rnv@Gy(}gwE^GXL%lb%(sE3L=A1N**K2Vn?IC0FQhkbudKd|7vD)o0K?cMuHc+6YflAEO=?QV<lPJiDEq&`l*s8MWrq4e9U?~Pwu'
+  'O`oS4rL-aWhdv*Tg~SBQr9~p=Y}qk_bZZeT>!!?OC9npRWHdx3)kmt=3X%+#X<l<Krq!8XRy=K&UoQ!pnXGk`$Qcybh=Dfo0fO8W'
+  'XfI=COAMiM(~%=C1$=<8O*20|1u#HO3IYP{bZw)2U7zgcp%Uh_@|oOY#rKt*+<#PO7?5~1gVsGw2rUlHC98Q-T8KW)8XSW+-c*gF'
+  'hus%#hfQ>(XM$@d%dJABKTZ<2S5VdmGHI0a49na{6n(I)!TMK!=~&UeaY)ki8^o_aBzrV16PPA+P(khtO;~|xf=JTh^=t)J5Iq$w'
+  'ZZ$hc{3h2P=7+?P;#XvYa#bj212hx3g{7L$ZnfT*wT)IubB;Bq;7eNYrHYTU>3nk#Ca#Dg@cOxfhB_fS=um0d{w7ka<;6B-FkSIN'
+  's(45p(uQRLRgj=nwEyH<y^CJR(xp*x#N9KquA9GBR~F=DuS*CU2+P!to=f2Xhl2beD!rjc9zG7ZyHF5H#0*(27HEWs7TWnm4sK@z'
+  '@+XGlueBU_CsLj5?GhvYlH#KolSP+-u+8Ns>3K$;Yn#!aAc1`g^=1j}JVi%kr=$@!qmRNA@nCw0hW?t0Z;=S7C{|n~4#nS~85W_B'
+  '81_4W!7_D#1_sc|87P5bq>^uaCpHUNl-_a^Qn?nbMHs5ql)rdvZa^E1!sf6LAPB+0f*rote~k=iAQpA6ITW>rR6yTtd8xhtX9-gr'
+  '$*XO|R(T{#6BxVL^~)BrJ4-fhy`;N{NZk!5d<4sTjb9Asa?kp(VHqcOr8AqDl38Q71=KnDPv)bQDVgCl#l~Rkd#y~#BONA+_?Mx<'
+  '{`xkTqN;WS!HNI8fruYO*c<PjU>^iS>rmZ|upnTn5fwJt2eceQ*AXyiR_xph%(Lh%F>?8`_1Wy)kyyYJ@49#SF?fskP3SITqE6Dg'
+  '42pFOAJapF3=ZKo(f<CuAnmAqN2qsKJi?q33LGM!{%==jQ#hP`H$QnU=Ay9>R(whEu3+<#u8=JxA=esC<S*6&RNO^qc*Ehzf-Y7O'
+  'X?8R7%<xg>8ViWIvw&beY~&wiNio!5a{xBq)1!gI4F)dUP$d`TkMGySdSLvq{e3*cgDMa}-6Hr{u@2Hku{SL+sbZ0q8utRzW*K!L'
+  'ZvobCcxj`38m}N=wUI>>ndwGe5dSn?(S|lC8}!CKAtI|TdMZSBm%FeHv2wH)e{HY7=M%zZ_%a;X%hJU*s8w*r;FB23QpT^8{JASA'
+  '_kubryegT)GiTwssY@rX1U+crU1XBDOvW0r^J+R3Y`h^dvltjzS{g(eG!Phi1^~kv6)Bo7tE;nE-}md?`;+^17yc(6DO3Y~L=+ZS'
+  '`{KTV-f_wO3z6c8#v79~Do{x~G4M`&YAE3)=-&h5_m2E6_J{re58_Lpw$iGFZJ;wNyoY?Ep2$@L`RKj0kM<|biUQJ>?R%Eo-?~Wl'
+  '{$nTUAk#k4?%AmkdPEi*snvyEYg_vs<&)S<;({f3fmtG9<Tu^NA=D+Z4~uAg*|h3Q1e*vlV;VZt(lzIMw3{k8pE%*}_a2_(z?!yI'
+  'Er;tE)xce;2Bu!q$!0WFE51{CsENG$U{M8yVc?^CVcRF?=-0cWS<kxZC1knC#|2QM9_lzoB460YPcf-dJOs4sZ|t6PzwRXm`C?iE'
+  'l)K>!L*ZG%EUFlH_kOefbka<1(CEo@C$YHRv=x788LQi;*Y{&Rc{l?mT;F_N|JkS8CYEDpuS8dgp)2#T5k`9^Or$oN@raHQ$tNO='
+  'Qn5Rn8iVkZJs+JiPE}(yvYObbFBt5>t}kxjD&1ibC&259fmOl<Qe_IOWS!|O5f}hKL#+y`HUQ@=saN7R?A51Y&t5}xW3ks~%jvCX'
+  '5y(sPnW+dV=Dna<mMb^ZO64%$5zi68XbouS)9-Ll1$8Cbrhwya2txj)U7Oq^jjUG@c2fC5!QKS{0LTsj&X>KGVI#vc{lX|iSR}jy'
+  '=7l>QyB&SFN2>;s(=RF(RumOWYYWc45$#TRO}~sdHCTZB{q;KxF&V;sxF?4fEW;>vbZ0Gp5L!0u$s`?8vG{dtZG@YB9b#ZbLOJm3'
+  'xYs{{cWvNNjYaX@`O-E_=%#GvktC=z8-NH}Oq%Y^vH};vv5Q?dzA6AkFue?C3bUG_GGc*yJ-ZM_$iu6w5!r1Q_@!XuTw<Ts>>+>J'
+  'yv_9K7s9W=pgMOuXXBey&<HG;HY@#XH_Ilo9mxj>1la0d?0#N}tLN3~YIIfPv(b1Qm8Rji$^9?Lq)0BS74!^DG*t^aSW(tkPXs%j'
+  'IhZcD^;f5i{07Sq12tJx^R{gTVH<?-)eW?(3AIIr8WTG{7u_?l&XJ~rV?!+BfT9Kq#LrKAVssGZmc-<IVj$kh>_SDF9AB0T!7hg*'
+  'ia88;12Q_a%6t(U!;7K<4d3mWpf%25LZ5Iz(wK=w%vAPIG?!IyiQM>2v?ccT;@$P)VE<nO7ztc_9I3ITN!J>)u3(e+d#K|Lnvnlb'
+  '?y+I;l_po{HaFimfW;A_vA7r(U4p3<o4czlXr=0=2Ka<)kU&6KXfTmbdLD>3g~TnS*onee{G&R{l8b41=AlxEv4Zyz0q*&tx=Jnp'
+  '(h9+Yz#F~1LO}QDugWtg_&XFcbUxsaVeR+}(#TtDwOZiSRJASheKW^!*O|uEhg3%VMz1R6q$9S-HgboSp=z7gAiQ?)pt1<VGhJ4>'
+  'b?q>P)oM8cYp@?5XUawvV)21b4i}ZR4*^E(4KACZuE+2k`rF?7SMNqIe|vRc+tA8N+jhdfMSm=cx$K#kI7f^F6T@%l3a-+*5)_2|'
+  '6GbU~0wijo2sbW&7<@uD-`lIagV)*WvUY-&S?aIb9%Ty{L*AjmAhT*=7qGTXlx@A1y+!A$d56Jy)EJGV-Ibxmka$nVeL8}NlUj7{'
+  '7z#|T%N)r<k8}}rg6rdEJ}t-P(!jVOO+|GEK|9gwT_h^TE5?qV6bnm(4R*l8FkVor=BBEc9^qvLOC#dl5vjcN_S)ceCqC=(42<OH'
+  'VpVqRL4qqS37-I$iy{iDn0F-lTf!~nX~Lia;G8i>vM0`qgahGG2s+!`uz`FpKV~>5S@Kq}k?e=9;c*%<aR^OUiR&bwE@=cM_$H|b'
+  'jR-=VSz^cHcN?O&htS=VGM`o#z<5(g<$NYfmI2BF2HvIxI%6zRCKazs+UIHOKhN;bu=(RwDz{2A*kEI$-(426xnv~@(7k9*4{Qhc'
+  '-pTngg8f7~0+v#6*DPItX{a_7bRMGqFd}Cdm$#Iz&FUsFZ|=^kDv!fC!IgT=TwE+aJ_4p-`4L1!qA~xd7Sb0>oEN_ilSh<LInO}S'
+  'zms-&Sqffo81d_%(fxrnmd4akNr>*o`vt8kJ5L_>v*giF(h7P}p)EdC_pG|<7&!Gqc=tv>_x|nR=-tcxy;p$8k&gwH9}Z+G=<Ytb'
+  'kTy($o)XJ?RxOv+l{DWKWP*McGslogs-2-V83&EN$`=>qY=jpEC_C*8cKp7H3*U5t`Ebs0pz+M*G{9=$S1a-p-NVkRn=HWsGN8kP'
+  '<oM7cB8|MZVM?bK_$&tF<A{i$Rha(Ux5EL#)vvQGZY;M2usP+4c!dct*$|W2sj%NSVpU(vthh4j8$?Q`Q`T;*N-zarR-MY@8X%$B'
+  ';>#ijbNg7EsY4hMF3=h=j~`ca@%fjtUvV;_6ug4{vJG$6S5I?{!L>xg7hokU)`Qg&_0d=qoXQ>poe)+ACowC72)dof#5~7ufj%z4'
+  'W|=lc=Se8RxSFo6W-85~-`s05uf}mT#uv<*#O;ryFDw@$%+H=AZ8}U)n)YhJT7ckhTMRM?YULf<C><MDOsC}>i31*jy#x6S5bV9z'
+  'FMlKMnMfmU1=^=ZIs6$$7qQaEi)uRMQ9H(mV)A#(*u_qY?GQ&oIlk>cp11h(-R->S9Uch6lO@jEz4!0lyxtS^C|=w(Z9j932U1=7'
+  'sl*ip*`PZTMM<Ufvei{)RCs7K-GolF#Y-u1HTd0mIU^AjUZG)cU^FP;8pjJfB8G!3nUojhvL5!$Wqn>2(}|oRQOvWIAl0+ptoSqn'
+  'hoTXKV1)}!opR`y!CE@>Czt|}r^>NQb#wx;A4S!Ig<I6tKGG?$vtC3(-a?p6jt>tmj(4U=7~03p3mtb8nMjPA4dzeA1}E;4257&!'
+  'I;+G|cqd4g{4SXxVmQsHSAa;b5GRAY(^s`bAQbetT2Yh{dX&r}z3w<1TNW<SY_t~I3dWe@#CaTY(h<~zem(`w5r0MOzF9Tv@^c!A'
+  '1l*y}CFT%-4rz7OG5dsZLr>*+zyrlUv9pD)`;n3cjU}Z9I}%P}y35KAi{8qi876+6Rv=Gva53pF9%&@x23{S&Rqxjn&9bxku;S2S'
+  '(=o>C$=NiYeLRIZ3^dnT!niy5x>2gR_fiDNo!$XG!Gz@?6M;7v%oKP<h)T~X31f6g!VjQ5g8_yz+v)fFF#YiAv3?UPUmj?5B4Dwi'
+  'saPA8H;6Y4n=n|PP}Xq_tyMMbw5UO3$dZR{LZxG8kkB|?uo4=|9?~<jH-XYWC+hv0{J7lMLs^He*HbKLG!h_;e=?nRl(nUW4NfZ+'
+  'MHH#IPhx9Pw7XqsTxuDcnvHTe&CA&m=xhX_3WE4;)<)SH3`3!+RBxcJ@EE#VLk&5KvDCn^@f#0xyr^YWiJO=h6_|BcVF<P|EAqwJ'
+  't-@T{5<3=9b@%CR_!NZ{<k6>qyD+LtDc;kKj+`ZG^lzAoi)L4uR`%?j+_ahGs=(c}vu3T^ouiFQYd;MgqPhTwF;SW=GePq)eB|IE'
+  '*T#{I4pM<5*=dbR7Hf^0fL?IyXQ{iEA=}#pr6swi&cKeVjs(Fe6TYGZ#*led^VJkEk>HzP5(OQByJ%GxGy7g6J}`jF2zIrDo54X!'
+  '{1%WY^%Xh&h3*J!o$ucg9JqXJfT6hLe6aJZ`-rskKxJ*}_Q2kOP!9Li@%6*R7gpjXD_UK+wI?IDqS>+&tRS_ZK?1tJNHtnE2c!R#'
+  'VPH5470kTt@oxsLa$|{+Q()b3byDKq>a>Lsht$%>&LD~5Yj037s*_9APeTFCgMm)?cyHF|)2bXSVIf$<cCAqNZ?kZ^D`zApumEdO'
+  '#(?37a~3c?OFDc1Aue3_@OLyXqTgi9&!;V$jeqzs)23n>g|PRKL3A4}`ii2DOtr0V5mpClci{o;D!S9QI#|K%W{?soS55~`z3!;V'
+  '5K`u#UCH567E$>0$r!JNIbN<IDIO<-HB-v%hlpIF4X1jnnp&=dZM3;;zj$->^55SazB8}eJAtu)$;#L>UaTY9vlP+w!@d82K6VGV'
+  'jH+wiN=ZQqb?E6P+DB2|HI(NT2c-Qjg>|8@J}uxYRa{`5qHGec>~iezAuKhtGx&szADVO2$k+&)*&%3by{402lYxq2goBQBqixsw'
+  '5ObI<d}aP$5~q%kc@dCLFo5WcsF@kc(1s#?24R1f`H)JBMuKJ>i=n|7khw_*3W|p|!onMDespmsT*qk^c)5k;oLcoe-$L0=W9WTR'
+  'A3?iKlK3|C(K(c&>q2l`Gr{P<?POYxKa!;iOi3UM^ANn_GcF=sM-Nr{Cvi%`YcFtG8s*iO)hEe98LEKEgt{pgk!Ko0jEX%;VD-vm'
+  '_0(rq&P_&>3;@WbPVt0B+u49OP`o71R09dVf~ET*Egkl&;kIhCHv#E@q^V-%fhrbp_B0nYE~e8u;J89*NvgXLcY?+87Cntvunfy&'
+  't*m)nX;=A87X^l06c|F856#n{iN!X8wt|9M@UBEECbTO;2*Ci=4dQ%fx*ZEXDe!N}kFvcXPAk>Imr#?lw4?Ll*c%&<+6}!ox?yDC'
+  '!(6Tbz=Gkk!cP?9aiz~4LE%8@f2{?ZTP+J<|H?_h@<a;<$cS57h+S-`EcuQrX)m)FI*L0i1FOSk(=JKt1s&OgU%mZ<!*>TqMrz67'
+  'NCA~NOS_Nzees9>Kj_<}L#7Y*d@im=#Uy#wWn1)wV#fhPKV5<M;jFkI`?FfCKtbNbt3Fua(H&l}G8bTEM>qHnvlr!LQqWBe@BZvS'
+  '39*{QyX|LS=(b1z3}`BiG&x>4Sg7<smf)8i6BIZ!pQ-N`rdqoR?*~n0c4@$*jeft^2P)g|)39a9&KhRM<SuvBxLUj=SHT1vMTQ|}'
+  'b63v!S4+h297$FvWQ^>G`#eU*@eaOw`cE<>P*jpwe?9OHC9!D|@XGQS!D~bGP|@NPbzWIA4OqEn`QjV+=qHBk94!tq4WYrDGsLuF'
+  'el*h!fjDvs1|gBKHs+k95p}A~vO=A%>NLn-$Yz-|!W8)MSP(bZAUWc6jlv^4&E;8uic<4G+<T|O*2);eUi?}u<h@wsi%COaKy<qd'
+  '={O@vBG6#*N1B|gqHrz4pu#L&f)Oc{ZHN6fJMXZ4Zokbzn_Pp@oNVU-@&?61HIjp|sg}s}qqFM9k=&7FK_<woq|y>4pOh;>K<8p*'
+  'p>N={yuxD(X~rYG7Ci)&L=Q9!Qrj?~ySUOm^!Zt<AF!AZdGCX?PmHr*oyzg9Ht!J!g~rJcgZmgwkBRJl(i)2%pgYR*fX?o^Kx_zY'
+  ')HgOM@)anS#()Biju)AlN_AHCcIak0K=S(-X|DV<kOE!j%VT&$<W!A~Be{l31EHe0;K#8#cY1v;`!W95!H-_qp`kU@8&cSf(K@8V'
+  '3;DVrr@-24!BAY67|YNWqXP&T%GZ0oL|%gP2O9929A#_}6k6+Iib09CxI(XpNg^t%1v3I+M@j=T{W@QiNG+-5$cS}O&j6kwf?-Hr'
+  'ip>C92H2SD91918#A$I|OndhBB)L$B<PxZ*P8}f)1}PTwdAt<71o+u>_E4%tyMk!!Aso$TPzUc3)C<zjjU^4Q$qAS?Sx4>#tP|f+'
+  'm2w<;;*iV4WxRQP<T3-Z533&uIc)^4iNC8&F+p!hm;p#DUvFHm#8TK*>kdavuV1QOCvz8zm7G7O){$lsv!K*aitoIOYbYl!kBp+}'
+  'xOrS+9U!ANv6l%_6KG3zoo_rNWCcBjsX#kTApVXD%)RfT;kQz$S$NbIjnD!lE;<dQHTQHZgVUbiUC8aFN4L21!BLYcwFA7mK*C*A'
+  '-*KQ&#OJIMGHzrD5;z=YAh5>d!0o@)fbay!1SZYI!Yd6Qvg`>$%WWg<C+z>TV)+U51qOgs9rD@&pP!!AnlT(@?6BVF&u9#d){4+3'
+  ')aoi)C9y>9!6%zYD+QnMcQcTBV%tYiiJ4inQ`tgU#C{87%V4F1$k`wf0fPOpxYhaxpv?r4D@L)KPv@6;a`gK6x1>{x3xSTkk)oI!'
+  'mto0D2zImui*`6kxI;~HVQ_6^_K`Ill9`;8mv9A|8l~7`Dx-UnKB#_##=ujHLnosN1EL{Lq->TA^N&G)pqT|LUFfuaGnsUOr4nRs'
+  '41T;~k;{RWkr$SW)oh$E34swM4$0Y~$Ul;&fY`O*8f&P@LD*;S2#3RFJY#zUSiH0~2AU}RozW1|%<fobRT|*GjpZD=n;7dqGnc+S'
+  'h?AloFG}(<3|QWBs%ddS4h+o+c%y?{60I=&xvf`MS2=R1UP+;`GFq3}Rb@_z4da6Yz~f^Y0aJDbPZBw{)c&@Ya8zpNFHTMQWLbz('
+  'nA>7Fufw#kVL^YP)Vrjp?4B<`4^NQI6vZ7Q3)HK5v7ie?1$4YEW5e_XN`D1dKH?MsQ|@^I=6oeL>}gWpUUBnja|pu0WC$WyOvx>@'
+  'eVv*pg({w3mg2~*OSmoxKJ6msW{4`jo=`JR{lPO9A&wirW_V@#%5$IvAojEd&wh8QI7?cspy1gr_pjs^sta)!lr-cmKR(m(J7fx4'
+  'IzR!iFUD4~tbAp1ExlQ;YGZq0Fl9~0th|(%zmS-#{tgGDRR<SqG_N2K81U#4b5CI_$kDG@m~RY>Zy1Idd_&gZYY>cH3hJzIfSxD4'
+  'y*n9X$C0^jy5sGzanQpP?%rw7$I6%F-)@Q0$c*xO1cH1N6uR_+g!zwM9hcw-a|%Cpa*bs4+Q1&CKUCheY5Ed?+Tel$T0i7nG=7W{'
+  'XV4@SfGG1Cu5|Z%I}iyVzrkP1m?umYP$kQCa@=leEnEJoZ`)2v2(W29j`m;d9X>x8y*_w%^m6}L5{Q$*X*)N3)wzDGZ--T)Fq(7%'
+  'yvS239DlKxa`KHgx)NM}d}wJ>6;QCFyB`Tf#V#G4<%?j_wpanNnl<Eh+6r92=ZC^lRkiZ1Q<rxf_<h=zN#yn13d~ng$oXpOBeGlc'
+  'Q<_!f(=mw2)eVK=etSJPq+3HvR3yyZh6=^mOlN^r3dT0vwo68k+ZJt?@Vf@^t|-b_r?kVo`m#`U&6Zg4o{%-gHm+;*J9ndn#9A*K'
+  'ixG|z4WJ>LY=B1@<=QGIvHEq9kjjrZ#rP81d7QD&gMjC*br_03NDWQW5YJi<Upu@U`mu^?O_kDWHVPWJ=yus?;PJfr_=b=?WLWID'
+  '#w#p;*6<#aKcp!HffVanG>o+fbcEr|PPY}_Q(y)*j=lo7FIpJE=qvK@a(O>j#-Q3{TXpEBLOqC@$>+7tZJY)PC{;vv*TOSwP&`h!'
+  'L=RvyM&s>OZfGV~vvzzAdGXuKh<Dy|$S)XAV6>f8DyJ@FDAwTOZ4Vh3M~tNB6M2m^@=-W|;D4n3pXxQfPiW_BRRpa^Z<VB4ti6zQ'
+  'th@-E0sck9p;hR~likyh$rwxUeB`pbn{XNm<`G(~H|cSsCS}r)TTd^-1H?7Yg6EVb+znP=6kzDzfVGj~g$z6awY$)T9qkMVB%49u'
+  'l?7@H<?fSZrW9t+?bON^pj~opQm`&P&8!rBIcOT@aAjV*4fCqapl4z|^KS=tD%Z7)7*a*P!GyWY?pT)`=%GLE#_+^I-pH90ju7o4'
+  'mPItWSzHmCHR~*63!S_}<I7{rinSrP$n24ynsHG?YQ2b9)7>#+q@fNtFw@w1P6CLt-@F*O`6FulkRQSLh}D539^fJWjoeP<Fd+ZY'
+  '->?zl3O8beV9Cf1NwfaV{kyystKdRVZp8E(UY^;jInf}JLo{vpmc{M>C=O{US`;9001}7%_Z!HB3l}()Kfa+%)O`&#IIr3+2Bz(B'
+  'BhB504Nzsn(hx&ws{5?*)Ct94^Hv^u3O|#|gdoP1GZq^ZbQsP^LNXd#Q@>POF^w}tk??qqZE^f0jyjCR$Q5J&rZkj^vB~=l(Nop~'
+  'K81mvl;e2DxB4)9WH6v~KZvIabIcBC;5vDR0~_MjA?1vxYhbAe#wo(ut3rGnv$o<G_g;H9F^on#3)~81=r^;$yX!g>13`<KLEfnn'
+  '4Ui`5pwii(MH%F^G4l)H*=%U#$0BOak}ZIvqHpN{bVcn@H}4ESODVo_^){2DYM#t&R!RwO+_ddt$*cuF2a0Xbs>iSHW~v_qLju?}'
+  '8V0#$?`VR+B%i$cs`^+Y;`+^Dio_Z$77WEz&VV$KzR3hqQUGmKMokj`nt(EP6NUp|<ae^;Ro5Xj;gz<aXuB&P)}JRDT7ATB%e#r|'
+  'l5C_w*`m!N8eg@%&tn|hw8S)6CDeKSY`|CT8f%JQ3%bBVB7U{&Gzs3Qsq|Y(yzr&5Y}yo9<I3AL*Aamsv!TFlqO2_BTh@~3Z&J_Q'
+  'qB=_zVw52D;G#i>xEUK}Ja13~9~MRx{N}5*d`<cxuC`r9KPD-hhJFH(FvzpI#dR^m{XfmG&L(;CV6-bPE=c1tI=)h^i{LuuVv-8U'
+  'NqZ<`rf-o!ig<)(_rCrg_UAj>'
+)
+
+
+def _collective_fit_runtime_directory():
+  """Unpack the versioned fitting runtime on first use, not at Coot startup."""
+  import base64
+  import hashlib
+  import json
+  import zlib
+  import tempfile
+  digest = hashlib.sha256(_COLLECTIVE_FIT_BUNDLE.encode("ascii")).hexdigest()[:20]
+  sources = json.loads(zlib.decompress(base64.b85decode(_COLLECTIVE_FIT_BUNDLE)))
+  names = {"collective_fit.py", "collective_fit_gui.py", "collective_fit_native.py",
+           "collective_fit_prototype.py", "multimap_refinement.py", "coot_trimmings.py"}
+  if set(sources) != names or any(not isinstance(text, str) for text in sources.values()):
+    raise RuntimeError("The bundled collective-fitting runtime is incomplete; update coot_trimmings.py.")
+  cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                       "Coot", "coot-trimmings-collective", digest)
+  try:
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+  except OSError:
+    cache = tempfile.mkdtemp(prefix="coot-collective-runtime-" + digest + "-")
+  for filename, source in sources.items():
+    path = os.path.join(cache, filename)
+    try:
+      with open(path, "r", encoding="utf-8") as handle:
+        if handle.read() == source:
+          continue
+    except (OSError, UnicodeError):
+      pass
+    temporary = None
+    try:
+      with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=cache,
+                                       prefix=".bundle-", delete=False) as handle:
+        temporary = handle.name
+        handle.write(source)
+      os.replace(temporary, path)
+    finally:
+      if temporary and os.path.exists(temporary):
+        os.unlink(temporary)
+  return cache
+
+
+def collective_flexible_fit():
+  """Launch the optional, isolated collective-fitting experiment."""
+  active = _active_residue_or_status()
+  if not active:
+    return None
+  markers = []
+  def clear():
+    while markers:
+      coot.close_generic_object(markers.pop())
+    draw = getattr(coot, "graphics_draw", None)
+    if callable(draw):
+      draw()
+  def marker(spec, index):
+    _mark_register_endpoint(spec, "cyan" if index == 1 else "orange", markers, "Collective fit endpoint")
+    add_status_bar_text(f"Clicked residue: {_click_spec_chain_id(spec)}:{_click_spec_res_no(spec)}"
+                        + (" | Click the end residue. Tab cancels." if index == 1 else " | Range selected."))
+  def click_range(callback, on_pick, cleanup):
+    def normalized(first, last):
+      def spec(value):
+        return (_click_spec_imol(value), _click_spec_chain_id(value),
+                _click_spec_res_no(value), _click_spec_ins_code(value))
+      callback(spec(first), spec(last))
+    _script_user_defined_click(2, normalized, on_pick=on_pick, cleanup=cleanup,
+      prompt="Collective fit: click start (cyan), then end (orange). Tab cancels.")
+  try:
+    import importlib.util
+    path = os.path.join(_collective_fit_runtime_directory(), "collective_fit_gui.py")
+    name = "_coot_collective_fit_gui_" + os.path.basename(os.path.dirname(path))
+    module = sys.modules.get(name)
+    if module is None:
+      spec = importlib.util.spec_from_file_location(name, path)
+      module = importlib.util.module_from_spec(spec)
+      spec.loader.exec_module(module)
+      sys.modules[name] = module
+    return module.show(coot, Gtk, _coot_gui_repository_module("GLib"), active,
+                       _global_fit_worker_python(), click_range, marker, clear, _cancel_script_clicks)
+  except Exception as error:
+    clear()
+    info_dialog("Cannot start collective fitting.\n\n" + str(error))
+    return None
 
 
 def global_fit_map(scope="molecule"):
@@ -19033,13 +20355,14 @@ def _register_fit_fixed_backbone_rotamer(fragment, chain, number, map_id):
     raise RuntimeError(f"Rotamer selection moved backbone atoms at {chain}:{number}; candidate excluded.")
 
 
-def _register_sidechain_correlation(fragment, specs, target, map_id):
+def _register_sidechain_correlation(fragment, specs, target, map_id, scoring_cache=None):
   """Mean residue CC beyond C-beta; Gly/Ala have no informative atoms here."""
   eligible = {tuple(spec) for spec, letter in zip(specs, target) if letter not in {"G", "A"}}
   scores = {}
   if eligible:
     # Mask 3 excludes main-chain atoms and CB in both CCP4 and Homebrew Coot.
-    results = coot.map_to_model_correlation_per_residue_py(fragment, specs, 3, map_id) or []
+    results = (_analysis_cc_residue_scores(scoring_cache, fragment, specs, 3) if scoring_cache is not None else
+               coot.map_to_model_correlation_per_residue_py(fragment, specs, 3, map_id) or [])
     for item in results:
       if not isinstance(item, (list, tuple)) or len(item) < 2:
         continue
@@ -19053,7 +20376,7 @@ def _register_sidechain_correlation(fragment, specs, target, map_id):
           "count": len(scores), "eligible": len(eligible)}
 
 
-def _build_register_comparison_fragment(source, chain, start, end, offset, target, map_id, rigid_fit=False):
+def _build_register_comparison_fragment(source, chain, start, end, offset, target, map_id, rigid_fit=False, scoring_cache=None):
   """Build on a disposable copy; restore global refinement settings on every path."""
   fragment = coot.new_molecule_by_atom_selection(source, _atom_selection_for_residue_range(chain, start, end))
   if fragment == source or not valid_model_molecule_qm(fragment):
@@ -19099,7 +20422,8 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
       if final_refinement is False:
         raise RuntimeError("Coot could not perform the final fragment refinement.")
       coot.accept_regularizement()
-    results = coot.map_to_model_correlation_per_residue_py(fragment, specs, 0, map_id) or []
+    results = (_analysis_cc_residue_scores(scoring_cache, fragment, specs, 0) if scoring_cache is not None else
+               coot.map_to_model_correlation_per_residue_py(fragment, specs, 0, map_id) or [])
     scores = {}
     for item in results:
       if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -19113,7 +20437,7 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
     if len(scores) != len(specs):
       raise RuntimeError(f"Only {len(scores)}/{len(specs)} residues could be scored; candidate excluded.")
     try:
-      sidechain = _register_sidechain_correlation(fragment, specs, target, map_id)
+      sidechain = _register_sidechain_correlation(fragment, specs, target, map_id, scoring_cache)
     except Exception as error:
       print(f"Register {offset:+d}: sidechain CC unavailable: {error}")
       sidechain = {"mean": None, "count": 0, "eligible": sum(letter not in {"G", "A"} for letter in target)}
@@ -19271,7 +20595,7 @@ def compare_local_sequence_registers():
   box.append(buttons)
   state = {"closed": False, "candidates": [], "selected": None, "idle": None,
            "hidden_original": False, "index": 0, "targets": [], "snapshot": None, "buttons": [],
-           "rigid_fit": False}
+           "rigid_fit": False, "scoring_cache": None}
   def choose(candidate):
     if state["closed"] or not valid_model_molecule_qm(candidate["model"]):
       return
@@ -19303,6 +20627,8 @@ def compare_local_sequence_registers():
       glib.source_remove(state["idle"])
       state["idle"] = None
     chosen = state["selected"] if keep_selected else None
+    _analysis_cc_close(state["scoring_cache"])
+    state["scoring_cache"] = None
     for candidate in state["candidates"]:
       if candidate is not chosen and valid_model_molecule_qm(candidate["model"]):
         _REGISTER_REFERENCE_ORIGINS.pop((candidate["model"], chain), None)
@@ -19320,7 +20646,7 @@ def compare_local_sequence_registers():
         raise ValueError("Source model or map changed; discard and restart the comparison.")
       candidate = _build_register_comparison_fragment(
         source, chain, state["start"], state["end"], offset, target, map_id,
-        rigid_fit=state["rigid_fit"])
+        rigid_fit=state["rigid_fit"], scoring_cache=state["scoring_cache"])
       try:
         _register_associate_reference(candidate["model"], chain, state["reference_sequence"], state["reference_origin"])
       except Exception:
@@ -19357,6 +20683,8 @@ def compare_local_sequence_registers():
     state["index"] += 1
     total = len(state["targets"])
     if state["index"] == total:
+      _analysis_cc_close(state["scoring_cache"])
+      state["scoring_cache"] = None
       state["idle"] = None
       keep.set_sensitive(state["selected"] is not None)
       available = [c for c in state["candidates"] if valid_model_molecule_qm(c["model"])]
@@ -19416,6 +20744,7 @@ def compare_local_sequence_registers():
     state.update(start=start, end=end, targets=targets, snapshot=snapshot,
                  reference_sequence=_register_clean_sequence(reference_sequence), reference_origin=int(origin_entry.get_text()),
                  rigid_fit=rigid_fit_available and bool(rigid_fit_option.get_active()))
+    state["scoring_cache"] = _analysis_cc_open(map_id)
     state["hidden_original"] = bool(coot.mol_is_displayed(source))
     if state["hidden_original"]:
       coot.set_mol_displayed(source, 0)
@@ -23879,6 +25208,11 @@ def _build_custom_display_menu(submenu_display):
     "Nearby residue annotations...",
     lambda func: nearby_residue_annotations_gui(),
   )
+  add_simple_coot_menu_menuitem(
+    submenu_display,
+    "Add note at view centre...",
+    lambda func: prompt_add_annotation_at_view_centre(),
+  )
 
 
 def _build_custom_user_colour_menu(submenu_colour):
@@ -23973,6 +25307,7 @@ def _build_custom_fit_menu(submenu_fit):
   add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", lambda func: rigid_fit_all_chains())
   add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", lambda func: rigid_fit_active_chain())
   add_simple_coot_menu_menuitem(submenu_fit, "Global fit to map...", lambda func: global_fit_map())
+  add_simple_coot_menu_menuitem(submenu_fit, "Collective flexible fit (experimental)...", lambda func: collective_flexible_fit())
   add_simple_coot_menu_menuitem(
     submenu_fit,
     "Jiggle-fit current chain to map (Slow!)",
@@ -26049,6 +27384,10 @@ if _coot_gui_module() is not None:
     _install_trackpad_native_close_guard()
   except Exception as error:
     print("Native editing-dialog close guards unavailable:", error)
+  try:
+    _install_window_cycle_shortcuts()
+  except Exception as error:
+    print("Window cycling shortcuts unavailable:", error)
 
 _initialize_trackpad_preferences()
 
