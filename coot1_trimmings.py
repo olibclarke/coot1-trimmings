@@ -121,10 +121,47 @@ except Exception as error:
   def three_letter_code2single_letter(resname):
     return _THREE_TO_ONE_FALLBACK.get(str(resname or "").upper(), "X")
 
+_GEMMI_IMPORT_ERROR = None
 try:
   import gemmi
-except Exception:
+except Exception as error:
   gemmi = None
+  _GEMMI_IMPORT_ERROR = repr(error)
+  _record_startup_diagnostic(
+    "warning",
+    f"Gemmi could not be imported ({_GEMMI_IMPORT_ERROR}). "
+    "Embedded mmCIF note import and annotated mmCIF export are unavailable.",
+  )
+
+
+def _warn_if_gemmi_unavailable():
+  if gemmi is None:
+    _show_startup_diagnostic_once(
+      "missing_gemmi",
+      "Coot Trimmings: Gemmi is unavailable\n\n"
+      "Residue, region and positional notes cannot be imported from mmCIF "
+      "or exported to annotated mmCIF. New notes remain in this session only "
+      "unless exported as Markdown. Low-pass map filtering is also unavailable.\n\n"
+      "Refinement, ordinary model saving and other Trimmings tools are unaffected.\n\n"
+      f"Install or rebuild Gemmi for Coot's embedded Python {sys.version_info.major}."
+      f"{sys.version_info.minor}, then restart Coot. Installing it for a different "
+      "Python version will not fix this.\n\n"
+      f"Import error: {_GEMMI_IMPORT_ERROR}",
+    )
+  return False
+
+
+def _schedule_gemmi_warning():
+  if gemmi is not None:
+    return
+  glib = _coot_gui_repository_module("GLib")
+  if glib is not None:
+    try:
+      glib.idle_add(_warn_if_gemmi_unavailable)
+      return
+    except Exception:
+      pass
+  _warn_if_gemmi_unavailable()
 
 from coot import *
 from coot_utils import *
@@ -433,6 +470,7 @@ STARTUP_MAP_SAMPLING_RATE = 3.0
 STARTUP_ADD_TERMINAL_PHI_PSI_TRIALS = 1000
 STARTUP_REFINEMENT_WEIGHT = 20.0
 STARTUP_REFINEMENT_STEPS_PER_UPDATE = 5
+STARTUP_INTERMEDIATE_ATOMS_BOND_WIDTH_SCALE_FACTOR = 1.5
 STARTUP_SMOOTH_SCROLL = 0
 STARTUP_ACTIVE_MAP_DRAG = 0
 STARTUP_SHOW_ENVIRONMENT_DISTANCES = 0
@@ -545,6 +583,7 @@ _TRACKPAD_STATE = {"enabled": False, "bindings": [], "native_zoom": [], "native_
                    "pinch": {}, "scroll_active": {}, "window": None, "reverse": True, "startup": False,
                    "save_source": None, "startup_source": None, "startup_attempts": 0,
                    "sensitivity": {"rotate": 2.0, "translate": 2.0, "zoom": 2.0, "contour": 2.0, "clipping": 2.0}}
+_TRACKPAD_STATE["deferred_map_update"] = set()
 MAP_SURFACE_DISPLAY_STATE = {}
 MAP_SURFACE_OPACITY_STATE = {}
 MAP_GLOBAL_VIEW_SETTINGS = {}
@@ -1278,6 +1317,8 @@ def _apply_startup_settings():
   set_add_terminal_residue_n_phi_psi_trials(STARTUP_ADD_TERMINAL_PHI_PSI_TRIALS)
   set_matrix(STARTUP_REFINEMENT_WEIGHT)
   _call_optional_coot_api("set_dragged_refinement_steps_per_frame", STARTUP_REFINEMENT_STEPS_PER_UPDATE)
+  _call_optional_coot_api("set_intermediate_atoms_bond_width_scale_factor",
+                          STARTUP_INTERMEDIATE_ATOMS_BOND_WIDTH_SCALE_FACTOR)
   set_smooth_scroll_flag(STARTUP_SMOOTH_SCROLL)
   set_active_map_drag_flag(STARTUP_ACTIVE_MAP_DRAG)
   set_show_environment_distances(STARTUP_SHOW_ENVIRONMENT_DISTANCES)
@@ -4798,7 +4839,7 @@ def _load_display_defaults():
   """Load display-default booleans from the companion Python preferences file."""
   defaults = {"high_contrast_models": False, "ambient_maps": False, "black_background": False,
               "refinement_ramachandran_overlay": True, "refinement_validation_spheres": None,
-              "refinement_contact_dots": None}
+              "refinement_contact_dots": None, "validation_tables_docked": None}
   path = _display_preferences_path()
   namespace = {}
   try:
@@ -4809,7 +4850,7 @@ def _load_display_defaults():
     defaults["ambient_maps"] = bool(namespace.get("DEFAULT_AMBIENT_MAPS", False))
     defaults["black_background"] = bool(namespace.get("DEFAULT_BLACK_BACKGROUND", False))
     defaults["refinement_ramachandran_overlay"] = bool(namespace.get("DEFAULT_REFINEMENT_RAMACHANDRAN_OVERLAY", True))
-    for name in ("refinement_validation_spheres", "refinement_contact_dots"):
+    for name in ("refinement_validation_spheres", "refinement_contact_dots", "validation_tables_docked"):
       value = namespace.get("DEFAULT_" + name.upper())
       if value is not None:
         defaults[name] = bool(value)
@@ -4832,7 +4873,7 @@ def _save_display_default(name, enabled=True):
     f'DEFAULT_BLACK_BACKGROUND = {defaults["black_background"]!r}\n'
     f'DEFAULT_REFINEMENT_RAMACHANDRAN_OVERLAY = {defaults["refinement_ramachandran_overlay"]!r}\n'
   )
-  for key in ("refinement_validation_spheres", "refinement_contact_dots"):
+  for key in ("refinement_validation_spheres", "refinement_contact_dots", "validation_tables_docked"):
     if defaults[key] is not None:
       source += f'DEFAULT_{key.upper()} = {defaults[key]!r}\n'
   try:
@@ -4977,6 +5018,36 @@ def toggle_refinement_contact_dots():
   # Temporarily disabled pending Coot's contact-dot display fix. Keep saved choices.
   add_status_bar_text("Refinement contact-dot toggle is temporarily disabled pending a Coot fix")
   return None
+
+
+def _set_validation_tables_docked(docked, show_dialog=True):
+  """Move native validation tables without changing validation graphs or restraints."""
+  setter = getattr(coot, "set_validation_boxes_is_docked", None)
+  if not callable(setter):
+    if show_dialog:
+      info_dialog("This Coot build cannot undock the validation tables.")
+    return False
+  try:
+    setter(int(bool(docked)))
+  except Exception as error:
+    if show_dialog:
+      info_dialog(f"Could not change validation-table docking.\n\n{error}")
+    else:
+      print(f"WARNING:: could not restore validation-table docking: {error}")
+    return False
+  # The native API currently has no getter. Its initial default is docked.
+  globals()["_VALIDATION_TABLES_DOCKED"] = bool(docked)
+  return True
+
+
+def toggle_validation_tables_docked():
+  docked = not globals().get("_VALIDATION_TABLES_DOCKED", True)
+  if not _set_validation_tables_docked(docked):
+    return None
+  saved = _save_display_default("validation_tables_docked", docked)
+  add_status_bar_text("Validation tables: " + ("docked" if docked else "floating window") +
+                      (" (saved for future sessions)" if saved else " (this session only; could not save)"))
+  return docked
 
 
 def _trackpad_preferences_path():
@@ -5251,6 +5322,8 @@ def _trackpad_apply_motion(mode, value, area):
       "quaternion": [qw, qx, qy, qz], "zoom": float(coot.zoom_factor())}))
     if coot.get_active_map_drag_flag():
       coot.update_maps()
+    else:
+      _TRACKPAD_STATE["deferred_map_update"].add(area)
     if coot.get_show_symmetry():
       coot.set_show_symmetry_master(1)
     return
@@ -5310,7 +5383,29 @@ def _trackpad_scroll_begin(_controller, area):
 
 
 def _trackpad_scroll_end(_controller, area):
-  _TRACKPAD_STATE["scroll_active"].pop(area, None)
+  state = _TRACKPAD_STATE
+  state["scroll_active"].pop(area, None)
+
+  # Flush pending motion before performing the final map update.
+  if any(
+      mode in ("translate", "slab_translate") and pending_area is area
+      for mode, pending_area in state["pending"]
+  ):
+    if state["source"] is not None:
+      _coot_gui_repository_module("GLib").source_remove(state["source"])
+      state["source"] = None
+    _trackpad_flush()
+
+  # Update maps once after a completed translation gesture.
+  if area in state["deferred_map_update"]:
+    state["deferred_map_update"].discard(area)
+
+    if not coot.get_active_map_drag_flag():
+      coot.set_active_map_drag_flag(1)
+      try:
+        coot.update_maps()
+      finally:
+        coot.set_active_map_drag_flag(0)
 
 
 def _trackpad_claim_scroll(controller, area):
@@ -6678,6 +6773,8 @@ def _apply_persistent_display_defaults():
   for name in ("refinement_validation_spheres",):
     if defaults.get(name) is not None:
       _set_refinement_validation_display(name, defaults[name], show_dialog=False)
+  if defaults.get("validation_tables_docked") is not None:
+    _set_validation_tables_docked(defaults["validation_tables_docked"], show_dialog=False)
   return False
 
 
@@ -9568,6 +9665,9 @@ def _export_residue_annotations_for_molecule(mol_id, output_path, allow_overwrit
     info_dialog(f"Failed to export annotated mmCIF.\n{error}")
     traceback.print_exc()
     return 0
+  record_saved = globals().get("_recent_saved_file")
+  if callable(record_saved):
+    record_saved(normalized_path, "models")
   add_status_bar_text(
     f"Exported annotated mmCIF with {_annotation_entry_count_label(len(_annotation_entries_for_molecule(mol_id)))} "
     f"to {os.path.basename(normalized_path)}"
@@ -12871,6 +12971,294 @@ def _candidate_map_file_paths(map_id):
   if not os.path.isabs(name):
     candidates.append(os.path.join(os.getcwd(), name))
   return [path for path in candidates if os.path.isfile(path)]
+
+
+def _lowpass_parameters(resolution, taper_fraction, padding):
+  values = tuple(float(value) for value in (resolution, taper_fraction, padding))
+  resolution, taper_fraction, padding = values
+  if not all(math.isfinite(value) for value in values):
+    raise ValueError("Filter settings must be finite numbers.")
+  if resolution <= 0:
+    raise ValueError("Resolution cutoff must be positive (Angstroms).")
+  if not 0 <= taper_fraction < 1:
+    raise ValueError("Cosine rolloff must be between 0 and 100% (exclusive).")
+  if padding < 0:
+    raise ValueError("Crop padding cannot be negative.")
+  return values
+
+
+def _lowpass_export(map_id, model_id, directory, padding):
+  """Coot exports stay on the GUI thread; filter the current map, not a stale disk copy."""
+  if not coot.is_valid_map_molecule(map_id):
+    raise ValueError("Choose an open map to filter.")
+  path = os.path.join(directory, "input.map")
+  if model_id is None:
+    result = coot.export_map(map_id, path)
+  else:
+    if not coot.is_valid_model_molecule(model_id):
+      raise ValueError("Choose an open model for cropping.")
+    np = _tq_numpy_module()
+    snapshot = _model_coordinate_snapshot(model_id)
+    points = np.asarray([atom[2] for record in snapshot.values() for atom in record["atoms"]], dtype=float)
+    if not points.size or not np.isfinite(points).all():
+      raise ValueError("The crop model contains no valid atom coordinates.")
+    low, high = points.min(axis=0), points.max(axis=0)
+    centre = (low+high)*0.5
+    radius = float((high-low).max()*0.5+padding)
+    if radius <= 0:
+      raise ValueError("Crop radius must be positive; increase the padding.")
+    result = coot.export_map_fragment(map_id, *map(float, centre), radius, path)
+  if result != 1 or not os.path.isfile(path) or os.path.getsize(path) < 1024:
+    raise RuntimeError("Coot could not export the map for filtering.")
+  return dict(path=path, name=coot.molecule_name(map_id),
+              difference=bool(coot.map_is_difference_map(map_id)))
+
+
+def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction):
+  """Pure file/FFT work: safe in a worker, no Coot or GTK calls.
+
+  Preserve the exported box and its CCP4 placement. In particular, setup()
+  would expand a fragment to the full cell, defeating cropping and changing it.
+  """
+  import numpy as np
+  ccp4 = gemmi.read_ccp4_map(input_path, setup=False)
+  data = np.asarray(ccp4.grid)
+  if not np.isfinite(data).all():
+    raise ValueError("Map contains NaN or infinite voxel values.")
+  axes = [ccp4.header_i32(word)-1 for word in (17, 18, 19)]
+  sampling = np.asarray([ccp4.header_i32(word) for word in (8, 9, 10)], dtype=float)
+  if sorted(axes) != [0, 1, 2] or np.any(sampling <= 0):
+    raise ValueError("Map has invalid axis order or grid sampling.")
+  if ccp4.has_skew_transformation():
+    raise ValueError("Maps with a CCP4 skew transformation are not supported.")
+  # Storage axes need not be XYZ. A fragment's FFT box is smaller than its
+  # unit cell: derive its basis from voxel spacing, not the full cell lengths.
+  direct = np.asarray(ccp4.grid.unit_cell.orth.mat.tolist(), dtype=float)
+  box = direct[:, axes]*(np.asarray(data.shape)/sampling[axes])[None, :]
+  inverse = np.linalg.inv(box)
+  metric = inverse @ inverse.T
+  if not np.isfinite(metric).all():
+    raise ValueError("Map has an invalid unit cell.")
+  nu, nv, nw = data.shape
+  h = np.fft.fftfreq(nu)*nu
+  k = np.fft.fftfreq(nv)*nv
+  l = np.fft.rfftfreq(nw)*nw
+  base = (metric[1, 1]*k[:, None]**2 + metric[2, 2]*l[None, :]**2 +
+          2*metric[1, 2]*k[:, None]*l[None, :])
+  cutoff = 1.0/resolution
+  spectrum = np.fft.rfftn(data)
+  # Apply one frequency plane at a time; no full 3-D weights/coordinate arrays.
+  for i, hi in enumerate(h):
+    weight = (base + metric[0, 0]*hi**2 + 2*metric[0, 1]*hi*k[:, None] +
+              2*metric[0, 2]*hi*l[None, :])
+    np.maximum(weight, 0, out=weight)
+    if taper_fraction == 0:
+      weight = weight < cutoff*cutoff
+    else:
+      np.sqrt(weight, out=weight)
+      weight -= cutoff
+      weight /= -cutoff*taper_fraction
+      np.clip(weight, 0, 1, out=weight)
+      weight *= np.pi
+      np.cos(weight, out=weight)
+      weight *= -0.5
+      weight += 0.5
+    spectrum[i] *= weight
+  filtered = np.fft.irfftn(spectrum, s=data.shape, axes=(0, 1, 2))
+  del spectrum
+  if not np.isfinite(filtered).all():
+    raise ValueError("Filtering produced non-finite density values.")
+  data[:] = filtered
+  del filtered
+  # update_ccp4_header() requires setup() for partial maps. Update only mode
+  # and density statistics; retain sampling, starts, origin, axes and symmetry.
+  ccp4.set_header_i32(4, 2)
+  for word, value in ((20, data.min()), (21, data.max()),
+                      (22, data.mean(dtype=np.float64)), (55, data.std(dtype=np.float64))):
+    ccp4.set_header_float(word, float(value))
+  ccp4.write_ccp4_map(output_path)
+  return tuple(data.shape)
+
+
+def _lowpass_import(path, source, resolution):
+  existing = set(map_molecule_list())
+  reader = getattr(coot, "handle_read_ccp4_map", None) or coot.read_ccp4_map
+  result = reader(path, int(source["difference"]))
+  if result in existing or result is None or not coot.is_valid_map_molecule(result):
+    raise RuntimeError("Coot could not load the filtered map.")
+  try:
+    coot.set_molecule_name(result, f"{source['name']} | low-pass {resolution:g} A")
+  except Exception:
+    coot.close_molecule(result)
+    raise
+  add_status_bar_text(f"Created low-pass map #{result} ({resolution:g} A); source map unchanged")
+  return result
+
+
+def lowpass_filter_map(imol_map, resolution=4.0, taper_fraction=0.10, model_imol=None, padding=20.0):
+  """Create a low-pass map (console API); optional model-centred crop with padding."""
+  resolution, taper_fraction, padding = _lowpass_parameters(resolution, taper_fraction, padding)
+  if gemmi is None or _tq_numpy_module() is None:
+    raise RuntimeError("Low-pass filtering requires Gemmi and NumPy in Coot's Python.")
+  with tempfile.TemporaryDirectory(prefix="coot-lowpass-") as directory:
+    source = _lowpass_export(imol_map, model_imol, directory, padding)
+    output = os.path.join(directory, "filtered.map")
+    _lowpass_filter_file(source["path"], output, resolution, taper_fraction)
+    return _lowpass_import(output, source, resolution)
+
+
+def lowpass_filter_map_dialog():
+  """Filter a chosen map without running its FFT on the GTK event thread."""
+  if gemmi is None or _tq_numpy_module() is None:
+    info_dialog("Low-pass filtering requires Gemmi and NumPy in Coot's embedded Python.")
+    return None
+  maps = list(map_molecule_list())
+  if not maps:
+    add_status_bar_text("Open a map before using low-pass filtering.")
+    return None
+  glib = _coot_gui_repository_module("GLib")
+  if glib is None:
+    info_dialog("The low-pass filter dialog requires GLib.")
+    return None
+  window = Gtk.Window(title="Low-pass filter map")
+  window.set_default_size(440, -1)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for edge in ("start", "end", "top", "bottom"):
+    getattr(box, "set_margin_"+edge)(12)
+  window.set_child(box)
+  grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+  box.append(grid)
+  map_choice = Gtk.ComboBoxText()
+  for number in maps:
+    map_choice.append(str(number), f"#{number}: {coot.molecule_name(number)}")
+  current = coot.scroll_wheel_map()
+  map_choice.set_active(maps.index(current) if current in maps else 0)
+  map_choice.set_hexpand(True)
+  cutoff, rolloff, padding = Gtk.Entry(), Gtk.Entry(), Gtk.Entry()
+  for widget, value in ((cutoff, "4"), (rolloff, "10"), (padding, "20")):
+    widget.set_text(value)
+    widget.set_width_chars(6)
+    widget.set_max_width_chars(6)
+  for row, (label, widget) in enumerate((("Map", map_choice), ("Resolution cutoff (A)", cutoff),
+                                         ("Cosine rolloff (%)", rolloff))):
+    text = Gtk.Label(label=label)
+    text.set_xalign(0)
+    grid.attach(text, 0, row, 1, 1)
+    grid.attach(widget, 1, row, 1, 1)
+  rolloff.set_tooltip_text("Width of the cosine rolloff below the cutoff, as a percentage of cutoff frequency. 0 = hard cutoff.")
+  crop = Gtk.CheckButton(label="Crop around model")
+  box.append(crop)
+  model_choice = Gtk.ComboBoxText()
+  models = list(model_molecule_list())
+  for number in models:
+    model_choice.append(str(number), f"#{number}: {coot.molecule_name(number)}")
+  active = coot.active_residue_py()
+  model_choice.set_active(models.index(active[0]) if active and active[0] in models else (0 if models else -1))
+  crop.set_sensitive(bool(models))
+  crop_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  model_choice.set_hexpand(True)
+  for widget in (model_choice, Gtk.Label(label="Padding (A)"), padding):
+    crop_row.append(widget)
+  crop_row.set_sensitive(False)
+  crop.connect("toggled", lambda widget: crop_row.set_sensitive(widget.get_active()))
+  box.append(crop_row)
+  status = Gtk.Label(label="Creates a new map; the source map is unchanged.")
+  status.set_xalign(0)
+  status.set_wrap(True)
+  box.append(status)
+  spinner = Gtk.Spinner()
+  box.append(spinner)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  apply, close = Gtk.Button(label="Filter"), Gtk.Button(label="Close")
+  buttons.append(apply)
+  buttons.append(close)
+  box.append(buttons)
+  state = dict(closed=False, running=False, finished=None, owner=None, result=None)
+  def busy(running):
+    state["running"] = running
+    for widget in (grid, crop, crop_row, apply):
+      widget.set_sensitive(not running)
+    crop.set_sensitive(not running and bool(models))
+    crop_row.set_sensitive(not running and crop.get_active())
+    spinner.start() if running else spinner.stop()
+  def cleanup():
+    if state["owner"] is not None:
+      state["owner"].cleanup()
+      state["owner"] = None
+  def poll():
+    finished = state["finished"]
+    if finished is None:
+      return True
+    try:
+      if not state["closed"]:
+        shape, error = finished
+        if error is not None:
+          raise RuntimeError(error)
+        status.set_text("Loading filtered map...")
+        state["result"] = _lowpass_import(state["output"], state["source"], state["resolution"])
+        status.set_text(f"Created map #{state['result']} | {state['resolution']:g} A | " +
+                        " x ".join(map(str, shape)))
+    except Exception as error:
+      status.set_text(f"Filtering failed: {error}")
+    finally:
+      cleanup()
+      if not state["closed"]:
+        busy(False)
+    return False
+  def start_worker():
+    if state["closed"]:
+      busy(False)
+      return False
+    try:
+      state["owner"] = tempfile.TemporaryDirectory(prefix="coot-lowpass-")
+      directory = state["owner"].name
+      source = _lowpass_export(state["map"], state["model"], directory, state["padding"])
+      output = os.path.join(directory, "filtered.map")
+      state.update(source=source, output=output)
+      status.set_text("Filtering map... (you can continue using Coot)")
+      def worker():
+        try:
+          shape = _lowpass_filter_file(source["path"], output, state["resolution"], state["taper"])
+          state["finished"] = (shape, None)
+        except Exception as error:
+          # Do not retain a worker traceback containing large FFT arrays.
+          state["finished"] = (None, str(error))
+      import threading
+      thread = threading.Thread(target=worker, name="coot-lowpass", daemon=True)
+      glib.timeout_add(100, poll)
+      thread.start()
+    except Exception as error:
+      cleanup()
+      state["finished"] = (None, str(error))
+      status.set_text(f"Filtering failed: {error}")
+      busy(False)
+    return False
+  def run(*_args):
+    if state["running"]:
+      return
+    try:
+      resolution, taper, pad = _lowpass_parameters(cutoff.get_text(), float(rolloff.get_text())/100, padding.get_text())
+      state.update(map=int(map_choice.get_active_id()),
+                   model=int(model_choice.get_active_id()) if crop.get_active() else None,
+                   resolution=resolution, taper=taper, padding=pad, finished=None, result=None)
+      busy(True)
+      status.set_text("Exporting current map...")
+      glib.idle_add(start_worker)
+    except Exception as error:
+      status.set_text(str(error))
+      busy(False)
+  def closed(*_args):
+    # A running FFT cannot be interrupted; discard its result and clean up
+    # when it finishes. Never delete files while the worker is using them.
+    state["closed"] = True
+    return False
+  apply.connect("clicked", run)
+  close.connect("clicked", lambda *_: window.close())
+  window.connect("close-request", closed)
+  window.lowpass_widgets = dict(map=map_choice, cutoff=cutoff, rolloff=rolloff, crop=crop,
+                               model=model_choice, padding=padding, apply=apply, status=status, state=state)
+  window.present()
+  return window
 
 
 def _parse_ccp4_mrc_header(path):
@@ -22635,6 +23023,113 @@ def _recent_entry_from_metadata(metadata):
   return entry
 
 
+def _recent_save_fingerprint(path):
+  try:
+    stat = os.stat(path)
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+  except OSError:
+    return None
+
+
+def _recent_saved_entry(path, category=None):
+  """Recognize a completed user export, not dictionaries, images or session files."""
+  path = os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
+  if not os.path.isfile(path) or os.path.getsize(path) == 0:
+    return None
+  if category == "models":
+    return "models", {"path": path, "kind": "model"}
+  lower = path.lower()
+  compressed = lower.endswith(".gz")
+  if compressed:
+    import gzip
+    opener, lower = gzip.open, lower[:-3]
+  else:
+    opener = open
+  # Read at most 1 MiB on a save event, never on the regular polling path.
+  with opener(path, "rb") as handle:
+    header = handle.read(1024*1024 if lower.endswith((".cif", ".mmcif")) else 1024)
+  if (lower.endswith((".pdb", ".ent", ".brk", ".pqr")) or
+      header.startswith((b"ATOM  ", b"HETATM", b"HEADER")) or b"_atom_site." in header):
+    return "models", {"path": path, "kind": "model"}
+  if len(header) >= 1024:
+    for endian in ("<", ">"):
+      nx, ny, nz, mode = struct.unpack_from(endian+"4i", header)
+      if all(0 < n <= 100000 for n in (nx, ny, nz)) and mode in (0, 1, 2, 6, 12):
+        symmetry_bytes = struct.unpack_from(endian+"i", header, 92)[0]
+        required = 1024 + max(0, symmetry_bytes) + nx*ny*nz*{0: 1, 1: 2, 2: 4, 6: 2, 12: 2}[mode]
+        if symmetry_bytes < 0 or (not compressed and os.path.getsize(path) < required):
+          continue
+        return "maps", {"path": path, "kind": "map", "difference": False}
+  return None
+
+
+def _recent_saved_file(path, category=None):
+  """Promote an actual final export without requiring it to be reopened."""
+  try:
+    saved = _recent_saved_entry(path, category)
+    if saved is None:
+      return False
+    # Consume filename changes from native Save As before promoting this event;
+    # a later poll must not put an older save ahead of a newer annotation export.
+    _poll_recent_files()
+    category, entry = saved
+    changed = _record_recent_file(entry, category)
+    _save_recent_files()
+    if changed:
+      _refresh_recent_files_menus()
+    return changed
+  except Exception as error:
+    print("Recent files: could not record saved file:", error)
+    return False
+
+
+def _recent_save_finished(path, before):
+  after = _recent_save_fingerprint(path)
+  if after is not None and after != before and after[2] > 0:
+    _recent_saved_file(path)
+  return False
+
+
+def _recent_save_response(dialog, response, *_unused):
+  """Emission hooks run before Coot's response handlers; idle runs after writing."""
+  try:
+    gtk = globals().get("Gtk")
+    if (gtk is not None and isinstance(dialog, gtk.FileChooser) and
+        dialog.get_action() == gtk.FileChooserAction.SAVE and
+        response in (gtk.ResponseType.OK, gtk.ResponseType.ACCEPT, gtk.ResponseType.YES)):
+      file = dialog.get_file()
+      path = file.get_path() if file is not None else None
+      if path:
+        before = _recent_save_fingerprint(path)
+        _coot_gui_repository_module("GLib").idle_add(_recent_save_finished, path, before)
+  except Exception as error:
+    print("Recent files: could not observe save dialog:", error)
+  return True  # Keep the hook installed; never consume or replay native callbacks.
+
+
+def _recent_install_save_tracking():
+  gtk = globals().get("Gtk")
+  gobject = _coot_gui_repository_module("GObject")
+  if gtk is None or gobject is None:
+    return False
+  state = _recent_files_state()
+  for cls, hook in state.pop("save_hooks", []):
+    gobject.remove_emission_hook(cls, "response", hook)
+  state["save_hooks"] = []
+  for cls in (gtk.Dialog, getattr(gtk, "NativeDialog", None)):
+    if cls is None:
+      continue
+    try:
+      if hasattr(gobject, "list_properties"):
+        gobject.list_properties(cls)  # Initialize lazy dialog classes before looking up their signals.
+      hook = gobject.add_emission_hook(cls, "response", _recent_save_response)
+      if hook:
+        state["save_hooks"].append((cls, hook))
+    except (TypeError, RuntimeError) as error:
+      print("Recent files: save dialog tracking unavailable:", error)
+  return bool(state["save_hooks"])
+
+
 def _poll_recent_files():
   state = _recent_files_state()
   changed = False
@@ -22810,6 +23305,7 @@ def _install_recent_files_tracking(models_menu, maps_menu):
     state["timer"] = None
   _poll_recent_files()
   _refresh_recent_files_menus()
+  _recent_install_save_tracking()
   if glib is not None:
     state["timer"] = glib.timeout_add_seconds(2, _poll_recent_files)
 
@@ -25158,6 +25654,12 @@ def _build_custom_display_menu(submenu_display):
     "Toggle Rama/rotamer spheres during refinement",
     lambda func: toggle_refinement_validation_spheres(),
   )
+  if callable(getattr(coot, "set_validation_boxes_is_docked", None)):
+    add_simple_coot_menu_menuitem(
+      submenu_display,
+      "Toggle docked validation tables",
+      lambda func: toggle_validation_tables_docked(),
+    )
   add_simple_coot_menu_menuitem(
     submenu_display,
     "Yellow-ify carbons",
@@ -25566,6 +26068,11 @@ def _build_custom_modify_menu(submenu_modify):
 
 
 def _build_custom_maps_menu(submenu_maps):
+  add_simple_coot_menu_menuitem(
+    submenu_maps,
+    "Low-pass filter map...",
+    lambda func: lowpass_filter_map_dialog(),
+  )
   add_simple_coot_menu_menuitem(
     submenu_maps,
     "Go to center of scrollable map",
@@ -27390,6 +27897,7 @@ if _coot_gui_module() is not None:
     print("Window cycling shortcuts unavailable:", error)
 
 _initialize_trackpad_preferences()
+_schedule_gemmi_warning()
 
 # Keep this as the final startup action in the file.  It covers settings Coot
 # may have changed while the rest of this startup script was being evaluated;
