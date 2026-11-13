@@ -17949,8 +17949,83 @@ def _global_fit_load_grid(map_id, original, radius):
     raise
 
 
+def _global_fit_crop_search(grid, original, radius):
+  """Exact-sample search sphere, enclosing every starting rotation and translation."""
+  if grid["periodic"]:
+    return grid
+  np = grid["np"]
+  points = np.asarray(list(original.values()), dtype=float)
+  centre = points.mean(axis=0)
+  basis = np.linalg.inv(grid["transform"])
+  voxel = float(np.linalg.norm(basis, axis=0).max())
+  core = float(np.linalg.norm(points-centre, axis=1).max()) + radius + 2*voxel
+  taper = max(2., 2*voxel)
+  extent = core+taper
+  q = (centre-grid["origin"]) @ grid["transform"].T-grid["starts"]
+  reach = extent*np.linalg.norm(grid["transform"], axis=1)
+  lower = np.maximum(0, np.floor(q-reach).astype(int))
+  upper = np.minimum(grid["shape"], np.ceil(q+reach).astype(int)+1)
+  shape = upper-lower
+  if (shape < 2).any():
+    raise ValueError("The model-centered search region does not overlap the map. Move the model into the map first.")
+  # If the complete map is inside the unmodified core, avoid a redundant copy.
+  corners = np.asarray([[x, y, z] for x in (0, grid["shape"][0]-1)
+                         for y in (0, grid["shape"][1]-1) for z in (0, grid["shape"][2]-1)])
+  world = (corners+grid["starts"]) @ basis.T+grid["origin"]
+  if np.linalg.norm(world-centre, axis=1).max() <= core:
+    return grid
+  owner = tempfile.TemporaryDirectory(prefix="coot-fit-search-")
+  data, complete = None, False
+  try:
+    data = np.lib.format.open_memmap(os.path.join(owner.name, "search.npy"), mode="w+",
+                                     dtype="f4", shape=tuple(map(int, shape[::-1])))
+    starts = grid["starts"]+lower
+    x = np.arange(shape[0])+starts[0]
+    rows = max(1, 65536//int(shape[0]))
+    deadline = time.monotonic()+.020
+    for z in range(int(shape[2])):
+      for y in range(0, int(shape[1]), rows):
+        ys = np.arange(y, min(y+rows, int(shape[1])))+starts[1]
+        distance_sq = np.zeros((len(ys), len(x)))
+        for axis in range(3):
+          component = (x[None, :]*basis[axis, 0]+ys[:, None]*basis[axis, 1]+
+                       (z+starts[2])*basis[axis, 2]+grid["origin"][axis]-centre[axis])
+          distance_sq += component*component
+        weight = .5+.5*np.cos(np.pi*np.clip((np.sqrt(distance_sq)-core)/taper, 0., 1.))
+        source = grid["data"][z+lower[2], y+lower[1]:y+lower[1]+len(ys), lower[0]:upper[0]]
+        data[z, y:y+len(ys)] = source*weight
+        if time.monotonic() >= deadline:
+          yield
+          deadline = time.monotonic()+.020
+    data.flush()
+    data._mmap.close()
+    data = np.load(os.path.join(owner.name, "search.npy"), mmap_mode="r")
+    cropped = dict(grid, data=data, shape=shape, starts=starts, periods=shape.copy(), owner=owner,
+                   search_region=dict(centre=centre.tolist(), radius=core, taper=taper,
+                                      fraction=float(math.prod(shape)/math.prod(grid["shape"]))))
+    complete = True
+    return cropped
+  finally:
+    if not complete:
+      if data is not None:
+        data._mmap.close()
+      owner.cleanup()
+
+
 def _global_fit_close_grid(grid):
   if grid is not None:
+    preparing = grid.get("preparing")
+    if preparing is not None and not preparing.is_set():
+      import threading
+      def after_preparation():
+        preparing.wait()
+        _global_fit_close_grid(grid)
+      threading.Thread(target=after_preparation, daemon=True).start()
+      return
+    for level in grid.pop("levels", []):
+      mapping = getattr(level["data"], "_mmap", None)
+      if mapping is not None and level["data"] is not grid["data"]:
+        mapping.close()
     mapping = getattr(grid.get("data"), "_mmap", None)
     if mapping is not None:
       mapping.close()
@@ -17969,37 +18044,351 @@ def _global_fit_close_grid(grid):
         owner.cleanup()
 
 
-def _global_fit_optimize_iter(snapshot, grid, deadline=None, return_transform=False):
+def _global_fit_representatives(points, spacing, maximum=2400):
+  """Spatial centroids with atom-count weights; never bias towards chain order."""
+  import numpy as np
+  points = np.asarray(points, dtype=float)
+  if len(points) <= 128:
+    return points.copy(), np.ones(len(points))
+  spacing = max(float(spacing), 0.1)
+  for _ in range(40):
+    cells = np.floor((points-points.min(axis=0))/spacing).astype(np.int64)
+    _, inverse, counts = np.unique(cells, axis=0, return_inverse=True, return_counts=True)
+    if len(counts) <= maximum:
+      centres = np.column_stack([np.bincount(inverse, weights=points[:, i])/counts for i in range(3)])
+      return centres, counts.astype(float)
+    spacing *= max(1.1, (len(counts)/maximum)**(1/3))
+  raise ValueError("Could not reduce the fitting atoms to spatial representatives.")
+
+
+def _global_fit_mass_weights(original):
+  """Occupancy-weighted atomic masses from the snapshot's atom properties."""
+  masses = {"H": 1.008, "D": 2.014, "C": 12.011, "N": 14.007, "O": 15.999,
+            "F": 18.998, "NA": 22.990, "MG": 24.305, "P": 30.974, "S": 32.06,
+            "CL": 35.45, "K": 39.098, "CA": 40.078, "MN": 54.938, "FE": 55.845,
+            "CO": 58.933, "NI": 58.693, "CU": 63.546, "ZN": 65.38, "SE": 78.971,
+            "BR": 79.904, "I": 126.904}
+  result = []
+  for key in original:
+    properties = ast.literal_eval(key[-1])
+    occupancy, element = float(properties[0]), str(properties[2]).strip().upper()
+    mass = masses.get(element)
+    if mass is None and globals().get("gemmi") is not None:
+      mass = float(gemmi.Element(element.title()).weight)
+    if mass is None or not math.isfinite(mass) or mass <= 0 or not math.isfinite(occupancy) or occupancy < 0:
+      raise ValueError(f"Cannot determine a finite atomic mass/occupancy for {key[:5]}.")
+    result.append(mass*occupancy)
+  if not result or sum(result) <= 0:
+    raise ValueError("Center preference requires atoms with positive occupancy.")
+  return result
+
+
+def _global_fit_center_field(grid, prior):
+  """Normalize the soft prior locally, not by padding-dependent whole-map variance."""
+  np = grid["np"]
+  axis = np.linspace(-prior["extent"], prior["extent"], 15)
+  offsets = np.stack(np.meshgrid(axis, axis, axis, indexing='ij'), axis=-1).reshape((-1, 3))
+  offsets = offsets[np.sum(offsets*offsets, axis=1) <= prior["extent"]**2]
+  values, _gradient, valid = _global_fit_grid_values(grid, offsets+prior["anchor"])
+  sigma = float(values[valid].std()) if valid.any() else 0.
+  return dict(prior, coefficient=prior["strength"]*sigma/prior["distance"]**2, sigma=sigma)
+
+
+def _global_fit_prepare_center(state):
+  if state.get("center_distance") is None or not state.get("center_strength"):
+    return
+  grid, np = state["grid"], state["grid"]["np"]
+  weights = np.asarray(_global_fit_mass_weights(state["original"]), dtype=float)
+  points = np.asarray(list(state["original"].values()), dtype=float)
+  anchor = np.average(points, weights=weights, axis=0)
+  extent = float(np.linalg.norm(points-anchor, axis=1).max())+state["radius"]+state["center_distance"]
+  prior = dict(anchor=anchor.tolist(), extent=extent, distance=state["center_distance"],
+               strength=state["center_strength"])
+  state["center_weights"] = weights
+  state["center_prior"] = grid["center_prior"] = _global_fit_center_field(grid, prior)
+  if state["center_prior"]["sigma"] <= 0:
+    raise ValueError("No variable map density near the starting center; turn off center preference or reposition the selection.")
+
+
+def _global_fit_rank_pose(state, candidate, fine=False):
+  prior = state.get("center_prior")
+  if prior is None:
+    candidate["rank_score"] = candidate["score"]
+    return
+  np = state["grid"]["np"]
+  if not fine and state.get("multiscale_active"):
+    prior = state["grid"]["levels"][state["level_index"]]["center_prior"]
+  anchor = np.asarray(prior["anchor"])
+  if "rotation" in candidate:
+    center = anchor @ candidate["rotation"].T+candidate["translation"]
+  else:
+    center = np.average([candidate["coordinates"][k] for k in state["original"]],
+                        weights=state["center_weights"], axis=0)
+  distance_sq = float(np.sum((center-anchor)**2))
+  candidate.update(center_shift=math.sqrt(distance_sq), penalty=prior["coefficient"]*distance_sq,
+                   rank_score=candidate["score"]-prior["coefficient"]*distance_sq)
+
+
+def _global_fit_resolution_levels(points):
+  """Size-driven extra Gaussian smoothing; the final level is always the input map."""
+  import numpy as np
+  if len(points) < 128:
+    return ()
+  offsets = points-points.mean(axis=0)
+  variance = np.linalg.eigvalsh(offsets.T @ offsets/len(points))
+  size = float(np.exp(np.log(np.maximum(2*np.sqrt(5*np.maximum(variance, 0)), 2)).mean()))
+  fine = float(np.clip(size/12, 2, 8))
+  coarse = max(fine, size/4)
+  count = min(4, max(1, int(math.ceil(math.log2(coarse/fine)))+1))
+  return tuple(float(r) for r in np.geomspace(coarse, fine, count))
+
+
+def _global_fit_make_level(grid, resolution, path):
+  """Pure NumPy coarse map: cell-average, zero-pad and isotropically Gaussian-filter."""
+  np = grid["np"]
+  basis = np.linalg.inv(grid["transform"])
+  factors = np.maximum(1, np.floor((resolution/3)/np.linalg.norm(basis, axis=0))).astype(int)
+  shape = np.ceil(grid["shape"]/factors).astype(int)
+  transform = np.diag(1/factors) @ grid["transform"]
+  sigma = resolution/(math.pi*math.sqrt(2))
+  halo = np.ceil(4*sigma*np.linalg.norm(transform, axis=1)).astype(int)+1
+  if math.prod(map(int, shape+2*halo)) > 16000000:
+    raise ValueError("Coarse fitting grid exceeds 16 million voxels; coarsen or box the target map first.")
+  data = np.asarray(grid["data"])
+  for axis in np.argsort(factors[::-1])[::-1]:
+    factor = int(factors[2-axis])
+    if factor > 1:
+      data = np.add.reduceat(data, np.arange(0, data.shape[axis], factor), axis=axis, dtype=np.float32)/factor
+  data = np.pad(data, tuple((int(h), int(h)) for h in halo[::-1]))
+  spectrum = np.fft.rfftn(data)
+  covariance = sigma*sigma*transform @ transform.T
+  fx = np.fft.rfftfreq(data.shape[2])[None, :]
+  fy = np.fft.fftfreq(data.shape[1])[:, None]
+  base = covariance[0, 0]*fx*fx+covariance[1, 1]*fy*fy+2*covariance[0, 1]*fx*fy
+  for index, fz in enumerate(np.fft.fftfreq(data.shape[0])):
+    weight = base+covariance[2, 2]*fz*fz+2*covariance[0, 2]*fx*fz+2*covariance[1, 2]*fy*fz
+    spectrum[index] *= np.exp(-2*math.pi*math.pi*np.maximum(weight, 0))
+  filtered = np.fft.irfftn(spectrum, s=data.shape, axes=(0, 1, 2)).astype('f4')
+  if not np.isfinite(filtered).all():
+    raise ValueError("Non-finite density in the coarse fitting map.")
+  np.save(path, filtered)
+  result = dict(grid, data=np.load(path, mmap_mode='r'), transform=transform,
+                starts=(grid["starts"]+(factors-1)/2)/factors-halo,
+                shape=np.asarray(filtered.shape[::-1]), periodic=False,
+                periods=np.asarray(filtered.shape[::-1]), resolution=resolution)
+  for key in ("owner", "levels", "preparing", "worker_pool"):
+    result.pop(key, None)
+  if grid.get("center_prior"):
+    result["center_prior"] = _global_fit_center_field(result, grid["center_prior"])
+  return result
+
+
+def _global_fit_prepare_levels(state):
+  """Keep preprocessing off GTK; cancellation defers cache deletion until completion."""
+  import threading
+  grid = state["grid"]
+  np = grid["np"]
+  points = np.asarray(list(state["original"].values()), dtype=float)
+  resolutions = _global_fit_resolution_levels(points) if state.get("multiscale") and not grid["periodic"] else ()
+  if not resolutions:
+    return
+  event = threading.Event()
+  grid["preparing"] = event
+  result = {}
+  def prepare():
+    levels = []
+    grid["levels"] = levels
+    try:
+      for i, resolution in enumerate(resolutions):
+        result["message"] = f"Preparing coarse fitting map {i+1}/{len(resolutions)} ({resolution:.1f} A)..."
+        level = _global_fit_make_level(grid, resolution, os.path.join(grid["owner"].name, f"level-{i}.npy"))
+        levels.append(level)
+        level["samples"], level["weights"] = _global_fit_representatives(points, resolution/6)
+      fine_points, fine_weights = ((points, np.ones(len(points))) if len(points) <= 6000 else
+                                  _global_fit_representatives(points, .35, 6000))
+      final = dict(grid, samples=fine_points, weights=fine_weights, resolution=0.)
+      for key in ("owner", "levels", "preparing", "worker_pool"):
+        final.pop(key, None)
+      levels.append(final)
+    except Exception as error:
+      result["error"] = str(error)
+    finally:
+      event.set()
+  threading.Thread(target=prepare, name="coot-fit-pyramid", daemon=True).start()
+  while not event.is_set():
+    state["message"] = result.get("message", "Preparing coarse fitting maps...")
+    yield
+  if "error" in result:
+    for level in grid.pop("levels", []):
+      mapping = getattr(level["data"], "_mmap", None)
+      if mapping is not None and level["data"] is not grid["data"]:
+        mapping.close()
+    state["message"] = "Using the original search: " + result["error"]
+    print("Global fit:", state["message"])
+    yield
+    return
+  state.update(multiscale_active=True, level_index=0, level_done=0,
+               stage_fraction=0., level_jobs=None)
+  centre = points.mean(axis=0)
+  offsets = points-centre
+  state["pose_moments"] = dict(original=points, centre=centre, keys=tuple(state["original"]),
+                               covariance=offsets.T @ offsets/len(points))
+  state["candidate_limit"] = 64
+  state["cluster_cutoff"] = max(1., resolutions[0]/3)
+
+
+def _global_fit_multiscale_job(state, index):
+  np = state["grid"]["np"]
+  if state["level_jobs"] is None:
+    if index == 0:
+      rotation, translation, hits = np.eye(3), np.zeros(3), 1
+    else:
+      rotation, shift = _global_fit_random_pose(state["radius"], state["rng"])
+      rotation = np.asarray(rotation)
+      centre = state["pose_moments"]["centre"]
+      translation, hits = centre+shift-centre @ rotation.T, 1
+  else:
+    candidate = state["level_jobs"][index]
+    rotation, translation, hits = candidate["rotation"], candidate["translation"], candidate["hits"]
+  return dict(trial=index, level=state["level_index"], rotation=rotation.tolist(),
+              translation=translation.tolist(), hits=hits)
+
+
+def _global_fit_multiscale_record(state, result, hits):
+  np = state["grid"]["np"]
+  if result["score"] is None:
+    if state["level_index"] == 0:
+      state["failed"] += 1
+  else:
+    rotation, translation = np.asarray(result["rotation"]), np.asarray(result["translation"])
+    if (rotation.shape != (3, 3) or translation.shape != (3,) or
+        not np.isfinite(rotation).all() or not np.isfinite(translation).all() or
+        not math.isfinite(result["score"]) or
+        not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6, rtol=0.) or
+        abs(float(np.linalg.det(rotation))-1.) > 1e-6):
+      raise RuntimeError("Invalid coarse-to-fine rigid transform.")
+    _global_fit_insert_transform(state, rotation, translation, float(result["score"]), hits)
+  state["level_done"] += 1
+  state["iteration"] = 0
+  if state["level_index"] == 0:
+    state["done"] += 1
+
+
+def _global_fit_multiscale_step(state):
+  """A level barrier keeps different score scales separate; workers are reused."""
+  grid, pool = state["grid"], state.get("pool")
+  np = grid["np"]
+  levels = grid["levels"]
+  level = levels[state["level_index"]]
+  count = state["trials"] if state["level_jobs"] is None else len(state["level_jobs"])
+  if pool is not None:
+    _global_fit_workers_read(pool)
+    if pool["events"]:
+      worker, result = pool["events"].popleft()
+      if result.get("trial") != worker["job"]:
+        raise RuntimeError("Unexpected coarse-to-fine worker identifier.")
+      if "iteration" in result:
+        worker["iteration"] = state["iteration"] = int(result["iteration"])
+      else:
+        _global_fit_multiscale_record(state, result, worker["hits"])
+        worker["job"] = None
+        worker["iteration"] = 0
+    for worker in pool["workers"]:
+      if worker["job"] is None and pool["next"] < count:
+        job = _global_fit_multiscale_job(state, pool["next"])
+        worker["process"].stdin.write((json.dumps(job)+"\n").encode())
+        worker["process"].stdin.flush()
+        worker.update(job=job["trial"], hits=job["hits"], iteration=0)
+        pool["next"] += 1
+  else:
+    if state.get("trial") is None and state["level_done"] < count:
+      job = _global_fit_multiscale_job(state, state["level_done"])
+      rotation, translation = np.asarray(job["rotation"]), np.asarray(job["translation"])
+      points = state["pose_moments"]["original"] @ rotation.T+translation
+      state["level_job"] = job
+      state["trial"] = _global_fit_optimize_iter(points, level, return_transform=True,
+          deadline=state.get("work_deadline"), samples=level["samples"] @ rotation.T+translation,
+          weights=level["weights"], max_iterations=300 if state["level_index"] == 0 else 600 if level["resolution"] else 2000,
+          center_prior=(dict(level["center_prior"], reference=np.asarray(level["center_prior"]["anchor"]) @ rotation.T+translation)
+                        if level.get("center_prior") else None))
+    if state.get("trial") is not None:
+      try:
+        state["iteration"] = next(state["trial"])
+      except StopIteration as result:
+        state.pop("trial")
+        transform, score = result.value
+        job = state.pop("level_job")
+        record = dict(score=score)
+        if transform is not None:
+          local_rotation, local_translation = transform
+          record.update(rotation=local_rotation @ np.asarray(job["rotation"]),
+                        translation=np.asarray(job["translation"]) @ local_rotation.T+local_translation)
+        _global_fit_multiscale_record(state, record, job["hits"])
+  limit = 300 if state["level_index"] == 0 else 600 if level["resolution"] else 2000
+  partial = (sum(min(.99, w.get("iteration", 0)/limit) for w in pool["workers"] if w["job"] is not None)
+             if pool is not None else min(.99, state["iteration"]/limit) if state.get("trial") is not None else 0.)
+  state["stage_fraction"] = (state["level_index"]+(state["level_done"]+partial)/max(1, count))/len(levels)
+  label = f"{level['resolution']:.1f} A extra smoothing" if level["resolution"] else "input fitting map"
+  state["message"] = f"Stage {state['level_index']+1}/{len(levels)}: {label} | {state['level_done']}/{count} placements"
+  if state["level_done"] < count:
+    return
+  if state["level_index"]+1 == len(levels) or not state["candidates"]:
+    if pool is not None:
+      _global_fit_workers_stop(pool)
+    state.update(phase="score", scored=0, iteration=0, stage_fraction=1.,
+                 message=f"Finished {state['done']} starts and coarse-to-fine polishing.")
+    return
+  state["level_jobs"] = state["candidates"]
+  state["candidates"] = []
+  state["level_index"] += 1
+  state["level_done"] = state["iteration"] = 0
+  state["candidate_limit"] = 5 if state["level_index"]+1 == len(levels) else 32
+  state["cluster_cutoff"] = max(1., levels[state["level_index"]]["resolution"]/3)
+  if pool is not None:
+    pool["next"] = 0
+
+
+def _global_fit_optimize_iter(snapshot, grid, deadline=None, return_transform=False,
+                              samples=None, weights=None, max_iterations=2000, center_prior=None):
   """Independent rigid gradient ascent on mean trilinearly interpolated atom density."""
   np = grid["np"]
   all_points = np.asarray(snapshot if isinstance(snapshot, np.ndarray) else list(snapshot.values()), dtype=float)
-  centre0 = all_points.mean(axis=0)
+  # With the prior enabled, rotate about COM so rotation itself is not resisted.
+  centre0 = (all_points.mean(axis=0) if center_prior is None else
+             np.asarray(center_prior["reference"], dtype=float).copy())
   centre = centre0.copy()
   # Keep the optimisation cost bounded for large structures; score the complete pose.
   indices = np.linspace(0, len(all_points)-1, min(3000, len(all_points)), dtype=int)
-  points = all_points[indices].copy()
+  points = all_points[indices].copy() if samples is None else np.asarray(samples, dtype=float).copy()
+  weights = np.ones(len(points))/len(points) if weights is None else np.asarray(weights, dtype=float)/np.sum(weights)
   rotation = np.eye(3)
+  coefficient = float(center_prior["coefficient"]) if center_prior else 0.
+  anchor = np.asarray(center_prior["anchor"], dtype=float) if center_prior else centre.copy()
+  mass_center = np.asarray(center_prior["reference"], dtype=float).copy() if center_prior else centre.copy()
   step = .5
   values, gradients, valid = _global_fit_grid_values(grid, points, gradients=True)
-  score = float(values.mean())
+  score = float(values @ weights)-coefficient*float(np.sum((mass_center-anchor)**2))
   if deadline is None:
     deadline = time.monotonic() + .020
-  for _iteration in range(2000):
+  for _iteration in range(max_iterations):
     if time.monotonic() >= deadline:
       yield _iteration
       deadline = time.monotonic() + .020
     if step < .01:
       break
     proposals = []
-    direction = gradients.mean(axis=0)
+    force = -2*coefficient*(mass_center-anchor)
+    direction = weights @ gradients+force
     norm = np.linalg.norm(grid["transform"] @ direction)
     if norm > 1e-15:
       shift = direction*(step/norm)
       proposed = points+shift
       v, proposed_gradient, _valid = _global_fit_grid_values(grid, proposed, gradients=True)
-      proposals.append((float(v.mean()), proposed, shift, None, proposed_gradient))
+      moved_center = mass_center+shift
+      value = float(v @ weights)-coefficient*float(np.sum((moved_center-anchor)**2))
+      proposals.append((value, proposed, shift, None, proposed_gradient, moved_center))
     offsets = points-centre
-    torque = np.cross(offsets, gradients).sum(axis=0)
+    torque = weights @ np.cross(offsets, gradients)+np.cross(mass_center-centre, force)
     torque_norm = np.linalg.norm(torque)
     if torque_norm > 1e-15:
       axis = torque/torque_norm
@@ -18011,12 +18400,14 @@ def _global_fit_optimize_iter(snapshot, grid, deadline=None, return_transform=Fa
         delta = np.eye(3) + math.sin(angle)*skew + (1-math.cos(angle))*(skew @ skew)
         proposed = offsets @ delta.T+centre
         v, proposed_gradient, _valid = _global_fit_grid_values(grid, proposed, gradients=True)
-        proposals.append((float(v.mean()), proposed, None, delta, proposed_gradient))
+        moved_center = (mass_center-centre) @ delta.T+centre
+        value = float(v @ weights)-coefficient*float(np.sum((moved_center-anchor)**2))
+        proposals.append((value, proposed, None, delta, proposed_gradient, moved_center))
     best = max(proposals, key=lambda p: p[0], default=None)
     if best is None or best[0] <= score + 1e-10*max(1., abs(score)):
       step *= .5
       continue
-    score, points, shift, delta, gradients = best
+    score, points, shift, delta, gradients, mass_center = best
     if shift is not None:
       centre += shift
     else:
@@ -18097,22 +18488,40 @@ def _global_fit_worker_main():
   try:
     with open(sys.argv[1]) as handle:
       config = json.load(handle)
+    level_configs = config.pop("levels", [])
     data = np.memmap(config.pop("path"), dtype=config.pop("dtype"), mode="r",
                      offset=config.pop("offset"), shape=tuple(config.pop("data_shape")))
     original = np.load(config.pop("original"), mmap_mode="r")
     grid = dict(config, np=np, data=data)
     for key in ("shape", "transform", "starts", "periods", "origin"):
       grid[key] = np.asarray(grid[key])
+    levels = []
+    for description in level_configs:
+      level = dict(description, np=np)
+      level["data"] = np.memmap(level.pop("path"), dtype=level.pop("dtype"), mode="r",
+                               offset=level.pop("offset"), shape=tuple(level.pop("data_shape")))
+      for key in ("shape", "transform", "starts", "periods", "origin"):
+        level[key] = np.asarray(level[key])
+      level["samples"] = np.load(level.pop("samples_path"), mmap_mode='r')
+      level["weights"] = np.load(level.pop("weights_path"), mmap_mode='r')
+      levels.append(level)
     centre = original.mean(axis=0)
     parent = os.getppid()
     print(json.dumps({"ready": True}), flush=True)
     for line in sys.stdin:
       job = json.loads(line)
       rotation = np.asarray(job["rotation"])
-      shift = np.asarray(job["shift"])
-      translation = centre+shift-centre @ rotation.T
+      translation = (np.asarray(job["translation"]) if "translation" in job else
+                     centre+np.asarray(job["shift"])-centre @ rotation.T)
       points = original @ rotation.T+translation
-      iterator = _global_fit_optimize_iter(points, grid, return_transform=True)
+      level = levels[job["level"]] if "level" in job else grid
+      options = (dict(samples=level["samples"] @ rotation.T+translation, weights=level["weights"],
+                      max_iterations=300 if job["level"] == 0 else 600 if level["resolution"] else 2000)
+                 if "level" in job else {})
+      if level.get("center_prior"):
+        options["center_prior"] = dict(level["center_prior"],
+            reference=np.asarray(level["center_prior"]["anchor"]) @ rotation.T+translation)
+      iterator = _global_fit_optimize_iter(points, level, return_transform=True, **options)
       last_progress = 0.
       while True:
         if os.getppid() != parent:
@@ -18216,6 +18625,22 @@ def _global_fit_workers_prepare(state):
   config.update(periodic=grid["periodic"], path=str(grid["data"].filename),
                 dtype=grid["data"].dtype.str, offset=int(grid["data"].offset),
                 data_shape=list(grid["data"].shape), original=original_path)
+  if grid.get("center_prior"):
+    config["center_prior"] = grid["center_prior"]
+  if grid.get("levels"):
+    config["levels"] = []
+    for index, level in enumerate(grid["levels"]):
+      description = {key: level[key].tolist() for key in ("shape", "transform", "starts", "periods", "origin")}
+      description.update(periodic=level["periodic"], path=str(level["data"].filename),
+          dtype=level["data"].dtype.str, offset=int(level["data"].offset),
+          data_shape=list(level["data"].shape), resolution=level["resolution"])
+      if level.get("center_prior"):
+        description["center_prior"] = level["center_prior"]
+      for key in ("samples", "weights"):
+        path = os.path.join(directory, f"level-{index}-{key}.npy")
+        np.save(path, level[key])
+        description[key+"_path"] = path
+      config["levels"].append(description)
   config_path = os.path.join(directory, "workers.json")
   with open(config_path, "w") as handle:
     json.dump(config, handle)
@@ -18312,32 +18737,33 @@ def _global_fit_rmsd(first, second, cutoff=None):
   return math.sqrt(total/len(first))
 
 
-def _global_fit_insert_transform(state, rotation, translation, score):
+def _global_fit_insert_transform(state, rotation, translation, score, hits=1):
   """Cluster rigid placements exactly from second moments, without rebuilding all atoms."""
-  pool, np = state["pool"], state["grid"]["np"]
+  pool, np = state.get("pool") or state["pose_moments"], state["grid"]["np"]
   centre = pool["centre"] @ rotation.T+translation
   match = None
   for candidate in state["candidates"]:
     delta = rotation-candidate["rotation"]
     mse = float(np.sum((delta @ pool["covariance"])*delta) + np.sum((centre-candidate["centre"])**2))
-    if max(0., mse) < 1.:
+    if max(0., mse) < state.get("cluster_cutoff", 1.)**2:
       match = candidate
       break
   pose = dict(rotation=rotation, translation=translation, centre=centre,
               coordinates=None, score=score, cc=None)
+  _global_fit_rank_pose(state, pose)
   if match is None:
-    state["candidates"].append(dict(pose, hits=1))
+    state["candidates"].append(dict(pose, hits=hits))
   else:
-    match["hits"] += 1
-    if score > match["score"]:
+    match["hits"] += hits
+    if pose["rank_score"] > match.get("rank_score", match["score"]):
       match.update(pose)
-  state["candidates"].sort(key=lambda c: c["score"], reverse=True)
-  del state["candidates"][20:]
+  state["candidates"].sort(key=lambda c: c.get("rank_score", c["score"]), reverse=True)
+  del state["candidates"][state.get("candidate_limit", 5):]
 
 
 def _global_fit_candidate_coordinates(state, candidate):
   if candidate["coordinates"] is None:
-    pool = state["pool"]
+    pool = state.get("pool") or state["pose_moments"]
     points = pool["original"] @ candidate["rotation"].T+candidate["translation"]
     candidate["coordinates"] = dict(zip(pool["keys"], map(tuple, points)))
   return candidate["coordinates"]
@@ -18355,18 +18781,73 @@ def _global_fit_write_coordinates(model, snapshot):
   coot.set_atom_attributes_py(attributes)
 
 
+def _global_fit_place_model(state, key, coordinates, candidate=None, shift=None):
+  """Move only an owned temporary model; verify native transforms and retain a safe fallback."""
+  model = state[key]
+  def absolute():
+    moved = (coordinates if shift is None else
+             {k: tuple(float(p[i]-shift[i]) for i in range(3)) for k, p in coordinates.items()})
+    _global_fit_write_coordinates(model, moved)
+  record = state.get("rigid_models", {}).get(key)
+  if record is not None and (not _global_fit_preview_owned(state, key) or record["model"] != model):
+    raise RuntimeError("The temporary fitting model was replaced.")
+  if record is None or record.get("disabled") or not callable(getattr(coot, "transform_molecule_by", None)):
+    absolute()
+    return
+  try:
+    np = record["np"]
+    original = record["original"]
+    target = np.asarray([coordinates[k] for k in record["keys"]], dtype=float)
+    if candidate is None:
+      rotation, translation = np.eye(3), np.zeros(3)
+    elif "rotation" in candidate:
+      rotation, translation = np.asarray(candidate["rotation"]), np.asarray(candidate["translation"])
+    else:
+      # Serial/legacy candidates carry coordinates rather than a transform.
+      before, after = original.mean(axis=0), target.mean(axis=0)
+      u, _s, vt = np.linalg.svd((original-before).T @ (target-after))
+      rotation = vt.T @ u.T
+      if np.linalg.det(rotation) < 0:
+        vt[-1] *= -1
+        rotation = vt.T @ u.T
+      translation = after-before @ rotation.T
+    if (not np.isfinite(target).all() or rotation.shape != (3, 3) or translation.shape != (3,) or
+        not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6, rtol=0) or
+        abs(float(np.linalg.det(rotation))-1) > 1e-6 or
+        not np.allclose(original @ rotation.T+translation, target, atol=2e-4, rtol=0)):
+      raise ValueError("The candidate is not the expected rigid placement.")
+    if shift is not None:
+      translation = translation-np.asarray(shift)
+      target = target-np.asarray(shift)
+    delta = rotation @ record["rotation"].T
+    displacement = translation-record["translation"] @ delta.T
+    if not np.allclose(delta, np.eye(3), atol=1e-14, rtol=0) or np.linalg.norm(displacement) > 1e-12:
+      coot.transform_molecule_by(model, *map(float, delta.ravel()), *map(float, displacement))
+    actual = _atom_snapshot_for_specs(model, record["probe_specs"])
+    if any(k not in actual or np.linalg.norm(np.asarray(actual[k])-target[i]) > .0005
+           for i, k in record["probes"]):
+      raise RuntimeError("Native rigid placement did not reproduce the expected coordinates.")
+    record.update(rotation=rotation.copy(), translation=translation.copy())
+  except Exception as error:
+    record["disabled"] = True
+    print("Global fit: using absolute coordinate updates:", error)
+    absolute()
+
+
 def _global_fit_insert_candidate(state, snapshot, score):
   if not math.isfinite(score):
     raise RuntimeError("Map density is unavailable for this placement.")
   match = next((c for c in state["candidates"] if _global_fit_rmsd(snapshot, c["coordinates"], cutoff=1.0) < 1.0), None)
+  pose = dict(coordinates=snapshot, score=score, cc=None)
+  _global_fit_rank_pose(state, pose)
   if match is not None:
     match["hits"] += 1
-    if score > match["score"]:
-      match.update(coordinates=snapshot, score=score, cc=None)
+    if pose["rank_score"] > match.get("rank_score", match["score"]):
+      match.update(pose)
   else:
-    state["candidates"].append({"coordinates": snapshot, "score": score, "cc": None, "hits": 1})
-  state["candidates"].sort(key=lambda c: c["score"], reverse=True)
-  del state["candidates"][20:]
+    state["candidates"].append(dict(pose, hits=1))
+  state["candidates"].sort(key=lambda c: c.get("rank_score", c["score"]), reverse=True)
+  del state["candidates"][5:]
 
 
 def _global_fit_preview_owned(state, key="preview"):
@@ -18436,34 +18917,31 @@ def _global_fit_candidate_cc(state, candidate):
   coordinates = _global_fit_candidate_coordinates(state, candidate)
   specs = [list(s) for s in state["specs"]]
   def full_cc():
-    _global_fit_write_coordinates(state["scorer"], coordinates)
+    _global_fit_place_model(state, "scorer", coordinates, candidate)
     return float(coot.map_to_model_correlation_py(state["scorer"], specs, [], 0, state["map"]))
   if state.get("score_grid") is not None and not state.get("score_box_disabled"):
     boxed = None
     old_scroll = None
+    cc = None
+    started = time.perf_counter()
     try:
       box = _global_fit_score_box(state["score_grid"], coordinates)
       if box is not None:
         if callable(getattr(coot, "scroll_wheel_map", None)):
           old_scroll = coot.scroll_wheel_map()
         path, shift = box
+        list_maps = globals().get("map_molecule_list")
+        existing = set(list_maps()) if callable(list_maps) else {state["map"]}
         model = coot.handle_read_ccp4_map(path, 0)
-        if not coot.is_valid_map_molecule(model) or model == state["map"]:
+        if not coot.is_valid_map_molecule(model) or model in existing:
           raise RuntimeError("Could not load the temporary scoring box.")
         boxed = model
         coot.set_map_displayed(boxed, 0)
-        moved = {key: tuple(float(p[i]-shift[i]) for i in range(3)) for key, p in coordinates.items()}
-        _global_fit_write_coordinates(state["scorer"], moved)
+        _global_fit_place_model(state, "scorer", coordinates, candidate, shift)
         cc = float(coot.map_to_model_correlation_py(state["scorer"], specs, [], 0, boxed))
         if not math.isfinite(cc) or not -1.0001 <= cc <= 1.0001:
+          cc = None
           raise ValueError("Scoring box returned an invalid CC.")
-        if not state.get("score_box_checked"):
-          reference = full_cc()
-          if not math.isfinite(reference) or abs(reference-cc) > 5e-5:
-            raise ValueError("Scoring box did not reproduce the original-map CC.")
-          state["score_box_checked"] = True
-          return reference
-        return cc
     except Exception as error:
       state["score_box_disabled"] = True
       print("Global fit: using full-map CC:", error)
@@ -18473,6 +18951,24 @@ def _global_fit_candidate_cc(state, candidate):
       if old_scroll is not None and coot.is_valid_map_molecule(old_scroll):
         if coot.scroll_wheel_map() != old_scroll:
           coot.set_scroll_wheel_map(old_scroll)
+    if cc is not None:
+      boxed_seconds = time.perf_counter()-started
+      if not state.get("score_box_checked"):
+        started = time.perf_counter()
+        reference = full_cc()
+        full_seconds = time.perf_counter()-started
+        if not math.isfinite(reference) or abs(reference-cc) > 5e-5:
+          state["score_box_disabled"] = True
+          print("Global fit: using full-map CC: scoring box did not reproduce original-map CC.")
+        else:
+          state["score_box_checked"] = True
+          state["score_box_timing"] = dict(boxed=boxed_seconds, full=full_seconds)
+          # Retain boxes only with a clear saving, including file I/O and cleanup.
+          if boxed_seconds >= .9*full_seconds:
+            state["score_box_disabled"] = True
+            print("Global fit: full-map CC is faster; skipping subsequent scoring boxes.")
+        return reference
+      return cc
   return full_cc()
 
 
@@ -18495,6 +18991,7 @@ def _global_fit_release(state):
   _global_fit_close_grid(state.get("grid"))
   state["grid"] = None
   state["pool"] = None
+  state["rigid_models"] = {}
 
 
 def _global_fit_prepare(state):
@@ -18522,16 +19019,31 @@ def _global_fit_prepare(state):
     state["message"] = "Caching the fitting map..."
     yield
     state["grid"] = _global_fit_load_grid(fitting_map, state["original"], state["radius"])
+    state["message"] = "Cropping the model-centered search region..."
+    yield
+    full_grid = state["grid"]
+    cropped = yield from _global_fit_crop_search(full_grid, state["original"], state["radius"])
+    if cropped is not full_grid:
+      state["grid"] = cropped
+      if (not state["blur_b"] and callable(getattr(coot, "handle_read_ccp4_map", None)) and
+          _global_fit_scoring_grid_supported(full_grid)):
+        state["score_grid"] = full_grid
+      else:
+        _global_fit_close_grid(full_grid)
+    if state.get("center_distance") is not None:
+      _global_fit_prepare_center(state)
+    if state.get("multiscale"):
+      yield from _global_fit_prepare_levels(state)
   finally:
     if (blurred is not None and coot.is_valid_map_molecule(blurred) and
         coot.molecule_name(blurred) == blur_name):
       coot.close_molecule(blurred)
-  if (callable(getattr(coot, "handle_read_ccp4_map", None)) and
+  if (state.get("score_grid") is None and callable(getattr(coot, "handle_read_ccp4_map", None)) and
       _global_fit_scoring_grid_supported(state["grid"])):
     state["message"] = "Caching the original map for scoring..."
     yield
     try:
-      state["score_grid"] = (state["grid"] if not state["blur_b"] else
+      state["score_grid"] = (state["grid"] if not state["blur_b"] and not state["grid"].get("search_region") else
                              _global_fit_load_grid(state["map"], state["original"], state["radius"]))
     except Exception as error:
       print("Global fit: using full-map CC:", error)
@@ -18549,6 +19061,14 @@ def _global_fit_prepare(state):
     coot.set_mol_displayed(model, 0)
     coot.set_mol_active(model, 0)
     coot.turn_off_backup(model)
+    if callable(getattr(coot, "transform_molecule_by", None)):
+      np = state["grid"]["np"]
+      keys = tuple(state["original"])
+      probes = [(int(i), keys[int(i)]) for i in np.linspace(0, len(keys)-1, min(12, len(keys)), dtype=int)]
+      state.setdefault("rigid_models", {})[key] = dict(model=model, np=np, keys=keys,
+          original=np.asarray(list(state["original"].values()), dtype=float),
+          rotation=np.eye(3), translation=np.zeros(3), probes=probes,
+          probe_specs=list(dict.fromkeys(k[:3] for _i, k in probes)))
   if not state.get("hidden_original") and coot.mol_is_displayed(state["source"]):
     coot.set_mol_displayed(state["source"], 0)
     state["hidden_original"] = True
@@ -18614,7 +19134,7 @@ def _global_fit_choose(state, candidate=None):
   preview = state["preview"]
   if not _global_fit_preview_owned(state):
     raise RuntimeError("The fitting preview was closed. Close and restart the search.")
-  _global_fit_write_coordinates(preview, state["original"] if candidate is None else candidate["coordinates"])
+  _global_fit_place_model(state, "preview", state["original"] if candidate is None else candidate["coordinates"], candidate)
   coot.set_mol_displayed(preview, 1)
   state["selected"] = candidate
 
@@ -18638,6 +19158,16 @@ def _global_fit_stop(state, message=None):
       coot.set_mol_displayed(state["source"], 1)
       state["hidden_original"] = False
   else:
+    if state.get("multiscale_active"):
+      # A stopped coarse stage must not label coarse-map values as final scores.
+      np = state["grid"]["np"]
+      for candidate in state["candidates"]:
+        points = np.asarray(list(_global_fit_candidate_coordinates(state, candidate).values()))
+        values, _gradient, _valid = _global_fit_grid_values(state["grid"], points)
+        candidate["score"] = float(values.mean())
+        _global_fit_rank_pose(state, candidate, fine=True)
+      state["candidates"].sort(key=lambda c: c.get("rank_score", c["score"]), reverse=True)
+      del state["candidates"][5:]
     state.update(phase="score", scored=0)
     _global_fit_schedule(state)
   state["update"]()
@@ -18676,13 +19206,20 @@ def _global_fit_step(state, update=True):
         state["scored"] += 1
       else:
         _global_fit_complete(state)
+    elif state.get("multiscale_active"):
+      _global_fit_multiscale_step(state)
     elif state.get("pool") is not None:
       _global_fit_workers_step(state)
     else:
       if state.get("trial") is None:
         coordinates = (state["original"] if state["done"] == 0 else
                        _global_fit_random_start(state["original"], state["radius"], state["rng"]))
-        state["trial"] = _global_fit_optimize_iter(coordinates, state["grid"], deadline=state.get("work_deadline"))
+        options = {}
+        if state.get("center_prior"):
+          np = state["grid"]["np"]
+          reference = np.average([coordinates[k] for k in state["original"]], weights=state["center_weights"], axis=0)
+          options["center_prior"] = dict(state["center_prior"], reference=reference)
+        state["trial"] = _global_fit_optimize_iter(coordinates, state["grid"], deadline=state.get("work_deadline"), **options)
       try:
         state["iteration"] = next(state["trial"])
       except StopIteration as result:
@@ -18741,11 +19278,13 @@ def _global_fit_reset(state):
   if state.get("hidden_original") and valid_model_molecule_qm(state["source"]):
     coot.set_mol_displayed(state["source"], 1)
   state.update(phase="idle", candidates=[], selected=None, hidden_original=False, done=0,
-               scored=0, iteration=0, message="Search cleared. Reposition the molecule or start another search.")
+               scored=0, iteration=0, center_prior=None, center_weights=None,
+               message="Search cleared. Reposition the molecule or start another search.")
   state["update"]()
 
 
-def _global_fit_start(state, scope, trials, radius, blur_b=0):
+def _global_fit_start(state, scope, trials, radius, blur_b=0, multiscale=False,
+                      center_distance=None, center_strength=.1):
   import random
   if state["running"] or state["closed"]:
     return
@@ -18754,6 +19293,11 @@ def _global_fit_start(state, scope, trials, radius, blur_b=0):
     raise ValueError("Use 1-10000 trials and a radius between 0 and 1000 A.")
   if not math.isfinite(blur_b) or not 0 <= blur_b <= 100000:
     raise ValueError("Use a blur B-factor between 0 and 100000 A^2 (0 means no blur).")
+  if center_distance is not None:
+    center_distance, center_strength = float(center_distance), float(center_strength)
+    if (not math.isfinite(center_distance) or not .1 <= center_distance <= 1000 or
+        not math.isfinite(center_strength) or not 0 <= center_strength <= 100):
+      raise ValueError("Center preference needs a distance between 0.1 and 1000 A and strength between 0 and 100 sigma.")
   if blur_b and not callable(getattr(coot, "sharpen_blur_map", None)):
     raise ValueError("This Coot build cannot create a temporary blurred map.")
   if coot.refinement_already_ongoing_p():
@@ -18771,7 +19315,12 @@ def _global_fit_start(state, scope, trials, radius, blur_b=0):
                trials=trials, radius=radius, rng=random.Random(), done=0, failed=0,
                candidates=[], selected=None, message="Preparing the search...", running=True,
                phase="prepare", blur_b=blur_b, scored=0, iteration=0,
+               multiscale=bool(multiscale), multiscale_active=False, stage_fraction=0.,
+               candidate_limit=5, cluster_cutoff=1., pose_moments=None,
                score_box_checked=False, score_box_disabled=False,
+               score_box_timing=None, rigid_models={},
+               center_distance=center_distance, center_strength=center_strength,
+               center_prior=None, center_weights=None,
                workers=min(trials, _global_fit_worker_count()), pool=None, worker_note="")
   state["preparation"] = _global_fit_prepare(state)
   _global_fit_schedule(state)
@@ -19589,6 +20138,25 @@ def global_fit_map(scope="molecule"):
   blur_controls.append(blur_b)
   blur_controls.set_tooltip_text("Optional positive B-factor blur for fitting only. CC is always calculated against the original target map; temporary maps are removed automatically.")
   box.append(blur_controls)
+  multiscale = Gtk.CheckButton(label="Coarse-to-fine search")
+  multiscale.set_active(True)
+  multiscale.set_tooltip_text("Search smooth, coarsely sampled maps first, then polish distinct placements on the input fitting map. Tiny selections and periodic maps use the original search. Turn off to compare with the original method.")
+  box.append(multiscale)
+  center_bias = Gtk.CheckButton(label="Prefer starting center")
+  box.append(center_bias)
+  center_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  center_distance, center_strength = Gtk.Entry(), Gtk.Entry()
+  for entry, value in ((center_distance, "5"), (center_strength, "0.1")):
+    entry.set_text(value)
+    entry.set_width_chars(5)
+    entry.set_max_width_chars(5)
+  for widget in (Gtk.Label(label="Distance (A)"), center_distance,
+                 Gtk.Label(label="Cost (sigma)"), center_strength):
+    center_row.append(widget)
+  center_row.set_sensitive(False)
+  center_bias.connect("toggled", lambda widget: center_row.set_sensitive(widget.get_active()))
+  center_row.set_tooltip_text("Soft center-of-mass penalty, not a distance limit. At the specified distance, subtract this many local map standard deviations from the fitting objective; cost grows with distance squared. Raw mean density and native CC are unchanged. 0 cost disables the preference.")
+  box.append(center_row)
   positioning = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
   move_button = Gtk.Button(label="Move molecule to screen center")
   move_button.set_tooltip_text(f"Translate the whole molecule #{active[0]} to the current view center, preserving its orientation. Available before searching; use Reset search to try another starting point.")
@@ -19667,6 +20235,10 @@ def global_fit_map(scope="molecule"):
         for index, candidate in enumerate(displayed_candidates):
           cc_text = f"{candidate['cc']:.3f}" if candidate["cc"] is not None else "-"
           row = table_row((str(index+1), f"{candidate['score']:.4g}", cc_text, str(candidate["hits"])))
+          if state.get("center_prior"):
+            row.set_tooltip_text(f"Center-of-mass shift: {candidate['center_shift']:.2f} A\n"
+                                 f"Density penalty: {candidate['penalty']/state['center_prior']['sigma']:.3g} sigma\n"
+                                 "Rank includes this penalty; mean density and CC do not.")
           row.global_fit_candidate = candidate
           rows.append(row)
         state["rows_signature"] = signature
@@ -19675,8 +20247,13 @@ def global_fit_map(scope="molecule"):
       rows.select_row(selected_row)
       running = state["running"]
       available = bool(state["candidates"]) and state.get("preview") is not None
-      for control in (selection, *fields, blur):
+      for control in (selection, *fields, blur, multiscale, center_bias):
         control.set_sensitive(not running)
+      center_row.set_sensitive(not running and center_bias.get_active())
+      heading.global_fit_cells[1].set_tooltip_text(
+          "Raw mean atom density on the fitting map. Rank includes the starting-center penalty."
+          if state.get("center_prior") else
+          "Mean atom density on the fitting map (blurred if enabled). Solutions are ranked by this value.")
       blur_b.set_sensitive(not running and blur.get_active())
       for key in ("previous", "next"):
         actions[key].set_sensitive(available and not running)
@@ -19691,6 +20268,8 @@ def global_fit_map(scope="molecule"):
       partial = (state.get("parallel_fraction", 0.) if state.get("pool") is not None else
                  min(.99, state.get("iteration", 0)/2000))
       fraction = .9*(state["done"]+partial)/state["trials"]
+      if state.get("multiscale_active"):
+        fraction = .9*state["stage_fraction"]
       text = f"{state['done']}/{state['trials']} trials | {len(state['candidates'])} distinct solutions"
       if phase == "search":
         text += f" | {state['workers']} worker{'s' if state['workers'] != 1 else ''}"
@@ -19705,7 +20284,12 @@ def global_fit_map(scope="molecule"):
         fraction = 1. if state["done"] else 0.
       progress.set_fraction(fraction)
       progress.set_text(text)
-      status.set_text(state["message"] or "Ranked by mean fitting-map density. CC: original map, -1 to +1.")
+      message = state["message"] or "Ranked by mean fitting-map density. CC: original map, -1 to +1."
+      if state.get("center_prior"):
+        message += " | Rank includes center preference; density and CC are unmodified."
+        if state.get("selected") is not None:
+          message += f" Center shift: {state['selected']['center_shift']:.2f} A."
+      status.set_text(message)
     finally:
       state["rendering"] = False
   def choose(_rows, row):
@@ -19720,7 +20304,9 @@ def global_fit_map(scope="molecule"):
       update()
   def start(*_args):
     attempt(_global_fit_start, state, selection.get_active_id(), fields[0].get_text(), fields[1].get_text(),
-            blur_b.get_text() if blur.get_active() else 0)
+            blur_b.get_text() if blur.get_active() else 0, multiscale.get_active(),
+            center_distance.get_text() if center_bias.get_active() else None,
+            center_strength.get_text() if center_bias.get_active() else .1)
   def original(*_args):
     attempt(_global_fit_choose, state)
     update()
@@ -19750,10 +20336,12 @@ def global_fit_map(scope="molecule"):
   window.connect("close-request", lambda *_: attempt(_global_fit_finish, state) or True)
   window.set_child(box)
   state["widgets"] = dict(actions, rows=rows, scope=selection, trials=fields[0], radius=fields[1],
-                          progress=progress, blur=blur, blur_b=blur_b, heading=heading, keys=keys, identifier=label)
+                          progress=progress, blur=blur, blur_b=blur_b, multiscale=multiscale,
+                          center_bias=center_bias, center_distance=center_distance, center_strength=center_strength,
+                          heading=heading, keys=keys, identifier=label)
   _GLOBAL_FIT_STATE = state
   update()
-  status.set_text("Uses the active scroll-wheel map, captured when this panel opens. Coarsen it first if desired.")
+  status.set_text("Uses the selected refinement map, captured when this panel opens. Coarse-to-fine search keeps the input map unchanged.")
   window.present()
   return state
 
