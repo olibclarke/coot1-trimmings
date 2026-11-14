@@ -11864,6 +11864,115 @@ def _tq_map_id_or_default(map_id=None):
   return _scrollable_map_or_status()
 
 
+def _local_em_weight_points(points, radius=4.0, max_anchors=2048):
+  """Bounded, spatially stratified neighborhoods, independent of map box and atom order."""
+  import numpy as np
+  radius = float(radius)
+  if not math.isfinite(radius) or not .5 <= radius <= 20:
+    raise ValueError("Use a local sampling radius between 0.5 and 20 A.")
+  points = np.asarray(points, dtype=float).reshape((-1, 3))
+  if not len(points) or not np.isfinite(points).all():
+    raise ValueError("No finite occupied heavy-atom coordinates are available.")
+  points = np.unique(points, axis=0)
+  cells = np.floor((points-points.min(axis=0))/4.).astype(np.int64)
+  _, inverse, counts = np.unique(cells, axis=0, return_inverse=True, return_counts=True)
+  centres = np.column_stack([np.bincount(inverse, weights=points[:, axis])/counts for axis in range(3)])
+  # Stable ties (especially two-atom bins) must not change after a coordinate translation.
+  distance_sq = np.round(np.sum((points-centres[inverse])**2, axis=1), 10)
+  order = np.lexsort((points[:, 2], points[:, 1], points[:, 0], distance_sq, inverse))
+  first = np.r_[True, np.diff(inverse[order]) != 0]
+  anchors = points[order[first]]
+  if len(anchors) > max_anchors:
+    keep = np.random.default_rng(1729).choice(len(anchors), max_anchors, replace=False)
+    anchors = anchors[np.sort(keep)]
+  # Equal-volume radii and low-discrepancy directions sample signal and nearby solvent.
+  n = max(32, int(math.ceil(512/len(anchors))))
+  i = np.arange(n)+.5
+  r = radius*(i/n)**(1/3)
+  z = 1-2*np.mod(i*.7548776662466927, 1.)
+  theta = 2*math.pi*np.mod(i*.5698402909980532, 1.)
+  xy = np.sqrt(1-z*z)
+  offsets = r[:, None]*np.column_stack((xy*np.cos(theta), xy*np.sin(theta), z))
+  samples = (anchors[:, None, :]+offsets).reshape((-1, 3))
+  return samples, len(anchors)
+
+
+def _local_em_weight_statistics(values):
+  """Coot's EM calibration (50 * 0.3 * 0.35), with a model-local sigma."""
+  import numpy as np
+  values = np.asarray(values, dtype=float)
+  if len(values) < 32 or not np.isfinite(values).all():
+    raise ValueError("Insufficient finite density samples near the model; weight unchanged.")
+  sigma, mean = float(values.std()), float(values.mean())
+  if sigma <= np.finfo(float).eps*max(float(np.max(np.abs(values))), np.finfo(float).tiny)*32:
+    raise ValueError("The density near the model is flat or unavailable; weight unchanged.")
+  weight = 5.25/sigma
+  if not math.isfinite(weight) or not 0 < weight <= np.finfo(np.float32).max:
+    raise ValueError("The estimated weight is outside Coot's numeric range; weight unchanged.")
+  return dict(weight=weight, sigma=sigma, mean=mean, samples=len(values), calibration=5.25)
+
+
+def estimate_local_em_map_weight(mol_id=None, map_id=None, radius=4.0, apply=True):
+  """Set an EM starting weight from near-model density, not whole-map padding.
+
+  Explicit IDs allow inspection without changing state via apply=False. Only the
+  selected refinement map can be used when applying the global refinement weight.
+  """
+  if mol_id is None:
+    active = _active_residue_or_status()
+    if not active:
+      raise ValueError("Choose an active model first.")
+    mol_id = active[0]
+  if map_id is None:
+    map_id = coot.imol_refinement_map()
+  if not valid_model_molecule_qm(mol_id) or not coot.is_valid_map_molecule(map_id):
+    raise ValueError("Choose a valid model and selected refinement map first.")
+  if callable(getattr(coot, "map_is_difference_map", None)) and coot.map_is_difference_map(map_id):
+    raise ValueError("Use the EM reconstruction, not a difference map.")
+  if apply and (coot.refinement_already_ongoing_p() or coot.imol_refinement_map() != map_id):
+    raise ValueError("Accept/cancel refinement and select this refinement map before changing its weight.")
+  snapshot = _model_coordinate_snapshot(mol_id)
+  points = []
+  for spec, record in snapshot.items():
+    if str(record["name"]).strip().upper() in ("HOH", "WAT", "DOD"):
+      continue
+    for atom in _tq_residue_atom_records(mol_id, spec, snapshot=snapshot):
+      if atom["occupancy"] > 0:
+        points.append(atom["xyz"])
+  samples, anchors = _local_em_weight_points(points, radius)
+  values = [float(coot.density_at_point(map_id, *map(float, point))) for point in samples]
+  result = _local_em_weight_statistics(values)
+  result.update(model=mol_id, map=map_id, radius=float(radius), anchors=anchors, atoms=len(points), applied=False)
+  if apply:
+    previous = float(coot.matrix_state())
+    try:
+      coot.set_matrix(result["weight"])
+      actual = float(coot.matrix_state())
+      if not math.isfinite(actual) or not math.isclose(actual, result["weight"], rel_tol=1e-5):
+        raise RuntimeError("Coot did not accept the estimated refinement weight.")
+    except Exception:
+      coot.set_matrix(previous)
+      raise
+    result.update(previous_weight=previous, applied=True)
+  return result
+
+
+def set_local_em_refinement_weight():
+  """One-shot menu action; leaves contour, coordinates and refinement-map selection alone."""
+  add_status_bar_text("Estimating EM refinement weight from density near the active model...")
+  try:
+    result = estimate_local_em_map_weight()
+    message = (f"EM refinement weight: {result['previous_weight']:.4g} -> {result['weight']:.4g} | "
+               f"Model #{result['model']}, map #{result['map']} | local sigma {result['sigma']:.4g} "
+               f"within {result['radius']:g} A ({result['samples']} samples).")
+    add_status_bar_text(message)
+    print(message + " Starting estimate, not geometry-optimized; ordinary B-factors and contour level are not used.")
+    return result
+  except Exception as error:
+    info_dialog(f"Could not estimate a local EM refinement weight.\n\n{error}")
+    return None
+
+
 def _tq_map_sigma(map_id):
   try:
     sigma_value = float(map_sigma_py(map_id))
@@ -17949,13 +18058,16 @@ def _global_fit_load_grid(map_id, original, radius):
     raise
 
 
-def _global_fit_crop_search(grid, original, radius):
+def _global_fit_crop_search(grid, original, radius, weights=None):
   """Exact-sample search sphere, enclosing every starting rotation and translation."""
   if grid["periodic"]:
     return grid
   np = grid["np"]
   points = np.asarray(list(original.values()), dtype=float)
-  centre = points.mean(axis=0)
+  if weights is not None:
+    weights = np.asarray(weights)
+    points, weights = points[weights > 0], weights[weights > 0]
+  centre = points.mean(axis=0) if weights is None else np.average(points, weights=weights, axis=0)
   basis = np.linalg.inv(grid["transform"])
   voxel = float(np.linalg.norm(basis, axis=0).max())
   core = float(np.linalg.norm(points-centre, axis=1).max()) + radius + 2*voxel
@@ -18044,19 +18156,50 @@ def _global_fit_close_grid(grid):
         owner.cleanup()
 
 
-def _global_fit_representatives(points, spacing, maximum=2400):
-  """Spatial centroids with atom-count weights; never bias towards chain order."""
+def _global_fit_confidence_weights(original):
+  """Explicit opt-in only: experimental B-factors are not confidence scores."""
+  import numpy as np
+  try:
+    values = np.asarray([float(ast.literal_eval(key[-1])[1]) for key in original])
+  except (ValueError, TypeError, IndexError, SyntaxError) as error:
+    raise ValueError("Cannot read pLDDT values from the B-factor column.") from error
+  if not len(values) or not np.isfinite(values).all() or ((values < 0) | (values > 100)).any():
+    raise ValueError("pLDDT weighting requires finite B-factor values from 0 to 100. Turn it off for ordinary B-factors.")
+  t = np.clip((values-50)/40, 0., 1.)
+  weights = t*t*(3-2*t)
+  points = np.asarray(list(original.values()), dtype=float)[weights > 0]
+  if len(points) < 4 or np.linalg.matrix_rank(points-np.average(points, weights=weights[weights > 0], axis=0)) < 2:
+    raise ValueError("pLDDT weighting leaves fewer than four non-collinear fitting atoms above 50. Expand the selection or turn weighting off.")
+  return weights
+
+
+def _global_fit_pose_moments(original, np, weights=None):
+  points = np.asarray(list(original.values()), dtype=float)
+  centre = points.mean(axis=0) if weights is None else np.average(points, weights=weights, axis=0)
+  offsets = points-centre
+  covariance = (offsets.T @ offsets/len(points) if weights is None else
+                (offsets.T*weights) @ offsets/np.sum(weights))
+  return dict(original=points, centre=centre, keys=tuple(original), covariance=covariance)
+
+
+def _global_fit_representatives(points, spacing, maximum=2400, weights=None):
+  """Spatial centroids preserving atom counts or confidence mass, without chain-order bias."""
   import numpy as np
   points = np.asarray(points, dtype=float)
+  if weights is not None:
+    weights = np.asarray(weights, dtype=float)
+    points, weights = points[weights > 0], weights[weights > 0]
   if len(points) <= 128:
-    return points.copy(), np.ones(len(points))
+    return points.copy(), np.ones(len(points)) if weights is None else weights.copy()
   spacing = max(float(spacing), 0.1)
   for _ in range(40):
     cells = np.floor((points-points.min(axis=0))/spacing).astype(np.int64)
     _, inverse, counts = np.unique(cells, axis=0, return_inverse=True, return_counts=True)
     if len(counts) <= maximum:
-      centres = np.column_stack([np.bincount(inverse, weights=points[:, i])/counts for i in range(3)])
-      return centres, counts.astype(float)
+      mass = counts.astype(float) if weights is None else np.bincount(inverse, weights=weights)
+      centres = np.column_stack([np.bincount(inverse, weights=points[:, i] if weights is None else
+                                           weights*points[:, i])/mass for i in range(3)])
+      return centres, mass
     spacing *= max(1.1, (len(counts)/maximum)**(1/3))
   raise ValueError("Could not reduce the fitting atoms to spatial representatives.")
 
@@ -18129,13 +18272,18 @@ def _global_fit_rank_pose(state, candidate, fine=False):
                    rank_score=candidate["score"]-prior["coefficient"]*distance_sq)
 
 
-def _global_fit_resolution_levels(points):
+def _global_fit_resolution_levels(points, weights=None):
   """Size-driven extra Gaussian smoothing; the final level is always the input map."""
   import numpy as np
+  if weights is not None:
+    weights = np.asarray(weights)
+    points, weights = points[weights > 0], weights[weights > 0]
   if len(points) < 128:
     return ()
-  offsets = points-points.mean(axis=0)
-  variance = np.linalg.eigvalsh(offsets.T @ offsets/len(points))
+  centre = points.mean(axis=0) if weights is None else np.average(points, weights=weights, axis=0)
+  offsets = points-centre
+  variance = np.linalg.eigvalsh(offsets.T @ offsets/len(points) if weights is None else
+                              (offsets.T*weights) @ offsets/weights.sum())
   size = float(np.exp(np.log(np.maximum(2*np.sqrt(5*np.maximum(variance, 0)), 2)).mean()))
   fine = float(np.clip(size/12, 2, 8))
   coarse = max(fine, size/4)
@@ -18189,7 +18337,8 @@ def _global_fit_prepare_levels(state):
   grid = state["grid"]
   np = grid["np"]
   points = np.asarray(list(state["original"].values()), dtype=float)
-  resolutions = _global_fit_resolution_levels(points) if state.get("multiscale") and not grid["periodic"] else ()
+  fit_weights = grid.get("fit_weights")
+  resolutions = _global_fit_resolution_levels(points, fit_weights) if state.get("multiscale") and not grid["periodic"] else ()
   if not resolutions:
     return
   event = threading.Event()
@@ -18203,9 +18352,11 @@ def _global_fit_prepare_levels(state):
         result["message"] = f"Preparing coarse fitting map {i+1}/{len(resolutions)} ({resolution:.1f} A)..."
         level = _global_fit_make_level(grid, resolution, os.path.join(grid["owner"].name, f"level-{i}.npy"))
         levels.append(level)
-        level["samples"], level["weights"] = _global_fit_representatives(points, resolution/6)
-      fine_points, fine_weights = ((points, np.ones(len(points))) if len(points) <= 6000 else
-                                  _global_fit_representatives(points, .35, 6000))
+        level["samples"], level["weights"] = _global_fit_representatives(points, resolution/6, weights=fit_weights)
+      active_points = points if fit_weights is None else points[fit_weights > 0]
+      active_weights = np.ones(len(points)) if fit_weights is None else fit_weights[fit_weights > 0]
+      fine_points, fine_weights = ((active_points, active_weights) if len(active_points) <= 6000 else
+                                  _global_fit_representatives(active_points, .35, 6000, weights=active_weights))
       final = dict(grid, samples=fine_points, weights=fine_weights, resolution=0.)
       for key in ("owner", "levels", "preparing", "worker_pool"):
         final.pop(key, None)
@@ -18229,10 +18380,7 @@ def _global_fit_prepare_levels(state):
     return
   state.update(multiscale_active=True, level_index=0, level_done=0,
                stage_fraction=0., level_jobs=None)
-  centre = points.mean(axis=0)
-  offsets = points-centre
-  state["pose_moments"] = dict(original=points, centre=centre, keys=tuple(state["original"]),
-                               covariance=offsets.T @ offsets/len(points))
+  state["pose_moments"] = _global_fit_pose_moments(state["original"], np, fit_weights)
   state["candidate_limit"] = 64
   state["cluster_cutoff"] = max(1., resolutions[0]/3)
 
@@ -18353,13 +18501,20 @@ def _global_fit_optimize_iter(snapshot, grid, deadline=None, return_transform=Fa
   """Independent rigid gradient ascent on mean trilinearly interpolated atom density."""
   np = grid["np"]
   all_points = np.asarray(snapshot if isinstance(snapshot, np.ndarray) else list(snapshot.values()), dtype=float)
+  fit_weights = grid.get("fit_weights")
+  if fit_weights is not None:
+    fit_weights = np.asarray(fit_weights, dtype=float)
   # With the prior enabled, rotate about COM so rotation itself is not resisted.
-  centre0 = (all_points.mean(axis=0) if center_prior is None else
+  centre0 = ((all_points.mean(axis=0) if fit_weights is None else np.average(all_points, weights=fit_weights, axis=0))
+             if center_prior is None else
              np.asarray(center_prior["reference"], dtype=float).copy())
   centre = centre0.copy()
   # Keep the optimisation cost bounded for large structures; score the complete pose.
-  indices = np.linspace(0, len(all_points)-1, min(3000, len(all_points)), dtype=int)
+  indices = (np.arange(len(all_points)) if fit_weights is None else np.flatnonzero(fit_weights > 0))
+  indices = indices[np.linspace(0, len(indices)-1, min(3000, len(indices)), dtype=int)]
   points = all_points[indices].copy() if samples is None else np.asarray(samples, dtype=float).copy()
+  if samples is None and fit_weights is not None:
+    weights = fit_weights[indices]
   weights = np.ones(len(points))/len(points) if weights is None else np.asarray(weights, dtype=float)/np.sum(weights)
   rotation = np.eye(3)
   coefficient = float(center_prior["coefficient"]) if center_prior else 0.
@@ -18415,11 +18570,12 @@ def _global_fit_optimize_iter(snapshot, grid, deadline=None, return_transform=Fa
     step = min(.5, step*1.1)
   fitted = (all_points-centre0) @ rotation.T+centre
   values, _gradient, valid = _global_fit_grid_values(grid, fitted)
-  if not valid.any():
+  if not (valid if fit_weights is None else valid & (fit_weights > 0)).any():
     return None, None
+  final_score = float(values.mean() if fit_weights is None else values @ fit_weights/fit_weights.sum())
   if return_transform:
-    return (rotation, centre-centre0 @ rotation.T), float(values.mean())
-  return dict(zip(snapshot, map(tuple, fitted))), float(values.mean())
+    return (rotation, centre-centre0 @ rotation.T), final_score
+  return dict(zip(snapshot, map(tuple, fitted))), final_score
 
 
 def _global_fit_optimize(snapshot, grid):
@@ -18449,10 +18605,12 @@ def _global_fit_random_pose(radius, rng):
   return rotation, shift
 
 
-def _global_fit_random_start(original, radius, rng):
-  """Uniform orientations and uniform-volume translations about the original centroid."""
+def _global_fit_random_start(original, radius, rng, weights=None):
+  """Uniform orientations and uniform-volume translations about the fitting centroid."""
   rotation, shift = _global_fit_random_pose(radius, rng)
   centre = [sum(p[i] for p in original.values())/len(original) for i in range(3)]
+  if weights is not None:
+    centre = [sum(w*p[i] for w, p in zip(weights, original.values()))/sum(weights) for i in range(3)]
   return {key: tuple(centre[i] + shift[i] + sum(rotation[i][j]*(p[j]-centre[j]) for j in range(3))
                      for i in range(3)) for key, p in original.items()}
 
@@ -18492,7 +18650,10 @@ def _global_fit_worker_main():
     data = np.memmap(config.pop("path"), dtype=config.pop("dtype"), mode="r",
                      offset=config.pop("offset"), shape=tuple(config.pop("data_shape")))
     original = np.load(config.pop("original"), mmap_mode="r")
+    fit_weights = np.load(config.pop("fit_weights_path"), mmap_mode="r") if "fit_weights_path" in config else None
     grid = dict(config, np=np, data=data)
+    if fit_weights is not None:
+      grid["fit_weights"] = fit_weights
     for key in ("shape", "transform", "starts", "periods", "origin"):
       grid[key] = np.asarray(grid[key])
     levels = []
@@ -18504,8 +18665,10 @@ def _global_fit_worker_main():
         level[key] = np.asarray(level[key])
       level["samples"] = np.load(level.pop("samples_path"), mmap_mode='r')
       level["weights"] = np.load(level.pop("weights_path"), mmap_mode='r')
+      if fit_weights is not None:
+        level["fit_weights"] = fit_weights
       levels.append(level)
-    centre = original.mean(axis=0)
+    centre = original.mean(axis=0) if fit_weights is None else np.average(original, weights=fit_weights, axis=0)
     parent = os.getppid()
     print(json.dumps({"ready": True}), flush=True)
     for line in sys.stdin:
@@ -18625,6 +18788,9 @@ def _global_fit_workers_prepare(state):
   config.update(periodic=grid["periodic"], path=str(grid["data"].filename),
                 dtype=grid["data"].dtype.str, offset=int(grid["data"].offset),
                 data_shape=list(grid["data"].shape), original=original_path)
+  if grid.get("fit_weights") is not None:
+    config["fit_weights_path"] = os.path.join(directory, "fit-weights.npy")
+    np.save(config["fit_weights_path"], grid["fit_weights"])
   if grid.get("center_prior"):
     config["center_prior"] = grid["center_prior"]
   if grid.get("levels"):
@@ -18650,10 +18816,8 @@ def _global_fit_workers_prepare(state):
     env.pop(key, None)
   for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"):
     env[key] = "1"
-  pool = dict(workers=[], events=deque(), reaped=threading.Event(), next=0,
-              original=original, centre=original.mean(axis=0), keys=tuple(state["original"]))
-  offsets = original-pool["centre"]
-  pool["covariance"] = offsets.T @ offsets/len(offsets)
+  pool = dict(_global_fit_pose_moments(state["original"], np, grid.get("fit_weights")),
+              workers=[], events=deque(), reaped=threading.Event(), next=0)
   grid["worker_pool"] = state["pool"] = pool
   for index in range(state["workers"]):
     state["message"] = f"Starting fitting workers: {index+1}/{state['workers']}..."
@@ -18837,7 +19001,14 @@ def _global_fit_place_model(state, key, coordinates, candidate=None, shift=None)
 def _global_fit_insert_candidate(state, snapshot, score):
   if not math.isfinite(score):
     raise RuntimeError("Map density is unavailable for this placement.")
-  match = next((c for c in state["candidates"] if _global_fit_rmsd(snapshot, c["coordinates"], cutoff=1.0) < 1.0), None)
+  if state.get("confidence_weights") is not None:
+    np = state["grid"]["np"]
+    points, weights = np.asarray(list(snapshot.values())), state["confidence_weights"]
+    match = next((c for c in state["candidates"] if
+                  float(np.sum((points-np.asarray([c["coordinates"][k] for k in snapshot]))**2, axis=1) @
+                        weights/weights.sum()) < 1.), None)
+  else:
+    match = next((c for c in state["candidates"] if _global_fit_rmsd(snapshot, c["coordinates"], cutoff=1.0) < 1.0), None)
   pose = dict(coordinates=snapshot, score=score, cc=None)
   _global_fit_rank_pose(state, pose)
   if match is not None:
@@ -19019,10 +19190,14 @@ def _global_fit_prepare(state):
     state["message"] = "Caching the fitting map..."
     yield
     state["grid"] = _global_fit_load_grid(fitting_map, state["original"], state["radius"])
+    crop_options = {}
+    if state.get("confidence_weights") is not None:
+      state["grid"]["fit_weights"] = state["confidence_weights"]
+      crop_options["weights"] = state["confidence_weights"]
     state["message"] = "Cropping the model-centered search region..."
     yield
     full_grid = state["grid"]
-    cropped = yield from _global_fit_crop_search(full_grid, state["original"], state["radius"])
+    cropped = yield from _global_fit_crop_search(full_grid, state["original"], state["radius"], **crop_options)
     if cropped is not full_grid:
       state["grid"] = cropped
       if (not state["blur_b"] and callable(getattr(coot, "handle_read_ccp4_map", None)) and
@@ -19164,7 +19339,8 @@ def _global_fit_stop(state, message=None):
       for candidate in state["candidates"]:
         points = np.asarray(list(_global_fit_candidate_coordinates(state, candidate).values()))
         values, _gradient, _valid = _global_fit_grid_values(state["grid"], points)
-        candidate["score"] = float(values.mean())
+        weights = state["grid"].get("fit_weights")
+        candidate["score"] = float(values.mean() if weights is None else values @ weights/weights.sum())
         _global_fit_rank_pose(state, candidate, fine=True)
       state["candidates"].sort(key=lambda c: c.get("rank_score", c["score"]), reverse=True)
       del state["candidates"][5:]
@@ -19213,7 +19389,8 @@ def _global_fit_step(state, update=True):
     else:
       if state.get("trial") is None:
         coordinates = (state["original"] if state["done"] == 0 else
-                       _global_fit_random_start(state["original"], state["radius"], state["rng"]))
+                       _global_fit_random_start(state["original"], state["radius"], state["rng"],
+                           **({"weights": state["confidence_weights"]} if state.get("confidence_weights") is not None else {})))
         options = {}
         if state.get("center_prior"):
           np = state["grid"]["np"]
@@ -19284,7 +19461,7 @@ def _global_fit_reset(state):
 
 
 def _global_fit_start(state, scope, trials, radius, blur_b=0, multiscale=False,
-                      center_distance=None, center_strength=.1):
+                      center_distance=None, center_strength=.1, confidence=False):
   import random
   if state["running"] or state["closed"]:
     return
@@ -19310,6 +19487,7 @@ def _global_fit_start(state, scope, trials, radius, blur_b=0, multiscale=False,
   specs = [tuple(s) for s in _all_residue_specs_for_colouring(source)
            if scope == "molecule" or (s[0] == active[0] and (scope == "chain" or tuple(s) == active))]
   original = _atom_snapshot_for_specs(source, specs)
+  confidence_weights = _global_fit_confidence_weights(original) if confidence else None
   _global_fit_release(state)
   state.update(preview=None, grid=None, original=original, specs=specs, scope=scope,
                trials=trials, radius=radius, rng=random.Random(), done=0, failed=0,
@@ -19321,6 +19499,7 @@ def _global_fit_start(state, scope, trials, radius, blur_b=0, multiscale=False,
                score_box_timing=None, rigid_models={},
                center_distance=center_distance, center_strength=center_strength,
                center_prior=None, center_weights=None,
+               confidence=bool(confidence), confidence_weights=confidence_weights,
                workers=min(trials, _global_fit_worker_count()), pool=None, worker_note="")
   state["preparation"] = _global_fit_prepare(state)
   _global_fit_schedule(state)
@@ -20142,6 +20321,10 @@ def global_fit_map(scope="molecule"):
   multiscale.set_active(True)
   multiscale.set_tooltip_text("Search smooth, coarsely sampled maps first, then polish distinct placements on the input fitting map. Tiny selections and periodic maps use the original search. Turn off to compare with the original method.")
   box.append(multiscale)
+  confidence = Gtk.CheckButton(label="Weight by pLDDT (assumes B-factor column contains pLDDT)")
+  confidence.set_active(False)
+  confidence.set_tooltip_text("For prediction confidence, not ordinary B-factors. Ignore pLDDT <=50, half weight at 70, full weight >=90. Fitting, ranking and crop sizing use these weights; every atom still moves rigidly and native CC stays unweighted.")
+  box.append(confidence)
   center_bias = Gtk.CheckButton(label="Prefer starting center")
   box.append(center_bias)
   center_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -20247,10 +20430,13 @@ def global_fit_map(scope="molecule"):
       rows.select_row(selected_row)
       running = state["running"]
       available = bool(state["candidates"]) and state.get("preview") is not None
-      for control in (selection, *fields, blur, multiscale, center_bias):
+      for control in (selection, *fields, blur, multiscale, center_bias, confidence):
         control.set_sensitive(not running)
       center_row.set_sensitive(not running and center_bias.get_active())
+      heading.global_fit_cells[1].set_text("Weighted density" if state.get("confidence") else "Mean density")
       heading.global_fit_cells[1].set_tooltip_text(
+          "pLDDT-weighted mean density on the fitting map. CC remains unweighted; rank also includes center preference if enabled."
+          if state.get("confidence") else
           "Raw mean atom density on the fitting map. Rank includes the starting-center penalty."
           if state.get("center_prior") else
           "Mean atom density on the fitting map (blurred if enabled). Solutions are ranked by this value.")
@@ -20289,6 +20475,8 @@ def global_fit_map(scope="molecule"):
         message += " | Rank includes center preference; density and CC are unmodified."
         if state.get("selected") is not None:
           message += f" Center shift: {state['selected']['center_shift']:.2f} A."
+      if state.get("confidence"):
+        message += " | pLDDT-weighted density; CC unweighted."
       status.set_text(message)
     finally:
       state["rendering"] = False
@@ -20306,7 +20494,7 @@ def global_fit_map(scope="molecule"):
     attempt(_global_fit_start, state, selection.get_active_id(), fields[0].get_text(), fields[1].get_text(),
             blur_b.get_text() if blur.get_active() else 0, multiscale.get_active(),
             center_distance.get_text() if center_bias.get_active() else None,
-            center_strength.get_text() if center_bias.get_active() else .1)
+            center_strength.get_text() if center_bias.get_active() else .1, confidence.get_active())
   def original(*_args):
     attempt(_global_fit_choose, state)
     update()
@@ -20338,6 +20526,7 @@ def global_fit_map(scope="molecule"):
   state["widgets"] = dict(actions, rows=rows, scope=selection, trials=fields[0], radius=fields[1],
                           progress=progress, blur=blur, blur_b=blur_b, multiscale=multiscale,
                           center_bias=center_bias, center_distance=center_distance, center_strength=center_strength,
+                          confidence=confidence,
                           heading=heading, keys=keys, identifier=label)
   _GLOBAL_FIT_STATE = state
   update()
@@ -26379,6 +26568,8 @@ def _build_custom_user_colour_menu(submenu_colour):
 
 
 def _build_custom_fit_menu(submenu_fit):
+  add_simple_coot_menu_menuitem(submenu_fit, "Set EM refinement weight from model-local density",
+                               lambda _item: set_local_em_refinement_weight())
   trackpad_menu = Gio.Menu.new()
   for scope, label in (("residue", "Active residue..."), ("range", "Clicked residue range..."),
                        ("chain", "Active chain..."), ("molecule", "Active molecule...")):
