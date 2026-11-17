@@ -25108,6 +25108,27 @@ def _register_import_worker_candidate(pool, result):
     raise
 
 
+def _register_result_grid(values, groups):
+  """Use the same bounded, size-grouped columns in result and header buttons."""
+  grid = Gtk.Grid(column_spacing=10)
+  grid.set_halign(Gtk.Align.START)
+  cells = []
+  for index, value in enumerate(values):
+    cell = Gtk.Label(label=value)
+    cell.add_css_class("monospace")
+    cell.set_xalign(1 if index in (0, 2, 3, 4) else 0)
+    cell.set_width_chars((5, 32, 8, 8, 15, 6)[index])
+    if index == 1:
+      cell.set_max_width_chars(32)
+      cell.set_ellipsize(_coot_gui_repository_module("Pango").EllipsizeMode.END)
+      cell.set_tooltip_text(value)
+    groups[index].add_widget(cell)
+    grid.attach(cell, index, 0, 1, 1)
+    cells.append(cell)
+  grid.register_result_cells = cells
+  return grid
+
+
 def _register_center_result_row(scroller, button):
   """Center a direct child of the results box, clamping at the list ends."""
   allocation = button.get_allocation()
@@ -25242,10 +25263,14 @@ def compare_local_sequence_registers():
   progress.set_max_width_chars(76)
   progress.set_xalign(0)
   box.append(progress)
-  headings = Gtk.Label(label="Shift   Sequence     Mean CC   Min CC   SC CC (n)")
-  headings.set_xalign(0)
-  headings.set_tooltip_text("SC CC: mean per-residue correlation beyond C-beta; coverage is scored/eligible residues. Gly/Ala excluded. Independent of contour.")
-  headings.add_css_class("monospace")
+  column_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(6)]
+  headings = Gtk.Button()
+  headings.add_css_class("flat")
+  headings.set_focusable(False)
+  headings.set_can_target(False)
+  headings.set_child(_register_result_grid(("Shift", "Sequence", "Mean CC", "Min CC", "SC CC (n)", "Fit"), column_groups))
+  headings.get_child().register_result_cells[4].set_tooltip_text(
+      "SC CC: correlation beyond C-beta; scored/eligible residues in parentheses. Gly/Ala excluded.")
   box.append(headings)
   rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
   scroll = Gtk.ScrolledWindow()
@@ -25365,12 +25390,19 @@ def compare_local_sequence_registers():
   def update_button(button, candidate):
     sidechain = candidate["sidechain"]
     sidechain_text = f"{sidechain['mean']:.3f}" if sidechain["mean"] is not None else "n/a"
-    text = Gtk.Label(label=f"{candidate['offset']:+3d}     {candidate['sequence']}    {candidate['mean']:.3f}    {candidate['minimum']:.3f}"
-                          f"    {sidechain_text} ({sidechain['count']}/{sidechain['eligible']})"
-                          + ("  [flex]" if candidate.get("flexible") else ""))
-    text.set_xalign(0)
-    text.add_css_class("monospace")
-    button.set_child(text)
+    values = (f"{candidate['offset']:+d}", candidate['sequence'], f"{candidate['mean']:.3f}",
+              f"{candidate['minimum']:.3f}", f"{sidechain_text} ({sidechain['count']}/{sidechain['eligible']})",
+              "Flex" if candidate.get("flexible") else "Rigid")
+    cells = vars(button).get("register_result_cells")
+    if cells is not None:
+      for index, (cell, value) in enumerate(zip(cells, values)):
+        cell.set_text(value)
+        if index == 1:
+          cell.set_tooltip_text(value)
+    else:
+      grid = _register_result_grid(values, column_groups)
+      button.register_result_cells = grid.register_result_cells
+      button.set_child(grid)
     button.set_tooltip_text(f"Centre {chain}:{centre+candidate['offset']} | " +
                             ("Coloured by density fit" if candidate["coloured"] else "Density-fit colouring unavailable"))
   def add_row(widget, index):
@@ -25717,7 +25749,7 @@ def compare_local_sequence_registers():
   window.register_comparison_state = state
   state["widgets"] = dict(generate=generate, rigid=rigid_fit_option, flexible=flexible_option,
       refine_selected=refine_selected, progress=progress, shift=shift_entry, discard=discard, keep=keep, merge=merge_selected,
-      size=size_entry, stop=stop, scroll=scroll, rows=rows, previous=previous, next=next_button)
+      size=size_entry, stop=stop, scroll=scroll, rows=rows, headings=headings, previous=previous, next=next_button)
   window.present()
   return window
 
