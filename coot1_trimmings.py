@@ -11137,6 +11137,916 @@ def nearby_residue_annotations_gui(radius=RESIDUE_ANNOTATION_NEARBY_RADIUS):
   return len(browser.grouped_annotations)
 
 
+def _pae_json_path(path):
+  if not str(path or "").strip():
+    raise ValueError("Choose/drop a PAE JSON file or fetch one from AlphaFold DB before previewing.")
+  path = os.path.abspath(os.path.expanduser(str(path).strip()))
+  if os.path.isdir(path):
+    raise ValueError("Choose a PAE JSON file, not a folder.")
+  if not os.path.isfile(path):
+    raise ValueError("The PAE JSON file was not found or is not accessible.")
+  return path
+
+
+def _pae_read_json(path):
+  """Read AFDB/ColabFold matrices and legacy one-based residue-pair JSON."""
+  import numpy as np
+  path = _pae_json_path(path)
+  if os.path.getsize(path) > 512*1024*1024:
+    raise ValueError("PAE JSON exceeds 512 MB; use a smaller prediction/chain-specific file.")
+  with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+  if isinstance(data, list) and data and isinstance(data[0], dict):
+    if len(data) != 1:
+      raise ValueError("Choose a PAE JSON for a single prediction, not multiple records.")
+    data = data[0]
+  sequence = data.get("sequence") if isinstance(data, dict) else None
+  if isinstance(data, dict):
+    if "token_chain_ids" in data or "atom_plddts" in data:
+      raise ValueError("AF3 token-mapped confidence JSON is not supported by this protein-residue version.")
+    if all(key in data for key in ("residue1", "residue2", "distance")):
+      first, second = np.asarray(data["residue1"], dtype=float), np.asarray(data["residue2"], dtype=float)
+      values = np.asarray(data["distance"], dtype=float)
+      if (first.ndim != 1 or first.shape != second.shape or first.shape != values.shape or not len(first) or
+          not np.isfinite(first).all() or not np.isfinite(second).all() or
+          (first < 1).any() or (second < 1).any() or (first != np.floor(first)).any() or (second != np.floor(second)).any()):
+        raise ValueError("Invalid one-based PAE residue-pair indices.")
+      n = int(max(first.max(), second.max()))
+      if n*n > 50000000 or len(first) != n*n:
+        raise ValueError("PAE pairs must form a complete square matrix of at most 50 million entries.")
+      indices = (first.astype(np.int64)-1)*n+second.astype(np.int64)-1
+      expected = np.arange(n*n)
+      if not np.array_equal(indices, expected) and not np.array_equal(np.sort(indices), expected):
+        raise ValueError("PAE pairs contain duplicate or missing entries.")
+      matrix = np.empty((n, n), dtype="f4")
+      matrix.ravel()[indices] = values
+    else:
+      raw = data.get("predicted_aligned_error", data.get("pae"))
+      if raw is None:
+        raise ValueError("No predicted_aligned_error, pae, or legacy residue-pair matrix was found.")
+      if len(raw)**2 > 50000000:
+        raise ValueError("PAE matrix exceeds 50 million entries; use a smaller prediction.")
+      matrix = np.asarray(raw, dtype="f4")
+  else:
+    if len(data)**2 > 50000000:
+      raise ValueError("PAE matrix exceeds 50 million entries.")
+    matrix = np.asarray(data, dtype="f4")
+  if (matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] < 4 or
+      not np.isfinite(matrix).all() or (matrix < 0).any()):
+    raise ValueError("PAE must be a finite, non-negative square matrix with at least four residues.")
+  return matrix, sequence
+
+
+def _pae_afdb_json(url, limit):
+  import urllib.request
+  from urllib.parse import urlparse
+  parsed = urlparse(url)
+  if parsed.scheme != "https" or parsed.hostname != "alphafold.ebi.ac.uk" or parsed.username or parsed.password:
+    raise ValueError("Refusing a PAE download outside the official HTTPS AlphaFold DB host.")
+  request = urllib.request.Request(url, headers={"User-Agent": "Coot-Trimmings-PAE/1"})
+  with urllib.request.urlopen(request, timeout=30) as response:
+    payload = response.read(limit+1)
+  if len(payload) > limit:
+    raise ValueError("AlphaFold DB response exceeds the supported download size.")
+  return json.loads(payload)
+
+
+def _pae_substitutions(source, target):
+  if len(source) != len(target) or not source:
+    raise ValueError("Sequence lengths differ; insertion/deletion mapping requires the matching prediction.")
+  changes = [(i+1, a, b) for i, (a, b) in enumerate(zip(source, target)) if a != b]
+  if len(changes) > min(20, max(1, int(.05*len(source)))):
+    raise ValueError("Sequences differ by more than the supported close-match limit (5%, at most 20 substitutions).")
+  return changes
+
+
+def _pae_find_afdb(sequence, identifier="", progress=None, cancel=None):
+  """Exact MD5 lookup first; AFDB's website BLAST search is a bounded fallback."""
+  import hashlib
+  from urllib.parse import urlencode
+  from urllib.error import HTTPError
+  if len(sequence) < 20 or set(sequence)-set(_REGISTER_AA):
+    raise ValueError("AFDB lookup needs at least 20 standard amino acids from a complete reference sequence.")
+  identifiers = []
+  if str(identifier).strip():
+    value = str(identifier).strip().upper()
+    if not re.fullmatch(r"(?:AF-)?[A-Z0-9]{3,20}(?:-\d+)?(?:-F\d+)?", value):
+      raise ValueError("Enter a UniProt accession/AFDB ID, or leave the field blank to search by sequence.")
+    identifiers = [value]
+  else:
+    digest = hashlib.md5(sequence.encode("ascii")).hexdigest()
+    if progress:
+      progress("Looking up the exact reference sequence in AFDB...")
+    try:
+      summary = _pae_afdb_json("https://alphafold.ebi.ac.uk/api/sequence/summary?"+
+                                urlencode(dict(id=digest, type="md5", rows=1000)), 8*1024*1024)
+    except HTTPError as error:
+      if error.code != 404:
+        raise
+      summary = {}
+    if summary and summary.get("entry", {}).get("sequence") != sequence:
+      raise ValueError("AFDB returned a sequence different from the exact hash query.")
+    for item in summary.get("structures", []):
+      record = item.get("summary", {})
+      entry = str(record.get("model_identifier", ""))
+      if re.fullmatch(r"AF-[A-Z0-9]+(?:-\d+)?-F\d+", entry) and record.get("coverage", 0) >= .999:
+        identifiers.append(entry)
+    if not identifiers:
+      if progress:
+        progress("No exact hit. Searching AFDB for close sequences; this can take several minutes...")
+      url = "https://alphafold.ebi.ac.uk/api/search?"+urlencode(dict(q=sequence, type="sequence", start=0, rows=10))
+      deadline = time.monotonic()+600
+      while True:
+        if cancel is not None and cancel.is_set():
+          raise RuntimeError("AFDB search cancelled.")
+        result = _pae_afdb_json(url, 8*1024*1024)
+        message = str(result.get("message", ""))
+        if not message.startswith(("Job for sequence", "Search in progress")):
+          break
+        if time.monotonic() >= deadline:
+          raise RuntimeError("AFDB sequence search is still running. Try Fetch again later; the service caches its search.")
+        if cancel is not None:
+          cancel.wait(30)
+        else:
+          time.sleep(30)
+      for record in result.get("docs", []):
+        if record.get("isComplex"):
+          continue
+        entry = record.get("entryId", record.get("modelEntityId", record.get("uniprotAccession", "")))
+        if re.fullmatch(r"(?:AF-)?[A-Z0-9]+(?:-\d+)?(?:-F\d+)?", str(entry)):
+          identifiers.append(str(entry))
+  choices, seen = [], set()
+  for identifier in list(dict.fromkeys(identifiers))[:10]:
+    if cancel is not None and cancel.is_set():
+      raise RuntimeError("AFDB search cancelled.")
+    try:
+      records = _pae_afdb_json("https://alphafold.ebi.ac.uk/api/prediction/"+identifier, 2*1024*1024)
+    except HTTPError as error:
+      if error.code == 404:
+        continue
+      raise
+    for record in records:
+      entry = str(record.get("entryId", record.get("modelEntityId", "")))
+      if entry in seen or not record.get("paeDocUrl"):
+        continue
+      candidate = record.get("sequence", record.get("uniprotSequence", ""))
+      try:
+        changes = _pae_substitutions(candidate, sequence)
+      except ValueError:
+        continue
+      if str(identifier).startswith("AF-") and entry != identifier:
+        continue
+      seen.add(entry)
+      choices.append(dict(identifier=entry, changes=changes, sequence=candidate,
+                          description=str(record.get("uniprotDescription", ""))))
+  choices.sort(key=lambda item: (len(item["changes"]), item["identifier"]))
+  if not choices:
+    raise ValueError("No full-length exact/close AFDB prediction was found. Select the complete reference sequence or provide a matching local PAE JSON.")
+  return choices[:10]
+
+
+def _pae_fetch_afdb(identifier, expected_sequence, cache_dir=None, reference_version=None, allow_substitutions=False):
+  """Fetch a sequence-matched, current AFDB PAE document; never guess a version URL."""
+  value = str(identifier).strip().upper()
+  match = re.fullmatch(r"(?:AF-)?([A-Z0-9]{3,20}(?:-\d+)?)(?:-F(\d+))?", value)
+  if match is None:
+    raise ValueError("Enter a UniProt accession or AFDB entry ID, e.g. P69905 or AF-P69905-F1.")
+  accession, fragment = match.groups()
+  records = _pae_afdb_json("https://alphafold.ebi.ac.uk/api/prediction/"+accession, 2*1024*1024)
+  if not isinstance(records, list):
+    raise ValueError("Unexpected AlphaFold DB metadata response.")
+  matches = []
+  for record in records:
+    entry = str(record.get("entryId", record.get("modelEntityId", "")))
+    if fragment is not None and entry != f"AF-{accession}-F{fragment}":
+      continue
+    sequence = record.get("sequence", record.get("uniprotSequence", ""))
+    try:
+      changes = _pae_substitutions(sequence, expected_sequence)
+    except ValueError:
+      continue
+    if (not changes or allow_substitutions) and record.get("paeDocUrl"):
+      matches.append((record, sequence))
+  if len(matches) != 1:
+    raise ValueError("No unique AFDB prediction matches the selected reference sequence. "
+                     "Select the matching single-chain prediction, or supply its local PAE JSON. Multimer/edited sequences are not inferred.")
+  record, sequence = matches[0]
+  entry = str(record.get("entryId", record.get("modelEntityId", accession)))
+  version = str(record.get("latestVersion", "current"))
+  url = str(record["paeDocUrl"])
+  if reference_version is not None and str(reference_version) != version:
+    if int(reference_version) not in record.get("allVersions", []):
+      raise ValueError("AFDB does not list the reference model's version. Supply its matching local PAE JSON.")
+    revised = re.sub(r"_v\d+\.json$", f"_v{int(reference_version)}.json", url)
+    if revised == url:
+      raise ValueError("Cannot resolve a matching historical PAE URL; supply a local JSON file.")
+    url, version = revised, str(int(reference_version))
+  safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", entry+"_v"+version)+"_pae.json"
+  if cache_dir is None:
+    cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "Coot", "pae")
+  os.makedirs(cache_dir, exist_ok=True)
+  path = os.path.join(cache_dir, safe_name)
+  if os.path.isfile(path):
+    try:
+      _matrix, cached_sequence = _pae_read_json(path)
+      if cached_sequence == sequence and len(_matrix) == len(sequence):
+        return path
+    except (OSError, ValueError, TypeError):
+      pass
+  data = _pae_afdb_json(url, 512*1024*1024)
+  if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+    data = data[0]
+  if not isinstance(data, dict):
+    raise ValueError("Unexpected AlphaFold DB PAE document.")
+  if "sequence" in data and data["sequence"] != sequence:
+    raise ValueError("Downloaded PAE sequence differs from AFDB metadata.")
+  data["sequence"] = sequence
+  data["coot_trimmings_afdb_source"] = dict(entry=entry, version=version, url=url)
+  temporary = None
+  try:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", dir=cache_dir, delete=False) as handle:
+      temporary = handle.name
+      json.dump(data, handle, separators=(",", ":"))
+    matrix, _sequence = _pae_read_json(temporary)
+    if len(matrix) != len(sequence):
+      raise ValueError("Downloaded PAE dimensions do not match the AFDB sequence.")
+    os.replace(temporary, path)
+    temporary = None
+    return path
+  finally:
+    if temporary is not None:
+      os.unlink(temporary)
+
+
+def _pae_chain_order(text):
+  chains = [part.strip() for part in str(text).split(",")]
+  if any(not part for part in chains) or len(set(chains)) != len(chains):
+    raise ValueError("List unique chain IDs, comma-separated, in prediction order (use . for a blank chain).")
+  return ["" if chain == "." else chain for chain in chains]
+
+
+def _pae_protein_records(snapshot, chains=None):
+  records = []
+  order = list(dict.fromkeys(spec[0] for spec, record in snapshot.items()
+                            if record["atoms"] and record["name"] in _REGISTER_PROTEIN_NAMES - {"UNK"})) if chains is None else list(chains)
+  for chain in order:
+    chain_records = [(spec, record) for spec, record in snapshot.items()
+                     if spec[0] == chain and record["atoms"] and record["name"] in _REGISTER_PROTEIN_NAMES - {"UNK"}]
+    if not chain_records:
+      raise ValueError(f"No supported protein residues in chain {chain or '.'}.")
+    for position, (spec, record) in enumerate(chain_records):
+      choices = [atom for atom in record["atoms"] if str(atom[0][0]).strip() == "CA" and float(atom[1][0]) > 0]
+      choices.sort(key=lambda a: (bool(a[0][1]), -float(a[1][0]), str(a[0][1])))
+      atom = choices[0] if choices else None
+      xyz = tuple(map(float, atom[2])) if atom is not None else None
+      if xyz is not None and not all(math.isfinite(v) for v in xyz):
+        raise ValueError("Non-finite C-alpha coordinates in the reference/target model.")
+      letter = "M" if record["name"] == "MSE" else next(letter for letter, name in _REGISTER_AA.items() if name == record["name"])
+      records.append(dict(spec=spec, letter=letter, position=position, xyz=xyz,
+                          atom=(*spec, str(atom[0][0]), str(atom[0][1] or "")) if atom is not None else None))
+  if not records:
+    raise ValueError("No supported protein residues were found.")
+  return records, order
+
+
+def _pae_reference_sequences(mol_id, snapshot):
+  """Capture full associated/SEQRES sequences on the main thread, not just observed residues."""
+  result = {}
+  records, chains = _pae_protein_records(snapshot)
+  for chain in chains:
+    numbered = [dict(number=r["spec"][1], ins=r["spec"][2], name=snapshot[r["spec"]]["name"])
+                for r in records if r["spec"][0] == chain]
+    sequence, message = _register_reference_sequence(mol_id, chain, numbered)
+    if sequence and not set(sequence)-set(_REGISTER_AA) and message.startswith(("Chain-associated", "PDB SEQRES")):
+      result[chain] = sequence
+  path = _annotation_source_path(mol_id)
+  if path and globals().get("gemmi") is not None and path.lower().endswith((".cif", ".mmcif")):
+    structure = gemmi.read_structure(path)
+    for chain in structure[0]:
+      if chain.name not in chains or chain.name in result:
+        continue
+      polymer = chain.get_polymer()
+      entity = structure.get_entity_of(polymer) if len(polymer) else None
+      if entity is not None and entity.full_sequence:
+        result[chain.name] = "".join(gemmi.find_tabulated_residue(name).one_letter_code for name in entity.full_sequence)
+  return result
+
+
+def _pae_sequence_rows(records, sequence):
+  """Use complete sequence order or a unique, sequence-validated numbering offset."""
+  observed = "".join(r["letter"] for r in records)
+  if len(observed) == len(sequence):
+    changes = _pae_substitutions(sequence, observed)
+    return list(range(len(records))), changes
+  origins = set()
+  for record in records[:8]:
+    for index, letter in enumerate(sequence):
+      if letter == record["letter"]:
+        origins.add(record["spec"][1]-index)
+  matches = []
+  for origin in origins:
+    rows = [r["spec"][1]-origin for r in records]
+    if any(r["spec"][2] for r in records) or len(set(rows)) != len(rows) or any(i < 0 or i >= len(sequence) for i in rows):
+      continue
+    changes = [(row+1, sequence[row], record["letter"]) for row, record in zip(rows, records) if sequence[row] != record["letter"]]
+    if len(changes) <= min(20, max(1, int(.05*len(records)))):
+      matches.append((len(changes), rows, changes))
+  matches.sort(key=lambda value: value[0])
+  if not matches or len(matches) > 1 and matches[0][0] == matches[1][0]:
+    raise ValueError("Cannot uniquely map the incomplete model to the full PAE sequence. Keep prediction residue numbering or use a complete reference model.")
+  return matches[0][1], matches[0][2]
+
+
+def _pae_plan_from_snapshots(path, reference, target, reference_chains=None, target_chains=None,
+                             pae_cutoff=8., distance_cutoff=12., neighbors=8, strength=1., reference_sequences=None):
+  pae_cutoff, distance_cutoff, strength = float(pae_cutoff), float(distance_cutoff), float(strength)
+  if (not all(math.isfinite(v) for v in (pae_cutoff, distance_cutoff, strength)) or
+      not .1 <= pae_cutoff <= 30 or not 4 <= distance_cutoff <= 30 or not .25 <= strength <= 4 or
+      int(neighbors) != float(neighbors) or not 1 <= int(neighbors) <= 24):
+    raise ValueError("Use PAE 0.1-30 A, distance 4-30 A, 1-24 partners, and strength 0.25-4.")
+  neighbors = int(neighbors)
+  refs, ref_order = _pae_protein_records(reference, reference_chains)
+  targets, target_order = _pae_protein_records(target, target_chains if target_chains is not None else ref_order)
+  if len(ref_order) != len(target_order):
+    raise ValueError("Reference and target must list the same number of chains.")
+  matrix, embedded_sequence = _pae_read_json(path)
+  full_sequences = [((reference_sequences or {}).get(chain) or "".join(r["letter"] for r in refs if r["spec"][0] == chain))
+                     for chain in ref_order]
+  if matrix.shape[0] != sum(map(len, full_sequences)):
+    if matrix.shape[0] == len(refs):
+      full_sequences = ["".join(r["letter"] for r in refs if r["spec"][0] == chain) for chain in ref_order]
+    else:
+      raise ValueError(f"PAE has {matrix.shape[0]} rows but the selected prediction contains {len(refs)} modeled protein residues "
+                       f"and {sum(map(len, full_sequences))} reference-sequence residues. Check chain order/SEQRES.")
+  mapping, substitutions, ref_rows, target_rows = [], [], {}, {}
+  offset = 0
+  for ref_chain, target_chain, sequence in zip(ref_order, target_order, full_sequences):
+    a = [r for r in refs if r["spec"][0] == ref_chain]
+    b = [r for r in targets if r["spec"][0] == target_chain]
+    for source, chain, collection in ((a, ref_chain, ref_rows), (b, target_chain, target_rows)):
+      rows, changes = _pae_sequence_rows(source, sequence)
+      substitutions.extend(f"{chain or '.'}:{old}{row}{new}" for row, old, new in changes)
+      for row, record in zip(rows, source):
+        collection[offset+row] = dict(record, position=row)
+    mapping.append(f"{ref_chain or '.'}:{a[0]['spec'][1]}-{a[-1]['spec'][1]} -> "
+                   f"{target_chain or '.'}:{b[0]['spec'][1]}-{b[-1]['spec'][1]} "
+                   f"(PAE rows {offset+1}-{offset+len(sequence)}; {len(b)} modeled)")
+    offset += len(sequence)
+  if isinstance(embedded_sequence, str):
+    sequence = "".join(embedded_sequence.split()).replace(":", "").replace("/", "").upper()
+    try:
+      changes = _pae_substitutions(sequence, "".join(full_sequences))
+    except ValueError as error:
+      raise ValueError("The sequence embedded in the PAE JSON does not match the reference prediction: "+str(error)) from error
+    substitutions.extend(f"PAE {old}{row}{new}" for row, old, new in changes)
+  n = len(matrix)
+  indexed = [(i, r) for i, r in ref_rows.items() if r["xyz"] is not None and i in target_rows and target_rows[i]["atom"] is not None]
+  index = _spatial_index(indexed, lambda item: item[1]["xyz"], distance_cutoff)
+  candidates = []
+  for i, left in indexed:
+    for j, right in _spatial_query(index, left["xyz"], distance_cutoff):
+      if j <= i or (left["spec"][0] == right["spec"][0] and abs(left["position"]-right["position"]) <= 3):
+        continue
+      error = max(float(matrix[i, j]), float(matrix[j, i]))
+      if error > pae_cutoff:
+        continue
+      distance = math.sqrt(_distance_sq(left["xyz"], right["xyz"]))
+      if distance >= 2.:
+        candidates.append((error, distance, i, j))
+  candidates.sort()
+  degree, restraints = [0]*n, []
+  for error, distance, i, j in candidates:
+    if degree[i] >= neighbors or degree[j] >= neighbors:
+      continue
+    # An empirical release-width/stiffness mapping, not PAE interpreted as a distance SD.
+    sigma = (.35+.018*min(error, 11.)**2)/math.sqrt(strength)
+    restraints.append(dict(first=target_rows[i]["atom"], second=target_rows[j]["atom"],
+                           distance=distance, sigma=sigma, pae=error))
+    degree[i] += 1
+    degree[j] += 1
+  if not restraints:
+    raise ValueError("No eligible C-alpha pairs. Check mapping, PAE cutoff and distance cutoff; existing restraints retained.")
+  return dict(restraints=restraints, mapping=mapping, residues=n, covered=sum(d > 0 for d in degree),
+              missing_ca=n-len(indexed), substitutions=sorted(set(substitutions)), neighbors=neighbors, strength=strength,
+              pae_cutoff=pae_cutoff, distance_cutoff=distance_cutoff,
+              reference_snapshot=reference, target_snapshot=target, order_confirmed=False)
+
+
+def prepare_pae_restraints(mol_id, path, reference_mol=None, reference_chains=None, target_chains=None, **options):
+  """Build a non-mutating preview. Distances come from reference_mol, not the JSON."""
+  reference_mol = mol_id if reference_mol is None else reference_mol
+  if not valid_model_molecule_qm(mol_id) or not valid_model_molecule_qm(reference_mol):
+    raise ValueError("Choose available target and reference models.")
+  target = _model_coordinate_snapshot(mol_id)
+  reference = target if reference_mol == mol_id else _model_coordinate_snapshot(reference_mol)
+  options.setdefault("reference_sequences", _pae_reference_sequences(reference_mol, reference))
+  plan = _pae_plan_from_snapshots(path, reference, target, reference_chains, target_chains, **options)
+  plan.update(model=mol_id, model_name=coot.molecule_name(mol_id), reference_model=reference_mol,
+              reference_name=coot.molecule_name(reference_mol))
+  return plan
+
+
+def _pae_apply_steps(plan, replace=False, confirm_order=False, confirm_substitutions=False):
+  """Replace ALL extra restraints only after explicit consent and stale-preview checks."""
+  if not replace or not confirm_order:
+    raise ValueError("Confirm PAE row order and explicitly request replacement of ALL extra restraints.")
+  if plan.get("substitutions") and not confirm_substitutions:
+    raise ValueError("Review and explicitly accept the sequence substitutions shown in the preview.")
+  yield 0.
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept/cancel intermediate atoms before replacing restraints.")
+  for key, name, snapshot in (("model", "model_name", "target_snapshot"),
+                              ("reference_model", "reference_name", "reference_snapshot")):
+    model = plan[key]
+    if key == "reference_model" and model == plan["model"]:
+      continue  # The reference is an immutable snapshot when editing that same model.
+    if (not valid_model_molecule_qm(model) or coot.molecule_name(model) != plan[name] or
+        _model_coordinate_snapshot(model) != plan[snapshot]):
+      raise ValueError("A model changed or was closed after preview. Preview again before replacing restraints.")
+  required = ("delete_all_extra_restraints", "add_extra_geman_mcclure_restraint")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    raise ValueError("This Coot build cannot replace extra restraints with GM restraints.")
+  rows = plan["restraints"]
+  if not rows:
+    raise ValueError("The preview contains no restraints; existing restraints retained.")
+  available = {r["atom"] for r in _pae_protein_records(plan["target_snapshot"])[0] if r["atom"] is not None}
+  for row in rows:
+    if (row["first"] not in available or row["second"] not in available or row["first"] == row["second"] or
+        not all(math.isfinite(row[v]) and row[v] > 0 for v in ("distance", "sigma"))):
+      raise ValueError("Invalid atom pair or distance/ESD in the preview; existing restraints retained.")
+  model = plan["model"]
+  coot.delete_all_extra_restraints(model)
+  deadline = time.monotonic()+.020
+  try:
+    for expected_index, row in enumerate(rows):
+      index = coot.add_extra_geman_mcclure_restraint(model, *row["first"], *row["second"], row["distance"], row["sigma"])
+      if index is None or index != expected_index:
+        raise RuntimeError("Coot rejected a validated GM restraint or did not clear the previous GM set.")
+      if time.monotonic() >= deadline:
+        yield (expected_index+1)/len(rows)
+        deadline = time.monotonic()+.020
+  except GeneratorExit:
+    coot.delete_all_extra_restraints(model)
+    raise
+  except Exception as error:
+    coot.delete_all_extra_restraints(model)
+    raise RuntimeError("Replacement failed; partial new restraints were cleared. Previous extra restraints were removed "
+                       "and cannot be restored through this API. " + str(error)) from error
+  add_status_bar_text(f"Replaced all extra restraints on model #{model} with {len(rows)} PAE-weighted GM restraints.")
+  return len(rows)
+
+
+def apply_pae_restraints(plan, replace=False, confirm_order=False, confirm_substitutions=False):
+  """Console API: explicit, synchronous replacement of all model extra restraints."""
+  iterator = _pae_apply_steps(plan, replace=replace, confirm_order=confirm_order, confirm_substitutions=confirm_substitutions)
+  while True:
+    try:
+      next(iterator)
+    except StopIteration as result:
+      return result.value
+
+
+def _pae_restraint_colour(sigma):
+  """Fixed logarithmic stiffness scale, independent of this preview's extremes."""
+  if not math.isfinite(sigma) or sigma <= 0:
+    raise ValueError("Restraint ESD must be finite and positive.")
+  stiffness_log2 = -2.*math.log2(sigma)
+  anchors = ((-3., (68, 153, 255)), (0., (54, 219, 220)),
+             (2., (255, 223, 80)), (5., (255, 85, 64)))
+  value = max(-3., min(5., stiffness_log2))
+  for (low, first), (high, second) in zip(anchors, anchors[1:]):
+    if value <= high:
+      t = (value-low)/(high-low)
+      return "#"+"".join(f"{round(a+t*(b-a)):02x}" for a, b in zip(first, second))
+
+
+def _pae_preview_lines(plan):
+  """Resolve each endpoint once on the current target, never on the reference."""
+  model = plan["model"]
+  if not valid_model_molecule_qm(model) or coot.molecule_name(model) != plan["model_name"]:
+    raise ValueError("The target model was closed or replaced. Preview again.")
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept/cancel intermediate atoms before refreshing the model preview.")
+  snapshot = _model_coordinate_snapshot(model)
+  endpoints = {row[key] for row in plan["restraints"] for key in ("first", "second")}
+  positions = {}
+  for endpoint in endpoints:
+    spec = endpoint[:3]
+    residue = snapshot.get(spec)
+    original = plan["target_snapshot"].get(spec)
+    if residue is None or original is None or residue["name"] != original["name"]:
+      raise ValueError("A preview residue changed or was deleted. Preview again.")
+    matches = [atom[2] for atom in residue["atoms"] if tuple(atom[0][:2]) == endpoint[3:]]
+    if len(matches) != 1 or len(matches[0]) != 3 or not all(math.isfinite(v) for v in matches[0]):
+      raise ValueError("A preview atom is missing, ambiguous or has invalid coordinates. Preview again.")
+    positions[endpoint] = list(matches[0])
+  return [[_pae_restraint_colour(row["sigma"]), .035,
+           *positions[row["first"]], *positions[row["second"]]] for row in plan["restraints"]]
+
+
+def _pae_show_preview(plan):
+  """A temporary drawing only: do not create restraints or change model colours."""
+  required = ("new_generic_object_number", "to_generic_object_add_lines",
+              "set_display_generic_object", "close_generic_object")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    raise ValueError("This Coot build lacks the temporary restraint preview APIs.")
+  lines = _pae_preview_lines(plan)
+  name = f"PAE restraint preview #{plan['model']} ({time.monotonic_ns()})"
+  obj = coot.new_generic_object_number(name)
+  if obj is None or obj < 0:
+    raise RuntimeError("Coot could not create the restraint preview.")
+  closed = False
+  def cleanup():
+    nonlocal closed
+    if closed:
+      return
+    closed = True
+    get_name = getattr(coot, "generic_object_name_py", None)
+    if not callable(get_name) or get_name(obj) == name:
+      coot.close_generic_object(obj)
+  try:
+    # Upload the whole network once, not a growing mesh after every line/dash.
+    coot.to_generic_object_add_lines(obj, lines)
+    coot.set_display_generic_object(obj, 1)
+  except Exception:
+    cleanup()
+    raise
+  return obj, cleanup
+
+
+def pae_restraints_dialog():
+  """Preview off-thread; native restraint replacement stays on Coot's GUI thread."""
+  import threading
+  active = _active_residue_or_status()
+  if not active:
+    return None
+  model = active[0]
+  glib = _coot_gui_repository_module("GLib")
+  if Gtk is None or glib is None or _tq_numpy_module() is None:
+    info_dialog("The PAE restraint dialog requires GTK and NumPy.")
+    return None
+  window = Gtk.Window(title="PAE to GM restraints (experimental)")
+  window.set_default_size(600, -1)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  window.set_child(box)
+  label = Gtk.Label(label=f"Target #{model}: {os.path.basename(str(coot.molecule_name(model)))}")
+  label.set_tooltip_text(str(coot.molecule_name(model)))
+  label.set_xalign(0)
+  box.append(label)
+  path, browse = Gtk.Entry(), Gtk.Button(label="Browse...")
+  path.set_hexpand(True)
+  row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  for widget in (Gtk.Label(label="PAE JSON"), path, browse):
+    row.append(widget)
+  box.append(row)
+  browse.connect("clicked", lambda *_: _populate_entry_from_file_chooser(window, path, "Choose PAE JSON", all_files=True))
+  afdb = Gtk.Entry()
+  afdb.set_placeholder_text("Optional accession; leave blank to find by sequence")
+  hint = re.search(r"AF-([A-Za-z0-9-]+)-F(\d+)", str(coot.molecule_name(model)))
+  if hint:
+    afdb.set_text(hint.group(0))
+  fetch = Gtk.Button(label="Find / fetch PAE")
+  fetch.set_tooltip_text("Blank accession: exact sequence-hash lookup, then close-match search. Similarity search sends the reference sequence to AFDB; no coordinates are uploaded.")
+  fetch_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  afdb.set_hexpand(True)
+  fetch_row.append(afdb)
+  fetch_row.append(fetch)
+  box.append(fetch_row)
+  candidates_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  candidates_choice, use_candidate = Gtk.ComboBoxText(), Gtk.Button(label="Use selected match")
+  candidates_choice.set_hexpand(True)
+  candidates_row.append(candidates_choice)
+  candidates_row.append(use_candidate)
+  candidates_row.set_visible(False)
+  box.append(candidates_row)
+  reference_choice = Gtk.ComboBoxText()
+  for number in model_molecule_list():
+    reference_choice.append(str(number), f"#{number}: {os.path.basename(str(coot.molecule_name(number)))}")
+  reference_choice.set_active_id(str(model))
+  box.append(Gtk.Label(label="Reference prediction (distances frozen when selected)", xalign=0))
+  box.append(reference_choice)
+  grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+  ref_chains, target_chains = Gtk.Entry(), Gtk.Entry()
+  fields = [Gtk.Entry() for _ in range(4)]
+  for field, value in zip(fields, ("8", "12", "8", "1")):
+    field.set_text(value)
+    field.set_width_chars(6)
+    field.set_max_width_chars(8)
+  for i, (text, widget) in enumerate(zip(("PAE chain order", "Target chain order", "PAE cutoff (A)",
+           "C-alpha distance (A)", "Max partners / residue", "Strength (experimental)"), (ref_chains, target_chains, *fields))):
+    grid.attach(Gtk.Label(label=text, xalign=0), 0, i, 1, 1)
+    grid.attach(widget, 1, i, 1, 1)
+  fields[-1].set_tooltip_text("0.25-4; 1 is the initial conservative default. Scales near-target stiffness by changing ESD, which also changes release width. Global GM alpha is unchanged.")
+  ref_chains.set_tooltip_text("Comma-separated chain IDs in PAE row order, not residue-number order. Use . for a blank chain.")
+  box.append(grid)
+  confirmed = Gtk.CheckButton(label="PAE rows match the reference chain/residue order above")
+  box.append(confirmed)
+  accept_substitutions = Gtk.CheckButton(label="Accept the sequence substitutions listed in the preview")
+  accept_substitutions.set_visible(False)
+  box.append(accept_substitutions)
+  warning = Gtk.Label(label="Apply REPLACES ALL extra restraints on the target model.\n"
+                            "The previous restraint set cannot be restored by this helper; do not rely on coordinate Undo.", xalign=0)
+  warning.set_wrap(True)
+  warning.set_max_width_chars(68)
+  box.append(warning)
+  status = Gtk.Label(label="Choose/drop a PAE JSON, or leave the accession blank and find it by reference sequence.", xalign=0)
+  status.set_wrap(True)
+  status.set_max_width_chars(68)
+  box.append(status)
+  spinner = Gtk.Spinner()
+  box.append(spinner)
+  display_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  show_restraints, clear_display = (Gtk.Button(label=text) for text in ("Show restraints", "Clear display"))
+  for widget in (show_restraints, clear_display):
+    display_row.append(widget)
+    widget.set_sensitive(False)
+  show_restraints.set_tooltip_text("Show the proposed/last-applied network at current model coordinates. Does not apply restraints. Refresh after moving atoms.")
+  clear_display.set_tooltip_text("Remove only this dialog's temporary links, not any applied restraints.")
+  box.append(display_row)
+  legend = Gtk.Label(xalign=0)
+  legend.set_markup('Link strength: <span foreground="#4499ff">weak</span> / '
+                    '<span foreground="#36dbdc">cyan</span> / '
+                    '<span foreground="#ffdf50">yellow</span> / '
+                    '<span foreground="#ff5540">strong</span>')
+  legend.set_tooltip_text("Fixed colour scale for near-target stiffness 1/ESD^2 (A^-2): blue 0.125, cyan 1, yellow 4, red 32. Includes the Strength setting; not current strain or pulling force. Values beyond the scale are clamped.")
+  box.append(legend)
+  display_status = Gtk.Label(label="Preview draws C-alpha links without applying restraints.", xalign=0)
+  display_status.set_wrap(True)
+  display_status.set_max_width_chars(68)
+  box.append(display_status)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  preview, apply, close = (Gtk.Button(label=text) for text in ("Preview", "Replace extra restraints", "Close"))
+  for widget in (preview, apply, close):
+    buttons.append(widget)
+  box.append(buttons)
+  apply.set_sensitive(False)
+  preview.set_sensitive(False)
+  state = dict(closed=False, running=False, plan=None, result=None, reference=None, choices=[],
+               reference_sequences={}, cancel_search=threading.Event(), display_plan=None,
+               display_object=None, display_cleanup=None)
+  def update_display():
+    show_restraints.set_sensitive(state["display_plan"] is not None and not state["running"])
+    clear_display.set_sensitive(state["display_cleanup"] is not None and not state["running"])
+  def clear_drawing(*_args):
+    cleanup = state["display_cleanup"]
+    state.update(display_object=None, display_cleanup=None)
+    if cleanup is not None:
+      cleanup()
+    display_status.set_text("Preview hidden. Applied restraints are unchanged.")
+    update_display()
+  def show_drawing(*_args):
+    clear_drawing()
+    try:
+      plan = state["display_plan"]
+      if plan is None:
+        return
+      obj, cleanup = _pae_show_preview(plan)
+      state.update(display_object=obj, display_cleanup=cleanup)
+      display_status.set_text(f"{len(plan['restraints'])} links | Model snapshot, not moving atoms. Show refreshes positions.")
+    except Exception as error:
+      display_status.set_text(f"Preview display unavailable: {error}")
+    update_display()
+  def update_preview():
+    filename = os.path.expanduser(path.get_text().strip())
+    preview.set_sensitive(not state["running"] and bool(filename) and os.path.isfile(filename))
+  def update_apply(*_args):
+    plan = state["plan"]
+    apply.set_sensitive(plan is not None and confirmed.get_active() and not state["running"] and
+                        (not plan.get("substitutions") or accept_substitutions.get_active()))
+  def invalidate(*_args, keep_display=False):
+    state["plan"] = None
+    if not keep_display:
+      clear_drawing()
+      state["display_plan"] = None
+      update_display()
+    apply.set_sensitive(False)
+    accept_substitutions.set_active(False)
+    accept_substitutions.set_visible(False)
+    update_preview()
+  def mapping_changed(*_args):
+    confirmed.set_active(False)
+    invalidate()
+    state["choices"] = []
+    candidates_row.set_visible(False)
+  for entry in (path, ref_chains, target_chains):
+    entry.connect("changed", mapping_changed)
+  for field in fields:
+    field.connect("changed", invalidate)
+  confirmed.connect("toggled", update_apply)
+  accept_substitutions.connect("toggled", update_apply)
+  def candidate_changed(*_args):
+    selected = candidates_choice.get_active_id()
+    if selected is not None and int(selected) < len(state["choices"]):
+      choice = state["choices"][int(selected)]
+      changes = ", ".join(f"{old}{row}{new}" for row, old, new in choice["changes"]) or "exact sequence match"
+      status.set_text(f"{choice['identifier']}: {changes}. Use selected match, then Preview; substitutions need separate acceptance.")
+  candidates_choice.connect("changed", candidate_changed)
+  def reference_changed(*_args):
+    try:
+      number = int(reference_choice.get_active_id())
+      snapshot = _model_coordinate_snapshot(number)
+      chains = _pae_protein_records(snapshot)[1]
+      state["reference"] = (number, coot.molecule_name(number), snapshot)
+      state["reference_sequences"] = _pae_reference_sequences(number, snapshot)
+      reference_choice.set_tooltip_text(str(coot.molecule_name(number)))
+      ref_chains.set_text(",".join(ch or "." for ch in chains))
+      target_order = _pae_protein_records(_model_coordinate_snapshot(model))[1]
+      target_chains.set_text(",".join(ch or "." for ch in (chains if set(chains) <= set(target_order) else target_order)))
+      mapping_changed()
+    except Exception as error:
+      state["reference"] = None
+      status.set_text(str(error))
+  reference_choice.connect("changed", reference_changed)
+  def busy(value):
+    state["running"] = value
+    for widget in (path, browse, afdb, fetch, candidates_row, reference_choice, grid, confirmed, accept_substitutions):
+      widget.set_sensitive(not value)
+    update_preview()
+    update_apply()
+    update_display()
+    spinner.start() if value else spinner.stop()
+  def poll():
+    if state["closed"]:
+      return False
+    if state["result"] is None:
+      return True
+    plan, error = state.pop("result")
+    state["result"] = None
+    busy(False)
+    if error is not None:
+      status.set_text(error)
+      return False
+    state["plan"] = plan
+    state["display_plan"] = plan
+    show_drawing()
+    sigmas = [r["sigma"] for r in plan["restraints"]]
+    status.set_text(f"{len(sigmas)} GM pairs | {plan['covered']}/{plan['residues']} residues covered | "
+                    f"{plan['missing_ca']} missing C-alpha\nESD {min(sigmas):.3g}-{max(sigmas):.3g} A\n"+
+                    "\n".join(plan["mapping"])+"\nConfirm the PAE row order before replacing restraints.")
+    if plan["substitutions"]:
+      status.set_text(status.get_text()+"\nSubstitutions: "+", ".join(plan["substitutions"]))
+      accept_substitutions.set_visible(True)
+    update_apply()
+    return False
+  def do_preview(*_args):
+    invalidate()
+    try:
+      number, name, reference = state["reference"]
+      target = _model_coordinate_snapshot(model)
+      model_name = coot.molecule_name(model)
+      orders = (_pae_chain_order(ref_chains.get_text()), _pae_chain_order(target_chains.get_text()))
+      filename = _pae_json_path(path.get_text())
+      options = dict(pae_cutoff=float(fields[0].get_text()), distance_cutoff=float(fields[1].get_text()),
+                     neighbors=float(fields[2].get_text()), strength=float(fields[3].get_text()),
+                     reference_sequences=dict(state["reference_sequences"]))
+      state["result"] = None
+      busy(True)
+      status.set_text("Reading PAE and building a sparse restraint network...")
+      def work():
+        try:
+          plan = _pae_plan_from_snapshots(filename, reference, target, *orders, **options)
+          plan.update(model=model, model_name=model_name, reference_model=number, reference_name=name)
+          state["result"] = (plan, None)
+        except Exception as error:
+          state["result"] = (None, str(error))
+      threading.Thread(target=work, name="coot-pae-preview", daemon=True).start()
+      glib.timeout_add(50, poll)
+    except Exception as error:
+      busy(False)
+      status.set_text(str(error))
+  def do_apply(*_args):
+    try:
+      iterator = _pae_apply_steps(state["plan"], replace=True, confirm_order=confirmed.get_active(),
+                                  confirm_substitutions=accept_substitutions.get_active())
+      busy(True)
+      state["applying"] = True
+      close.set_sensitive(False)
+      window.set_modal(True)
+      def adding():
+        try:
+          fraction = next(iterator)
+          status.set_text(f"Replacing extra restraints: {fraction:.0%}. Please wait; the previous set cannot be restored.")
+          return True
+        except StopIteration as result:
+          message = f"Replaced all extra restraints with {result.value} PAE-weighted GM restraints. Coordinates unchanged."
+          succeeded = True
+        except Exception as error:
+          message = str(error)
+          succeeded = False
+        state["applying"] = False
+        window.set_modal(False)
+        close.set_sensitive(True)
+        invalidate(keep_display=succeeded)
+        busy(False)
+        status.set_text(message)
+        return False
+      glib.timeout_add(16, adding)
+    except Exception as error:
+      status.set_text(str(error))
+  def do_fetch(*_args, selected=False):
+    invalidate()
+    try:
+      records = _pae_protein_records(state["reference"][2], _pae_chain_order(ref_chains.get_text()))[0]
+      chains = _pae_chain_order(ref_chains.get_text())
+      sequence = "".join(state["reference_sequences"].get(chain) or
+                         "".join(r["letter"] for r in records if r["spec"][0] == chain) for chain in chains)
+      identifier = afdb.get_text()
+      version_match = re.search(r"AF-[A-Za-z0-9-]+-F\d+.*?_v(\d+)\.", state["reference"][1])
+      reference_version = int(version_match.group(1)) if version_match else None
+      chosen = state["choices"][int(candidates_choice.get_active_id())] if selected else None
+      result = dict(done=False)
+      cancel = state["cancel_search"] = threading.Event()
+      busy(True)
+      status.set_text("Fetching sequence-matched PAE from AlphaFold DB...")
+      def download():
+        try:
+          choices = [chosen] if chosen is not None else _pae_find_afdb(sequence, identifier,
+              progress=lambda text: result.update(progress=text), cancel=cancel)
+          if chosen is not None or len(choices) == 1 and not choices[0]["changes"]:
+            result["path"] = _pae_fetch_afdb(choices[0]["identifier"], sequence, reference_version=reference_version,
+                                             allow_substitutions=chosen is not None)
+          else:
+            result["choices"] = choices
+        except Exception as error:
+          result["error"] = str(error)
+        finally:
+          result["done"] = True
+      def downloaded():
+        if state["closed"]:
+          return False
+        if not result["done"]:
+          if result.get("progress"):
+            status.set_text(result["progress"])
+          return True
+        busy(False)
+        if "error" in result:
+          status.set_text(result["error"])
+        elif "choices" in result:
+          state["choices"] = result["choices"]
+          candidates_choice.remove_all()
+          for i, choice in enumerate(state["choices"]):
+            candidates_choice.append(str(i), f"{choice['identifier']} | {len(choice['changes'])} substitutions | {choice['description'][:45]}")
+          candidates_row.set_visible(True)
+          status.set_text("Select an AFDB prediction, then Use selected match. Close matches require explicit substitution acceptance in Preview.")
+          candidates_choice.set_active(0)
+        else:
+          path.set_text(result["path"])
+          status.set_text("Fetched PAE. Preview the residue mapping and any substitutions before replacing restraints.")
+        return False
+      threading.Thread(target=download, name="coot-pae-afdb", daemon=True).start()
+      glib.timeout_add(50, downloaded)
+    except Exception as error:
+      busy(False)
+      status.set_text(str(error))
+  drop_target = None
+  gdk = _coot_gui_repository_module("Gdk")
+  if gdk is not None and hasattr(gdk, "FileList") and hasattr(Gtk, "DropTarget"):
+    drop_target = Gtk.DropTarget.new(gdk.FileList.__gtype__, gdk.DragAction.COPY)
+    def dropped(_drop, value, _x, _y):
+      try:
+        if state["running"]:
+          return False
+        files = value.get_files()
+        filename = files[0].get_path() if len(files) == 1 else None
+        if not filename or not filename.lower().endswith(".json") or not os.path.isfile(filename):
+          raise ValueError("Drop one local PAE .json file.")
+        path.set_text(filename)
+        status.set_text("PAE file selected. Preview before replacing restraints.")
+        return True
+      except Exception as error:
+        status.set_text(str(error))
+        return False
+    drop_target.connect("drop", dropped)
+    box.add_controller(drop_target)
+    box.append(Gtk.Label(label="Or drop a PAE JSON file into this window.", xalign=0))
+  def finish(*_args):
+    if state.get("applying"):
+      return True
+    state["closed"] = True
+    state["cancel_search"].set()
+    clear_drawing()
+    window.destroy()
+    return True
+  preview.connect("clicked", do_preview)
+  show_restraints.connect("clicked", show_drawing)
+  clear_display.connect("clicked", clear_drawing)
+  fetch.connect("clicked", do_fetch)
+  use_candidate.connect("clicked", lambda *_: do_fetch(selected=True))
+  apply.connect("clicked", do_apply)
+  close.connect("clicked", finish)
+  window.connect("close-request", finish)
+  reference_changed()
+  state.update(window=window, widgets=dict(path=path, reference=reference_choice, ref_chains=ref_chains,
+               target_chains=target_chains, fields=fields, confirmed=confirmed, preview=preview, apply=apply, close=close,
+               status=status, drop=drop_target, afdb=afdb, fetch=fetch, candidates=candidates_choice,
+               use_candidate=use_candidate, accept_substitutions=accept_substitutions, identifier=label,
+               show_restraints=show_restraints, clear_display=clear_display, display_status=display_status))
+  window.present()
+  return state
+
+
 def _generate_smart_local_extra_restraints_for_mol(
   mol_id,
   distance_cutoff=3.7,
@@ -11897,8 +12807,8 @@ def _local_em_weight_points(points, radius=4.0, max_anchors=2048):
   return samples, len(anchors)
 
 
-def _local_em_weight_statistics(values):
-  """Coot's EM calibration (50 * 0.3 * 0.35), with a model-local sigma."""
+def _local_em_weight_statistics(values, reference_values=None):
+  """Normalize map units once, then attenuate weak regions instead of amplifying them."""
   import numpy as np
   values = np.asarray(values, dtype=float)
   if len(values) < 32 or not np.isfinite(values).all():
@@ -11906,17 +12816,76 @@ def _local_em_weight_statistics(values):
   sigma, mean = float(values.std()), float(values.mean())
   if sigma <= np.finfo(float).eps*max(float(np.max(np.abs(values))), np.finfo(float).tiny)*32:
     raise ValueError("The density near the model is flat or unavailable; weight unchanged.")
-  weight = 5.25/sigma
+  reference = None if reference_values is None else _local_em_weight_statistics(reference_values)
+  reference_sigma = sigma if reference is None else reference["sigma"]
+  baseline_weight = 5.25/reference_sigma
+  # Local contrast is a support heuristic, not an independent units calibration
+  # or a measured SNR. Never compensate for a weak region with a larger weight.
+  local_factor = min(1., max(.1, sigma/reference_sigma))
+  weight = baseline_weight*local_factor
   if not math.isfinite(weight) or not 0 < weight <= np.finfo(np.float32).max:
     raise ValueError("The estimated weight is outside Coot's numeric range; weight unchanged.")
-  return dict(weight=weight, sigma=sigma, mean=mean, samples=len(values), calibration=5.25)
+  return dict(weight=weight, sigma=sigma, mean=mean, samples=len(values), calibration=5.25,
+              reference_sigma=reference_sigma, baseline_weight=baseline_weight, local_factor=local_factor,
+              reference_samples=len(values) if reference is None else reference["samples"])
 
 
-def estimate_local_em_map_weight(mol_id=None, map_id=None, radius=4.0, apply=True):
+def _local_em_resolution_scale(resolution=None, lowpass_resolution=0.):
+  """Quartic attenuation also counters rising inverse-sigma weights on smoother maps."""
+  cutoff = float(lowpass_resolution or 0.)
+  if not math.isfinite(cutoff) or not 0 <= cutoff <= 500:
+    raise ValueError('Use a low-pass cutoff between 0 and 500 A (0 = unfiltered).')
+  if resolution is None:
+    return dict(resolution=None, effective_resolution=None, resolution_factor=1., lowpass_resolution=cutoff)
+  try:
+    value = float(resolution)
+  except (TypeError, ValueError, OverflowError):
+    raise ValueError('Enter a numeric map resolution between 0.1 and 500 A; voxel spacing is not resolution.') from None
+  if not math.isfinite(value) or not .1 <= value <= 500:
+    raise ValueError('Enter a map resolution between 0.1 and 500 A; voxel spacing is not resolution.')
+  effective = max(value, cutoff)
+  return dict(resolution=value, effective_resolution=effective,
+              resolution_factor=min(1., (3./effective)**4), lowpass_resolution=cutoff)
+
+
+def _local_em_resolution_identity(map_id):
+  if not coot.is_valid_map_molecule(map_id):
+    raise ValueError('The map is no longer available.')
+  return (str(coot.molecule_name(map_id)), tuple(coot.cell_py(map_id)))
+
+
+def _local_em_map_resolution(map_id):
+  """Session-only, per-open-map resolution; never infer it from voxel spacing."""
+  saved = globals().get('_LOCAL_EM_MAP_RESOLUTIONS', {}).get(map_id)
+  if saved is None:
+    return None
+  try:
+    if saved[0] == _local_em_resolution_identity(map_id):
+      return saved[1]
+  except Exception:
+    pass
+  globals()['_LOCAL_EM_MAP_RESOLUTIONS'].pop(map_id, None)
+  return None
+
+
+def _remember_local_em_map_resolution(map_id, resolution):
+  value = _local_em_resolution_scale(resolution)['resolution']
+  identity = _local_em_resolution_identity(map_id)
+  globals().setdefault('_LOCAL_EM_MAP_RESOLUTIONS', {})[map_id] = (identity, value)
+
+
+def estimate_local_em_map_weight(mol_id=None, map_id=None, radius=4.0, apply=True, residue_specs=None,
+                                 reference_map_id=None, resolution=None, lowpass_resolution=0.):
   """Set an EM starting weight from near-model density, not whole-map padding.
 
   Explicit IDs allow inspection without changing state via apply=False. Only the
   selected refinement map can be used when applying the global refinement weight.
+  Optional residue_specs use regional contrast to reduce the model-wide baseline
+  weight; they do not independently renormalize weak density to full strength.
+  For a filtered map, reference_map_id anchors calibration to the unfiltered map
+  in the same density units; lost contrast reduces, rather than increases, weight.
+  A supplied (or session-configured) resolution adds min(1, (3/d)^4) once,
+  using d=max(source resolution, known low-pass cutoff) for filtered stages.
   """
   if mol_id is None:
     active = _active_residue_or_status()
@@ -11929,20 +12898,42 @@ def estimate_local_em_map_weight(mol_id=None, map_id=None, radius=4.0, apply=Tru
     raise ValueError("Choose a valid model and selected refinement map first.")
   if callable(getattr(coot, "map_is_difference_map", None)) and coot.map_is_difference_map(map_id):
     raise ValueError("Use the EM reconstruction, not a difference map.")
+  reference_map_id = map_id if reference_map_id is None else reference_map_id
+  if not coot.is_valid_map_molecule(reference_map_id):
+    raise ValueError("Choose a valid original reference map for weight estimation.")
+  if callable(getattr(coot, "map_is_difference_map", None)) and coot.map_is_difference_map(reference_map_id):
+    raise ValueError("Use a reconstruction, not a difference reference map.")
   if apply and (coot.refinement_already_ongoing_p() or coot.imol_refinement_map() != map_id):
     raise ValueError("Accept/cancel refinement and select this refinement map before changing its weight.")
+  if resolution is None:
+    resolution = _local_em_map_resolution(reference_map_id)
+  resolution_info = _local_em_resolution_scale(resolution, lowpass_resolution)
   snapshot = _model_coordinate_snapshot(mol_id)
-  points = []
+  specs = list(snapshot) if residue_specs is None else list(dict.fromkeys(tuple(s) for s in residue_specs))
+  if not specs or any(spec not in snapshot for spec in specs):
+    raise ValueError("Select existing residues for local map-weight estimation.")
+  points, reference_points = [], []
+  selected = set(specs)
   for spec, record in snapshot.items():
     if str(record["name"]).strip().upper() in ("HOH", "WAT", "DOD"):
       continue
     for atom in _tq_residue_atom_records(mol_id, spec, snapshot=snapshot):
       if atom["occupancy"] > 0:
-        points.append(atom["xyz"])
+        reference_points.append(atom["xyz"])
+        if spec in selected:
+          points.append(atom["xyz"])
   samples, anchors = _local_em_weight_points(points, radius)
   values = [float(coot.density_at_point(map_id, *map(float, point))) for point in samples]
-  result = _local_em_weight_statistics(values)
-  result.update(model=mol_id, map=map_id, radius=float(radius), anchors=anchors, atoms=len(points), applied=False)
+  reference_values = None
+  if len(specs) != len(snapshot) or reference_map_id != map_id:
+    reference_samples = samples if len(specs) == len(snapshot) else _local_em_weight_points(reference_points, radius)[0]
+    reference_values = [float(coot.density_at_point(reference_map_id, *map(float, point))) for point in reference_samples]
+  result = _local_em_weight_statistics(values, reference_values)
+  result['density_weight'] = result['weight']
+  result.update(resolution_info)
+  result['weight'] *= result['resolution_factor']
+  result.update(model=mol_id, map=map_id, reference_map=reference_map_id, radius=float(radius), anchors=anchors, atoms=len(points),
+                region_residues=len(specs), applied=False)
   if apply:
     previous = float(coot.matrix_state())
     try:
@@ -11957,19 +12948,101 @@ def estimate_local_em_map_weight(mol_id=None, map_id=None, radius=4.0, apply=Tru
   return result
 
 
-def set_local_em_refinement_weight():
-  """One-shot menu action; leaves contour, coordinates and refinement-map selection alone."""
+def _apply_local_em_refinement_weight(resolution, mol_id=None, map_id=None):
+  """Apply once, remembering an explicitly entered resolution only after success."""
   add_status_bar_text("Estimating EM refinement weight from density near the active model...")
   try:
-    result = estimate_local_em_map_weight()
+    resolution = _local_em_resolution_scale(resolution)['resolution']
+    if resolution is None:
+      raise ValueError('Enter the nominal map resolution first.')
+    # Capture map identity before changing any state, so failed metadata access
+    # cannot leave a half-applied resolution preference.
+    selected = coot.imol_refinement_map() if map_id is None else map_id
+    identity = _local_em_resolution_identity(selected)
+    result = estimate_local_em_map_weight(mol_id, selected, resolution=resolution)
+    globals().setdefault('_LOCAL_EM_MAP_RESOLUTIONS', {})[selected] = (identity, resolution)
     message = (f"EM refinement weight: {result['previous_weight']:.4g} -> {result['weight']:.4g} | "
                f"Model #{result['model']}, map #{result['map']} | local sigma {result['sigma']:.4g} "
-               f"within {result['radius']:g} A ({result['samples']} samples).")
+               f"within {result['radius']:g} A | {resolution:g} A resolution x {result['resolution_factor']:.4g} "
+               f"({result['samples']} samples).")
     add_status_bar_text(message)
     print(message + " Starting estimate, not geometry-optimized; ordinary B-factors and contour level are not used.")
     return result
   except Exception as error:
     info_dialog(f"Could not estimate a local EM refinement weight.\n\n{error}")
+    return None
+
+
+def set_local_em_refinement_weight(resolution=None):
+  """Prompt for nominal resolution; explicit console calls can supply it directly."""
+  if resolution is not None:
+    return _apply_local_em_refinement_weight(resolution)
+  try:
+    active = _active_residue_or_status()
+    if not active:
+      return None
+    model, map_id = active[0], coot.imol_refinement_map()
+    if not valid_model_molecule_qm(model) or not coot.is_valid_map_molecule(map_id):
+      raise ValueError('Choose an active model and refinement map first.')
+    if globals().get('Gtk') is None:
+      raise ValueError('The resolution prompt needs GTK; use set_local_em_refinement_weight(resolution=3.5) in the console.')
+    window = Gtk.Window(title='EM refinement weight')
+    window.set_default_size(480, -1)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    for edge in ('top', 'bottom', 'start', 'end'):
+      getattr(box, 'set_margin_'+edge)(12)
+    window.set_child(box)
+    identity = Gtk.Label(label=f"Model #{model}: {os.path.basename(str(coot.molecule_name(model)))}\n"
+                               f"Refinement map #{map_id}: {os.path.basename(str(coot.molecule_name(map_id)))}", xalign=0)
+    identity.set_wrap(True)
+    identity.set_max_width_chars(64)
+    box.append(identity)
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.append(Gtk.Label(label='Map resolution (A)'))
+    entry = Gtk.Entry()
+    entry.set_width_chars(7)
+    entry.set_max_width_chars(9)
+    entry.set_placeholder_text('e.g. 3.5')
+    entry.set_tooltip_text('Map resolution in Angstroms, not voxel size. Remembered for this map during this session.')
+    previous = _local_em_map_resolution(map_id)
+    entry.set_text(f'{previous if previous is not None else 3.:g}')
+    row.append(entry)
+    box.append(row)
+    explanation = Gtk.Label(label='Use map resolution, not voxel size.', xalign=0)
+    explanation.set_wrap(True)
+    explanation.set_max_width_chars(64)
+    box.append(explanation)
+    status = Gtk.Label(label='', xalign=0)
+    status.set_wrap(True)
+    status.set_max_width_chars(64)
+    status.set_visible(False)
+    box.append(status)
+    buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    apply, close = Gtk.Button(label='Estimate and apply'), Gtk.Button(label='Close')
+    buttons.append(apply)
+    buttons.append(close)
+    box.append(buttons)
+    state = dict(result=None)
+    def calculate(*_args):
+      status.set_visible(True)
+      try:
+        value = _local_em_resolution_scale(entry.get_text())['resolution']
+      except (TypeError, ValueError) as error:
+        status.set_text(str(error))
+        return
+      result = _apply_local_em_refinement_weight(value, model, map_id)
+      state['result'] = result
+      if result is not None:
+        status.set_text(f"Weight: {result['previous_weight']:.4g} -> {result['weight']:.4g}")
+      else:
+        status.set_text('Weight unchanged.')
+    apply.connect('clicked', calculate)
+    close.connect('clicked', lambda *_: window.close())
+    window.local_em_weight_widgets = dict(resolution=entry, apply=apply, close=close, status=status, state=state)
+    window.present()
+    return window
+  except Exception as error:
+    info_dialog(f'Could not open EM weight estimation.\n\n{error}')
     return None
 
 
@@ -13123,18 +14196,22 @@ def _lowpass_export(map_id, model_id, directory, padding):
               difference=bool(coot.map_is_difference_map(map_id)))
 
 
-def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction):
+def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction, progress=None):
   """Pure file/FFT work: safe in a worker, no Coot or GTK calls.
 
   Preserve the exported box and its CCP4 placement. In particular, setup()
   would expand a fragment to the full cell, defeating cropping and changing it.
   """
   import numpy as np
+  if progress is not None:
+    progress("Reading map grid")
   ccp4 = gemmi.read_ccp4_map(input_path, setup=False)
-  data = np.asarray(ccp4.grid)
+  # Gemmi stores X/columns contiguously (Fortran order). Reverse the view so
+  # NumPy's real FFT operates along its contiguous last axis, without copying.
+  data = np.asarray(ccp4.grid).transpose(2, 1, 0)
   if not np.isfinite(data).all():
     raise ValueError("Map contains NaN or infinite voxel values.")
-  axes = [ccp4.header_i32(word)-1 for word in (17, 18, 19)]
+  axes = [ccp4.header_i32(word)-1 for word in (19, 18, 17)]
   sampling = np.asarray([ccp4.header_i32(word) for word in (8, 9, 10)], dtype=float)
   if sorted(axes) != [0, 1, 2] or np.any(sampling <= 0):
     raise ValueError("Map has invalid axis order or grid sampling.")
@@ -13155,11 +14232,24 @@ def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction):
   base = (metric[1, 1]*k[:, None]**2 + metric[2, 2]*l[None, :]**2 +
           2*metric[1, 2]*k[:, None]*l[None, :])
   cutoff = 1.0/resolution
+  dimensions = " x ".join(map(str, data.shape))
+  if progress is not None:
+    progress("Forward FFT: " + dimensions)
   spectrum = np.fft.rfftn(data)
-  # Apply one frequency plane at a time; no full 3-D weights/coordinate arrays.
-  for i, hi in enumerate(h):
-    weight = (base + metric[0, 0]*hi**2 + 2*metric[0, 1]*hi*k[:, None] +
-              2*metric[0, 2]*hi*l[None, :])
+  # Bounded slabs avoid thousands of GIL handoffs to Coot's busy GTK thread.
+  # Keep float64 cutoff arithmetic and cap the weight workspace at 16 MiB
+  # (or one plane if larger); never allocate a full frequency-coordinate grid.
+  planes = max(1, min(nu, (16*1024**2)//max(1, 8*nv*len(l))))
+  for start in range(0, nu, planes):
+    if progress is not None:
+      progress(f"Filtering frequencies: {start}/{nu} planes")
+    hi = h[start:start+planes]
+    weight = np.empty((len(hi), nv, len(l)), dtype=np.float64)
+    np.add(base[None, :, :], (metric[0, 0]*hi**2)[:, None, None], out=weight)
+    if metric[0, 1] != 0:
+      weight += (2*metric[0, 1]*hi[:, None]*k[None, :])[:, :, None]
+    if metric[0, 2] != 0:
+      weight += (2*metric[0, 2]*hi[:, None]*l[None, :])[:, None, :]
     np.maximum(weight, 0, out=weight)
     if taper_fraction == 0:
       weight = weight < cutoff*cutoff
@@ -13172,13 +14262,18 @@ def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction):
       np.cos(weight, out=weight)
       weight *= -0.5
       weight += 0.5
-    spectrum[i] *= weight
+    spectrum[start:start+len(hi)] *= weight
+    del weight
+  if progress is not None:
+    progress("Inverse FFT: " + dimensions)
   filtered = np.fft.irfftn(spectrum, s=data.shape, axes=(0, 1, 2))
   del spectrum
   if not np.isfinite(filtered).all():
     raise ValueError("Filtering produced non-finite density values.")
   data[:] = filtered
   del filtered
+  if progress is not None:
+    progress("Writing filtered map")
   # update_ccp4_header() requires setup() for partial maps. Update only mode
   # and density statistics; retain sampling, starts, origin, axes and symmetry.
   ccp4.set_header_i32(4, 2)
@@ -13186,7 +14281,7 @@ def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction):
                       (22, data.mean(dtype=np.float64)), (55, data.std(dtype=np.float64))):
     ccp4.set_header_float(word, float(value))
   ccp4.write_ccp4_map(output_path)
-  return tuple(data.shape)
+  return tuple(ccp4.grid.shape)
 
 
 def _lowpass_import(path, source, resolution):
@@ -13204,20 +14299,132 @@ def _lowpass_import(path, source, resolution):
   return result
 
 
+def _lowpass_worker_main():
+  """Standalone numerical worker; deliberately never import Coot or GTK."""
+  import json
+  import sys
+  config = json.loads(sys.argv[1])
+  def publish(value):
+    print(json.dumps(value), flush=True)
+  try:
+    if list(sys.version_info[:2]) != config["version"]:
+      raise ImportError("Standalone Python does not match Coot's Python version.")
+    sys.path[:0] = config["module_roots"]
+    global gemmi
+    import gemmi
+    import numpy
+  except Exception as error:
+    publish(dict(unavailable=str(error)))
+    return
+  try:
+    shape = _lowpass_filter_file(config["input"], config["output"], config["resolution"], config["taper"])
+    publish(dict(shape=shape))
+  except Exception as error:
+    publish(dict(error=str(error)))
+
+
+def _lowpass_worker_source():
+  """Cache source on the GUI thread rather than inspecting a large script off-thread."""
+  import inspect
+  functions = (_lowpass_filter_file, _lowpass_worker_main)
+  cached = globals().get("_LOWPASS_WORKER_SOURCE_CACHE")
+  if cached is not None and cached[0] == functions:
+    return cached[1]
+  source = "\n".join(inspect.getsource(f) for f in functions)+"\n_lowpass_worker_main()\n"
+  globals()["_LOWPASS_WORKER_SOURCE_CACHE"] = (functions, source)
+  return source
+
+
+def _lowpass_filter_background(input_path, output_path, resolution, taper_fraction, progress=None):
+  """Isolate FFT work from Coot's GIL; fall back if no usable Python is available."""
+  import json
+  import os
+  from pathlib import Path
+  import subprocess
+  import sys
+  import threading
+  def local():
+    if progress is not None:
+      progress("Using in-process FFT")
+    return _lowpass_filter_file(input_path, output_path, resolution, taper_fraction, progress=progress)
+  try:
+    python = _global_fit_worker_python()
+    source = _lowpass_worker_source()
+  except (OSError, TypeError, RuntimeError):
+    return local()
+  roots = []
+  for module in (gemmi, _tq_numpy_module()):
+    filename = getattr(module, "__file__", None)
+    if filename:
+      # Keep symlinks: resolving every path component adds many GIL handoffs
+      # in a Coot worker, and imports work equally well through these paths.
+      path = Path(os.path.abspath(filename))
+      root = str(path.parent.parent if path.name == "__init__.py" else path.parent)
+      if root not in roots:
+        roots.append(root)
+  env = dict(os.environ)
+  for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "DYLD_INSERT_LIBRARIES"):
+    env.pop(name, None)
+  for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    env[name] = "1"
+  config = dict(input=os.path.abspath(input_path), output=os.path.abspath(output_path),
+                resolution=resolution, taper=taper_fraction,
+                version=list(sys.version_info[:2]), module_roots=roots)
+  try:
+    process = subprocess.Popen([python, "-I", "-B", "-u", "-c", source, json.dumps(config)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, env=env)
+  except OSError:
+    return local()
+  # One blocking pipe read releases the GIL until completion. Polling or
+  # exchanging progress files would repeatedly compete with Coot's draw calls.
+  deadline = threading.Timer(1800., process.kill)
+  deadline.daemon = True
+  deadline.start()
+  try:
+    if progress is not None:
+      progress("Isolated FFT: reading, filtering and writing map")
+    output = process.communicate()[0].decode("utf-8", errors="replace")
+  finally:
+    deadline.cancel()
+    if process.poll() is None:
+      process.terminate()
+      try:
+        process.wait(timeout=2.)
+      except subprocess.TimeoutExpired:
+        process.kill()
+    process.wait()
+    process.stdout.close()
+  try:
+    result = json.loads(output)
+  except ValueError:
+    raise RuntimeError("Low-pass FFT worker failed: "+output[-2000:])
+  if not process.returncode and "unavailable" in result:
+    return local()
+  if process.returncode or "shape" not in result:
+    raise RuntimeError(result.get("error", "Low-pass FFT worker did not finish."))
+  return tuple(result["shape"])
+
+
 def lowpass_filter_map(imol_map, resolution=4.0, taper_fraction=0.10, model_imol=None, padding=20.0):
   """Create a low-pass map (console API); optional model-centred crop with padding."""
   resolution, taper_fraction, padding = _lowpass_parameters(resolution, taper_fraction, padding)
   if gemmi is None or _tq_numpy_module() is None:
     raise RuntimeError("Low-pass filtering requires Gemmi and NumPy in Coot's Python.")
+  started = time.perf_counter()
   with tempfile.TemporaryDirectory(prefix="coot-lowpass-") as directory:
     source = _lowpass_export(imol_map, model_imol, directory, padding)
+    exported = time.perf_counter()
     output = os.path.join(directory, "filtered.map")
-    _lowpass_filter_file(source["path"], output, resolution, taper_fraction)
-    return _lowpass_import(output, source, resolution)
+    shape = _lowpass_filter_file(source["path"], output, resolution, taper_fraction)
+    filtered = time.perf_counter()
+    result = _lowpass_import(output, source, resolution)
+    print(f"Low-pass {shape}: export {exported-started:.2f}s, filter {filtered-exported:.2f}s, load {time.perf_counter()-filtered:.2f}s")
+    return result
 
 
 def lowpass_filter_map_dialog():
-  """Filter a chosen map without running its FFT on the GTK event thread."""
+  """Filter a chosen map with an isolated FFT and a background-thread fallback."""
   if gemmi is None or _tq_numpy_module() is None:
     info_dialog("Low-pass filtering requires Gemmi and NumPy in Coot's embedded Python.")
     return None
@@ -13297,6 +14504,8 @@ def lowpass_filter_map_dialog():
   def poll():
     finished = state["finished"]
     if finished is None:
+      if not state["closed"]:
+        status.set_text(f"{state.get('phase', 'Filtering map')}... {time.perf_counter()-state['started']:.1f}s")
       return True
     try:
       if not state["closed"]:
@@ -13304,9 +14513,13 @@ def lowpass_filter_map_dialog():
         if error is not None:
           raise RuntimeError(error)
         status.set_text("Loading filtered map...")
+        loading = time.perf_counter()
         state["result"] = _lowpass_import(state["output"], state["source"], state["resolution"])
+        state["timings"]["load"] = time.perf_counter()-loading
+        state["timings"]["total"] = time.perf_counter()-state["started"]
+        print("Low-pass timing: " + ", ".join(f"{key} {value:.2f}s" for key, value in state["timings"].items()))
         status.set_text(f"Created map #{state['result']} | {state['resolution']:g} A | " +
-                        " x ".join(map(str, shape)))
+                        " x ".join(map(str, shape)) + f" | {state['timings']['total']:.2f}s")
     except Exception as error:
       status.set_text(f"Filtering failed: {error}")
     finally:
@@ -13319,15 +14532,24 @@ def lowpass_filter_map_dialog():
       busy(False)
       return False
     try:
+      try:
+        _lowpass_worker_source()
+      except (OSError, TypeError, RuntimeError):
+        pass  # The background helper can use the in-process fallback.
       state["owner"] = tempfile.TemporaryDirectory(prefix="coot-lowpass-")
       directory = state["owner"].name
+      export_started = time.perf_counter()
       source = _lowpass_export(state["map"], state["model"], directory, state["padding"])
+      state["timings"]["export"] = time.perf_counter()-export_started
       output = os.path.join(directory, "filtered.map")
       state.update(source=source, output=output)
       status.set_text("Filtering map... (you can continue using Coot)")
       def worker():
         try:
-          shape = _lowpass_filter_file(source["path"], output, state["resolution"], state["taper"])
+          started = time.perf_counter()
+          shape = _lowpass_filter_background(source["path"], output, state["resolution"], state["taper"],
+              progress=lambda message: state.update(phase=message))
+          state["timings"]["filter"] = time.perf_counter()-started
           state["finished"] = (shape, None)
         except Exception as error:
           # Do not retain a worker traceback containing large FFT arrays.
@@ -13349,7 +14571,8 @@ def lowpass_filter_map_dialog():
       resolution, taper, pad = _lowpass_parameters(cutoff.get_text(), float(rolloff.get_text())/100, padding.get_text())
       state.update(map=int(map_choice.get_active_id()),
                    model=int(model_choice.get_active_id()) if crop.get_active() else None,
-                   resolution=resolution, taper=taper, padding=pad, finished=None, result=None)
+                   resolution=resolution, taper=taper, padding=pad, finished=None, result=None,
+                   started=time.perf_counter(), phase="Exporting map", timings={})
       busy(True)
       status.set_text("Exporting current map...")
       glib.idle_add(start_worker)
@@ -13366,6 +14589,607 @@ def lowpass_filter_map_dialog():
   window.connect("close-request", closed)
   window.lowpass_widgets = dict(map=map_choice, cutoff=cutoff, rolloff=rolloff, crop=crop,
                                model=model_choice, padding=padding, apply=apply, status=status, state=state)
+  window.present()
+  return window
+
+
+def _global_multimap_schedule(start=5., finest=4., repeats=1):
+  start, finest = float(start), float(finest)
+  if not all(math.isfinite(v) and .5 <= v <= 200 for v in (start, finest)) or start < finest:
+    raise ValueError("Use resolutions between 0.5 and 200 A, with start >= finest filtered resolution.")
+  if isinstance(repeats, bool) or float(repeats) != int(float(repeats)) or not 1 <= int(float(repeats)) <= 10:
+    raise ValueError("Use 1-10 passes per stage.")
+  levels = [start]
+  while levels[-1] > finest*(1+1e-6):
+    value = levels[-1]*2/3
+    levels.append(finest if value <= 1.25*finest else value)
+  return [resolution for resolution in (*levels, None) for _ in range(int(float(repeats)))]
+
+
+def _global_multimap_compact_crop(input_path, output_path):
+  """Compact orthogonal P1 crops without moving the model or interpolating voxels.
+
+  Keep absolute grid starts: Clipper wraps them into the smaller P1 cell, so
+  density still samples correctly in the model's original Cartesian frame.
+  Generous padding separates the model from the new periodic boundary.
+  """
+  import numpy as np
+  crop = gemmi.read_ccp4_map(input_path, setup=False)
+  cell = crop.grid.unit_cell
+  sampling = np.array([crop.header_i32(i) for i in (8, 9, 10)], dtype=float)
+  axes = np.array([crop.header_i32(i)-1 for i in (17, 18, 19)])
+  if sorted(axes.tolist()) != [0, 1, 2]:
+    return False
+  shape = np.array(crop.grid.shape, dtype=int)[np.argsort(axes)]
+  if (crop.header_i32(23) not in (0, 1) or
+      any(abs(v-90.) > 1e-5 for v in (cell.alpha, cell.beta, cell.gamma)) or
+      any(abs(crop.header_float(i)) > 1e-6 for i in (50, 51, 52)) or crop.has_skew_transformation() or
+      (sampling <= 0).any() or not (shape < sampling).any()):
+    return False
+  lengths = np.array((cell.a, cell.b, cell.c))*shape/sampling
+  crop.grid.set_unit_cell(gemmi.UnitCell(*map(float, lengths), 90, 90, 90))
+  for word, value in zip((8, 9, 10), shape):
+    crop.set_header_i32(word, int(value))
+  for word, value in zip((11, 12, 13), lengths):
+    crop.set_header_float(word, float(value))
+  crop.set_header_i32(23, 1)
+  crop.write_ccp4_map(output_path)
+  return True
+
+
+def _global_multimap_identity(snapshot):
+  identities = {}
+  for spec, record in snapshot.items():
+    for atom in record["atoms"]:
+      key = (*spec, record["name"], *atom[0])
+      if key in identities or len(atom[2]) != 3 or not all(math.isfinite(v) for v in atom[2]):
+        raise ValueError("The model has ambiguous atoms or non-finite coordinates.")
+      identities[key] = repr(atom[1])
+  if not identities:
+    raise ValueError("The model has no atoms to refine.")
+  return identities
+
+
+def _global_multimap_snapshot_change(expected, current):
+  """Describe actual atom changes, ignoring list order and sub-microangstrom noise."""
+  if current == expected:
+    return None
+  if current.keys() != expected.keys():
+    return "the residue list changed"
+  if _global_multimap_identity(current) != _global_multimap_identity(expected):
+    return "atom identities or properties changed"
+  moved, maximum, worst = 0, 0., None
+  for spec, before in expected.items():
+    if current[spec]["name"] != before["name"]:
+      return f"residue {spec} changed type"
+    after = {tuple(atom[0]): atom for atom in current[spec]["atoms"]}
+    for atom in before["atoms"]:
+      observed = after[tuple(atom[0])]
+      distance = math.sqrt(_distance_sq(atom[2], observed[2]))
+      if distance > 1e-6:
+        moved += 1
+        if distance > maximum:
+          maximum, worst = distance, (*spec, atom[0][0].strip(), atom[0][1])
+  if moved:
+    return f"{moved} {'atom' if moved == 1 else 'atoms'} moved (maximum {maximum:.6g} A at {worst})"
+  return None
+
+
+def _global_multimap_cleanup(state):
+  """Remove only this run's map, after native refinement has released it."""
+  errors = []
+  temporary = state.get("temporary")
+  try:
+    if temporary is not None:
+      number, name = temporary
+      if coot.is_valid_map_molecule(number) and coot.molecule_name(number) == name:
+        original = state.get("map")
+        if original is not None and coot.is_valid_map_molecule(original):
+          if coot.imol_refinement_map() == number:
+            coot.set_imol_refinement_map(original)
+          if coot.scroll_wheel_map() == number:
+            coot.set_scroll_wheel_map(original)
+        coot.close_molecule(number)
+      state.pop("temporary", None)
+  except Exception as error:
+    errors.append(f"map {temporary}: {error}")
+  owner = state.pop("owner", None)
+  if owner is not None:
+    try:
+      owner.cleanup()
+    except Exception as error:
+      errors.append(str(error))
+  if errors:
+    raise RuntimeError("; ".join(errors))
+
+
+def _global_multimap_refine(state, stage_map, estimate=None):
+  """One whole-model native refinement; preserve all original extra restraints."""
+  model = state["model"]
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept/cancel the other active refinement first.")
+  previous = (coot.imol_refinement_map(), float(coot.matrix_state()), coot.refinement_immediate_replacement_state())
+  attempted = False
+  try:
+    # Read statistics anew at the model's current coordinates on THIS stage map.
+    estimate = estimate or estimate_local_em_map_weight(model, stage_map, apply=False, reference_map_id=state["map"],
+                                                       lowpass_resolution=state.get('resolution') or 0.)
+    weight = estimate["weight"]*state["multiplier"]
+    if not math.isfinite(weight) or weight <= 0:
+      raise ValueError("Invalid estimated stage weight.")
+    if coot.set_imol_refinement_map(stage_map) != stage_map:
+      raise RuntimeError("Coot could not select the stage map.")
+    coot.set_matrix(weight)
+    if not math.isclose(float(coot.matrix_state()), weight, rel_tol=1e-5):
+      raise RuntimeError("Coot did not accept the temporary stage weight.")
+    coot.set_refinement_immediate_replacement(1)
+    state["phase"] = "refining"
+    state["message"] = f"Pass {state['index']+1}/{len(state['schedule'])}: {state['stage_label']} | weight {weight:.4g}"
+    state["notify"]()
+    with _grouped_model_edit(model):
+      attempted = True
+      result = coot.refine_residues_py(model, state["specs"])
+      if result is False or result is None:
+        raise RuntimeError("Coot could not refine the whole model; check dictionaries and residue selection.")
+      if coot.refinement_already_ongoing_p():
+        accepted = coot.accept_moving_atoms_py()
+        if accepted is False or accepted is None:
+          raise RuntimeError("Coot could not accept the global refinement.")
+    coot.graphics_draw()
+  except Exception:
+    if attempted and coot.refinement_already_ongoing_p():
+      coot.clear_up_moving_atoms()
+    raise
+  finally:
+    errors = []
+    for function, args in ((coot.set_refinement_immediate_replacement, (previous[2],)),
+                           (coot.set_matrix, (previous[1],)),
+                           (coot.set_imol_refinement_map, (previous[0],))):
+      try:
+        if function is not coot.set_imol_refinement_map or coot.is_valid_map_molecule(previous[0]):
+          function(*args)
+      except Exception as error:
+        errors.append(str(error))
+    if errors:
+      raise RuntimeError("Could not restore refinement settings: "+"; ".join(errors))
+  # Capture the baseline after all of our native finalization/restoration calls,
+  # not before them. Never refresh it on a later tick, which could hide edits.
+  snapshot = _model_coordinate_snapshot(model)
+  if _global_multimap_identity(snapshot) != state["identity"]:
+    raise RuntimeError("Refinement unexpectedly changed atom identities/properties. Use Coot Undo to recover.")
+  state["expected"] = snapshot
+  state["history"].append(dict(resolution=state["resolution"], map=stage_map, weight=weight,
+      sigma=estimate["sigma"], reference_sigma=estimate["reference_sigma"],
+      baseline_weight=estimate["baseline_weight"], local_factor=estimate["local_factor"],
+      resolution_factor=estimate.get('resolution_factor', 1.), effective_resolution=estimate.get('effective_resolution'),
+      samples=estimate["samples"], cropped=state["cropped"], result=result))
+  print(f"Global multimap: {state['stage_label']} | weight {weight:.6g} | original-map baseline {estimate['baseline_weight']:.6g} x contrast {estimate['local_factor']:.4g} | local sigma {estimate['sigma']:.6g}, original {estimate['reference_sigma']:.6g} | {estimate['samples']} samples")
+
+
+def _global_multimap_timed_restore(state):
+  native = state['native']
+  errors = []
+  for function, args in ((coot.set_refinement_immediate_replacement, (native['previous'][2],)),
+                         (coot.set_matrix, (native['previous'][1],)),
+                         (coot.set_imol_refinement_map, (native['previous'][0],))):
+    try:
+      if function is not coot.set_imol_refinement_map or coot.is_valid_map_molecule(args[0]):
+        function(*args)
+    except Exception as error:
+      errors.append(str(error))
+  state['native'] = None
+  if errors:
+    raise RuntimeError('Could not restore timed refinement settings: '+'; '.join(errors))
+
+
+def _global_multimap_timed_finish(state, accept=True):
+  """Stop and accept in one GUI callback, before Coot's pending cancel cleanup runs."""
+  native = state['native']
+  result = None
+  try:
+    if not coot.refinement_already_ongoing_p():
+      if accept:
+        raise RuntimeError('The native refinement was accepted/cancelled outside this widget.')
+    else:
+      coot.stop_refinement_internal()
+      if accept:
+        enabled = coot.backup_state(state['model'])
+        try:
+          coot.turn_off_backup(state['model'])
+          result = coot.accept_moving_atoms_py()
+          if result is False or result is None:
+            raise RuntimeError('Coot could not accept the timed refinement.')
+        finally:
+          (coot.turn_on_backup if enabled else coot.turn_off_backup)(state['model'])
+          _mark_model_changed(state['model'])
+      else:
+        coot.clear_up_moving_atoms()
+    coot.graphics_draw()
+  finally:
+    _global_multimap_timed_restore(state)
+  if not accept:
+    return
+  snapshot = _model_coordinate_snapshot(state['model'])
+  if _global_multimap_identity(snapshot) != state['identity']:
+    raise RuntimeError('Timed refinement changed atom identities/properties. Use Coot Undo to recover.')
+  state['expected'] = snapshot
+  progress = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else None
+  termination = ('converged' if progress == 0 else 'no progress' if progress == 27 else
+                 'stopped' if state['stop'] or state['closed'] else 'time limit')
+  estimate = native['estimate']
+  elapsed = time.monotonic()-native['started']
+  state['history'].append(dict(resolution=state['resolution'], map=native['map'], weight=native['weight'],
+      sigma=estimate['sigma'], reference_sigma=estimate['reference_sigma'],
+      baseline_weight=estimate['baseline_weight'], local_factor=estimate['local_factor'],
+      resolution_factor=estimate.get('resolution_factor', 1.), effective_resolution=estimate.get('effective_resolution'),
+      samples=estimate['samples'], cropped=state['cropped'], result=result,
+      elapsed=elapsed, termination=termination))
+  print(f"Global multimap: {state['stage_label']} | weight {native['weight']:.6g} | {elapsed:.2f}s | {termination}")
+
+
+def _global_multimap_timed_start(state, stage_map, estimate):
+  if coot.refinement_already_ongoing_p():
+    raise ValueError('Accept/cancel the other active refinement first.')
+  weight = estimate['weight']*state['multiplier']
+  if not math.isfinite(weight) or weight <= 0:
+    raise ValueError('Invalid estimated stage weight.')
+  state['native'] = dict(map=stage_map, estimate=estimate, weight=weight, started=time.monotonic(),
+      previous=(coot.imol_refinement_map(), float(coot.matrix_state()), coot.refinement_immediate_replacement_state()))
+  try:
+    if coot.set_imol_refinement_map(stage_map) != stage_map:
+      raise RuntimeError('Coot could not select the timed stage map.')
+    coot.set_matrix(weight)
+    coot.set_refinement_immediate_replacement(0)
+    # Restore backups immediately after launching; do not leave them disabled
+    # while the GUI is interactive. Acceptance uses the same single checkpoint.
+    with _grouped_model_edit(state['model']):
+      result = coot.refine_residues_py(state['model'], state['specs'])
+      if result is False or result is None or not coot.refinement_already_ongoing_p():
+        raise RuntimeError('Coot could not launch nonblocking refinement.')
+    state['phase'] = 'refining'
+  except Exception:
+    _global_multimap_timed_finish(state, accept=False)
+    raise
+
+
+def start_global_multimap_refinement(model, map_id, start=5., finest=4., repeats=1,
+                                    padding=30., final_crop=True, multiplier=1., on_update=None, max_seconds=20.):
+  """In-place global passes with background FFTs and per-pass temporary weights.
+
+  Timed passes use native intermediate atoms and GUI-thread stop/accept.
+  A zero time budget keeps the original synchronous convergence-driven path.
+  """
+  import threading
+  glib = _coot_gui_repository_module("GLib")
+  if glib is None or gemmi is None or _tq_numpy_module() is None:
+    raise ValueError("Global multimap refinement requires GLib, Gemmi and NumPy in Coot.")
+  running = globals().get("_GLOBAL_MULTIMAP_JOB")
+  if running is not None and running["running"]:
+    raise ValueError("Another global multimap run is still active.")
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept/cancel intermediate atoms first.")
+  if not coot.is_valid_model_molecule(model) or not coot.is_valid_map_molecule(map_id):
+    raise ValueError("Choose an available model and refinement map.")
+  if coot.map_is_difference_map(map_id):
+    raise ValueError("Choose a reconstruction, not a difference map.")
+  schedule = _global_multimap_schedule(start, finest, repeats)
+  max_seconds = float(max_seconds)
+  if not math.isfinite(max_seconds) or not 0 <= max_seconds <= 86400:
+    raise ValueError('Use a stage time budget between 0 and 86400 seconds (0 = unlimited).')
+  if max_seconds and not all(callable(getattr(coot, name, None)) for name in
+      ('stop_refinement_internal', 'accept_moving_atoms_py', 'backup_state', 'turn_off_backup', 'turn_on_backup')):
+    raise ValueError('Timed refinement is unavailable in this build. Set maximum seconds to 0 for unlimited refinement.')
+  try:
+    _lowpass_worker_source()
+  except (OSError, TypeError, RuntimeError):
+    pass
+  padding, multiplier = float(padding), float(multiplier)
+  if not math.isfinite(padding) or padding < 8 or not math.isfinite(multiplier) or not 0 < multiplier <= 10:
+    raise ValueError("Use crop padding >= 8 A and a weight multiplier > 0 and <= 10.")
+  snapshot = _model_coordinate_snapshot(model)
+  identity = _global_multimap_identity(snapshot)
+  points = [a[2] for r in snapshot.values() for a in r["atoms"]]
+  probes = points[::max(1, len(points)//64)][:64]
+  fingerprint = _register_map_fingerprint(map_id, probes)
+  state = dict(model=model, model_name=coot.molecule_name(model), map=map_id,
+      schedule=schedule, index=0, history=[], running=True, paused=False, stop=False, closed=False,
+      expected=snapshot, identity=identity, specs=[list(s) for s, r in snapshot.items() if r["atoms"]],
+      phase="prepare", message="Preparing global refinement...", padding=padding,
+      final_crop=bool(final_crop), multiplier=multiplier, probes=probes, fingerprint=fingerprint,
+      worker=None, prepared=None, source=None, native=None, max_seconds=max_seconds)
+  def notify():
+    if on_update is not None and not state["closed"]:
+      try:
+        on_update(state)
+      except Exception as error:
+        print("Global multimap GUI update failed:", error)
+  state["notify"] = notify
+  def finish(message, error=None):
+    try:
+      if state.get('native') is not None:
+        _global_multimap_timed_finish(state, accept=False)
+      _global_multimap_cleanup(state)
+    except Exception as cleanup_error:
+      message += " Cleanup failed: "+str(cleanup_error)
+      error = error or str(cleanup_error)
+    state.update(running=False, phase="error" if error else "finished", message=message, error=error)
+    notify()
+    return False
+  def check():
+    if not coot.is_valid_model_molecule(model):
+      raise ValueError("The model was closed; completed passes remain.")
+    if coot.molecule_name(model) != state["model_name"]:
+      raise ValueError(f"The model name changed from {state['model_name']!r} to {coot.molecule_name(model)!r}; completed passes remain.")
+    change = _global_multimap_snapshot_change(state["expected"], _model_coordinate_snapshot(model))
+    if change:
+      print(f"Global multimap safety check: pass {state['index']+1}, phase {state['phase']}: {change}")
+      raise ValueError(f"The model no longer matches the last completed pass: {change}; completed passes remain.")
+    if _register_map_fingerprint(map_id, probes) != fingerprint:
+      raise ValueError("The original map changed or was closed; completed passes remain.")
+    module = getattr(coot, "_trimmings_multimap_refinement", None)
+    if module is not None and getattr(module, "_MULTIMAP_RUNNING", None) is not None:
+      raise ValueError("Stop the other multimap job first.")
+  def tick():
+    try:
+      worker = state["worker"]
+      if worker is not None:
+        if worker.is_alive():
+          return True
+        state["worker"] = None
+      if state.get('native') is not None:
+        check()
+        elapsed = time.monotonic()-state['native']['started']
+        if not state['stop'] and not state['closed'] and elapsed < state['max_seconds']:
+          state['message'] = (f"Pass {state['index']+1}/{len(schedule)}: {state['stage_label']} | "
+                              f"{elapsed:.1f}/{state['max_seconds']:g}s | weight {state['native']['weight']:.4g}")
+          notify()
+          return True
+        _global_multimap_timed_finish(state)
+        _global_multimap_cleanup(state)
+        state['index'] += 1
+        state.update(prepared=None, phase='settling', message=f"Completed {state['index']}/{len(schedule)} passes.")
+        notify()
+        return True  # Let Coot drain its pending intermediate-atoms callbacks.
+      if state["stop"] or state["closed"]:
+        return finish(f"Stopped after {len(state['history'])}/{len(schedule)} passes. Completed edits remain.")
+      if state["paused"]:
+        state["message"] = f"Paused after {len(state['history'])}/{len(schedule)} passes."
+        notify()
+        return True
+      if state['phase'] == 'settling':
+        if state['index'] == len(schedule):
+          return finish(f"Finished {len(schedule)} global passes; final pass used original density. Previous refinement settings restored.")
+        state['phase'] = 'prepare'
+        return True
+      check()
+      if coot.refinement_already_ongoing_p():
+        raise ValueError("Another refinement is active; completed passes remain.")
+      if state["phase"] == "prepare":
+        resolution = schedule[state["index"]]
+        cropped = resolution is not None or state["final_crop"]
+        label = f"Low-pass {resolution:g} A" if resolution is not None else "Original (cropped)" if cropped else "Original"
+        state.update(resolution=resolution, cropped=cropped, stage_label=label)
+        if not cropped:
+          state["prepared"] = (None, None)
+          state["phase"] = "ready"
+        else:
+          state["owner"] = tempfile.TemporaryDirectory(prefix="coot-global-multimap-")
+          # Low-pass convolution needs generous margins to suppress FFT wraparound.
+          margin = max(padding, 2*resolution if resolution is not None else 0.)
+          source = _lowpass_export(map_id, model, state["owner"].name, margin)
+          output = os.path.join(state["owner"].name, "filtered.map") if resolution is not None else source["path"]
+          state["message"] = f"Preparing pass {state['index']+1}/{len(schedule)}: {label}..."
+          state["phase"] = "filtering"
+          notify()
+          def filtering():
+            try:
+              compact = os.path.join(state["owner"].name, "compact.map")
+              input_path = compact if _global_multimap_compact_crop(source["path"], compact) else source["path"]
+              if resolution is not None:
+                _lowpass_filter_background(input_path, output, resolution, .10)
+              output_path = output if resolution is not None else input_path
+              state["prepared"] = (output_path, None)
+            except Exception as error:
+              state["prepared"] = (None, str(error))
+          state["worker"] = threading.Thread(target=filtering, name="coot-global-multimap-filter", daemon=True)
+          state["worker"].start()
+          return True
+      if state["phase"] == "filtering":
+        state["phase"] = "ready"
+      if state["phase"] == "ready":
+        path, error = state["prepared"]
+        if error:
+          raise RuntimeError(error)
+        stage_map = map_id
+        if path is not None:
+          existing = set(map_molecule_list())
+          scroll = coot.scroll_wheel_map()
+          selected = coot.imol_refinement_map()
+          try:
+            stage_map = coot.handle_read_ccp4_map(path, 0)
+            if stage_map in existing or not coot.is_valid_map_molecule(stage_map):
+              raise RuntimeError("Could not load the temporary stage map.")
+            name = f"Global multimap temporary {id(state)}: {state['stage_label']}"
+            state["temporary"] = (stage_map, coot.molecule_name(stage_map))
+            coot.set_molecule_name(stage_map, name)
+            state["temporary"] = (stage_map, name)
+            coot.set_map_displayed(stage_map, 0)
+            if state["resolution"] is None:
+              current_points = [a[2] for r in state["expected"].values() for a in r["atoms"]]
+              current_probes = current_points[::max(1, len(current_points)//64)][:64]
+              values = [coot.density_at_point(stage_map, *p) for p in current_probes]
+              original = [coot.density_at_point(map_id, *p) for p in current_probes]
+              if any(not math.isclose(a, b, abs_tol=1e-6, rel_tol=1e-5) for a, b in zip(values, original)):
+                raise RuntimeError("Cropped final map did not reproduce original density at the model.")
+          finally:
+            if coot.is_valid_map_molecule(scroll):
+              coot.set_scroll_wheel_map(scroll)
+            if coot.is_valid_map_molecule(selected):
+              coot.set_imol_refinement_map(selected)
+        estimate = estimate_local_em_map_weight(model, stage_map, apply=False, reference_map_id=map_id,
+                                               lowpass_resolution=state['resolution'] or 0.)
+        state.update(phase="launch", stage_map=stage_map, estimate=estimate,
+                     message=f"Pass {state['index']+1}/{len(schedule)}: {state['stage_label']} | temporary weight {estimate['weight']*multiplier:.4g}")
+        notify()
+        return True  # Let GTK paint the stage/weight before the native call.
+      if state["phase"] == "launch":
+        if state['max_seconds']:
+          _global_multimap_timed_start(state, state['stage_map'], state.pop('estimate'))
+          return True
+        _global_multimap_refine(state, state["stage_map"], state.pop("estimate"))
+        _global_multimap_cleanup(state)
+        state["index"] += 1
+        state["prepared"] = None
+        if state["index"] == len(schedule):
+          return finish(f"Finished {len(schedule)} global passes; final pass used original density. Previous refinement settings restored.")
+        state.update(phase="prepare", message=f"Completed {state['index']}/{len(schedule)} global passes.")
+        notify()
+      return True
+    except Exception as error:
+      return finish(f"Stopped: {error}", str(error))
+  state["tick"] = tick
+  globals()["_GLOBAL_MULTIMAP_JOB"] = state
+  try:
+    state["source"] = glib.timeout_add(100, tick)
+    if not state["source"]:
+      raise RuntimeError("Could not schedule global refinement.")
+  except Exception:
+    state["running"] = False
+    raise
+  notify()
+  return state
+
+
+def global_multimap_refinement_dialog():
+  """Compact coarse-to-fine global refinement using the selected refinement map."""
+  glib = _coot_gui_repository_module("GLib")
+  if Gtk is None or glib is None or gemmi is None or _tq_numpy_module() is None:
+    info_dialog("Global multimap refinement requires GTK, Gemmi and NumPy.")
+    return None
+  active = _active_residue_or_status()
+  models, maps = list(model_molecule_list()), [m for m in map_molecule_list() if not coot.map_is_difference_map(m)]
+  if not models or not maps:
+    info_dialog("Open a model and a non-difference refinement map first.")
+    return None
+  window = Gtk.Window(title="Global multimap refinement")
+  window.set_default_size(580, -1)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for edge in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+edge)(12)
+  window.set_child(box)
+  grid = Gtk.Grid(column_spacing=12, row_spacing=7)
+  box.append(grid)
+  model_choice, map_choice = Gtk.ComboBoxText(), Gtk.ComboBoxText()
+  for choice, numbers, selected in ((model_choice, models, active[0] if active else models[0]),
+                                   (map_choice, maps, coot.imol_refinement_map())):
+    for number in numbers:
+      choice.append(str(number), f"#{number}: {os.path.basename(str(coot.molecule_name(number)))}")
+    choice.set_active_id(str(selected if selected in numbers else numbers[0]))
+    choice.set_hexpand(True)
+  start, finest, repeats, padding, multiplier, max_seconds = [Gtk.Entry() for _ in range(6)]
+  for field, value in zip((start, finest, repeats, padding, multiplier, max_seconds), ("5", "4", "1", "30", "1", "20")):
+    field.set_text(value)
+    field.set_width_chars(6)
+    field.set_max_width_chars(8)
+  for row, (label, field) in enumerate((("Whole model", model_choice), ("Refinement map", map_choice),
+      ("Starting resolution (A)", start), ("Finest filtered resolution (A)", finest),
+      ("Passes per stage", repeats), ("Crop padding (A)", padding), ("Weight multiplier", multiplier),
+      ("Maximum seconds per stage", max_seconds))):
+    grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+    grid.attach(field, 1, row, 1, 1)
+  max_seconds.set_tooltip_text('20 seconds by default; 0 = unlimited convergence-driven refinement. Map preparation is excluded. Stopping waits for the current minimization batch. Timed stages may wait for their budget even if Coot converges earlier; convergence is checked at acceptance.')
+  final_crop = Gtk.CheckButton(label="Use cropped original map for final stage")
+  final_crop.set_active(True)
+  box.append(final_crop)
+  schedule_label = Gtk.Label(xalign=0)
+  schedule_label.set_wrap(True)
+  box.append(schedule_label)
+  def preview(*_args):
+    try:
+      stages = _global_multimap_schedule(start.get_text(), finest.get_text(), 1)
+      schedule_label.set_text(" -> ".join(f"{v:.3g} A" if v is not None else "Original" for v in stages))
+    except (ValueError, TypeError) as error:
+      schedule_label.set_text(str(error))
+  for field in (start, finest):
+    field.connect("changed", preview)
+  preview()
+  note = Gtk.Label(label="Refines in place, preserving existing restraints. Each pass re-estimates weight near the current model, calibrated to the original map; filtered stages are down-weighted by retained contrast (heuristic). Resolution attenuation uses the value configured via Fit > Set EM refinement weight; unset values are not guessed. Timed passes accept the current result at their budget; Stop accepts early, Pause acts between passes. Do not start other model edits/refinements during a run. Coot Undo restores each accepted pass.", xalign=0)
+  note.set_wrap(True)
+  note.set_max_width_chars(74)
+  box.append(note)
+  progress = Gtk.ProgressBar()
+  progress.set_show_text(True)
+  box.append(progress)
+  status = Gtk.Label(label="Temporary maps only; original map and global weight are retained.", xalign=0)
+  status.set_wrap(True)
+  status.set_max_width_chars(74)
+  box.append(status)
+  history_label = Gtk.Label(xalign=0)
+  history_label.set_selectable(True)
+  history_label.add_css_class("monospace")
+  history_expander = Gtk.Expander(label="Completed passes / weights")
+  history_expander.set_child(history_label)
+  box.append(history_expander)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+  run, pause, stop, close = [Gtk.Button(label=label) for label in ("Start", "Pause", "Stop", "Close")]
+  for widget in (run, pause, stop, close):
+    buttons.append(widget)
+  box.append(buttons)
+  pause.set_sensitive(False)
+  stop.set_sensitive(False)
+  state = dict(job=None, closed=False)
+  def update(job):
+    if state["closed"]:
+      return
+    status.set_text(job["message"])
+    progress.set_fraction(len(job["history"])/len(job["schedule"]))
+    progress.set_text(f"{len(job['history'])}/{len(job['schedule'])} passes | {job['phase']}")
+    history_label.set_text("\n".join(
+        f"{i+1}: {h['resolution'] if h['resolution'] is not None else 'Original'} | weight {h['weight']:.4g} | original {h['baseline_weight']:.4g} x {h['local_factor']:.3g}"
+        + (f" x resolution {h['resolution_factor']:.3g}" if h.get('effective_resolution') is not None else '')
+        + (f" | {h['elapsed']:.1f}s, {h['termination']}" if 'elapsed' in h else '')
+        for i, h in enumerate(job["history"])))
+    run.set_sensitive(not job["running"])
+    grid.set_sensitive(not job["running"])
+    final_crop.set_sensitive(not job["running"])
+    pause.set_sensitive(job["running"] and not job["stop"])
+    stop.set_sensitive(job["running"] and not job["stop"])
+    if not job["running"]:
+      pause.set_label("Pause")
+  def begin(*_args):
+    try:
+      state["job"] = start_global_multimap_refinement(int(model_choice.get_active_id()), int(map_choice.get_active_id()),
+          start.get_text(), finest.get_text(), repeats.get_text(), padding.get_text(), final_crop.get_active(),
+          multiplier.get_text(), update, max_seconds=max_seconds.get_text())
+    except Exception as error:
+      status.set_text(str(error))
+  def toggle_pause(*_args):
+    job = state["job"]
+    if job and job["running"]:
+      job["paused"] = not job["paused"]
+      pause.set_label("Resume" if job["paused"] else "Pause")
+  def request_stop(*_args):
+    job = state["job"]
+    if job and job["running"]:
+      job["stop"] = True
+      status.set_text("Stopping; completed passes remain.")
+  def finish(*_args):
+    state["closed"] = True
+    job = state["job"]
+    if job and job["running"]:
+      job.update(stop=True, closed=True)
+    window.destroy()
+    return True
+  run.connect("clicked", begin)
+  pause.connect("clicked", toggle_pause)
+  stop.connect("clicked", request_stop)
+  close.connect("clicked", finish)
+  window.connect("close-request", finish)
+  state["widgets"] = dict(run=run, pause=pause, stop=stop, close=close, model=model_choice, map=map_choice,
+      start=start, finest=finest, repeats=repeats, padding=padding, multiplier=multiplier, final_crop=final_crop,
+      max_seconds=max_seconds,
+      progress=progress, status=status)
+  window.global_multimap_state = state
   window.present()
   return window
 
@@ -14614,6 +16438,266 @@ def color_by_density_fit_native_for_active_residue():
   return _start_user_defined_colour_action(mol_id, color_by_density_fit_native, "Density-fit colouring")
 
 
+def _sidechain_density_records(snapshot):
+  """Canonical, complete, single-conformer sidechains; retain other rows as breaks/context."""
+  distal = dict(ARG="CG CD NE CZ NH1 NH2", ASN="CG OD1 ND2", ASP="CG OD1 OD2",
+                CYS="SG", GLN="CG CD OE1 NE2", GLU="CG CD OE1 OE2",
+                HIS="CG ND1 CD2 CE1 NE2", ILE="CG1 CG2 CD1", LEU="CG CD1 CD2",
+                LYS="CG CD CE NZ", MET="CG SD CE", PHE="CG CD1 CD2 CE1 CE2 CZ",
+                PRO="CG CD", SER="OG", THR="OG1 CG2",
+                TRP="CG CD1 CD2 NE1 CE2 CE3 CZ2 CZ3 CH2",
+                TYR="CG CD1 CD2 CE1 CE2 CZ OH", VAL="CG1 CG2")
+  rows = []
+  for spec, record in snapshot.items():
+    xyz, alternate = {}, False
+    for atom in record["atoms"]:
+      name, alt = (str(value).strip() for value in atom[0])
+      if name.startswith(("H", "D")) or name[:1].isdigit():
+        continue
+      point = tuple(float(value) for value in atom[2])
+      occupancy = float(atom[1][0])
+      if occupancy <= 0 or not math.isfinite(occupancy) or len(point) != 3 or not all(map(math.isfinite, point)):
+        continue
+      alternate = alternate or bool(alt) or name in xyz
+      xyz.setdefault(name, point)
+    name = str(record["name"]).strip()
+    backbone = [xyz[atom] for atom in ("N", "CA", "C", "O") if atom in xyz]
+    required = set(distal.get(name, "").split()) | {"CB"}
+    rows.append(dict(spec=tuple(spec), name=name, xyz=xyz, backbone=backbone,
+                     context=(name in distal or name in ("ALA", "GLY")) and not alternate and len(backbone) == 4,
+                     eligible=(name in distal and not alternate and len(backbone) == 4
+                               and required.issubset(xyz))))
+  return rows
+
+
+def _sidechain_density_scores(records, backbone_rows, sidechain_rows, densities,
+                              window=1, backbone_cc_floor=.35, min_support=.2):
+  """Regional density gates confidence; CC is a normalization, not a visibility gate."""
+  try:
+    width = int(window)
+  except (TypeError, ValueError, OverflowError):
+    raise ValueError("Window must be an integer from 1 to 25 (1 = per residue).") from None
+  if isinstance(window, bool) or width != window or not 1 <= width <= 25:
+    raise ValueError("Window must be an integer from 1 to 25 (1 = per residue).")
+  window = width
+  if not math.isfinite(backbone_cc_floor) or not 0 < backbone_cc_floor <= 1:
+    raise ValueError("Backbone CC normalization floor must be greater than 0 and at most 1.")
+  if not math.isfinite(min_support) or not 0 <= min_support <= 1:
+    raise ValueError("Minimum relative density support must be between 0 and 1.")
+  def correlation(rows):
+    result = {}
+    for item in rows:
+      if not isinstance(item, (list, tuple)) or len(item) < 2:
+        continue
+      spec = _coot_residue_spec_from_spec(item[0])
+      try:
+        value = float(item[1])
+      except (TypeError, ValueError):
+        continue
+      if spec is not None and math.isfinite(value) and -1.0001 <= value <= 1.0001:
+        result[tuple(spec)] = max(-1., min(1., value))
+    return result
+  bb, sc = correlation(backbone_rows), correlation(sidechain_rows)
+  canonical = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split())
+  values = sorted(float(densities[r["spec"]]) for r in records if r["name"] in canonical
+                  and len(r["backbone"]) == 4 and r["spec"] in densities
+                  and math.isfinite(densities[r["spec"]]))
+  def percentile(fraction):
+    if not values:
+      return 0.
+    position = (len(values)-1)*fraction
+    lower = int(position)
+    return values[lower] + (values[min(lower+1, len(values)-1)]-values[lower])*(position-lower)
+  low, high = percentile(.1), percentile(.9)
+  result, segment = [], 0
+  previous = None
+  for record in records:
+    spec = record["spec"]
+    # C-N connectivity plus residue ordering: never smooth across chains, gaps or ligands.
+    connected = (previous is not None and previous["spec"][0] == spec[0]
+                 and previous["name"] in canonical and record["name"] in canonical
+                 and ((not spec[2] and not previous["spec"][2] and spec[1] == previous["spec"][1]+1)
+                      or (spec[1] == previous["spec"][1] and spec[2] > previous["spec"][2]))
+                 and "C" in previous["xyz"] and "N" in record["xyz"]
+                 and .25 < sum((a-b)**2 for a, b in zip(previous["xyz"]["C"], record["xyz"]["N"])) <= 2.2**2)
+    if not connected:
+      segment += 1
+    density = densities.get(spec, float("nan"))
+    support = (max(0., min(1., (density-low)/(high-low)))
+               if high > low and math.isfinite(density) else 0.)
+    result.append(dict(spec=spec, segment=segment, backbone_cc=bb.get(spec),
+                       sidechain_cc=sc.get(spec), support=support, eligible=record["eligible"],
+                       context=record["context"], score=None, deficit=None, count=0,
+                       residue_deficit=None, window_deficit=None, window_support=None,
+                       confidence_support=None))
+    previous = record
+  for row in result:
+    if row["eligible"] and row["sidechain_cc"] is not None:
+      # A low/negative backbone CC can reflect calculated-map shape rather than
+      # absent observed density. Avoid both a small denominator and hard masking.
+      reference = max(backbone_cc_floor, row["backbone_cc"] or backbone_cc_floor)
+      row["residue_deficit"] = max(0., min(1., 1.-row["sidechain_cc"]/reference))
+  # For even widths the extra neighbor follows the central residue.
+  before, after = (window-1)//2, window//2
+  for i, row in enumerate(result):
+    if not row["context"]:
+      continue
+    neighbors = [r for r in result[max(0, i-before):i+after+1]
+                 if r["segment"] == row["segment"] and r["context"]]
+    support = sum(r["support"] for r in neighbors)/len(neighbors)
+    pairs = [r for r in neighbors if r["residue_deficit"] is not None]
+    row["window_support"] = support
+    row["confidence_support"] = max(row["support"], support)
+    if row["confidence_support"] < min_support or not pairs:
+      continue
+    bb_values = [r["backbone_cc"] for r in pairs if r["backbone_cc"] is not None]
+    b = sum(bb_values)/len(bb_values) if bb_values else None
+    s = sum(r["sidechain_cc"] for r in pairs)/len(pairs)
+    window_deficit = sum(r["residue_deficit"] for r in pairs)/len(pairs)
+    # Windows can extend a warning, never conceal the central residue's defect.
+    # Gly/Ala have no distal SC CC, but can inherit a genuine regional score.
+    deficit = max(row["residue_deficit"] or 0., window_deficit)
+    row.update(score=1.-deficit, deficit=deficit, count=len(pairs),
+               window_deficit=window_deficit, window_backbone_cc=b, window_sidechain_cc=s)
+  return result
+
+
+def _iter_sidechain_density_colours(mol_id, map_id, window, backbone_cc_floor, min_support):
+  snapshot = _model_coordinate_snapshot(mol_id)
+  map_identity = _local_em_resolution_identity(map_id)
+  def check_map():
+    if _local_em_resolution_identity(map_id) != map_identity:
+      raise RuntimeError("The refinement map was closed or replaced; please try again.")
+  records = _sidechain_density_records(snapshot)
+  canonical = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split())
+  specs = [list(r["spec"]) for r in records if len(r["backbone"]) == 4
+           and r["name"] in canonical]
+  if not specs:
+    raise ValueError("No complete protein backbones found.")
+  cache = _analysis_cc_open(map_id)
+  try:
+    yield "Calculating backbone correlations...", .05, True
+    check_map()
+    backbone = _analysis_cc_residue_scores(cache, mol_id, specs, 1)
+    yield "Calculating sidechain correlations...", .35, True
+    check_map()
+    sidechain = _analysis_cc_residue_scores(cache, mol_id, specs, 3)
+    yield "Measuring backbone density support...", .65, True
+    check_map()
+    points = [p for r in records for p in r["backbone"]]
+    values = _analysis_density_values(map_id, points)
+    densities, offset = {}, 0
+    for record in records:
+      count = len(record["backbone"])
+      if count:
+        densities[record["spec"]] = sum(values[offset:offset+count])/count
+      offset += count
+    scores = _sidechain_density_scores(records, backbone, sidechain, densities,
+                                      window, backbone_cc_floor, min_support)
+  finally:
+    _analysis_cc_close(cache)
+  yield "Preparing sidechain-fit colours...", .8, True
+  check_map()
+  if _model_coordinate_snapshot(mol_id) != snapshot or not coot.is_valid_map_molecule(map_id):
+    raise RuntimeError("The model or refinement map changed; please try again.")
+  blank = [(list(spec), 0) for spec in snapshot]
+  colours = [(list(row["spec"]), _density_fit_score_to_colour_index(row["score"]))
+             for row in scores if row["score"] is not None]
+  legend = ("Sidechain density correlation, normalized to backbone support.\n\n"
+            "Red = large sidechain deficit; blue = little/no deficit.\n"
+            "Residue deficit = clamp(1 - sidechain CC / max(backbone CC, floor), 0, 1).\n"
+            "Distal sidechains exclude C-beta. Window: %d residues; display uses the larger of the residue and window-mean deficits.\n"
+            "In window mode, Gly/Ala and incomplete sidechains inherit nearby sidechain evidence.\n"
+            "Gray = weak regional density, no usable sidechain evidence, alternate conformers or non-standard residues.\n"
+            "Backbone CC floor (not a cutoff): %.2f; minimum regional density support: %.2f.\n"
+            "Either central or window-mean backbone density can establish support.\n"
+            "Support uses backbone atom density relative to this model's 10th-90th percentiles.\n\n"
+            "%d/%d residues scored. This is a mismatch diagnostic, not proof of a register error."
+            % (window, backbone_cc_floor, min_support, len(colours), len(scores)))
+  yield from _apply_user_defined_residue_colours(mol_id, blank, colours, legend, defer_apply=True)
+
+
+def color_by_sidechain_density_for_active_residue():
+  mol_id = _active_polymer_molecule_for_colouring("Sidechain density-fit colouring")
+  if mol_id is None:
+    return None
+  map_id = imol_refinement_map()
+  if not coot.is_valid_map_molecule(map_id):
+    info_dialog("Select a refinement map for sidechain density-fit colouring.")
+    return None
+  if Gtk is None:
+    info_dialog("Sidechain density-fit options require GTK.")
+    return None
+  dialog = Gtk.Window(title="Sidechain density correlation")
+  dialog.set_default_size(560, -1)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  identifier = Gtk.Label(label="Model #%s: %s\nRefinement map #%s: %s" %
+                         (mol_id, os.path.basename(coot.molecule_name(mol_id)),
+                          map_id, os.path.basename(coot.molecule_name(map_id))))
+  identifier.set_xalign(0.)
+  identifier.set_wrap(True)
+  identifier.set_max_width_chars(68)
+  box.append(identifier)
+  entries = {}
+  for key, label, default in (("window", "Window (1-25, 1 = per residue)", "1"),
+                               ("backbone", "Backbone CC normalization floor", "0.35"),
+                               ("support", "Minimum regional density support", "0.2")):
+    line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+    line.append(Gtk.Label(label=label))
+    entry = Gtk.Entry()
+    entry.set_width_chars(6)
+    entry.set_max_width_chars(8)
+    entry.set_text(default)
+    if key == "window":
+      entry.set_tooltip_text("Even windows include one extra following residue; e.g. 4 = previous, current, next two.")
+    line.append(entry)
+    entries[key] = entry
+    box.append(line)
+  help_text = Gtk.Label(label="Red: sidechains fit worse than a supported backbone. Blue: little/no deficit.\n"
+                         "Windows extend highlighting without averaging away an individual mismatch.\n"
+                         "Window mode includes Gly/Ala using nearby sidechains; weak regional density is gray.\n"
+                         "This can flag register errors, but also incorrect rotamers and other mismatches.")
+  help_text.set_xalign(0.)
+  help_text.set_wrap(True)
+  help_text.set_max_width_chars(68)
+  box.append(help_text)
+  status = Gtk.Label(label="")
+  status.set_wrap(True)
+  status.set_max_width_chars(68)
+  box.append(status)
+  buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+  apply_button, close = Gtk.Button(label="Colour molecule"), Gtk.Button(label="Close")
+  buttons.append(apply_button)
+  buttons.append(close)
+  box.append(buttons)
+  dialog.set_child(box)
+  model_identity, map_identity = coot.molecule_name(mol_id), _local_em_resolution_identity(map_id)
+  def apply(*_args):
+    try:
+      window = int(entries["window"].get_text())
+      backbone = float(entries["backbone"].get_text())
+      support = float(entries["support"].get_text())
+      _sidechain_density_scores([], [], [], {}, window, backbone, support)
+      if (not valid_model_molecule_qm(mol_id) or coot.molecule_name(mol_id) != model_identity
+          or _local_em_resolution_identity(map_id) != map_identity):
+        raise ValueError("The selected model or map was closed or replaced. Reopen this dialog.")
+      def action(model, defer_apply=False):
+        steps = _iter_sidechain_density_colours(model, map_id, window, backbone, support)
+        return steps if defer_apply else _consume_colour_steps(steps)
+      result = _start_user_defined_colour_action(mol_id, action, "Sidechain density-fit colouring")
+      if result is not None:
+        dialog.destroy()
+    except Exception as error:
+      status.set_text(str(error))
+  apply_button.connect("clicked", apply)
+  close.connect("clicked", lambda *_: dialog.destroy())
+  dialog.sidechain_density_widgets = dict(entries=entries, apply=apply_button, status=status)
+  dialog.present()
+  return dialog
+
+
 def _ncs_difference_scores_from_ghosts(snapshot, ghosts):
   """Mean matched-atom displacement after Coot's peer-to-master NCS transform."""
   chains = {}
@@ -14931,7 +17015,7 @@ def cycle_rep_down_current():
 
 # Embedded multimap tool: kept identical to multimap_refinement.py by tests.
 # Load lazily in its own namespace so helper names cannot shadow trimmings.
-_MULTIMAP_REFINEMENT_SOURCE = r'''"""Experimental, sequential multi-map refinement for Coot 1 / Python 3.
+_MULTIMAP_REFINEMENT_SOURCE = r'''"""Experimental multi-map refinement for Coot 1 / Python 3.
 
 Load this file in Coot, then call multimap_refinement_gui(). Nothing runs on load.
 Native edits are main-thread only; Pause/Stop take effect between refinement calls.
@@ -14939,6 +17023,8 @@ Native edits are main-thread only; Pause/Stop take effect between refinement cal
 
 import math
 import heapq
+import queue
+import time
 import traceback
 from dataclasses import dataclass
 from itertools import product
@@ -14969,6 +17055,8 @@ class RefinementStage:
     repeats: int = 1
     autofit_rotamers: bool = False
     b_factor: float = 0.0
+    lowpass_resolution: float = 0.0
+    auto_weight: bool = False
 
     def __post_init__(self):
         if type(self.map_id) is not int or self.map_id < 0:
@@ -14981,6 +17069,10 @@ class RefinementStage:
             raise ValueError("Autofit rotamers must be True or False.")
         if not math.isfinite(self.b_factor):
             raise ValueError("Stage B-factor must be finite (positive blurs; negative sharpens).")
+        if not math.isfinite(self.lowpass_resolution) or (self.lowpass_resolution != 0 and not .5 <= self.lowpass_resolution <= 200):
+            raise ValueError("Low-pass resolution must be 0 (off), or between 0.5 and 200 A.")
+        if type(self.auto_weight) is not bool:
+            raise ValueError("Auto weight must be True or False.")
 
 
 @dataclass(frozen=True)
@@ -15002,6 +17094,7 @@ class RefinementOptions:
     prioritize_misfits: bool = False
     priority_max_cc: float = 0.5
     priority_min_density: float = 2.0
+    parallel: bool = False
 
     def __post_init__(self):
         for name in ("window_size", "step_size"):
@@ -15031,6 +17124,8 @@ class RefinementOptions:
             raise ValueError("Priority density cutoff must be finite and positive.")
         if self.prioritize_misfits and self.order != "window":
             raise ValueError("Misfit prioritization requires window-major stage order.")
+        if type(self.parallel) is not bool or (self.parallel and self.order != "window"):
+            raise ValueError("Parallel refinement requires window-major stage order.")
 
     @property
     def moving_residue_limit(self):
@@ -15364,10 +17459,24 @@ class CootRefinementBackend:
         self._polymer_order = {}
         self._priority_enabled = False
         self._stage_maps = {}
+        self.last_weight = None
+        self.last_weight_estimate = None
+
+    def lowpass_map(self, map_id, resolution):
+        raise RuntimeError("Low-pass stages require the main coot_trimmings script.")
+
+    def estimate_weight(self, imol, specs, stage, map_id):
+        raise RuntimeError("Auto-weight stages require the main coot_trimmings script.")
 
     def _release_stage_map(self, key):
-        map_id, name, _source_name = self._stage_maps[key]
+        map_id, name, source_name = self._stage_maps[key]
         if self.api.is_valid_map_molecule(map_id) and self.api.molecule_name(map_id) == name:
+            source = key[0]
+            if self.api.is_valid_map_molecule(source) and self.api.molecule_name(source) == source_name:
+                if self.api.imol_refinement_map() == map_id:
+                    self.api.set_imol_refinement_map(source)
+                if callable(getattr(self.api, "scroll_wheel_map", None)) and self.api.scroll_wheel_map() == map_id:
+                    self.api.set_scroll_wheel_map(source)
             self.api.close_molecule(map_id)
         del self._stage_maps[key]
 
@@ -15383,13 +17492,13 @@ class CootRefinementBackend:
             raise RuntimeError("Temporary map cleanup failed: " + "; ".join(errors))
 
     def stage_map(self, stage):
-        """Lazily cache one hidden native map per source/B-factor pair for this run."""
+        """Cache hidden B-factor/low-pass maps; apply B-factor before low-pass."""
         api = self.api
         if not api.is_valid_map_molecule(stage.map_id):
             raise ValueError("Stage source map has been closed.")
-        if not stage.b_factor:
+        if not stage.b_factor and not stage.lowpass_resolution:
             return stage.map_id
-        key = (stage.map_id, stage.b_factor)
+        key = (stage.map_id, stage.b_factor, stage.lowpass_resolution)
         source_name = api.molecule_name(stage.map_id)
         cached = self._stage_maps.get(key)
         if cached is not None:
@@ -15400,24 +17509,50 @@ class CootRefinementBackend:
             self._release_stage_map(key)
         existing = {i for i in range(api.graphics_n_molecules()) if api.is_valid_map_molecule(i)}
         previous_map = api.imol_refinement_map()
+        previous_scroll = api.scroll_wheel_map() if callable(getattr(api, "scroll_wheel_map", None)) else None
+        created = []
         try:
-            map_id = api.sharpen_blur_map(stage.map_id, stage.b_factor)
+            map_id = stage.map_id
+            if stage.b_factor:
+                map_id = api.sharpen_blur_map(stage.map_id, stage.b_factor)
+                if map_id in existing or not api.is_valid_map_molecule(map_id):
+                    raise RuntimeError("Could not create the temporary stage map; source map unchanged.")
+                created.append(map_id)
+            if stage.lowpass_resolution:
+                map_id = self.lowpass_map(map_id, stage.lowpass_resolution)
+                if map_id in existing or map_id in created or not api.is_valid_map_molecule(map_id):
+                    raise RuntimeError("Could not create the temporary low-pass map.")
+                created.append(map_id)
             if map_id in existing or not api.is_valid_map_molecule(map_id):
                 raise RuntimeError("Could not create the temporary stage map; source map unchanged.")
-            name = "Multimap temporary map %s #%d: source #%d, B %+g" % (
-                id(self), map_id, stage.map_id, stage.b_factor)
-            try:
-                api.set_molecule_name(map_id, name)
-                api.set_map_displayed(map_id, 0)
-            except Exception:
-                api.close_molecule(map_id)
-                raise
+            name = "Multimap temporary map %s #%d: source #%d, B %+g, low-pass %g A" % (
+                id(self), map_id, stage.map_id, stage.b_factor, stage.lowpass_resolution)
+            api.set_molecule_name(map_id, name)
+            api.set_map_displayed(map_id, 0)
+            for intermediate in created[:-1]:
+                api.close_molecule(intermediate)
             self._stage_maps[key] = (map_id, name, source_name)
             return map_id
+        except Exception:
+            for number in reversed(created):
+                if api.is_valid_map_molecule(number):
+                    api.close_molecule(number)
+            raise
         finally:
-            if api.is_valid_map_molecule(previous_map) and api.imol_refinement_map() != previous_map:
-                if api.set_imol_refinement_map(previous_map) != previous_map:
-                    raise RuntimeError("Could not restore the refinement map after stage-map preparation.")
+            errors = []
+            try:
+                if previous_scroll is not None and api.is_valid_map_molecule(previous_scroll):
+                    api.set_scroll_wheel_map(previous_scroll)
+            except Exception as error:
+                errors.append(str(error))
+            try:
+                if api.is_valid_map_molecule(previous_map) and api.imol_refinement_map() != previous_map:
+                    if api.set_imol_refinement_map(previous_map) != previous_map:
+                        raise RuntimeError("Could not restore the refinement map after stage-map preparation.")
+            except Exception as error:
+                errors.append(str(error))
+            if errors:
+                raise RuntimeError("Stage-map restoration failed: " + "; ".join(errors))
 
     def snapshot(self, imol):
         if not self.api.is_valid_model_molecule(imol):
@@ -15627,6 +17762,9 @@ class CootRefinementBackend:
         for stage in stages:
             if not self.api.is_valid_map_molecule(stage.map_id):
                 raise ValueError("Map #%s has been closed or is not a map." % stage.map_id)
+            difference = getattr(self.api, "map_is_difference_map", None)
+            if stage.auto_weight and callable(difference) and difference(stage.map_id):
+                raise ValueError("Auto weight requires a reconstruction, not a difference map.")
         if any(stage.b_factor for stage in stages):
             for name in ("sharpen_blur_map", "graphics_n_molecules", "set_molecule_name",
                          "molecule_name", "set_map_displayed", "close_molecule"):
@@ -15816,7 +17954,12 @@ class CootRefinementBackend:
             map_id = self.stage_map(stage)
             if api.set_imol_refinement_map(map_id) != map_id:
                 raise RuntimeError("Could not set refinement map.")
-            api.set_matrix(stage.weight)
+            estimate = self.estimate_weight(imol, specs, stage, map_id) if stage.auto_weight else None
+            weight = float(estimate["weight"] if estimate else stage.weight)
+            if not math.isfinite(weight) or weight <= 0:
+                raise ValueError("Invalid estimated refinement weight.")
+            self.last_weight, self.last_weight_estimate = weight, estimate
+            api.set_matrix(weight)
             api.set_refinement_immediate_replacement(1)
             attempted = True
             result = api.refine_residues_py(imol, [list(s) for s in specs])
@@ -16091,11 +18234,16 @@ class MultimapRefinementJob:
             navigate = getattr(self.backend, "navigate", None)
             if self.options.follow_refinement and callable(navigate):
                 navigate(self.imol, seed)
-            self.message = "Refining %d/%d | %s:%d%s-%d%s | Stage %d/%d, map #%d, weight %g | Repeat %d/%d" % (
+            self.message = "Refining %d/%d | %s:%d%s-%d%s | Stage %d/%d, map #%d, %s | Repeat %d/%d" % (
                 self.index+1, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
-                si+1, len(self.stages), stage.map_id, stage.weight, repeat+1, stage.repeats)
+                si+1, len(self.stages), stage.map_id, "auto weight" if stage.auto_weight else "weight %g" % stage.weight,
+                repeat+1, stage.repeats)
             if stage.b_factor:
                 self.message += " | B %+g A^2 (cached stage map)" % stage.b_factor
+            if stage.lowpass_resolution:
+                self.message += " | Low-pass %g A" % stage.lowpass_resolution
+            if stage.auto_weight:
+                self.message += " | Auto weight (original-map calibration)"
             if stage.autofit_rotamers:
                 self.message += " | Autofit rotamers, then refine"
             if self.options.prioritize_misfits:
@@ -16132,12 +18280,14 @@ class MultimapRefinementJob:
                 self._queue_priority_refresh(set(seed) | {_residue_spec(spec) for spec in moving})
             entry = {"window": w, "stage": si, "repeat": repeat, "moving": len(moving),
                      "hbonds": hbonds, "result": result, "cc_before": before, "rotamers": rotamers}
+            entry["weight"] = getattr(self.backend, "last_weight", None) or stage.weight
+            entry["weight_estimate"] = getattr(self.backend, "last_weight_estimate", None)
             if self.options.prioritize_misfits:
                 entry["priority"] = dict(self.window_priorities.get(w, {}))
             self.history.append(entry)
             self.message = "%d/%d | %s:%d%s-%d%s | Map #%d, weight %g | %d moving" % (
                 self.index, len(self.tasks), seed[0][0], seed[0][1], seed[0][2], seed[-1][1], seed[-1][2],
-                stage.map_id, stage.weight, len(moving))
+                stage.map_id, entry["weight"], len(moving))
             if stage.b_factor:
                 self.message += " | B %+g A^2" % stage.b_factor
             if rotamers:
@@ -16174,6 +18324,192 @@ class MultimapRefinementJob:
         return self.state == "running"
 
 
+class ParallelMultimapRefinementJob(MultimapRefinementJob):
+    """Independent spatial waves; native work stays on isolated processes' main threads."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        check = getattr(self.backend, "parallel_reason", None)
+        self.parallel_reason = check(self.imol) if callable(check) else "Isolated workers require the main coot_trimmings script."
+        self.parallel_enabled = not self.parallel_reason
+        self.pool = None
+        self._serial_queue = []
+        self._serial_remaining = 0
+        self._wave_dirty = set()
+        self._wave_plan = None
+        self._wave_cursor = 0
+        self._wave_candidates = []
+        self._wave_started = 0.
+        self._pending_message = None
+        self._last_status_time = 0.
+
+    def start(self):
+        if self.state == "paused":
+            self._wave_plan = None
+            self._pending_message = None
+            check = getattr(self.backend, "parallel_reason", None)
+            reason = check(self.imol) if callable(check) else self.parallel_reason
+            if reason:
+                self.parallel_enabled, self.parallel_reason = False, reason
+                partial = self.tasks[self.index:self.index+self._serial_remaining]
+                pending = [(w, i, r) for w in sorted(self._remaining_windows) for i, r in self._stage_steps]
+                self.tasks[self.index:] = partial + pending
+        super().start()
+        if not self.parallel_enabled and self.state == "running":
+            self.message += " | Serial fallback: " + self.parallel_reason
+            self._notify()
+
+    def _settle(self, state, message):
+        if self.pool is not None:
+            self.pool["cancel"].set()
+            self._requested = state
+            self.message = message + " Waiting for workers to exit..."
+            self._pending_message = message
+            self._notify()
+            return
+        cleanup = getattr(self.backend, "release_parallel_resources", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception as error:
+                message += " | " + str(error)
+        super()._settle(state, message)
+
+    def pause(self):
+        if self.pool is not None:
+            self._requested = "paused"
+            self._pending_message = "Paused; completed edits retained."
+            self.pool["cancel"].set()
+        else:
+            super().pause()
+
+    def stop(self):
+        if self.pool is not None:
+            self._requested = "stopped"
+            self._pending_message = "Stopped; completed edits retained."
+            self.pool["cancel"].set()
+        else:
+            super().stop()
+
+    def prepare_step(self):
+        if not self.parallel_enabled or self._serial_remaining or self._priority_targets is not None:
+            keep = super().prepare_step()
+            if self.parallel_reason and keep and ("Serial fallback: " + self.parallel_reason) not in self.message:
+                self.message += " | Serial fallback: " + self.parallel_reason
+                self._notify()
+            return keep
+        if self.state != "running":
+            return False
+        if self.pool and time.monotonic()-self._last_status_time < 1.:
+            return True
+        self._last_status_time = time.monotonic()
+        if self._requested:
+            self.message = (self._pending_message or self.message) + " Waiting for worker cleanup..."
+            self._notify()
+            return True
+        self.message = ("Parallel workers: %d ranges | %d/%d steps accepted | %.0f s" %
+                        (self.pool["count"], self.index, len(self.tasks), time.monotonic()-self._wave_started)
+                        if self.pool else "Preparing spatially independent ranges... %d/%d steps accepted" % (self.index, len(self.tasks)))
+        self._notify()
+        return True
+
+    def tick(self):
+        if not self.parallel_enabled:
+            return super().tick()
+        if self.state != "running":
+            return False
+        if self._serial_remaining:
+            before = self.index
+            keep = super().tick()
+            self._serial_remaining -= self.index-before
+            return keep
+        try:
+            if self._priority_targets is not None:
+                self._score_priority_tick()
+                return self.state == "running"
+            if self.pool is not None:
+                try:
+                    event, value = self.pool["events"].get_nowait()
+                except queue.Empty:
+                    return True
+                if event == "result" and not self._requested:
+                    if value.get("error"):
+                        raise RuntimeError(value["error"])
+                    w = value["index"]
+                    if value.get("needs_serial"):
+                        self._serial_queue.append(w)
+                    else:
+                        entry, moving = self.backend.import_parallel(self.imol, self.pool, value)
+                        self._remaining_windows.remove(w)
+                        self.history.extend(entry)
+                        self.index += len(entry)
+                        self.processed_residues.update(moving)
+                        self.processed_residues.update(self.windows[w])
+                        self._wave_dirty.update(moving)
+                        if self.options.follow_refinement:
+                            self.backend.navigate(self.imol, self.windows[w])
+                        reasons = value.get("pause_reasons", [])
+                        self.message = "Accepted range %s:%d-%d | %d/%d steps" % (
+                            self.windows[w][0][0], self.windows[w][0][1], self.windows[w][-1][1], self.index, len(self.tasks))
+                        if reasons:
+                            self._requested = "paused"
+                            self.pool["cancel"].set()
+                            self.message += " | CHECK: " + "; ".join(reasons)
+                            self._pending_message = self.message
+                        self._notify()
+                elif event == "error" and not self._requested:
+                    raise RuntimeError(value)
+                elif event == "done":
+                    if not self.pool["done"].is_set():
+                        raise RuntimeError("Workers reported completion before cleanup.")
+                    self.pool = None
+                    if self._requested:
+                        requested, self._requested = self._requested, None
+                        self._settle(requested, (self._pending_message or self.message) + " Uncommitted ranges were not applied.")
+                    elif self.index == len(self.tasks):
+                        self._settle("complete", "Complete: %d/%d steps accepted." % (self.index, len(self.tasks)))
+                    elif self.options.prioritize_misfits:
+                        self._queue_priority_refresh(self._wave_dirty)
+                    self._wave_dirty.clear()
+                return self.state == "running"
+            if self._serial_queue:
+                w = self._serial_queue.pop(0)
+                self._remaining_windows.remove(w)
+                self._active_window = w
+                self._serial_remaining = len(self._stage_steps)
+                self.tasks[self.index:self.index+self._serial_remaining] = [(w, i, r) for i, r in self._stage_steps]
+                self._prepared_index = None
+                return True
+            if self._wave_plan is None:
+                self.backend.snapshot(self.imol)
+                self._wave_plan = sorted(self._remaining_windows, key=lambda w: (
+                    0 if self.window_priorities.get(w, {}).get("eligible") else 1,
+                    self.window_priorities.get(w, {}).get("cc", 0) or 0, w)) if self.options.prioritize_misfits else sorted(self._remaining_windows)
+                self._wave_cursor, self._wave_candidates = 0, []
+                self._wave_capacity = self.backend.parallel_capacity(self.imol, self.stages, len(self._wave_plan))
+            # One contact-shell calculation per tick keeps large-model scheduling interruptible.
+            w = self._wave_plan[self._wave_cursor]
+            moving = self.backend.moving_selection(self.imol, self.windows[w], self.options)
+            if self.backend.parallel_independent(moving, [item[2] for item in self._wave_candidates]):
+                self._wave_candidates.append((w, self.windows[w], moving))
+            self._wave_cursor += 1
+            if self._wave_cursor == len(self._wave_plan) or len(self._wave_candidates) == self._wave_capacity:
+                self.pool = self.backend.start_parallel(self.imol, self._wave_candidates, self.stages, self.options)
+                self._wave_started = time.monotonic()
+                self._wave_plan = None
+            return True
+        except Exception as error:
+            traceback.print_exc()
+            self._settle("failed", "Failed: %s. Earlier edits remain; use Coot Undo if needed." % error)
+            return self.state == "running"
+
+
+def make_multimap_job(imol, specs, stages, options=None, backend=None, on_update=None):
+    options = options or RefinementOptions()
+    cls = ParallelMultimapRefinementJob if options.parallel else MultimapRefinementJob
+    return cls(imol, specs, stages, options, backend, on_update)
+
+
 class MultimapRefinementRunner:
     """One-shot, low-priority callbacks leave paint time before and after native work."""
 
@@ -16208,15 +18544,19 @@ class MultimapRefinementRunner:
     def pause(self):
         self._cancel()
         self.job.pause()
+        if self.job.state == "running":
+            self._queue(False)
 
     def stop(self):
         self._cancel()
         self.job.stop()
+        if self.job.state == "running":
+            self._queue(False)
 
 
 def start_multimap_refinement(imol, residue_specs, stages, options=None):
     """Start via GLib. Stages are explicit RefinementStage objects, in execution order."""
-    job = MultimapRefinementJob(imol, residue_specs, stages, options)
+    job = make_multimap_job(imol, residue_specs, stages, options)
     job.runner = MultimapRefinementRunner(job)
     job.runner.start()
     return job
@@ -16242,7 +18582,7 @@ def multimap_refinement_gui():
         return
     gtk4 = Gtk.get_major_version() >= 4
     window = Gtk.Window(title="Multimap refinement: model #%d" % imol)
-    window.set_default_size(650, 480)
+    window.set_default_size(980, 520)
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     for edge in ("top", "bottom", "start", "end"):
         getattr(root, "set_margin_" + edge)(12)
@@ -16351,11 +18691,11 @@ def multimap_refinement_gui():
         else:
             for widget in stage_grid.get_children():
                 stage_grid.remove(widget)
-        for column, text in enumerate(("", "Map", "B (A^2)", "Weight", "Repeats", "Autofit\nrotamers", "")):
+        for column, text in enumerate(("", "Map", "B (A^2)", "Low-pass\n(A; 0 = off)", "Auto\nweight", "Weight", "Repeats", "Autofit\nrotamers", "")):
             stage_grid.attach(label(text), column, 0, 1, 1)
         for index, row in enumerate(stage_rows):
             stage_grid.attach(label(str(index+1)), 0, index+1, 1, 1)
-            for column, key in enumerate(("map", "b_factor", "weight", "repeats", "autofit_rotamers"), 1):
+            for column, key in enumerate(("map", "b_factor", "lowpass_resolution", "auto_weight", "weight", "repeats", "autofit_rotamers"), 1):
                 stage_grid.attach(row[key], column, index+1, 1, 1)
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
             for text, change, tooltip in (("^", -1, "Move stage earlier"),
@@ -16374,7 +18714,7 @@ def multimap_refinement_gui():
                     redraw_stages()
                 button.connect("clicked", edit)
                 append(actions, button)
-            stage_grid.attach(actions, 6, index+1, 1, 1)
+            stage_grid.attach(actions, 8, index+1, 1, 1)
         if not gtk4:
             stage_grid.show_all()
 
@@ -16396,8 +18736,16 @@ def multimap_refinement_gui():
         autofit.set_halign(Gtk.Align.CENTER)
         b_factor = spin(0, -5000, 5000, 10, 1)
         b_factor.set_tooltip_text("Applied B-factor: positive blurs, negative sharpens, 0 uses the original map.\nHidden maps are cached per map/B pair until completion or stop. CC uses the original last-stage map.")
-        stage_rows.append({"map": combo, "weight": spin(weight, 0.01, 100000, 1, 2),
-                           "b_factor": b_factor, "repeats": spin(1, 1, 100), "autofit_rotamers": autofit})
+        lowpass = spin(0, 0, 200, .5, 1)
+        lowpass.set_tooltip_text("0 = off. B-factor is applied first, then a low-pass filter with 10% cosine rolloff. The original source map is unchanged.")
+        auto_weight = Gtk.CheckButton()
+        auto_weight.set_halign(Gtk.Align.CENTER)
+        auto_weight.set_tooltip_text("Re-estimate local weight before each refinement. Uses original-map calibration and reduces weight for weak/filtered density. Reuses a resolution supplied via Fit > Set EM refinement weight; unknown resolution is not guessed. Manual Weight is ignored.")
+        manual_weight = spin(weight, 0.01, 100000, 1, 2)
+        auto_weight.connect("toggled", lambda item: manual_weight.set_sensitive(not item.get_active()))
+        stage_rows.append({"map": combo, "weight": manual_weight,
+                           "b_factor": b_factor, "lowpass_resolution": lowpass, "auto_weight": auto_weight,
+                           "repeats": spin(1, 1, 100), "autofit_rotamers": autofit})
         redraw_stages()
 
     def refresh_maps(_button=None):
@@ -16418,6 +18766,11 @@ def multimap_refinement_gui():
     for item in (hb, guard):
         append(outer, item)
         controls.append(item)
+    parallel = Gtk.CheckButton(label="Parallel independent ranges (experimental)")
+    parallel.set_tooltip_text("Automatic CPU/memory limit. Full contact shells must be separated in 3D. Existing extra restraints or LINKs force serial refinement. Native fixed-atom flags and settings without getters cannot be transferred; use serial if these are important.")
+    append(outer, parallel)
+    controls.append(parallel)
+    append(outer, label("Parallel workers do not inherit native fixed-atom flags or settings without getters.\nLeave parallel off when those are needed; existing extra restraints/LINKs use serial automatically."))
     advanced = Gtk.Expander(label="Options")
     advanced_box = grid()
     child(advanced, advanced_box)
@@ -16441,7 +18794,7 @@ def multimap_refinement_gui():
         priority_density.set_sensitive(enabled)
     priority_order.connect("changed", priority_changed)
     priority_changed()
-    append(outer, label("Each range: all stages top to bottom, then the next range.\nPriority scoring and CC use the last map. Pause/Stop act between native calls; completed edits remain."))
+    append(outer, label("Each range: all stages top to bottom. Independent ranges can run together.\nPriority scoring and CC use the original last-stage map. Serial Pause/Stop act between native calls; parallel workers are cancelled and uncommitted ranges retried on Resume."))
     changes = Gtk.Expander(label="Changes from starting model")
     changes.set_sensitive(False)
     changes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -16546,10 +18899,13 @@ def multimap_refinement_gui():
                     row["weight"].update()
                     row["repeats"].update()
                     row["b_factor"].update()
+                    row["lowpass_resolution"].update()
                     stages.append(RefinementStage(int(map_id), row["weight"].get_value(),
                                                   row["repeats"].get_value_as_int(),
                                                   autofit_rotamers=row["autofit_rotamers"].get_active(),
-                                                  b_factor=row["b_factor"].get_value()))
+                                                  b_factor=row["b_factor"].get_value(),
+                                                  lowpass_resolution=row["lowpass_resolution"].get_value(),
+                                                  auto_weight=row["auto_weight"].get_active()))
                 for field in (size, step, radius, padding, limit, min_cc, cc_drop, geometry, priority_cc, priority_density):
                     field.update()
                 contact = radius.get_value()
@@ -16560,12 +18916,13 @@ def multimap_refinement_gui():
                                             minimum_mean_cc=min_cc.get_value(), maximum_cc_drop=cc_drop.get_value(),
                                             maximum_geometry=geometry.get_value(),
                                             order="window", prioritize_misfits=priority_order.get_active_id() == "misfits",
-                                            priority_max_cc=priority_cc.get_value(), priority_min_density=priority_density.get_value())
+                                            priority_max_cc=priority_cc.get_value(), priority_min_density=priority_density.get_value(),
+                                            parallel=parallel.get_active())
                 refinement_windows(specs, options.window_size, options.step_size)
                 backend._check_idle()
                 if not api.is_valid_map_molecule(api.imol_refinement_map()):
                     api.set_imol_refinement_map(stages[0].map_id)
-                job = MultimapRefinementJob(imol, specs, stages, options, backend, update)
+                job = make_multimap_job(imol, specs, stages, options, backend, update)
                 state["job"] = job
                 state["comparison_shown"] = False
                 change_summary.set_text("")
@@ -16595,14 +18952,21 @@ def multimap_refinement_gui():
     pause_button.set_sensitive(False)
     stop_button.set_sensitive(False)
     # Retain references for native widget smoke tests and interactive inspection.
-    window.multimap_widgets = {"scope": scope, "stages": stage_rows, "add_stage": add_stage,
+    window.multimap_widgets = {"scope": scope, "stages": stage_rows, "add_stage": add_stage, "parallel": parallel,
+                               "state": state,
+                               "size": size, "step": step, "radius": radius, "padding": padding,
                                "priority_order": priority_order, "priority_cc": priority_cc, "priority_density": priority_density,
                                "refresh_maps": refresh_maps, "start": run_button, "status": status,
                                "progress": progress, "pause": pause_button,
                                "stop": stop_button, "changes": changes, "change_metric": change_metric,
                                "change_window": change_window, "show_changes": show_changes,
                                "change_summary": change_summary}
-    window.connect("close-request" if gtk4 else "delete-event", lambda *_: (stop(), False)[1])
+    def close_window(*_args):
+        if state["job"] is not None:
+            state["job"].on_update = None
+        stop()
+        return False
+    window.connect("close-request" if gtk4 else "delete-event", close_window)
     window.present() if gtk4 else window.show_all()
     return window
 '''
@@ -16611,6 +18975,341 @@ def multimap_refinement_gui():
 def _make_multimap_user_defined_colours(module):
   colours = _make_default_user_defined_colours()
   return colours + module._standalone_change_colour_table()[len(colours):]
+
+
+def _multimap_parallel_reason(model):
+  required = ("list_extra_restraints_py", "link_info_py", "set_atom_attributes_py", "export_map",
+              "python_representation_kk", "add_molecule_py", "set_monomer_restraints_py", "coot_version")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    return "This build cannot safely export isolated refinement inputs."
+  # An empty list can mean GM/target restraints exist but cannot be enumerated.
+  # Only False is the native API's no-extra-restraints sentinel.
+  if coot.list_extra_restraints_py(model) is not False:
+    return "Existing extra restraints (including unexportable GM restraints) must stay in this Coot session."
+  if coot.link_info_py(model):
+    return "Explicit LINK records require in-session refinement."
+  symmetry = getattr(coot, "space_group_py", None)
+  has_cell = getattr(coot, "has_unit_cell_state", None)
+  if (callable(symmetry) and callable(has_cell) and has_cell(model) and
+      str(symmetry(model) or "").replace(" ", "").upper() not in ("", "P1")):
+    return "Crystallographic model symmetry requires in-session refinement."
+  try:
+    _register_worker_launcher()
+  except Exception as error:
+    return str(error)
+  return None
+
+
+def _multimap_record_atoms(records):
+  atoms = {}
+  for spec, record in records.items():
+    for atom in record["atoms"]:
+      key = (*spec, record["name"], *atom[0], repr(atom[1]))
+      xyz = tuple(float(v) for v in atom[2])
+      if key in atoms or len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+        raise ValueError("Ambiguous or invalid multimap atom coordinates.")
+      atoms[key] = xyz
+  return atoms
+
+
+def _multimap_motion_safe(original_atoms, current, reserved):
+  atoms = _multimap_record_atoms(current)
+  return original_atoms.keys() == atoms.keys() and all(
+      _distance_sq(original_atoms[k], atoms[k]) <= (9. if tuple(k[:3]) in reserved else 1e-12)
+      for k in original_atoms)
+
+
+def _multimap_parallel_independent(records, moving, others, chains, halo=12.):
+  """Separate full moving shells, backbone boundaries and a 12 A spatial halo."""
+  selected = set(moving)
+  previous = set().union(*(set(group) for group in others))
+  if selected & previous:
+    return False
+  for ordered in chains.values():
+    for left, right in zip(ordered, ordered[1:]):
+      if (left in selected and right in previous) or (right in selected and left in previous):
+        return False
+  bins = {}
+  for spec in previous:
+    for atom in records[spec]["atoms"]:
+      xyz = atom[2]
+      key = tuple(math.floor(v/halo) for v in xyz)
+      bins.setdefault(key, []).append(xyz)
+  for spec in selected:
+    for atom in records[spec]["atoms"]:
+      xyz = atom[2]
+      key = tuple(math.floor(v/halo) for v in xyz)
+      for delta in product((-1, 0, 1), repeat=3):
+        for other in bins.get(tuple(a+b for a, b in zip(key, delta)), ()):
+          if sum((a-b)**2 for a, b in zip(xyz, other)) <= halo*halo:
+            return False
+  return True
+
+
+def _multimap_parallel_resources(backend, model, stages, jobs):
+  """Export maps once per run, preserving exact current density and dictionaries."""
+  resources = getattr(backend, "_parallel_resources", None)
+  if resources is None:
+    owner = tempfile.TemporaryDirectory(prefix="coot-multimap-inputs-")
+    try:
+      snapshot = backend.snapshot(model)
+      points = [a[2] for r in snapshot.values() for a in r["atoms"]]
+      probes = points[::max(1, len(points)//32)][:32]
+      map_ids = sorted({s.map_id for s in stages} | {backend.stage_map(s) for s in stages})
+      maps = {}
+      for number in map_ids:
+        fingerprint = _register_map_fingerprint(number, probes)
+        path = os.path.join(owner.name, f"map-{number}.map")
+        coot.export_map(number, path)
+        if not os.path.isfile(path) or os.path.getsize(path) < 1024:
+          raise RuntimeError("Could not export a current multimap stage map.")
+        if fingerprint != _register_map_fingerprint(number, probes):
+          raise RuntimeError("A stage map changed during export.")
+        maps[number] = dict(path=path, fingerprint=fingerprint)
+      dictionaries = {}
+      for name in sorted({r["name"] for r in snapshot.values()}):
+        getter = getattr(coot, "monomer_restraints_for_molecule_py", None)
+        dictionary = getter(name, model) if callable(getter) else coot.monomer_restraints_py(name)
+        if not isinstance(dictionary, dict) or not dictionary.get("_chem_comp_atom"):
+          raise ValueError(f"No transferable geometry dictionary for {name}; use serial refinement.")
+        dictionaries[name] = dictionary
+      script = os.path.join(owner.name, "worker.py")
+      with open(script, "w") as handle:
+        handle.write(_multimap_worker_source())
+      resources = dict(owner=owner, maps=maps, dictionaries=dictionaries, probes=probes, script=script,
+          bytes=sum(os.path.getsize(item["path"]) for item in maps.values()) +
+                160*sum(len(r["atoms"]) for r in snapshot.values()))
+      backend._parallel_resources = resources
+    except Exception:
+      owner.cleanup()
+      raise
+  for number, item in resources["maps"].items():
+    if _register_map_fingerprint(number, resources["probes"]) != item["fingerprint"]:
+      raise ValueError("A multimap source/stage map changed; pause and restart the run.")
+  backend._parallel_planning_snapshot = backend.snapshot(model)
+  return _register_worker_limit(resources["bytes"], jobs)
+
+
+def _multimap_workers_start(backend, model, candidates, stages, options):
+  import queue
+  import threading
+  reason = _multimap_parallel_reason(model)
+  if reason:
+    raise ValueError(reason)
+  resources = backend._parallel_resources
+  snapshot = backend.snapshot(model)
+  if snapshot != backend._parallel_planning_snapshot:
+    raise ValueError("Model changed while planning parallel ranges; no worker edits imported.")
+  for index, (_w, seed, moving) in enumerate(candidates):
+    if set(backend.moving_selection(model, seed, options)) != set(moving) or not _multimap_parallel_independent(
+        snapshot, moving, [c[2] for c in candidates[:index]], backend.chain_specs):
+      raise ValueError("Parallel contact shells changed or overlap; restart the run.")
+  for number, item in resources["maps"].items():
+    if _register_map_fingerprint(number, resources["probes"]) != item["fingerprint"]:
+      raise ValueError("A multimap stage map changed before dispatch.")
+  for name, saved in resources["dictionaries"].items():
+    getter = getattr(coot, "monomer_restraints_for_molecule_py", None)
+    current = getter(name, model) if callable(getter) else coot.monomer_restraints_py(name)
+    if current != saved:
+      raise ValueError("A geometry dictionary changed before parallel dispatch.")
+  owner = tempfile.TemporaryDirectory(prefix="coot-multimap-workers-")
+  try:
+    settings = _register_worker_settings()
+    from dataclasses import asdict
+    jobs = [dict(index=w, seed=seed, moving=moving) for w, seed, moving in candidates]
+    shared = dict(representation=coot.python_representation_kk(model), maps=resources["maps"],
+        dictionaries=resources["dictionaries"], probes=resources["probes"], settings=settings,
+        version=coot.coot_version(), options=asdict(options), stages=[dict(asdict(s),
+          effective_map=backend.stage_map(s), source_resolution=_local_em_map_resolution(s.map_id)) for s in stages])
+    input_path = os.path.join(owner.name, "input.json")
+    with open(input_path, "w") as handle:
+      json.dump(shared, handle, allow_nan=False)
+    configs = []
+    for index, job in enumerate(jobs):
+      home = os.path.join(owner.name, str(index))
+      os.mkdir(home)
+      path = os.path.join(home, "config.json")
+      with open(path, "w") as handle:
+        json.dump(dict(input=input_path, jobs=[job]), handle, allow_nan=False)
+      configs.append((path, [job]))
+    pool = dict(owner=owner, configs=configs, jobs=jobs, script=resources["script"],
+        launcher=_register_worker_launcher(), events=queue.Queue(), cancel=threading.Event(), done=threading.Event(),
+        count=len(jobs), timeout=120+180*sum(s.repeats for s in stages),
+        source_name=coot.molecule_name(model), expected=snapshot, original=snapshot, resources=resources,
+        settings=settings, stages=stages, imported=set(),
+        resolutions={s.map_id: _local_em_map_resolution(s.map_id) for s in stages})
+    threading.Thread(target=_register_workers_monitor, args=(pool,), name="coot-multimap-workers", daemon=True).start()
+    return pool
+  except Exception:
+    owner.cleanup()
+    raise
+
+
+def _multimap_import_parallel(backend, model, pool, result):
+  """Validate immutable identities, stale inputs and reserved motion before coordinate-only merge."""
+  index = result["index"]
+  job = next((job for job in pool["jobs"] if job["index"] == index), None)
+  if job is None or index in pool["imported"]:
+    raise ValueError("Unexpected or duplicate multimap result.")
+  if any(_local_em_map_resolution(number) != resolution for number, resolution in pool.get('resolutions', {}).items()):
+    raise ValueError('A supplied map resolution changed during parallel refinement; restart the run.')
+  if (coot.molecule_name(model) != pool["source_name"] or backend.snapshot(model) != pool["expected"] or
+      _multimap_parallel_reason(model) or _register_worker_settings() != pool["settings"]):
+    raise ValueError("Model, restraints or refinement settings changed; stale worker coordinates were not imported.")
+  for number, item in pool["resources"]["maps"].items():
+    if _register_map_fingerprint(number, pool["resources"]["probes"]) != item["fingerprint"]:
+      raise ValueError("A stage map changed; stale coordinates were not imported.")
+  for name, saved in pool["resources"].get("dictionaries", {}).items():
+    getter = getattr(coot, "monomer_restraints_for_molecule_py", None)
+    current = getter(name, model) if callable(getter) else coot.monomer_restraints_py(name)
+    if current != saved:
+      raise ValueError("A geometry dictionary changed; stale coordinates were not imported.")
+  records = {}
+  for spec, record in result["records"]:
+    spec = tuple(spec)
+    if spec in records:
+      raise ValueError("Duplicate worker residue.")
+    records[spec] = record
+  moving = set(map(tuple, job["moving"]))
+  if set(records) != moving:
+    raise ValueError("Worker returned an incomplete/unexpected moving selection.")
+  before = _multimap_record_atoms({s: pool["original"][s] for s in moving})
+  after = _multimap_record_atoms(records)
+  if before.keys() != after.keys() or any(_distance_sq(before[k], after[k]) > 9.000001 for k in before):
+    raise ValueError("Worker altered atom identities or exceeded its 3 A motion allowance.")
+  history = result["history"]
+  expected_steps = [(i, r) for i, stage in enumerate(pool["stages"]) for r in range(stage.repeats)]
+  if ([(h["stage"], h["repeat"]) for h in history] != expected_steps or
+      any(h["window"] != index or not math.isfinite(h["weight"]) or h["weight"] <= 0 for h in history)):
+    raise ValueError("Worker returned an incomplete stage sequence or invalid weights.")
+  with _grouped_model_edit(model):
+    try:
+      _global_fit_write_coordinates(model, after)
+      actual = backend.snapshot(model)
+      expected = dict(pool["expected"])
+      expected.update(records)
+      observed, desired = _multimap_record_atoms(actual), _multimap_record_atoms(expected)
+      if observed.keys() != desired.keys() or any(_distance_sq(observed[k], desired[k]) > 1e-8 for k in desired):
+        raise RuntimeError("Native coordinate import did not reproduce the worker result.")
+    except Exception:
+      _global_fit_write_coordinates(model, before)
+      raise
+  pool["expected"] = actual
+  pool["imported"].add(index)
+  backend.redraw()
+  return history, moving
+
+
+def _multimap_worker_main():
+  """Headless native main thread, full fixed environment, all stages for one window."""
+  config_path = os.environ["COOT_REGISTER_CONFIG"]
+  with open(config_path) as handle:
+    local = json.load(handle)
+  with open(local["input"]) as handle:
+    config = json.load(handle)
+  folder = os.path.dirname(config_path)
+  def publish(index, result):
+    path = os.path.join(folder, f"result-{index}.json")
+    with open(path+".tmp", "w") as handle:
+      json.dump(dict(result, index=index), handle, allow_nan=False)
+    os.replace(path+".tmp", path)
+  try:
+    if coot.coot_version() != config["version"]:
+      raise RuntimeError("Worker and interactive Coot versions differ.")
+    model = coot.add_molecule_py(config["representation"], "Multimap worker input")
+    backend = CootRefinementBackend()
+    original = backend.snapshot(model)
+    original_atoms = _multimap_record_atoms(original)
+    maps = {}
+    for key, item in config["maps"].items():
+      number = coot.handle_read_ccp4_map(item["path"], 0)
+      if not coot.is_valid_map_molecule(number):
+        raise RuntimeError("Worker could not read a stage map.")
+      values = [coot.density_at_point(number, *p) for p in config["probes"]]
+      if any(not math.isclose(a, b, abs_tol=1e-6, rel_tol=1e-5) for a, b in zip(values, item["fingerprint"][-1])):
+        raise RuntimeError("Worker map density does not reproduce the exported stage.")
+      maps[int(key)] = number
+    for name, dictionary in config["dictionaries"].items():
+      if not coot.set_monomer_restraints_py(name, dictionary):
+        raise RuntimeError(f"Could not transfer {name} dictionary.")
+    for setter, args, getter in config["settings"]:
+      getattr(coot, setter)(*args)
+      if getter and not math.isclose(float(getattr(coot, getter)()), float(args[0]), rel_tol=1e-5):
+        raise RuntimeError(f"Worker did not accept {setter}.")
+    coot.turn_off_backup(model)
+    coot.set_imol_refinement_map(maps[config["stages"][0]["map_id"]])
+    options = RefinementOptions(**config["options"])
+    stages = [RefinementStage(maps[s["effective_map"]], s["weight"], s["repeats"], s["autofit_rotamers"],
+                              auto_weight=s["auto_weight"]) for s in config["stages"]]
+    references = {maps[s["effective_map"]]: maps[s["map_id"]] for s in config["stages"]}
+    resolutions = {maps[s['effective_map']]: s.get('source_resolution') for s in config['stages']}
+    cutoffs = {maps[s['effective_map']]: s.get('lowpass_resolution', 0.) for s in config['stages']}
+    global _model_coordinate_snapshot
+    _model_coordinate_snapshot = backend.snapshot
+    backend.estimate_weight = lambda imol, specs, stage, map_id: estimate_local_em_map_weight(
+        imol, map_id, apply=False, residue_specs=specs, reference_map_id=references[map_id],
+        resolution=resolutions[map_id], lowpass_resolution=cutoffs[map_id])
+    reference = maps[config["stages"][-1]["map_id"]]
+    for job in local["jobs"]:
+      index, history, reasons = job["index"], [], []
+      seed, reserved = list(map(tuple, job["seed"])), set(map(tuple, job["moving"]))
+      fallback = False
+      for si, stage in enumerate(stages):
+        for repeat in range(stage.repeats):
+          before = backend.correlation(model, seed, reference) if options.auto_pause else None
+          rotamers = backend.autofit_rotamers(model, seed, stage) if stage.autofit_rotamers else None
+          moving = backend.moving_selection(model, seed, options)
+          if not set(moving) <= reserved:
+            fallback = True
+            break
+          result, hbonds = backend.refine(model, moving, stage, options)
+          if not _multimap_motion_safe(original_atoms, backend.snapshot(model), reserved):
+            fallback = True
+            break
+          history.append(dict(window=index, stage=si, repeat=repeat, moving=len(moving), hbonds=hbonds,
+              result=result, rotamers=rotamers, cc_before=before, weight=backend.last_weight,
+              weight_estimate=backend.last_weight_estimate))
+          if options.auto_pause:
+            after = backend.correlation(model, seed, reference)
+            history[-1]["cc_after"] = after
+            if after < options.minimum_mean_cc or before-after > options.maximum_cc_drop:
+              reasons.append("Poor map fit in window %d" % index)
+            for name, label, value in result[2] or []:
+              if str(name).lower() in ("bonds", "angles", "chirals") and (
+                  not math.isfinite(float(value)) or float(value) > options.maximum_geometry):
+                reasons.append(str(label))
+            if reasons:
+              fallback = True  # Let the serial guard pause immediately after this stage.
+              break
+        if fallback:
+          break
+      current = backend.snapshot(model)
+      if not _multimap_motion_safe(original_atoms, current, reserved):
+        fallback = True
+      if fallback or len(history) != sum(s.repeats for s in stages):
+        publish(index, dict(needs_serial=True))
+      else:
+        publish(index, dict(records=[[s, current[s]] for s in sorted(reserved)], history=history, pause_reasons=reasons))
+    coot.coot_no_state_real_exit(0)
+  except Exception as error:
+    for job in local["jobs"]:
+      publish(job["index"], dict(error="Multimap worker failed: "+str(error)))
+    coot.coot_no_state_real_exit(1)
+
+
+def _multimap_worker_source():
+  import inspect
+  functions = (_coot_text_arg, _coot_int_arg, _coot_residue_spec_tuple, _coot_residue_spec_from_spec,
+      _distance_sq, _tq_is_heavy_atom, _tq_residue_atom_records, _local_em_weight_points,
+      _local_em_weight_statistics, _local_em_resolution_scale, _local_em_resolution_identity,
+      _local_em_map_resolution, estimate_local_em_map_weight, _multimap_record_atoms,
+      _multimap_motion_safe, _multimap_worker_main)
+  header = ("import os, math, json\nimport coot\n"
+            "from coot_utils import residue_spec_to_chain_id, residue_spec_to_res_no, residue_spec_to_ins_code\n"
+            "valid_model_molecule_qm = coot.is_valid_model_molecule\n")
+  return (header+"_THRESHOLDED_Q_HYDROGEN_ELEMENTS = "+repr(_THRESHOLDED_Q_HYDROGEN_ELEMENTS)+"\n"+
+          _MULTIMAP_REFINEMENT_SOURCE+"\n"+"\n".join(inspect.getsource(f) for f in functions)+
+          "\n_multimap_worker_main()\n")
 
 
 def _multimap_refinement_module():
@@ -16629,6 +19328,33 @@ def _multimap_refinement_module():
     module._change_colour_table = lambda: _make_multimap_user_defined_colours(module)
 
     class TrimmingsMultimapBackend(module.CootRefinementBackend):
+      def lowpass_map(self, map_id, resolution):
+        return lowpass_filter_map(map_id, resolution)
+
+      def estimate_weight(self, imol, specs, stage, map_id):
+        return estimate_local_em_map_weight(imol, map_id, apply=False, residue_specs=specs,
+                                            reference_map_id=stage.map_id, lowpass_resolution=stage.lowpass_resolution)
+
+      def parallel_reason(self, imol):
+        return _multimap_parallel_reason(imol)
+
+      def parallel_capacity(self, imol, stages, jobs):
+        return _multimap_parallel_resources(self, imol, stages, jobs)
+
+      def parallel_independent(self, moving, others):
+        return _multimap_parallel_independent(self._parallel_planning_snapshot, moving, others, self.chain_specs)
+
+      def start_parallel(self, imol, candidates, stages, options):
+        return _multimap_workers_start(self, imol, candidates, stages, options)
+
+      def import_parallel(self, imol, pool, result):
+        return _multimap_import_parallel(self, imol, pool, result)
+
+      def release_parallel_resources(self):
+        resources = self.__dict__.pop("_parallel_resources", None)
+        if resources is not None:
+          resources["owner"].cleanup()
+
       def _priority_density_values(self, map_id, points):
         factory = globals().get("_analysis_density_open")
         if not callable(factory):
@@ -16645,6 +19371,14 @@ def _multimap_refinement_module():
       def validate(self, *args, **kwargs):
         if globals().get("_USER_DEFINED_COLOUR_JOB_ACTIVE"):
           raise RuntimeError("Wait for model colouring to finish before starting refinement.")
+        if globals().get("_GLOBAL_MULTIMAP_JOB", {}).get("running"):
+          raise RuntimeError("Stop global multimap refinement first.")
+        stages = args[1] if len(args) > 1 else kwargs.get("stages", ())
+        if any(getattr(s, "lowpass_resolution", 0) for s in stages) and globals().get("gemmi") is None:
+          raise RuntimeError("Low-pass stages require Gemmi and NumPy.")
+        if any(getattr(s, "lowpass_resolution", 0) or getattr(s, "auto_weight", False) for s in stages):
+          if _tq_numpy_module() is None:
+            raise RuntimeError("Low-pass and auto-weight stages require NumPy.")
         return super().validate(*args, **kwargs)
 
       def autofit_rotamers(self, imol, seed, stage):
@@ -17026,7 +19760,7 @@ def segment_list_chain(mol_id, ch_id):
 #Local cylinder refinement around the active residue:
 # main polymer range +/- 5 residues, contact-expanded secondary ranges,
 # then local polymer gap-filling/pruning while keeping non-polymer contacts.
-def auto_refine(primary_specs=None, mol_id=None, secondary_structure=None):
+def auto_refine(primary_specs=None, mol_id=None, secondary_structure=None, local_weight=False):
   if imol_refinement_map()==-1:
     info_dialog("You must set a refinement map!")
     return None
@@ -17211,7 +19945,7 @@ def auto_refine(primary_specs=None, mol_id=None, secondary_structure=None):
   selected_residue_specs = main_range_specs | secondary_polymer_specs | secondary_non_polymer_specs
 
   residue_list = [list(spec) for spec in sorted(selected_residue_specs, key=lambda spec: (spec[0], spec[1], spec[2]))]
-  return _start_cylinder_refinement(mol_id, residue_list, sorted(main_range_specs), secondary_structure)
+  return _start_cylinder_refinement(mol_id, residue_list, sorted(main_range_specs), secondary_structure, local_weight)
 
 
 def _cylinder_secondary_restraints(snapshot, primary, kind):
@@ -17305,9 +20039,64 @@ def _cylinder_temporary_restraints(mol_id, restraints):
       raise RuntimeError("Could not remove temporary cylinder restraints: " + "; ".join(errors))
 
 
-def _start_cylinder_refinement(mol_id, moving, primary, secondary_structure=None):
+def _cylinder_restore_map_weight(state=None, force=False):
+  """End only our temporary weight lease; preserve a subsequent manual override."""
+  current = globals().get("_CYLINDER_MAP_WEIGHT_STATE")
+  if state is None:
+    state = current
+  if state is None or state is not current:
+    return False
+  if not force and coot.refinement_already_ongoing_p():
+    return True
+  globals()["_CYLINDER_MAP_WEIGHT_STATE"] = None
+  if state.get("source"):
+    state["glib"].source_remove(state["source"])
+    state["source"] = None
+  try:
+    if math.isclose(float(coot.matrix_state()), state["temporary"], rel_tol=1e-5):
+      coot.set_matrix(state["previous"])
+      if not math.isclose(float(coot.matrix_state()), state["previous"], rel_tol=1e-5):
+        raise RuntimeError("Coot did not accept the previous refinement weight.")
+      add_status_bar_text(f"Cylinder refinement: restored map weight {state['previous']:.4g}.")
+    else:
+      print("Cylinder refinement: kept the user's changed map weight.")
+  except Exception as error:
+    message = f"Could not restore cylinder map weight to {state['previous']:.4g}: {error}"
+    print(message)
+    info_dialog(message)
+  return False
+
+
+@contextmanager
+def _cylinder_local_map_weight(mol_id, primary):
+  glib = _coot_gui_repository_module("GLib")
+  if glib is None:
+    raise ValueError("Automatic temporary weight restoration requires GLib.")
+  result = estimate_local_em_map_weight(mol_id, imol_refinement_map(), apply=False, residue_specs=primary)
+  state = dict(previous=float(coot.matrix_state()), temporary=result["weight"], glib=glib, source=None)
+  globals()["_CYLINDER_MAP_WEIGHT_STATE"] = state
+  try:
+    coot.set_matrix(result["weight"])
+    if not math.isclose(float(coot.matrix_state()), result["weight"], rel_tol=1e-5):
+      raise RuntimeError("Coot did not accept the local refinement weight.")
+    yield result
+    if coot.refinement_already_ongoing_p():
+      # Keep the global value until Accept/Reject: dragging/poking refinement
+      # re-reads it and would otherwise silently revert the live map weight.
+      state["source"] = glib.timeout_add(100, _cylinder_restore_map_weight, state)
+      if not state["source"]:
+        raise RuntimeError("Could not schedule automatic map-weight restoration.")
+    else:
+      _cylinder_restore_map_weight(state)
+  except Exception:
+    _cylinder_restore_map_weight(state, force=True)
+    raise
+
+
+def _start_cylinder_refinement(mol_id, moving, primary, secondary_structure=None, local_weight=False):
   if coot.refinement_already_ongoing_p():
     raise ValueError("Accept or reject the current refinement first.")
+  _cylinder_restore_map_weight()
   if not valid_model_molecule_qm(mol_id) or not valid_map_molecule_qm(imol_refinement_map()):
     raise ValueError("Choose an available model and refinement map.")
   restraints = []
@@ -17325,15 +20114,17 @@ def _start_cylinder_refinement(mol_id, moving, primary, secondary_structure=None
     # Disable forced global SS. Coot still auto-preserves detected helices in
     # the contact shell; its Python API does not expose a switch for that.
     coot.set_secondary_structure_restraints_type(0)
-    with _cylinder_temporary_restraints(mol_id, restraints) if restraints else nullcontext():
-      attempted = True
-      result = coot.refine_residues_py(mol_id, moving)
-      if result is False or result is None or not coot.refinement_already_ongoing_p():
-        raise RuntimeError("Coot could not start cylinder refinement; check the selection and dictionaries.")
+    with _cylinder_local_map_weight(mol_id, primary) if local_weight else nullcontext() as estimate:
+      with _cylinder_temporary_restraints(mol_id, restraints) if restraints else nullcontext():
+        attempted = True
+        result = coot.refine_residues_py(mol_id, moving)
+        if result is False or result is None or not coot.refinement_already_ongoing_p():
+          raise RuntimeError("Coot could not start cylinder refinement; check the selection and dictionaries.")
     # Native refinement owns a copy of the restraints, so the source-model extras
     # can be removed now without losing them from the live intermediate atoms.
     add_status_bar_text(f"Cylinder refinement: {len(primary)} primary + {len(moving)-len(primary)} contact residues"
                         + (f" | {secondary_structure}" if secondary_structure else "")
+                        + (f" | temporary local EM weight {estimate['weight']:.4g}" if estimate else "")
                         + ". Inspect intermediate atoms and Accept or Reject in Coot.")
     return result
   except Exception:
@@ -17347,7 +20138,7 @@ def _start_cylinder_refinement(mol_id, moving, primary, secondary_structure=None
       coot.set_refinement_immediate_replacement(previous[0])
 
 
-def _pick_cylinder_refinement(secondary_structure=None):
+def _pick_cylinder_refinement(secondary_structure=None, local_weight=False):
   if not valid_map_molecule_qm(imol_refinement_map()):
     info_dialog("Select a refinement map before cylinder refinement.")
     return
@@ -17372,7 +20163,7 @@ def _pick_cylinder_refinement(secondary_structure=None):
     try:
       primary = _clicked_residue_specs(first, last)
       if primary:
-        return auto_refine(primary, _click_spec_imol(first), secondary_structure)
+        return auto_refine(primary, _click_spec_imol(first), secondary_structure, local_weight)
     except (ValueError, RuntimeError) as error:
       info_dialog(f"Cylinder refinement could not start.\n\n{error}")
     finally:
@@ -17381,10 +20172,10 @@ def _pick_cylinder_refinement(secondary_structure=None):
   return _script_user_defined_click(2, picked, on_pick=mark, cleanup=cleanup)
 
 
-def cylinder_refine(mol_id=None, chain_id=None, start=None, end=None, secondary_structure=None):
+def cylinder_refine(mol_id=None, chain_id=None, start=None, end=None, secondary_structure=None, local_weight=False):
   """Refine a primary range plus local contacts, leaving native intermediate atoms."""
   if all(value is None for value in (mol_id, chain_id, start, end)):
-    return _pick_cylinder_refinement(secondary_structure)
+    return _pick_cylinder_refinement(secondary_structure, local_weight)
   if any(value is None for value in (mol_id, chain_id, start, end)):
     raise ValueError("Supply model, chain, start and end, or use no arguments to pick the range.")
   if mol_id not in model_molecule_list():
@@ -17396,7 +20187,12 @@ def cylinder_refine(mol_id=None, chain_id=None, start=None, end=None, secondary_
   primary = [tuple(spec) for spec in _tq_chain_residue_specs(mol_id, chain_id) if start <= spec[1] <= end]
   if not primary or not any(s[1] == start for s in primary) or not any(s[1] == end for s in primary):
     raise ValueError("Both range endpoints must exist in the selected chain.")
-  return auto_refine(primary, mol_id, secondary_structure)
+  return auto_refine(primary, mol_id, secondary_structure, local_weight)
+
+
+def cylinder_refine_local_weight(mol_id=None, chain_id=None, start=None, end=None, secondary_structure=None):
+  """Cylinder preview using a temporary EM weight sampled around the primary range."""
+  return cylinder_refine(mol_id, chain_id, start, end, secondary_structure, local_weight=True)
 
 
 def cylinder_refine_alpha_helix(mol_id=None, chain_id=None, start=None, end=None):
@@ -21072,8 +23868,13 @@ def _register_shift_model_signature(mol_id):
   def rounded(value, digits):
     value = round(float(value), digits)
     return value if value else 0.0
+  def b_factor(value):
+    if isinstance(value, (list, tuple)):
+      # Coot represents anisotropic data as [B, U11, ...]; PDB Uij has 4 decimals.
+      return tuple(rounded(v, 2 if index == 0 else 4) for index, v in enumerate(value))
+    return rounded(value, 2)
   for spec, record in sorted(_model_coordinate_snapshot(mol_id).items()):
-    atoms = sorted((a[0][0], a[0][1], rounded(a[1][0], 2), rounded(a[1][1], 2),
+    atoms = sorted((a[0][0], a[0][1], rounded(a[1][0], 2), b_factor(a[1][1]),
                     str(a[1][2]).strip(), tuple(rounded(x, 3) for x in a[2]))
                    for a in record["atoms"])
     digest.update(repr((spec, record["name"], atoms)).encode("utf-8"))
@@ -21421,11 +24222,20 @@ _REGISTER_REFERENCE_ORIGINS = {}
 
 def _register_associate_reference(fragment, chain, sequence, origin):
   sequence = _register_clean_sequence(sequence)
-  coot.delete_sequence_by_chain_id(fragment, chain)
-  coot.assign_sequence_from_string(fragment, chain, sequence)
+  before = coot.sequence_info_py(fragment) or []
+  # Some builds remove only the first matching association per call.
+  for _ in range(max(1, sum(item[0] == chain for item in before))):
+    coot.delete_sequence_by_chain_id(fragment, chain)
+  fasta = getattr(coot, "assign_fasta_sequence", None)
+  if callable(fasta):
+    # Unlike assign_sequence_from_string(), this targets only the given chain,
+    # without adding/changing associations on NCS-related chains.
+    fasta(fragment, chain, ">register-reference\n"+sequence+"\n")
+  else:
+    coot.assign_sequence_from_string(fragment, chain, sequence)
   associated = coot.sequence_info_py(fragment) or []
-  if not any(item[0] == chain and _register_clean_sequence(item[1]) == sequence
-             for item in associated if isinstance(item, (list, tuple)) and len(item) == 2):
+  matches = [item[1] for item in associated if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == chain]
+  if len(matches) != 1 or _register_clean_sequence(matches[0]) != sequence:
     raise RuntimeError("Coot did not associate the reference sequence with the fragment.")
   _REGISTER_REFERENCE_ORIGINS[(fragment, chain)] = (sequence, int(origin))
 
@@ -21541,13 +24351,18 @@ def _register_sidechain_correlation(fragment, specs, target, map_id, scoring_cac
           "count": len(scores), "eligible": len(eligible)}
 
 
-def _build_register_comparison_fragment(source, chain, start, end, offset, target, map_id, rigid_fit=False, scoring_cache=None):
+def _build_register_comparison_fragment(source, chain, start, end, offset, target, map_id,
+                                        rigid_fit=True, scoring_cache=None, flexible=False, prepare=True):
   """Build on a disposable copy; restore global refinement settings on every path."""
+  ongoing = getattr(coot, "refinement_already_ongoing_p", None)
+  if callable(ongoing) and ongoing():
+    raise ValueError("Accept or cancel the current refinement before comparing registers.")
   fragment = coot.new_molecule_by_atom_selection(source, _atom_selection_for_residue_range(chain, start, end))
   if fragment == source or not valid_model_molecule_qm(fragment):
     raise RuntimeError("Coot could not create an independent fragment.")
   previous_map = coot.imol_refinement_map()
   previous_replacement = coot.refinement_immediate_replacement_state()
+  attempted = False
   try:
     coot.set_imol_refinement_map(map_id)
     # Optional rotamer post-refinement must auto-accept on the disposable copy.
@@ -21561,32 +24376,34 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
           _register_fit_fixed_backbone_rotamer(fragment, chain, spec[1], map_id)
 
     with _grouped_model_edit(fragment):
-      if offset and not coot.renumber_residue_range(fragment, chain, start, end, offset):
+      if prepare and offset and not coot.renumber_residue_range(fragment, chain, start, end, offset):
         raise RuntimeError("Fragment renumbering failed.")
-      for spec, letter in zip(specs, target):
-        _register_collapse_alternates(fragment, chain, spec[1])
-        name = _REGISTER_AA[letter]
-        if not coot.mutate(fragment, *spec, name):
-          raise RuntimeError(f"Mutation failed at {chain}:{spec[1]}.")
+      if prepare:
+        for spec, letter in zip(specs, target):
+          _register_collapse_alternates(fragment, chain, spec[1])
+          name = _REGISTER_AA[letter]
+          if not coot.mutate(fragment, *spec, name):
+            raise RuntimeError(f"Mutation failed at {chain}:{spec[1]}.")
       if rigid_fit:
         fit_function = getattr(coot, "rigid_body_refine_by_atom_selection", None)
         if not callable(fit_function):
           raise RuntimeError("Rigid-body fitting is unavailable in this Coot build.")
         before_fit = _rigid_fit_atom_snapshot(fragment)
+        attempted = True
         fit_function(fragment, "//")
         coot.accept_regularizement()
         if _rigid_fit_atom_snapshot(fragment).keys() != before_fit.keys():
           raise RuntimeError("Rigid fitting changed fragment atom identities.")
       fit_rotamers()
-      refinement = coot.refine_residues_py(fragment, specs)
-      if refinement is False:
-        raise RuntimeError("Coot could not refine this fragment.")
-      coot.accept_regularizement()
-      fit_rotamers()
-      final_refinement = coot.refine_residues_py(fragment, specs)
-      if final_refinement is False:
-        raise RuntimeError("Coot could not perform the final fragment refinement.")
-      coot.accept_regularizement()
+      if flexible:
+        for cycle in range(2):
+          attempted = True
+          refinement = coot.refine_residues_py(fragment, specs)
+          if refinement is False or refinement is None:
+            raise RuntimeError("Coot could not refine this fragment.")
+          coot.accept_regularizement()
+          if cycle == 0:
+            fit_rotamers()
     results = (_analysis_cc_residue_scores(scoring_cache, fragment, specs, 0) if scoring_cache is not None else
                coot.map_to_model_correlation_per_residue_py(fragment, specs, 0, map_id) or [])
     scores = {}
@@ -21612,13 +24429,699 @@ def _build_register_comparison_fragment(source, chain, start, end, offset, targe
       coloured = bool(_apply_direct_user_defined_residue_colours(fragment, [], rows))
     return {"model": fragment, "offset": offset, "sequence": target,
             "mean": sum(scores.values())/len(scores), "minimum": min(scores.values()), "coloured": coloured,
-            "sidechain": sidechain}
+            "sidechain": sidechain, "flexible": bool(flexible),
+            "scores": [[list(spec), score] for spec, score in scores.items()]}
   except Exception:
-    coot.close_molecule(fragment)
+    try:
+      if attempted and callable(ongoing) and ongoing():
+        coot.clear_up_moving_atoms()
+    finally:
+      coot.close_molecule(fragment)
     raise
   finally:
     coot.set_refinement_immediate_replacement(previous_replacement)
     coot.set_imol_refinement_map(previous_map)
+
+
+def _refine_register_comparison_candidate(candidate, chain, start, end, map_id):
+  """Refine a disposable copy of the current candidate, preserving it on failure."""
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept or cancel the current refinement first.")
+  offset = candidate["offset"]
+  refined = _build_register_comparison_fragment(candidate["model"], chain, start+offset, end+offset,
+      0, candidate["sequence"], map_id, rigid_fit=False, flexible=True, prepare=False)
+  try:
+    coot.set_molecule_name(refined["model"], f"Register {offset:+d}: {chain}:{start+offset}-{end+offset} (flex)")
+    refined["offset"] = offset
+  except Exception:
+    coot.close_molecule(refined["model"])
+    raise
+  return refined
+
+
+def _register_merge_plan(original, fragment, chain, start, end, offset):
+  """Plan same-chain replacement; trim numbering overlap and terminal backbone clashes."""
+  first, last = start+offset, end+offset
+  specs = [(chain, n, "") for n in range(first, last+1)]
+  if set(fragment) != set(specs):
+    raise ValueError("The candidate no longer contains exactly the tested residue range.")
+  removed = {s for s in original if s[0] == chain and start <= s[1] <= end}
+  if removed != {(chain, n, "") for n in range(start, end+1)}:
+    raise ValueError("The original range is incomplete or has insertion codes; regenerate the comparison.")
+  def backbone(record):
+    if record['name'] not in _REGISTER_PROTEIN_NAMES:
+      raise ValueError("Automatic boundary trimming requires protein residues.")
+    points = [(a[0][0].strip(), a[2]) for a in record['atoms']
+              if a[0][0].strip() in {'N', 'CA', 'C', 'O'}]
+    if {name for name, _ in points} != {'N', 'CA', 'C', 'O'}:
+      raise ValueError("Automatic merging requires complete N/CA/C/O backbone atoms.")
+    if any(not all(math.isfinite(v) for v in xyz) for _, xyz in points):
+      raise ValueError("Non-finite candidate or boundary coordinates.")
+    return points
+  candidate_atoms = [(s, name, xyz) for s in specs for name, xyz in backbone(fragment[s])]
+  trim = {}
+  for side in (-1, 1):
+    neighbours = sorted((s for s in original if s[0] == chain and
+                         (s[1] < start if side < 0 else s[1] > end)), reverse=side < 0)
+    geometric = 0
+    for spec in neighbours:
+      collision = first <= spec[1] <= last
+      points = backbone(original[spec]) if collision or not spec[2] else []
+      clashes = False
+      for name, xyz in points:
+        for added, other, position in candidate_atoms:
+          d2 = _distance_sq(xyz, position)
+          peptide = ((added[1] == spec[1]+1 and name == 'C' and other == 'N') or
+                     (spec[1] == added[1]+1 and name == 'N' and other == 'C'))
+          if d2 < 1.8**2 and not (peptide and d2 >= 1.05**2):
+            clashes = True
+            break
+        if clashes:
+          break
+      if not collision and not clashes:
+        break
+      if spec[2]:
+        raise ValueError("An overlapping boundary has insertion codes; trim it manually first.")
+      if clashes and not collision:
+        geometric += 1
+        if geometric > 5:
+          raise ValueError("More than five extra boundary residues clash on one side; trim manually or adjust the candidate.")
+      trim[spec] = 'numbering overlap' if collision else 'backbone clash'
+  conflicts = {s for s in original if s[0] == chain and first <= s[1] <= last} - removed - trim.keys()
+  if conflicts:
+    raise ValueError("Candidate numbering collides beyond the adjacent chain boundary.")
+  deleted = removed | trim.keys()
+  expected = {s: r for s, r in original.items() if s not in deleted}
+  remaining_atoms = [(s, a[0][0].strip(), a[2]) for s, r in expected.items()
+                     if r['name'] in _REGISTER_PROTEIN_NAMES for a in r['atoms']
+                     if a[0][0].strip() in {'N', 'CA', 'C', 'O'}]
+  index = _spatial_index(remaining_atoms, lambda item: item[2], 1.8)
+  for added, name, xyz in candidate_atoms:
+    for spec, other, position in _spatial_query(index, xyz, 1.8):
+      peptide = (spec[0] == chain and not spec[2] and
+                 ((added[1] == spec[1]+1 and name == 'N' and other == 'C') or
+                  (spec[1] == added[1]+1 and name == 'C' and other == 'N')))
+      if not (peptide and _distance_sq(xyz, position) >= 1.05**2):
+        raise ValueError(f"Candidate backbone clashes with untrimmed residue {spec}; adjust the candidate or trim manually.")
+  expected.update(fragment)
+  _global_multimap_identity(expected)
+  return dict(deleted=sorted(deleted), trim=trim, expected=expected, first=first, last=last)
+
+
+def _apply_register_comparison_merge(source, candidate, chain, plan, source_signature, candidate_signature, reference=None):
+  """Validate on disposable copies, then perform one native, undoable chain merge."""
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept or cancel the current refinement before merging.")
+  donor = candidate['model']
+  if not valid_model_molecule_qm(source) or not valid_model_molecule_qm(donor) or source == donor:
+    raise ValueError("The source model or candidate is no longer available.")
+  if (_register_shift_model_signature(source) != source_signature or
+      _register_shift_model_signature(donor) != candidate_signature):
+    raise ValueError("The source or candidate changed after the merge preview; preview again.")
+  if coot.backup_state(source) != 1:
+    raise ValueError("Enable Coot backups for the source model before merging.")
+  reference = reference if reference is not None else _REGISTER_REFERENCE_ORIGINS.get((donor, chain))
+  previous_sequences = previous_origins = None
+  if reference is not None:
+    sequence, origin = reference
+    reference = (_register_clean_sequence(sequence), int(origin))
+    if not 0 <= plan['first']-reference[1] <= plan['last']-reference[1] < len(reference[0]):
+      raise ValueError('The full reference sequence does not cover the merged residue numbering.')
+    previous_sequences = [list(item) for item in coot.sequence_info_py(source) or []]
+    previous_origins = {key: value for key, value in _REGISTER_REFERENCE_ORIGINS.items() if key[0] == source}
+  deleted = set(plan['deleted'])
+  links = getattr(coot, 'link_info_py', None)
+  if callable(links) and any(tuple(atom[-5:-2]) in deleted
+                            for link in links(source) or [] for atom in link[1:3]):
+    raise ValueError('The replaced/trimmed residues have explicit LINK records. Review/remove those links first.')
+  # Extra restraints are retained, but must not be left pointing at removed atoms.
+  expected_atoms = {(*s, *a[0]) for s, r in plan['expected'].items() for a in r['atoms']}
+  def check_restraint(value):
+    if not isinstance(value, (list, tuple)):
+      return
+    if (len(value) >= 5 and isinstance(value[-4], int) and
+        isinstance(value[-5], str) and tuple(value[-5:-2]) in deleted and
+        tuple(value[-5:]) not in expected_atoms):
+      raise ValueError("Extra restraints reference atoms removed by this merge. Remove those restraints first.")
+    for item in value:
+      check_restraint(item)
+  getter = getattr(coot, 'list_extra_restraints_py', None)
+  restraints = getter(source) if callable(getter) else None
+  check_restraint(restraints)
+  temporary = []
+  def copied(model):
+    existing = set(model_molecule_list())
+    result = coot.copy_molecule(model)
+    if result in existing or not valid_model_molecule_qm(result):
+      raise RuntimeError("Could not create an independent merge-validation copy.")
+    temporary.append(result)
+    coot.set_mol_displayed(result, 0)
+    return result
+  def merge(target, fragment):
+    _delete_residue_specs(target, plan['deleted'])
+    before_chains = {s[0] for s in _model_coordinate_snapshot(target)}
+    result = coot.merge_molecules_py([fragment], target)
+    if not result or not result[0]:
+      raise RuntimeError("Coot rejected the candidate merge.")
+    for added_chain in result[1:]:
+      if isinstance(added_chain, str) and added_chain != chain:
+        if added_chain in before_chains:
+          raise RuntimeError('Coot consolidated the candidate into an unrelated existing chain; merge cancelled.')
+        coot.change_chain_id(target, added_chain, chain, 1, plan['first'], plan['last'])
+    actual = _model_coordinate_snapshot(target)
+    change = _global_multimap_snapshot_change(plan['expected'], actual)
+    if change:
+      missing = sorted(plan['expected'].keys()-actual.keys())
+      added = sorted(actual.keys()-plan['expected'].keys())
+      raise RuntimeError(f"The merged model did not match the preview: {change}; missing {missing[:5]}, unexpected {added[:5]}")
+    if reference is not None:
+      _register_associate_reference(target, chain, *reference)
+  try:
+    stage, fragment = copied(source), copied(donor)
+    merge(stage, fragment)
+    # Use a fresh donor: native merging hides/deactivates its donor model.
+    fragment = copied(donor)
+    attempted = False
+    try:
+      with _grouped_model_edit(source):
+        attempted = True
+        merge(source, fragment)
+        if callable(getter) and getter(source) != restraints:
+          raise RuntimeError("Coot unexpectedly changed the extra restraints during merging.")
+    except Exception as error:
+      if not attempted:
+        raise RuntimeError(f'Merge stopped before editing; original unchanged. {error}') from error
+      try:
+        coot.set_undo_molecule(source)
+        recovered = coot.apply_undo()
+        if previous_sequences is not None:
+          # Native coordinate Undo need not restore Coot's sequence metadata.
+          current = [list(item) for item in coot.sequence_info_py(source) or []]
+          for label in {item[0] for item in current+previous_sequences}:
+            for _ in range(max(1, sum(item[0] == label for item in current))):
+              coot.delete_sequence_by_chain_id(source, label)
+          for label, sequence in previous_sequences:
+            fasta = getattr(coot, 'assign_fasta_sequence', None)
+            if callable(fasta):
+              fasta(source, label, '>restored-reference\n'+sequence+'\n')
+            else:
+              coot.assign_sequence_from_string(source, label, sequence)
+          if sorted(coot.sequence_info_py(source) or []) != sorted(previous_sequences):
+            raise RuntimeError('Could not restore the original reference-sequence associations.')
+          for key in list(_REGISTER_REFERENCE_ORIGINS):
+            if key[0] == source:
+              del _REGISTER_REFERENCE_ORIGINS[key]
+          _REGISTER_REFERENCE_ORIGINS.update(previous_origins)
+      except Exception as undo_error:
+        raise RuntimeError(f'Merge failed; automatic recovery failed. Use Coot Undo before further edits. {undo_error}') from error
+      if not recovered or _register_shift_model_signature(source) != source_signature:
+        raise RuntimeError(f"Merge failed; recovery could not be verified. Use Coot Undo before further edits. {error}") from error
+      raise RuntimeError(f"Merge failed and was undone; the candidate was retained. {error}") from error
+  finally:
+    for model in temporary:
+      _REGISTER_REFERENCE_ORIGINS.pop((model, chain), None)
+      if valid_model_molecule_qm(model):
+        coot.close_molecule(model)
+  return True
+
+
+def _register_worker_settings():
+  """Only public, readable settings; setters without getters retain worker defaults."""
+  pairs = (("get_cryo_em_refinement", "set_cryo_em_refinement"),
+           ("matrix_state", "set_matrix"),
+           ("secondary_structure_restraints_type", "set_secondary_structure_restraints_type"),
+           ("refine_ramachandran_angles_state", "set_refine_ramachandran_angles"),
+           ("refine_ramachandran_restraints_weight", "set_refine_ramachandran_restraints_weight"),
+           ("refine_with_torsion_restraints_state", "set_refine_with_torsion_restraints"),
+           ("get_refinement_geman_mcclure_alpha", "set_refinement_geman_mcclure_alpha"),
+           ("get_refine_use_noughties_physics_state", "set_refine_use_noughties_physics"),
+           ("refinement_move_atoms_with_zero_occupancy_state", "set_refinement_move_atoms_with_zero_occupancy"),
+           ("rotamer_search_mode_state", "set_rotamer_search_mode"),
+           ("rotamer_auto_fit_do_post_refine_state", "set_rotamer_auto_fit_do_post_refine"),
+           ("use_only_extra_torsion_restraints_for_torsions_state", "set_use_only_extra_torsion_restraints_for_torsions"))
+  settings = []
+  for getter, setter in pairs:
+    if callable(getattr(coot, getter, None)) and callable(getattr(coot, setter, None)):
+      value = getattr(coot, getter)()
+      if not isinstance(value, (int, float, bool)) or not math.isfinite(value):
+        raise ValueError(f"Cannot transfer refinement setting {getter}.")
+      settings.append([setter, [value], getter])
+  if callable(getattr(coot, "planar_peptide_restraints_state", None)):
+    enabled = coot.planar_peptide_restraints_state()
+    settings.append(["add_planar_peptide_restraints" if enabled else "remove_planar_peptide_restraints", [], None])
+  return settings
+
+
+def _register_worker_launcher():
+  # Prefer this Coot installation over another executable earlier on PATH.
+  module = os.path.realpath(getattr(coot, "__file__", ""))
+  parent = os.path.dirname(module)
+  while parent and parent != os.path.dirname(parent):
+    candidate = os.path.join(parent, "bin", "coot")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+      return candidate
+    parent = os.path.dirname(parent)
+  candidate = shutil.which("coot")
+  if candidate:
+    return candidate
+  raise RuntimeError("Cannot locate a Coot launcher for isolated refinement.")
+
+
+def _register_worker_limit(map_bytes, jobs, cpu_count=None, memory_bytes=None):
+  """Reserve CPU capacity and a conservative per-process map/FFT memory budget."""
+  cpus = _global_fit_worker_count() if cpu_count is None else max(1, int(cpu_count)-1)
+  if memory_bytes is None:
+    try:
+      memory_bytes = os.sysconf("SC_PHYS_PAGES")*os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+      memory_bytes = 2*1024**3
+  per_worker = 256*1024**2 + 16*max(0, int(map_bytes))
+  memory_limit = max(1, int(memory_bytes*.25)//per_worker)
+  return max(1, min(int(jobs), cpus, memory_limit))
+
+
+def _register_map_fingerprint(map_id, points):
+  if not coot.is_valid_map_molecule(map_id):
+    raise ValueError("The comparison map was closed.")
+  values = [float(coot.density_at_point(map_id, *point)) for point in points]
+  if not all(math.isfinite(v) for v in values):
+    raise ValueError("Comparison map contains non-finite density.")
+  return [coot.molecule_name(map_id), list(coot.cell_py(map_id)), coot.space_group_py(map_id), values]
+
+
+def _register_worker_atom_snapshot(model):
+  """Headless-safe equivalent of the graphical rigid-fit identity check."""
+  result = {}
+  for entry in coot.python_representation_kk(model):
+    for chain, residues in entry:
+      for number, ins, name, atoms in residues:
+        for atom in atoms:
+          key = (chain, number, ins, name, *atom[0], repr(atom[1]))
+          xyz = tuple(atom[2])
+          if key in result or len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+            raise ValueError("Invalid worker atom identities/coordinates.")
+          result[key] = xyz
+  if not result:
+    raise ValueError("Empty worker fragment.")
+  return result
+
+
+def _register_worker_main():
+  """Headless Coot entry; every native call runs on this process's main thread."""
+  config = json.load(open(os.environ["COOT_REGISTER_CONFIG"]))
+  folder = os.path.dirname(os.environ["COOT_REGISTER_CONFIG"])
+  def publish(index, result):
+    path = os.path.join(folder, f"result-{index}.json")
+    with open(path+".tmp", "w") as handle:
+      json.dump(result, handle, allow_nan=False)
+    os.replace(path+".tmp", path)
+  try:
+    if coot.coot_version() != config["version"]:
+      raise RuntimeError("Worker and interactive Coot versions differ.")
+    model = coot.add_molecule_py(config["representation"], "Register worker input")
+    map_id = coot.handle_read_ccp4_map(config["map_path"], 0)
+    if not coot.is_valid_model_molecule(model) or not coot.is_valid_map_molecule(map_id):
+      raise RuntimeError("Coot could not load the exported fragment or map.")
+    coot.set_imol_refinement_map(map_id)
+    values = [float(coot.density_at_point(map_id, *p)) for p in config["probes"]]
+    if any(not math.isclose(a, b, abs_tol=1e-6, rel_tol=1e-5) for a, b in zip(values, config["probe_values"])):
+      raise RuntimeError("Exported map does not reproduce the current refinement-map density.")
+    coot.turn_off_backup(model)
+    for name, dictionary in config["dictionaries"].items():
+      if not coot.set_monomer_restraints_py(name, dictionary):
+        raise RuntimeError(f"Could not transfer {name} geometry dictionary.")
+    for setter, args, getter in config["settings"]:
+      getattr(coot, setter)(*args)
+      if getter and not math.isclose(float(getattr(coot, getter)()), float(args[0]), rel_tol=1e-5):
+        raise RuntimeError(f"Worker did not accept {setter}.")
+    for job in config["jobs"]:
+      candidate = None
+      try:
+        candidate = _build_register_comparison_fragment(model, config["chain"], config["start"], config["end"],
+            job["shift"], job["sequence"], map_id, rigid_fit=config["rigid_fit"], flexible=True,
+            prepare=config["prepare"])
+        candidate["representation"] = coot.python_representation_kk(candidate.pop("model"))
+        candidate["offset"] = job["offset"]
+        publish(job["index"], dict(index=job["index"], candidate=candidate))
+      except Exception as error:
+        publish(job["index"], dict(index=job["index"], error=str(error)))
+      finally:
+        # The worker is disposable, but retain one source/map across its jobs.
+        for number in range(coot.graphics_n_molecules()):
+          if number not in (model, map_id) and coot.is_valid_model_molecule(number):
+            coot.close_molecule(number)
+    coot.coot_no_state_real_exit(0)
+  except Exception as error:
+    for job in config["jobs"]:
+      publish(job["index"], dict(index=job["index"], error="Worker setup failed: "+str(error)))
+    coot.coot_no_state_real_exit(1)
+
+
+def _make_register_worker_source():
+  import inspect
+  functions = (_coot_text_arg, _coot_int_arg, _coot_residue_spec_tuple, _coot_residue_spec_from_spec,
+      _distance_sq, _grouped_model_edit, _mark_model_changed, _atom_selection_for_residue_range,
+      _register_collapse_alternates, _register_fit_fixed_backbone_rotamer, _register_sidechain_correlation,
+      _build_register_comparison_fragment, _register_worker_atom_snapshot, _register_worker_main)
+  header = ("import math, os, re, json\nimport coot\nfrom contextlib import contextmanager\n"
+            "from coot_utils import residue_spec_to_chain_id, residue_spec_to_res_no, residue_spec_to_ins_code\n"
+            "valid_model_molecule_qm = coot.is_valid_model_molecule\n"
+            "_MODEL_EDIT_EPOCHS = {}\n_supports_direct_user_defined_colouring = lambda: False\n")
+  return (header+"_REGISTER_AA = "+repr(_REGISTER_AA)+"\n"+
+          "\n".join(inspect.getsource(f) for f in functions)+
+          "\n_rigid_fit_atom_snapshot = _register_worker_atom_snapshot\n_register_worker_main()\n")
+
+
+try:
+  # inspect uses on-disk line numbers. Freeze while file and loaded code match,
+  # not after an installed-script update during a long-running Coot session.
+  _REGISTER_WORKER_SOURCE_AT_LOAD = _make_register_worker_source()
+except (OSError, TypeError):
+  _REGISTER_WORKER_SOURCE_AT_LOAD = None
+
+
+def _register_worker_source():
+  source = globals().get("_REGISTER_WORKER_SOURCE_AT_LOAD")
+  return source if source is not None else _make_register_worker_source()
+
+
+def _register_worker_stop_process(process):
+  """Coot launchers may be shells: stop their private group, not just the shell."""
+  import signal
+  import subprocess
+  try:
+    if os.name == "posix":
+      try:
+        os.killpg(process.pid, signal.SIGTERM)
+      except ProcessLookupError:
+        pass
+    elif process.poll() is None:
+      process.terminate()
+    try:
+      process.wait(timeout=1.)
+    except subprocess.TimeoutExpired:
+      pass
+  finally:
+    if os.name == "posix":
+      try:
+        os.killpg(process.pid, signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+    elif process.poll() is None:
+      process.kill()
+    process.wait(timeout=5.)
+
+
+def _register_workers_monitor(pool):
+  """Only filesystem/process operations here. Never call Coot or GTK off-thread."""
+  import subprocess
+  processes = []
+  seen = set()
+  failures = {}
+  def missing_result(process, log, home, started, timed_out):
+    elapsed = time.monotonic()-started
+    code = process.poll()
+    if timed_out:
+      reason = f"Coot worker timed out after {elapsed:.1f}s"
+    elif code is not None and code < 0:
+      import signal
+      try:
+        label = signal.Signals(-code).name
+      except ValueError:
+        label = str(-code)
+      reason = f"Coot worker terminated by {label} after {elapsed:.1f}s"
+    else:
+      reason = f"Coot worker exited with status {code} after {elapsed:.1f}s"
+    log.flush()
+    try:
+      with open(os.path.join(home, "worker.log"), "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell()-8192))
+        tail = handle.read().decode("utf-8", errors="replace").strip()
+    except OSError as error:
+      tail = f"Could not read worker log: {error}"
+    import tempfile
+    details = dict(reason=reason, returncode=code, elapsed=elapsed, log=tail)
+    try:
+      with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="coot-register-worker-failure-",
+                                       suffix=".log", delete=False) as handle:
+        handle.write(reason+"; no candidate returned.\n\n"+tail+"\n")
+        details["path"] = handle.name
+    except OSError:
+      pass
+    pool.setdefault("diagnostics", []).append(details)
+    print(reason+"; no candidate returned.\n"+tail)
+    last = tail.splitlines()[-1][:240] if tail else "No worker log output."
+    return reason+"; no candidate returned. "+last+(" Details: "+details["path"] if "path" in details else "")
+  try:
+    for path, jobs in pool["configs"]:
+      if pool["cancel"].is_set():
+        break
+      home = os.path.dirname(path)
+      environment = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home+"/config", XDG_STATE_HOME=home+"/state",
+          XDG_CACHE_HOME=home+"/cache", COOT_REGISTER_CONFIG=path, COOT_N_THREADS="1",
+          OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", VECLIB_MAXIMUM_THREADS="1", PYTHONDONTWRITEBYTECODE="1")
+      for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+        environment.pop(key, None)
+      log = open(os.path.join(home, "worker.log"), "w")
+      try:
+        process = subprocess.Popen([pool["launcher"], "--no-graphics", "--no-startup-scripts", "--no-state-script",
+                                   "--no-guano", "--script", pool["script"]], cwd=home, env=environment,
+                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=os.name == "posix")
+      except Exception:
+        log.close()
+        raise
+      processes.append((process, log, home, jobs, time.monotonic()))
+    pool["events"].put(("started", len(processes)))
+    while processes and not pool["cancel"].is_set():
+      active = False
+      for process, log, home, jobs, started in processes:
+        running = process.poll() is None
+        timed_out = running and time.monotonic()-started > pool.get("timeout", 120+180*len(jobs))
+        if timed_out:
+          _register_worker_stop_process(process)
+          running = False
+        active |= running
+        for job in jobs:
+          index = job["index"]
+          if index in seen:
+            continue
+          path = os.path.join(home, f"result-{index}.json")
+          if os.path.isfile(path):
+            if os.path.getsize(path) > 32*1024**2:
+              raise RuntimeError("Worker result exceeded the safety limit.")
+            with open(path) as handle:
+              result = json.load(handle)
+            if result.get("index") != index:
+              raise RuntimeError("Worker returned the wrong job identifier.")
+            seen.add(index)
+            pool["events"].put(("result", result))
+          elif not running:
+            seen.add(index)
+            if home not in failures:
+              failures[home] = missing_result(process, log, home, started, timed_out)
+            message = failures[home]
+            pool["events"].put(("result", dict(index=index, error=message)))
+      if not active or len(seen) == len(pool["jobs"]):
+        break
+      pool["cancel"].wait(.05)
+  except Exception as error:
+    pool["events"].put(("error", str(error)))
+  finally:
+    for process, log, _home, _jobs, _started in processes:
+      try:
+        if process.poll() is None or pool["cancel"].is_set():
+          _register_worker_stop_process(process)
+        else:
+          process.wait(timeout=1.)
+      except (OSError, subprocess.TimeoutExpired):
+        pass
+      log.close()
+    try:
+      pool["owner"].cleanup()
+    except Exception as error:
+      pool["events"].put(("error", "Could not remove worker temporary files: "+str(error)))
+    finally:
+      pool["done"].set()
+      pool["events"].put(("done", pool["cancel"].is_set()))
+
+
+def _register_workers_start(source, chain, start, end, targets, map_id, rigid_fit=False, prepare=True):
+  """Snapshot native state on the GUI thread; start only pure orchestration off-thread."""
+  import queue
+  import threading
+  required = ("export_map", "python_representation_kk", "add_molecule_py", "set_monomer_restraints_py",
+              "monomer_restraints_py", "coot_version", "density_at_point", "cell_py", "space_group_py",
+              "matrix_state", "set_matrix", "secondary_structure_restraints_type", "set_secondary_structure_restraints_type")
+  if any(not callable(getattr(coot, name, None)) for name in required):
+    raise RuntimeError("This Coot build lacks the safe isolated-refinement export/import APIs.")
+  if coot.refinement_already_ongoing_p():
+    raise ValueError("Accept/cancel current refinement before starting workers.")
+  snapshot = _model_coordinate_snapshot(source)
+  selected = [[number, ins, record["name"], record["atoms"]] for (ch, number, ins), record in snapshot.items()
+              if ch == chain and start <= number <= end and record["atoms"]]
+  if len(selected) != end-start+1:
+    raise ValueError("The worker input range is incomplete.")
+  representation = [[[chain, selected]]]
+  points = [atom[2] for _n, _i, _name, atoms in selected for atom in atoms]
+  # Bounded local probes detect changed/replaced target density before import.
+  anchors = points[::max(1, len(points)//32)][:32]
+  probes = [[float(p[i])+(2. if i == axis else 0.) for i in range(3)] for p in anchors for axis in range(3)]
+  fingerprint = _register_map_fingerprint(map_id, probes)
+  names = {row[2] for row in selected} | {_REGISTER_AA[letter] for _offset, sequence in targets for letter in sequence}
+  dictionaries = {}
+  for name in sorted(names):
+    getter = getattr(coot, "monomer_restraints_for_molecule_py", None)
+    dictionary = getter(name, source) if callable(getter) else coot.monomer_restraints_py(name)
+    if not isinstance(dictionary, dict) or not dictionary.get("_chem_comp_atom"):
+      raise ValueError(f"No transferable geometry dictionary for {name}.")
+    dictionaries[name] = dictionary
+  owner = tempfile.TemporaryDirectory(prefix="coot-register-workers-")
+  try:
+    map_path = os.path.join(owner.name, "refinement.map")
+    coot.export_map(map_id, map_path)
+    if not os.path.isfile(map_path) or os.path.getsize(map_path) < 1024:
+      raise RuntimeError("Coot could not export the current refinement map.")
+    if _register_map_fingerprint(map_id, probes) != fingerprint:
+      raise RuntimeError("The refinement map changed while it was being exported.")
+    launcher = _register_worker_launcher()
+    settings = _register_worker_settings()
+    script = os.path.join(owner.name, "register_worker.py")
+    with open(script, "w") as handle:
+      handle.write(_register_worker_source())
+    jobs = [dict(index=i, offset=offset, shift=offset if prepare else 0, sequence=sequence)
+            for i, (offset, sequence) in enumerate(targets)]
+    count = _register_worker_limit(os.path.getsize(map_path), len(jobs))
+    configs = []
+    for index in range(count):
+      home = os.path.join(owner.name, str(index))
+      os.mkdir(home)
+      path = os.path.join(home, "config.json")
+      assigned = jobs[index::count]
+      config = dict(representation=representation, chain=chain, start=start, end=end,
+          map_path=map_path, dictionaries=dictionaries, settings=settings, jobs=assigned,
+          version=coot.coot_version(), rigid_fit=bool(rigid_fit), prepare=bool(prepare),
+          probes=probes, probe_values=fingerprint[-1])
+      with open(path, "w") as handle:
+        json.dump(config, handle, allow_nan=False)
+      configs.append((path, assigned))
+    pool = dict(owner=owner, configs=configs, jobs=jobs, script=script, launcher=launcher,
+                events=queue.Queue(), cancel=threading.Event(), done=threading.Event(),
+                count=count, probes=probes, fingerprint=fingerprint,
+                source=source, source_name=coot.molecule_name(source), source_snapshot=snapshot,
+                map=map_id, chain=chain, start=start, end=end, prepare=prepare)
+    threading.Thread(target=_register_workers_monitor, args=(pool,), name="coot-register-workers", daemon=True).start()
+    return pool
+  except Exception:
+    owner.cleanup()
+    raise
+
+
+def _register_validate_worker_result(candidate, job, chain, start, end):
+  """Validate coordinates, identities and score coverage before creating a GUI model."""
+  if candidate.get("offset") != job["offset"] or candidate.get("sequence") != job["sequence"] or candidate.get("flexible") is not True:
+    raise ValueError("Worker returned the wrong register/sequence.")
+  representation = candidate["representation"]
+  if len(representation) != 1 or len(representation[0]) != 1 or representation[0][0][0] != chain:
+    raise ValueError("Worker returned unexpected models/chains.")
+  residues = representation[0][0][1]
+  expected = [(chain, n+job["shift"], "") for n in range(start, end+1)]
+  if len(residues) != len(expected):
+    raise ValueError("Worker returned an incomplete fragment.")
+  atoms = {}
+  for residue, spec, letter in zip(residues, expected, job["sequence"]):
+    number, ins, name, rows = residue
+    if (chain, number, ins) != spec or name != _REGISTER_AA[letter]:
+      raise ValueError("Worker changed residue identifiers or types.")
+    names = set()
+    for atom in rows:
+      atom_name, alt = atom[0]
+      key = (*spec, name, atom_name, alt)
+      if (key in atoms or alt or len(atom[2]) != 3 or len(atom[1]) < 3 or
+          not all(math.isfinite(v) for v in (*atom[2], *atom[1][:2]))):
+        raise ValueError("Worker returned invalid/ambiguous atoms.")
+      atoms[key] = atom[2]
+      names.add(atom_name.strip())
+    if not {"N", "CA", "C", "O"} <= names:
+      raise ValueError("Worker removed backbone atoms.")
+  scores = {tuple(spec): float(value) for spec, value in candidate["scores"]}
+  if (len(candidate["scores"]) != len(expected) or set(scores) != set(expected) or
+      any(not math.isfinite(v) or not -1. <= v <= 1. for v in scores.values())):
+    raise ValueError("Worker returned invalid/incomplete density scores.")
+  if (not math.isclose(candidate["mean"], sum(scores.values())/len(scores), abs_tol=1e-7) or
+      not math.isclose(candidate["minimum"], min(scores.values()), abs_tol=1e-7)):
+    raise ValueError("Worker density-score summary is inconsistent.")
+  sidechain = candidate["sidechain"]
+  eligible = sum(letter not in {"G", "A"} for letter in job["sequence"])
+  value = sidechain["mean"]
+  if (sidechain["eligible"] != eligible or not 0 <= sidechain["count"] <= eligible or
+      (value is None) != (sidechain["count"] == 0) or
+      value is not None and (not math.isfinite(value) or not -1 <= value <= 1)):
+    raise ValueError("Worker returned invalid sidechain scores.")
+  return atoms
+
+
+def _register_import_worker_candidate(pool, result):
+  job = pool["jobs"][result["index"]]
+  candidate = dict(result["candidate"])
+  expected = _register_validate_worker_result(candidate, job, pool["chain"], pool["start"], pool["end"])
+  properties = {(ch, n, ins, name, *atom[0]): atom[1][:3] for entry in candidate["representation"]
+                for ch, residues in entry for n, ins, name, atoms in residues for atom in atoms}
+  source = pool["source"]
+  if (not valid_model_molecule_qm(source) or coot.molecule_name(source) != pool["source_name"] or
+      _model_coordinate_snapshot(source) != pool["source_snapshot"]):
+    raise ValueError("The source changed or was closed; worker results were not imported.")
+  if not pool.get("prepare", True):
+    identities = {(*spec, record["name"], *atom[0]) for spec, record in pool["source_snapshot"].items()
+                  for atom in record["atoms"]}
+    if expected.keys() != identities:
+      raise ValueError("Selected refinement changed atom identities; previous candidate retained.")
+  if _register_map_fingerprint(pool["map"], pool["probes"]) != pool["fingerprint"]:
+    raise ValueError("The target map changed; worker results were not imported.")
+  existing = set(model_molecule_list())
+  model = coot.add_molecule_py(candidate.pop("representation"),
+      f"Register {job['offset']:+d}: {pool['chain']} (flex)")
+  if model in existing or not valid_model_molecule_qm(model):
+    raise RuntimeError("Coot could not create an independent result model.")
+  try:
+    coot.set_mol_displayed(model, 0)
+    imported_snapshot = _model_coordinate_snapshot(model)
+    actual = {(*spec, record["name"], *atom[0]): atom[2]
+              for spec, record in imported_snapshot.items() for atom in record["atoms"]}
+    if actual.keys() != expected.keys() or any(_distance_sq(actual[k], expected[k]) > 1e-8 for k in actual):
+      raise RuntimeError("Imported coordinates did not reproduce the worker result.")
+    for spec, record in imported_snapshot.items():
+      for atom in record["atoms"]:
+        original = properties[(*spec, record["name"], *atom[0])]
+        if (str(atom[1][2]).strip() != str(original[2]).strip() or
+            any(not math.isclose(float(a), float(b), abs_tol=1e-5, rel_tol=1e-5)
+                for a, b in zip(atom[1][:2], original[:2]))):
+          raise RuntimeError("Imported occupancies/B-factors did not reproduce the worker result.")
+    candidate.update(model=model, coloured=False)
+    if _supports_direct_user_defined_colouring():
+      rows = [(spec, _density_fit_score_to_colour_index(score)) for spec, score in candidate["scores"]]
+      candidate["coloured"] = bool(_apply_direct_user_defined_residue_colours(model, [], rows))
+    return candidate
+  except Exception:
+    coot.close_molecule(model)
+    raise
+
+
+def _register_center_result_row(scroller, button):
+  """Center a direct child of the results box, clamping at the list ends."""
+  allocation = button.get_allocation()
+  adjustment = scroller.get_vadjustment()
+  page = adjustment.get_page_size()
+  if allocation.height <= 0 or page <= 0:
+    return False
+  lower = adjustment.get_lower()
+  upper = adjustment.get_upper()
+  if upper < allocation.y+allocation.height:
+    return False
+  target = allocation.y+allocation.height/2.-page/2.
+  adjustment.set_value(max(lower, min(max(lower, upper-page), target)))
+  return True
 
 
 def compare_local_sequence_registers():
@@ -21715,16 +25218,28 @@ def compare_local_sequence_registers():
   sequence_controls.append(sequence_scroll)
   reference.set_child(sequence_controls)
   box.append(reference)
-  rigid_fit_option = Gtk.CheckButton(label="Rigid fit before refinement")
+  rigid_fit_option = Gtk.CheckButton(label="Rigid-body fit")
   rigid_fit_available = callable(getattr(coot, "rigid_body_refine_by_atom_selection", None))
-  rigid_fit_option.set_active(False)
+  rigid_fit_option.set_active(rigid_fit_available)
   rigid_fit_option.set_sensitive(rigid_fit_available)
   rigid_fit_option.set_tooltip_text(
-    "Mutate, rigid fit, select fixed-backbone rotamers, refine, select rotamers again, then final refine."
+    "Fit the entire fragment as one rigid body, then select fixed-backbone rotamers."
     if rigid_fit_available else "Rigid-body fitting is unavailable in this Coot build.")
   box.append(rigid_fit_option)
-  progress = Gtk.Label(label="Isolated fragments; CC guides comparison, not certainty.")
+  flexible_option = Gtk.CheckButton(label="Flexibly refine all candidates (slower)")
+  flexible_option.set_active(False)
+  flexible_option.set_tooltip_text("Two flexible refinement rounds with rotamer selection between them. Otherwise use fast rigid fitting and rotamer selection only.")
+  flexible_option.set_tooltip_text("Two flexible refinement rounds in isolated workers using the current map, geometry dictionaries and readable refinement settings. Native settings without getters use worker defaults.")
+  box.append(flexible_option)
+  worker_note = Gtk.Label(label="Flexible fitting: current map/weight and readable settings are copied; other native settings use worker defaults.", xalign=0)
+  worker_note.set_wrap(True)
+  worker_note.set_max_width_chars(72)
+  worker_note.set_visible(False)
+  flexible_option.connect("toggled", lambda *_: worker_note.set_visible(flexible_option.get_active()))
+  box.append(worker_note)
+  progress = Gtk.Label(label="Fast rigid fit + rotamers. Flexible refinement is optional; CC is a guide.")
   progress.set_wrap(True)
+  progress.set_max_width_chars(76)
   progress.set_xalign(0)
   box.append(progress)
   headings = Gtk.Label(label="Shift   Sequence     Mean CC   Min CC   SC CC (n)")
@@ -21754,15 +25269,55 @@ def compare_local_sequence_registers():
   keep = Gtk.Button(label="Keep selected")
   keep.set_tooltip_text("Keep this fragment as a separate model; discard the other candidates.")
   keep.set_sensitive(False)
+  merge_selected = Gtk.Button(label="Merge selected")
+  merge_available = all(callable(getattr(coot, name, None)) for name in
+      ("copy_molecule", "merge_molecules_py", "change_chain_id", "delete_residue", "set_undo_molecule", "apply_undo"))
+  merge_selected.set_sensitive(False)
+  merge_selected.set_tooltip_text("Replace the original range in its chain, trimming overlapping adjacent boundaries. Preview required; one Coot Undo restores the merge."
+                                  if merge_available else "Native merge/Undo APIs are unavailable in this build.")
+  refine_selected = Gtk.Button(label="Flexibly refine selected")
+  refine_selected.set_sensitive(False)
+  refine_selected.set_tooltip_text("Refine a copy in an isolated worker, then update its scores and colouring. Preserve the candidate if refinement fails. Current map/weight and readable settings are copied; parameters without getters use worker defaults.")
   discard = Gtk.Button(label="Discard all")
   buttons.append(keep)
+  buttons.append(merge_selected)
   buttons.append(discard)
   box.append(buttons)
+  box.append(refine_selected)
+  stop = Gtk.Button(label="Stop")
+  stop.set_sensitive(False)
+  buttons.append(stop)
   state = {"closed": False, "candidates": [], "selected": None, "idle": None,
            "hidden_original": False, "index": 0, "targets": [], "snapshot": None, "buttons": [],
-           "rigid_fit": False, "scoring_cache": None}
+           "rigid_fit": True, "flexible": False, "scoring_cache": None, "refining": False,
+           "pool": None, "pending_rows": {}, "failures": [], "merging": False,
+           "scroll_tick": None}
+  def cancel_scroll():
+    pending = state["scroll_tick"]
+    state["scroll_tick"] = None
+    if pending is not None:
+      pending[0].remove_tick_callback(pending[1])
+  def center_button(button, candidate):
+    cancel_scroll()
+    frames = 0
+    def after_layout(widget, _clock):
+      nonlocal frames
+      frames += 1
+      if state["closed"] or state["selected"] is not candidate:
+        state["scroll_tick"] = None
+        return False
+      # Tick callbacks precede layout; the second frame sees the new row sizes.
+      if frames < 2:
+        return True
+      if _register_center_result_row(scroll, widget) or frames >= 8:
+        state["scroll_tick"] = None
+        return False
+      return True
+    tick = button.add_tick_callback(after_layout)
+    if tick:
+      state["scroll_tick"] = (button, tick)
   def choose(candidate):
-    if state["closed"] or not valid_model_molecule_qm(candidate["model"]):
+    if state["closed"] or state["refining"] or state["merging"] or not valid_model_molecule_qm(candidate["model"]):
       return
     for other in state["candidates"]:
       if valid_model_molecule_qm(other["model"]):
@@ -21771,9 +25326,12 @@ def compare_local_sequence_registers():
     for button, other in state["buttons"]:
       if other is candidate:
         button.add_css_class("suggested-action")
+        center_button(button, candidate)
       else:
         button.remove_css_class("suggested-action")
     keep.set_sensitive(state["idle"] is None)
+    merge_selected.set_sensitive(merge_available and state["idle"] is None)
+    refine_selected.set_sensitive(state["idle"] is None)
     add_status_bar_text(f"Register {candidate['offset']:+d} | mean CC {candidate['mean']:.3f} | min CC {candidate['minimum']:.3f}")
   def navigate(direction):
     available = [c for c in state["candidates"] if valid_model_molecule_qm(c["model"])]
@@ -21788,6 +25346,9 @@ def compare_local_sequence_registers():
     if state["closed"]:
       return
     state["closed"] = True
+    cancel_scroll()
+    if state["pool"] is not None:
+      state["pool"]["cancel"].set()
     if state["idle"] is not None:
       glib.source_remove(state["idle"])
       state["idle"] = None
@@ -21801,6 +25362,195 @@ def compare_local_sequence_registers():
     if state["hidden_original"] and valid_model_molecule_qm(source):
       coot.set_mol_displayed(source, 1)
     window.destroy()
+  def update_button(button, candidate):
+    sidechain = candidate["sidechain"]
+    sidechain_text = f"{sidechain['mean']:.3f}" if sidechain["mean"] is not None else "n/a"
+    text = Gtk.Label(label=f"{candidate['offset']:+3d}     {candidate['sequence']}    {candidate['mean']:.3f}    {candidate['minimum']:.3f}"
+                          f"    {sidechain_text} ({sidechain['count']}/{sidechain['eligible']})"
+                          + ("  [flex]" if candidate.get("flexible") else ""))
+    text.set_xalign(0)
+    text.add_css_class("monospace")
+    button.set_child(text)
+    button.set_tooltip_text(f"Centre {chain}:{centre+candidate['offset']} | " +
+                            ("Coloured by density fit" if candidate["coloured"] else "Density-fit colouring unavailable"))
+  def add_row(widget, index):
+    placeholder = state["pending_rows"].pop(index, None)
+    if placeholder is None:
+      rows.append(widget)
+    else:
+      rows.insert_child_after(widget, placeholder)
+      rows.remove(placeholder)
+  def add_candidate(candidate, index):
+    try:
+      _register_associate_reference(candidate["model"], chain, state["reference_sequence"], state["reference_origin"])
+    except Exception:
+      _REGISTER_REFERENCE_ORIGINS.pop((candidate["model"], chain), None)
+      coot.close_molecule(candidate["model"])
+      raise
+    state["candidates"].append(candidate)
+    state["candidates"].sort(key=lambda c: c["offset"])
+    button = Gtk.Button()
+    update_button(button, candidate)
+    button.connect("clicked", lambda *_args, candidate=candidate: choose(candidate))
+    add_row(button, index)
+    state["buttons"].append((button, candidate))
+    previous.set_sensitive(True)
+    next_button.set_sensitive(True)
+    if state["selected"] is None:
+      choose(candidate)
+  def failed_row(index, message):
+    offset = state["targets"][index][0]
+    state["failures"].append((offset, message))
+    widget = Gtk.Label(label=f"{offset:+d}  Failed: {message}")
+    widget.set_wrap(True)
+    widget.set_xalign(0)
+    add_row(widget, index)
+    print(f"Register comparison {offset:+d}: {message}")
+  def finish_generation(stopped=False):
+    _analysis_cc_close(state["scoring_cache"])
+    state["scoring_cache"] = None
+    state["idle"] = None
+    stop.set_sensitive(False)
+    keep.set_sensitive(state["selected"] is not None)
+    available = [c for c in state["candidates"] if valid_model_molecule_qm(c["model"])]
+    sidechain_available = [c for c in available if c["sidechain"]["mean"] is not None]
+    best = max(sidechain_available or available,
+               key=lambda c: (c["sidechain"]["mean"], c["mean"]) if sidechain_available else (c["mean"],), default=None)
+    if best is not None:
+      choose(best)
+    metric_label = "SC CC" if sidechain_available else "mean CC"
+    score = best["sidechain"]["mean"] if sidechain_available else (best["mean"] if best else None)
+    progress.set_text(("Stopped. " if stopped else "")+
+        (f"{len(available)}/{len(state['targets'])} built. Highest {metric_label}: {best['offset']:+d} ({score:.3f})."
+         if best else "No candidates succeeded; inspect the failed rows."))
+    for index, widget in list(state["pending_rows"].items()):
+      widget.set_text(f"{state['targets'][index][0]:+d}  Not completed")
+    state["pending_rows"].clear()
+  def stop_workers(*_args):
+    if state["pool"] is not None:
+      state["pool"]["cancel"].set()
+      stop.set_sensitive(False)
+      progress.set_text("Stopping workers; completed candidates will be retained.")
+  stop.connect("clicked", stop_workers)
+  def start_workers(selected=None):
+    import queue
+    if state["closed"]:
+      return
+    state.pop("worker_message", None)
+    mode = "selected" if selected is not None else "all"
+    if selected is None:
+      args = (source, chain, state["start"], state["end"], state["targets"], map_id)
+    else:
+      offset = selected["offset"]
+      args = (selected["model"], chain, state["start"]+offset, state["end"]+offset,
+              [(offset, selected["sequence"])], map_id)
+    pool = _register_workers_start(*args, rigid_fit=state["rigid_fit"] if selected is None else False,
+                                    prepare=selected is None)
+    if state["closed"]:
+      pool["cancel"].set()
+      return
+    state["pool"] = pool
+    state["worker_diagnostics"] = pool.setdefault("diagnostics", [])
+    state["worker_count"] = pool["count"]
+    stop.set_sensitive(True)
+    progress.set_text(f"Refining in {pool['count']} isolated Coot worker(s)...")
+    def poll_workers():
+      if state["closed"]:
+        pool["cancel"].set()
+        return False
+      try:
+        event, payload = pool["events"].get_nowait()
+      except queue.Empty:
+        return True
+      if event == "result" and not pool["cancel"].is_set():
+        imported = None
+        try:
+          if "error" in payload:
+            raise RuntimeError(payload["error"])
+          imported = _register_import_worker_candidate(pool, payload)
+          if state["closed"]:
+            _REGISTER_REFERENCE_ORIGINS.pop((imported["model"], chain), None)
+            if valid_model_molecule_qm(imported["model"]):
+              coot.close_molecule(imported["model"])
+            return False
+          if mode == "all":
+            add_candidate(imported, payload["index"])
+          else:
+            _register_associate_reference(imported["model"], chain, state["reference_sequence"], state["reference_origin"])
+            old = selected["model"]
+            coot.close_molecule(old)
+            _REGISTER_REFERENCE_ORIGINS.pop((old, chain), None)
+            selected.update(imported)
+            for button, candidate in state["buttons"]:
+              if candidate is selected:
+                update_button(button, candidate)
+            state["worker_message"] = f"Refined register {selected['offset']:+d}; scores updated. Other candidates unchanged."
+        except Exception as error:
+          if imported is not None and (mode == "all" and imported not in state["candidates"] or
+                                      mode == "selected" and imported["model"] != selected["model"]):
+            _REGISTER_REFERENCE_ORIGINS.pop((imported["model"], chain), None)
+            if valid_model_molecule_qm(imported["model"]):
+              coot.close_molecule(imported["model"])
+          if mode == "all":
+            failed_row(payload["index"], str(error))
+          else:
+            state["worker_message"] = f"Refinement failed; previous candidate retained: {error}"
+        if mode == "all":
+          state["index"] += 1
+          progress.set_text(f"Completed {state['index']}/{len(state['targets'])} | {pool['count']} workers")
+      elif event == "error":
+        state["worker_message"] = "Workers failed: "+payload
+        progress.set_text(state["worker_message"])
+      elif event == "done":
+        state["pool"] = None
+        state["idle"] = None
+        stop.set_sensitive(False)
+        if mode == "all":
+          finish_generation(stopped=payload)
+          if state.get("worker_message"):
+            progress.set_text(state["worker_message"])
+        else:
+          state["refining"] = False
+          previous.set_sensitive(True)
+          next_button.set_sensitive(True)
+          choose(selected)
+          progress.set_text("Stopped; previous candidate retained." if payload else
+                            state.pop("worker_message", "Refinement finished."))
+        return False
+      return True
+    try:
+      state["idle"] = glib.timeout_add(50, poll_workers)
+      if not state["idle"]:
+        raise RuntimeError("Could not schedule worker progress polling.")
+    except Exception:
+      pool["cancel"].set()
+      state["pool"] = None
+      raise
+  def refine_chosen(*_args):
+    candidate = state["selected"]
+    if state["closed"] or state["idle"] is not None or candidate is None:
+      return
+    state["refining"] = True
+    for widget in (keep, merge_selected, refine_selected, previous, next_button):
+      widget.set_sensitive(False)
+    progress.set_text(f"Flexibly refining register {candidate['offset']:+d}...")
+    def run():
+      if state["closed"]:
+        return False
+      try:
+        if map_id not in map_molecule_list() or not valid_model_molecule_qm(candidate["model"]):
+          raise ValueError("Candidate or refinement map is no longer available.")
+        start_workers(candidate)
+      except Exception as error:
+        progress.set_text(f"Refinement failed; previous candidate retained: {error}")
+        state["refining"] = False
+        state["idle"] = None
+        for widget in (previous, next_button):
+          widget.set_sensitive(True)
+        choose(candidate)
+      return False
+    state["idle"] = glib.idle_add(run)
+  refine_selected.connect("clicked", refine_chosen)
   def step():
     if state["closed"]:
       return False
@@ -21811,58 +25561,19 @@ def compare_local_sequence_registers():
         raise ValueError("Source model or map changed; discard and restart the comparison.")
       candidate = _build_register_comparison_fragment(
         source, chain, state["start"], state["end"], offset, target, map_id,
-        rigid_fit=state["rigid_fit"], scoring_cache=state["scoring_cache"])
-      try:
-        _register_associate_reference(candidate["model"], chain, state["reference_sequence"], state["reference_origin"])
-      except Exception:
-        _REGISTER_REFERENCE_ORIGINS.pop((candidate["model"], chain), None)
-        coot.close_molecule(candidate["model"])
-        raise
+        rigid_fit=state["rigid_fit"], scoring_cache=state["scoring_cache"], flexible=state["flexible"])
       if state["closed"]:
         coot.close_molecule(candidate["model"])
         return False
-      state["candidates"].append(candidate)
-      button = Gtk.Button()
-      sidechain = candidate["sidechain"]
-      sidechain_text = f"{sidechain['mean']:.3f}" if sidechain["mean"] is not None else "n/a"
-      candidate_label = Gtk.Label(label=f"{offset:+3d}     {target}    {candidate['mean']:.3f}    {candidate['minimum']:.3f}"
-                                       f"    {sidechain_text} ({sidechain['count']}/{sidechain['eligible']})")
-      candidate_label.set_xalign(0)
-      candidate_label.add_css_class("monospace")
-      button.set_child(candidate_label)
-      button.set_tooltip_text(f"Centre {chain}:{centre+offset} | " +
-                              ("Coloured by density fit" if candidate["coloured"] else "Density-fit colouring unavailable"))
-      button.connect("clicked", lambda *_args, candidate=candidate: choose(candidate))
-      rows.append(button)
-      state["buttons"].append((button, candidate))
-      previous.set_sensitive(True)
-      next_button.set_sensitive(True)
-      if state["selected"] is None:
-        choose(candidate)
+      add_candidate(candidate, index)
     except Exception as error:
-      error_label = Gtk.Label(label=f"{offset:+d}  Failed: {error}")
-      error_label.set_wrap(True)
-      error_label.set_xalign(0)
-      rows.append(error_label)
-      print(f"Register comparison {offset:+d}: {error}")
+      if state["closed"]:
+        return False
+      failed_row(index, str(error))
     state["index"] += 1
     total = len(state["targets"])
     if state["index"] == total:
-      _analysis_cc_close(state["scoring_cache"])
-      state["scoring_cache"] = None
-      state["idle"] = None
-      keep.set_sensitive(state["selected"] is not None)
-      available = [c for c in state["candidates"] if valid_model_molecule_qm(c["model"])]
-      sidechain_available = [c for c in available if c["sidechain"]["mean"] is not None]
-      best = max(sidechain_available or available,
-                 key=lambda c: (c["sidechain"]["mean"], c["mean"]) if sidechain_available else (c["mean"],),
-                 default=None)
-      if best is not None:
-        choose(best)
-      metric_label = "SC CC" if sidechain_available else "mean CC (SC CC unavailable)"
-      best_score = best["sidechain"]["mean"] if sidechain_available else (best["mean"] if best else None)
-      progress.set_text(f"{len(state['candidates'])}/{total} built. Highest {metric_label}: {best['offset']:+d} ({best_score:.3f})." if best
-                        else "No candidates succeeded; inspect the failed rows.")
+      finish_generation()
       return False
     progress.set_text(f"Built {state['index']}/{total}; next shift {state['targets'][state['index']][0]:+d}")
     return True
@@ -21874,6 +25585,9 @@ def compare_local_sequence_registers():
         raise ValueError("The selected refinement map is no longer available.")
       pending_refinement = getattr(coot, "get_continue_updating_refinement_atoms_state", None)
       if callable(pending_refinement) and pending_refinement():
+        raise ValueError("Accept or cancel the current refinement before comparing registers.")
+      ongoing = getattr(coot, "refinement_already_ongoing_p", None)
+      if callable(ongoing) and ongoing():
         raise ValueError("Accept or cancel the current refinement before comparing registers.")
       buffer = sequence_view.get_buffer()
       reference_sequence = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
@@ -21889,7 +25603,10 @@ def compare_local_sequence_registers():
       progress.set_text(str(error))
       return
     fragment_size = end-start+1
-    if fragment_size > 12 and confirmed_size != fragment_size:
+    flexible = bool(flexible_option.get_active())
+    warning_limit = 12 if flexible else 30
+    confirmation = (fragment_size, flexible)
+    if fragment_size > warning_limit and confirmed_size != confirmation:
       generate.set_sensitive(False)
       def cancel_generation():
         if not state["closed"]:
@@ -21897,18 +25614,20 @@ def compare_local_sequence_registers():
       def confirm_generation():
         if not state["closed"]:
           generate.set_sensitive(True)
-          begin(confirmed_size=fragment_size)
+          begin(confirmed_size=confirmation)
       generic_confirm_dialog(
         "Generate large register fragments?",
-        f"Fit {len(targets)} fragments of {fragment_size} residues each?\n"
-        "Fragments longer than 12 residues may take a while to fit and refine.",
+        f"Fit {len(targets)} fragments of {fragment_size} residues each?\n" +
+        ("Flexible refinement of fragments longer than 12 residues may take a while."
+         if flexible else "Rigid fitting and rotamer testing of fragments longer than 30 residues may take a while."),
         "Cancel", cancel_generation, "Generate", confirm_generation,
         handle_close_function=cancel_generation,
       )
       return
     state.update(start=start, end=end, targets=targets, snapshot=snapshot,
                  reference_sequence=_register_clean_sequence(reference_sequence), reference_origin=int(origin_entry.get_text()),
-                 rigid_fit=rigid_fit_available and bool(rigid_fit_option.get_active()))
+                 rigid_fit=rigid_fit_available and bool(rigid_fit_option.get_active()),
+                 flexible=bool(flexible_option.get_active()))
     state["scoring_cache"] = _analysis_cc_open(map_id)
     state["hidden_original"] = bool(coot.mol_is_displayed(source))
     if state["hidden_original"]:
@@ -21920,14 +25639,87 @@ def compare_local_sequence_registers():
     label.set_text(f"Centre: {centre_label} | Model #{source}\nRegion {chain}:{start}-{end} | Map #{map_id}")
     sequence_view.set_editable(False)
     rigid_fit_option.set_sensitive(False)
+    flexible_option.set_sensitive(False)
     progress.set_text(f"Building register {targets[0][0]:+d}...")
-    state["idle"] = glib.idle_add(step)
+    if state["flexible"]:
+      for index, (offset, _target) in enumerate(targets):
+        widget = Gtk.Label(label=f"{offset:+d}  Waiting...")
+        widget.set_xalign(0)
+        rows.append(widget)
+        state["pending_rows"][index] = widget
+      def launch():
+        if state["closed"]:
+          return False
+        try:
+          start_workers()
+        except Exception as error:
+          for index in list(state["pending_rows"]):
+            failed_row(index, str(error))
+          finish_generation()
+          progress.set_text("Cannot start isolated refinement: "+str(error))
+        return False
+      state["idle"] = glib.idle_add(launch)
+    else:
+      state["idle"] = glib.idle_add(step)
   generate.connect("clicked", begin)
+  def merge_chosen(*_args):
+    candidate = state['selected']
+    if state['closed'] or state['idle'] is not None or state['refining'] or state['merging'] or candidate is None:
+      return
+    try:
+      if _register_chain_snapshot(source, chain) != state['snapshot']:
+        raise ValueError("The original chain changed; discard and regenerate the comparison before merging.")
+      original = _model_coordinate_snapshot(source)
+      fragment = _model_coordinate_snapshot(candidate['model'])
+      plan = _register_merge_plan(original, fragment, chain, state['start'], state['end'], candidate['offset'])
+      link_getter = getattr(coot, 'link_info_py', None)
+      if callable(link_getter) and any(_links_containing_residue(source, s) for s in plan['deleted']):
+        raise ValueError("The replaced/trimmed residues have explicit LINK records. Review/remove those links before merging.")
+      source_signature = _register_shift_model_signature(source)
+      candidate_signature = _register_shift_model_signature(candidate['model'])
+    except Exception as error:
+      info_dialog(f"Cannot merge selected candidate; original unchanged.\n\n{error}")
+      return
+    state['merging'] = True
+    for widget in (keep, merge_selected, refine_selected, previous, next_button):
+      widget.set_sensitive(False)
+    def cancel():
+      state['merging'] = False
+      if not state['closed']:
+        previous.set_sensitive(True)
+        next_button.set_sensitive(True)
+        choose(candidate)
+    def apply():
+      if state['closed']:
+        return
+      try:
+        _apply_register_comparison_merge(source, candidate, chain, plan, source_signature, candidate_signature,
+            reference=(state['reference_sequence'], state['reference_origin']))
+      except Exception as error:
+        cancel()
+        info_dialog(str(error))
+        return
+      finish(False)
+      coot.set_mol_displayed(source, 1)
+      add_status_bar_text(f"Merged register {candidate['offset']:+d} into #{source} {chain}:{plan['first']}-{plan['last']}; trimmed {len(plan['trim'])} boundary residues. Coot Undo restores the merge.")
+    trimmed = ', '.join(f"{s[1]}{s[2]} ({reason})" for s, reason in sorted(plan['trim'].items())) or 'none'
+    generic_confirm_dialog("Merge selected register?",
+        f"Replace #{source} {chain}:{state['start']}-{state['end']} with the selected candidate\n"
+        f"at {chain}:{plan['first']}-{plan['last']}.\n\nAdditional boundary residues to delete: {trimmed}.\n\n"
+        "Vacated residue numbers remain gaps. Joins are not automatically rebuilt or refined.\n"
+        "One Coot Undo restores the operation.",
+        "Cancel", cancel, "Merge selected", apply, handle_close_function=cancel)
+  merge_selected.connect("clicked", merge_chosen)
   keep.connect("clicked", lambda *_: finish(True))
   discard.connect("clicked", lambda *_: finish(False))
   window.connect("close-request", lambda *_: finish(False) or True)
   window.set_child(box)
+  window.register_comparison_state = state
+  state["widgets"] = dict(generate=generate, rigid=rigid_fit_option, flexible=flexible_option,
+      refine_selected=refine_selected, progress=progress, shift=shift_entry, discard=discard, keep=keep, merge=merge_selected,
+      size=size_entry, stop=stop, scroll=scroll, rows=rows, previous=previous, next=next_button)
   window.present()
+  return window
 
 
 #Mutate range to poly-unk
@@ -26552,6 +30344,11 @@ def _build_custom_user_colour_menu(submenu_colour):
   )
   add_simple_coot_menu_menuitem(
     submenu_colour,
+    "Color active mol by sidechain density correlation (backbone-normalized)",
+    lambda func: color_by_sidechain_density_for_active_residue(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_colour,
     "Color active mol by NCS difference",
     lambda func: color_by_ncs_difference_for_active_residue(),
   )
@@ -26568,6 +30365,7 @@ def _build_custom_user_colour_menu(submenu_colour):
 
 
 def _build_custom_fit_menu(submenu_fit):
+  add_simple_coot_menu_menuitem(submenu_fit, "PAE to GM restraints (experimental)...", lambda _item: pae_restraints_dialog())
   add_simple_coot_menu_menuitem(submenu_fit, "Set EM refinement weight from model-local density",
                                lambda _item: set_local_em_refinement_weight())
   trackpad_menu = Gio.Menu.new()
@@ -26578,6 +30376,7 @@ def _build_custom_fit_menu(submenu_fit):
   submenu_fit.append_submenu("Trackpad Rotate/Translate", trackpad_menu)
   add_simple_coot_menu_menuitem(submenu_fit, "Trackpad Edit Chi Angles...", lambda _item: trackpad_edit_chi_angles())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (click range)...", lambda func: cylinder_refine())
+  add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (local EM weight)...", lambda func: cylinder_refine_local_weight())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (alpha helix)...", lambda func: cylinder_refine_alpha_helix())
   add_simple_coot_menu_menuitem(submenu_fit, "Cylinder refine (beta strand)...", lambda func: cylinder_refine_beta_strand())
   add_simple_coot_menu_menuitem(
@@ -26585,6 +30384,8 @@ def _build_custom_fit_menu(submenu_fit):
     "Multimap stepped refinement...",
     lambda func: multimap_refinement_gui(),
   )
+  add_simple_coot_menu_menuitem(submenu_fit, "Global multimap refinement...",
+                               lambda _item: global_multimap_refinement_dialog())
   add_simple_coot_menu_menuitem(submenu_fit, "Fit all chains to map", lambda func: rigid_fit_all_chains())
   add_simple_coot_menu_menuitem(submenu_fit, "Fit current chain to map", lambda func: rigid_fit_active_chain())
   add_simple_coot_menu_menuitem(submenu_fit, "Global fit to map...", lambda func: global_fit_map())
