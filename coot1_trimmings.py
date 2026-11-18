@@ -2601,13 +2601,14 @@ def clear_pending_custom_picks():
 
 
 def _script_user_defined_click(count, callback, on_pick=None, cleanup=None, title=None, prompt=None):
-  """Resolve picks immediately, keeping picking instructions in the status bar."""
+  """Resolve picks immediately; count=None streams picks until cancelled."""
   _cancel_script_clicks()
   clear_annotation = globals().get("_clear_annotation_range_pick")
   if callable(clear_annotation):
     clear_annotation()
   token = object()
   picks = []
+  pick_count = 0
   _SCRIPT_CLICK_STATE.update(token=token, picking=True, cleanup=cleanup)
   def current():
     return _SCRIPT_CLICK_STATE.get("token") is token
@@ -2617,6 +2618,7 @@ def _script_user_defined_click(count, callback, on_pick=None, cleanup=None, titl
   def arm():
     coot.user_defined_click_py(1, picked)
   def picked(raw):
+    nonlocal pick_count
     if not current():
       return
     try:
@@ -2634,10 +2636,14 @@ def _script_user_defined_click(count, callback, on_pick=None, cleanup=None, titl
       cancel()
       raise
     try:
-      picks.append(spec)
+      pick_count += 1
+      if count is not None:
+        picks.append(spec)
       if callable(on_pick):
-        on_pick(spec, len(picks))
-      if len(picks) < count:
+        on_pick(spec, pick_count)
+      if not current():
+        return
+      if count is None or len(picks) < count:
         arm()
         return
       # A model may have been closed between the two clicks.
@@ -2661,7 +2667,12 @@ def _script_user_defined_click(count, callback, on_pick=None, cleanup=None, titl
   return token
 
 
-def ncs_master_chain_id(imol):
+def ncs_master_chain_id(imol, chain_id=None):
+  if chain_id is not None:
+    for ghost in coot.ncs_ghosts_py(imol) or []:
+      if chain_id in ghost[1:3]:
+        return ghost[2]
+    return False
   if hasattr(coot, "ncs_master_chains_py"):
     master_chains = coot.ncs_master_chains_py(imol)
     if isinstance(master_chains, list) and master_chains:
@@ -4771,7 +4782,7 @@ def goto_ncs_master():
   mol_id=residue[0]
   resno=residue[2]
   atom_name=residue[4]
-  ncs_ch_id=ncs_master_chain_id(mol_id)
+  ncs_ch_id=ncs_master_chain_id(mol_id, residue[1])
   if not ncs_ch_id:
     add_status_bar_text("No NCS master chain found")
     return None
@@ -24309,6 +24320,7 @@ _REGISTER_REFERENCE_ORIGINS = {}
 
 def _register_associate_reference(fragment, chain, sequence, origin):
   sequence = _register_clean_sequence(sequence)
+  origin = int(origin) if origin is not None else None
   before = coot.sequence_info_py(fragment) or []
   # Some builds remove only the first matching association per call.
   for _ in range(max(1, sum(item[0] == chain for item in before))):
@@ -24324,7 +24336,11 @@ def _register_associate_reference(fragment, chain, sequence, origin):
   matches = [item[1] for item in associated if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == chain]
   if len(matches) != 1 or _register_clean_sequence(matches[0]) != sequence:
     raise RuntimeError("Coot did not associate the reference sequence with the fragment.")
-  _REGISTER_REFERENCE_ORIGINS[(fragment, chain)] = (sequence, int(origin))
+  if origin is not None:
+    _REGISTER_REFERENCE_ORIGINS[(fragment, chain)] = (sequence, origin)
+  else:
+    # Nonlinear author numbering needs Coot's sequence alignment, not a guessed offset.
+    _REGISTER_REFERENCE_ORIGINS.pop((fragment, chain), None)
 
 
 def _register_terminal_residue_type(mol_id, chain, destination):
@@ -24546,14 +24562,18 @@ def _refine_register_comparison_candidate(candidate, chain, start, end, map_id):
   return refined
 
 
-def _register_merge_plan(original, fragment, chain, start, end, offset):
+def _register_merge_plan(original, fragment, chain, start, end, offset, selected_specs=None):
   """Plan same-chain replacement; trim numbering overlap and terminal backbone clashes."""
   first, last = start+offset, end+offset
-  specs = [(chain, n, "") for n in range(first, last+1)]
+  specs = [(chain, n, "") for n in range(first, last+1)] if selected_specs is None else list(selected_specs)
+  if selected_specs is not None and (offset or not specs or len(set(specs)) != len(specs)
+      or any(s[0] != chain or s not in original for s in specs)
+      or min(s[1] for s in specs) != first or max(s[1] for s in specs) != last):
+    raise ValueError("Explicit replacement requires distinct existing residues in one chain, without a numbering shift.")
   if set(fragment) != set(specs):
     raise ValueError("The candidate no longer contains exactly the tested residue range.")
-  removed = {s for s in original if s[0] == chain and start <= s[1] <= end}
-  if removed != {(chain, n, "") for n in range(start, end+1)}:
+  removed = {s for s in original if s[0] == chain and start <= s[1] <= end} if selected_specs is None else set(specs)
+  if selected_specs is None and removed != {(chain, n, "") for n in range(start, end+1)}:
     raise ValueError("The original range is incomplete or has insertion codes; regenerate the comparison.")
   def backbone(record, require_complete=True):
     if record['name'] not in _REGISTER_PROTEIN_NAMES:
@@ -24632,7 +24652,8 @@ def _register_merge_plan(original, fragment, chain, start, end, offset):
   return dict(deleted=sorted(deleted), trim=trim, expected=expected, first=first, last=last)
 
 
-def _apply_register_comparison_merge(source, candidate, chain, plan, source_signature, candidate_signature, reference=None):
+def _apply_register_comparison_merge(source, candidate, chain, plan, source_signature, candidate_signature, reference=None,
+                                     preserve_sequences=False):
   """Validate on disposable copies, then perform one native, undoable chain merge."""
   if coot.refinement_already_ongoing_p():
     raise ValueError("Accept or cancel the current refinement before merging.")
@@ -24644,13 +24665,16 @@ def _apply_register_comparison_merge(source, candidate, chain, plan, source_sign
     raise ValueError("The source or candidate changed after the merge preview; preview again.")
   if coot.backup_state(source) != 1:
     raise ValueError("Enable Coot backups for the source model before merging.")
-  reference = reference if reference is not None else _REGISTER_REFERENCE_ORIGINS.get((donor, chain))
+  reference = reference if reference is not None else (None if preserve_sequences else _REGISTER_REFERENCE_ORIGINS.get((donor, chain)))
   previous_sequences = previous_origins = None
   if reference is not None:
     sequence, origin = reference
-    reference = (_register_clean_sequence(sequence), int(origin))
-    if not 0 <= plan['first']-reference[1] <= plan['last']-reference[1] < len(reference[0]):
+    reference = (_register_clean_sequence(sequence), int(origin) if origin is not None else None)
+    if reference[1] is not None and not 0 <= plan['first']-reference[1] <= plan['last']-reference[1] < len(reference[0]):
       raise ValueError('The full reference sequence does not cover the merged residue numbering.')
+    previous_sequences = [list(item) for item in coot.sequence_info_py(source) or []]
+    previous_origins = {key: value for key, value in _REGISTER_REFERENCE_ORIGINS.items() if key[0] == source}
+  elif preserve_sequences:
     previous_sequences = [list(item) for item in coot.sequence_info_py(source) or []]
     previous_origins = {key: value for key, value in _REGISTER_REFERENCE_ORIGINS.items() if key[0] == source}
   deleted = set(plan['deleted'])
@@ -24700,6 +24724,16 @@ def _apply_register_comparison_merge(source, candidate, chain, plan, source_sign
       raise RuntimeError(f"The merged model did not match the preview: {change}; missing {missing[:5]}, unexpected {added[:5]}")
     if reference is not None:
       _register_associate_reference(target, chain, *reference)
+    elif preserve_sequences:
+      current = [list(item) for item in coot.sequence_info_py(target) or []]
+      if sorted(current) != sorted(previous_sequences):
+        for label in {item[0] for item in current+previous_sequences}:
+          for _ in range(sum(item[0] == label for item in current)):
+            coot.delete_sequence_by_chain_id(target, label)
+        for label, sequence in previous_sequences:
+          coot.assign_fasta_sequence(target, label, '>restored-reference\n'+sequence+'\n')
+        if sorted(coot.sequence_info_py(target) or []) != sorted(previous_sequences):
+          raise RuntimeError('Could not preserve the original sequence associations.')
   try:
     stage, fragment = copied(source), copied(donor)
     merge(stage, fragment)
@@ -24747,6 +24781,1455 @@ def _apply_register_comparison_merge(source, candidate, chain, plan, source_sign
       if valid_model_molecule_qm(model):
         coot.close_molecule(model)
   return True
+
+
+def _af_replace_alignment(target_seq, donor_seq):
+    """Align all of target to an embedded donor region (free donor ends).
+
+    mapping is zero-based target index -> donor index, including substitutions.
+    identity is exact known-letter matches / mapped pairs; coverage is mapped
+    pairs / target length. gaps reports target deletions and internal donor
+    insertions, not free donor flanks. Tied optimal alignments are conservative
+    confirmation requirements, never silently asserted unique correspondences.
+    Use the WHOLE observed/assigned target sequence, not a short clicked range.
+    """
+    def clean(seq):
+        seq = ''.join(str(seq).split()).upper()
+        if not seq or any(c not in 'ACDEFGHIKLMNPQRSTVWYBXZJUO' for c in seq):
+            raise ValueError('Supply a non-empty ungapped protein sequence.')
+        return seq
+
+    target, donor = clean(target_seq), clean(donor_seq)
+    n, m = len(target), len(donor)
+    # Exact embedding is common and avoids quadratic storage for long chains.
+    offset = donor.find(target)
+    known = set('ACDEFGHIKLMNPQRSTVWYUO')
+    if offset >= 0 and set(target) <= known:
+        mapping = {i: offset+i for i in range(n)}
+        ambiguous = donor.find(target, offset+1) >= 0
+        score = 3*n
+    else:
+        band = max(n, m)
+        if n == m:
+            mismatches = sum(a != b or a not in known for a, b in zip(target, donor))
+            # The ungapped score is a lower bound. Each gap costs at least
+            # five points versus the perfect score, bounding every viable path.
+            band = min(m, (7*mismatches)//5+1)
+        starts = [max(0, i-band) for i in range(n+1)]
+        widths = [min(m, i+band)-starts[i]+1 for i in range(n+1)]
+        if sum(widths) > 25000000:
+            raise ValueError('Alignment exceeds 25 million cells; supply an explicit verified mapping.')
+        trace = [bytearray(width) for width in widths]
+        unreachable = -10*(n+m+1)
+        previous = [0 if j <= band else unreachable for j in range(m+1)]
+        ways = [int(j <= band) for j in range(m+1)]
+        for i in range(1, n+1):
+            current, counts = [unreachable]*(m+1), [0]*(m+1)
+            if i <= band:
+                current[0], counts[0] = -5*i, 1
+            if starts[i] == 0:
+                trace[i][0] = 2
+            for j in range(max(1, i-band), min(m, i+band)+1):
+                same = target[i-1] == donor[j-1] and target[i-1] in known
+                values = (previous[j-1]+(3 if same else -4),
+                          previous[j]-5, current[j-1]-5)
+                best = max(values)
+                current[j] = best
+                trace[i][j-starts[i]] = values.index(best)+1
+                counts[j] = min(2, sum(c for v, c in zip(values, (ways[j-1], ways[j], counts[j-1])) if v == best))
+            previous, ways = current, counts
+        score = max(previous)
+        ends = [j for j, value in enumerate(previous) if value == score]
+        ambiguous = sum(ways[j] for j in ends) > 1
+        i, j = n, ends[0]
+        mapping = {}
+        while i:
+            direction = trace[i][j-starts[i]]
+            if direction == 1:
+                mapping[i-1] = j-1
+                i, j = i-1, j-1
+            elif direction == 2:
+                i -= 1
+            else:
+                j -= 1
+        mapping = dict(sorted(mapping.items()))
+    substitutions = [(i, j, target[i], donor[j]) for i, j in mapping.items()
+                     if target[i] != donor[j] or target[i] not in known]
+    used = set(mapping.values())
+    first, last = (min(used), max(used)) if used else (0, -1)
+    gaps = dict(target=[i for i in range(n) if i not in mapping],
+                donor=[j for j in range(first, last+1) if j not in used])
+    matches = len(mapping)-len(substitutions)
+    return dict(mapping=mapping, identity=matches/float(len(mapping)) if mapping else 0.,
+                coverage=len(mapping)/float(n), donor_coverage=len(mapping)/float(m),
+                substitutions=substitutions, gaps=gaps, ambiguous=ambiguous,
+                requires_confirmation=ambiguous, score=score, matches=matches,
+                target_sequence=target, donor_sequence=donor,
+                donor_range=(first, last) if used else None)
+
+
+def _af_replace_ca(row):
+    """One deterministic occupied carbon CA; preserve all donor altlocs later."""
+    import math
+    choices = []
+    for identity, properties, xyz in row['atoms']:
+        name, alt = identity[0].strip(), str(identity[1] or '').strip()
+        element = str(properties[2]).strip().upper() if len(properties) > 2 else ''
+        occupancy = float(properties[0])
+        if name == 'CA' and element in ('', 'C') and occupancy > 0:
+            point = list(map(float, xyz))
+            if len(point) != 3 or not all(math.isfinite(v) for v in point):
+                raise ValueError('Non-finite or invalid CA coordinates.')
+            choices.append(((not alt, occupancy, alt == 'A', alt), point))
+    return max(choices, key=lambda item: item[0])[1] if choices else None
+
+
+def _af_replace_robust_fit(moving, target, ca_cutoff=2.0):
+    """Donor -> target rigid fit, iterative pruning and local-domain seeds.
+
+    Start with ALL selected pairs, then deterministic contiguous windows. Pick
+    the largest consensus, not the smallest three-point RMSD. Report every
+    distance under the final operator, including pruned points.
+    """
+    import math
+    cutoff = float(ca_cutoff)
+    if not math.isfinite(cutoff) or cutoff <= 0:
+        raise ValueError('CA cutoff must be finite and positive (Angstrom).')
+    moving = [list(map(float, p)) for p in moving]
+    target = [list(map(float, p)) for p in target]
+    n = len(moving)
+    if n < 3 or n != len(target):
+        raise ValueError('At least three matched CA pairs are required.')
+    if any(len(p) != 3 or not all(math.isfinite(v) for v in p) for p in moving+target):
+        raise ValueError('Non-finite or invalid CA coordinates.')
+
+    def errors(operator):
+        return [math.sqrt(sum((a-b)**2 for a, b in zip(_ncs_transform(operator, p), q)))
+                for p, q in zip(moving, target)]
+
+    seeds = [tuple(range(n))]
+    for width in sorted({3, max(3, n//3), max(3, n//2)}):
+        if width >= n:
+            continue
+        starts = {int(round(k*(n-width)/float(min(11, n-width)))) for k in range(min(11, n-width)+1)}
+        seeds.extend(tuple(range(start, start+width)) for start in sorted(starts))
+    candidates = []
+    for seed in seeds:
+        keep = list(seed)
+        for iteration in range(n+1):
+            try:
+                operator = _ncs_rigid_fit([moving[i] for i in keep], [target[i] for i in keep])
+            except ValueError:
+                break
+            distances = errors(operator)
+            inliers = [i for i, d in enumerate(distances) if d <= cutoff+1e-9]
+            if len(inliers) >= 3:
+                rmsd = math.sqrt(sum(distances[i]**2 for i in inliers)/len(inliers))
+                candidates.append((len(inliers), -rmsd, operator, inliers, distances, iteration+1))
+            selected = [i for i in keep if distances[i] <= cutoff+1e-9]
+            if len(selected) == len(keep):
+                break
+            if len(selected) < 3:
+                # Large domain movements can spoil the initial all-pair fit.
+                count = max(3, int(math.ceil(.8*len(keep))))
+                if count == len(keep):
+                    break
+                selected = sorted(sorted(keep, key=lambda i: distances[i])[:count])
+            keep = selected
+    if not candidates:
+        raise ValueError('No non-collinear core of at least three CA pairs fits the cutoff.')
+    best = max(candidates, key=lambda c: c[:2])
+    _, _, operator, inliers, distances, iterations = best
+    # Refit the consensus; retain the seed operator if growing it loses support.
+    for _ in range(10):
+        fitted = _ncs_rigid_fit([moving[i] for i in inliers], [target[i] for i in inliers])
+        ds = errors(fitted)
+        selected = [i for i, d in enumerate(ds) if d <= cutoff+1e-9]
+        rmsd = math.sqrt(sum(ds[i]**2 for i in selected)/len(selected)) if selected else float('inf')
+        old_rmsd = math.sqrt(sum(distances[i]**2 for i in inliers)/len(inliers))
+        if (len(selected), -rmsd) < (len(inliers), -old_rmsd-1e-10):
+            break
+        unchanged = selected == inliers
+        operator, inliers, distances = fitted, selected, ds
+        if unchanged:
+            break
+    rmsd = math.sqrt(sum(distances[i]**2 for i in inliers)/len(inliers))
+    core_sets = {tuple(c[3]) for c in candidates if c[0] == len(inliers) and abs(-c[1]-rmsd) < .05}
+    return dict(operator=operator, distances=distances, inliers=inliers,
+                outliers=[i for i in range(n) if i not in set(inliers)], rmsd=rmsd,
+                rmsd_all=math.sqrt(sum(d*d for d in distances)/n),
+                core_fraction=len(inliers)/float(n), ambiguous_core=len(core_sets) > 1,
+                iterations=iterations, seed_count=len(seeds))
+
+
+def _af_replace_ca_distances(original, donor_rows, operator, target_specs=None):
+    """Distances keyed by TARGET spec; absent CA/mapping yields None."""
+    import math
+    result = {}
+    for spec in (target_specs if target_specs is not None else original):
+        a = _af_replace_ca(original[spec])
+        b = _af_replace_ca(donor_rows[spec]) if spec in donor_rows else None
+        result[spec] = (math.sqrt(sum((x-y)**2 for x, y in zip(a, _ncs_transform(operator, b))))
+                        if a is not None and b is not None else None)
+    return result
+
+
+def _af_replace_fragment(original, target_specs, donor_rows, mapping=None,
+                         ca_cutoff=2.0, steric_hook=None, mutate_substitutions=False):
+    """Build a preview, never edit a model or authorize a merge.
+
+    donor_rows is either a target-spec -> snapshot-row dict, or an ordered list
+    of snapshot rows. For a list, mapping optionally gives target-spec -> donor
+    row index. Main should align the FULL observed chain once, then pass this
+    mapping and only the clicked/active-chain target_specs for geometry fitting.
+    Without mapping a list is aligned to the supplied target_specs sequence.
+
+    fragment spans first..last CA-compatible records, INCLUDING internal loops
+    and unsupported/unmapped records. With mutate_substitutions, differing
+    residues use donor coordinates and are marked for native mutation. all_fragment covers
+    the whole request for an explicit whole-chain action. Missing CA does not
+    remove a residue from either fragment. Runs contain compatible consecutive
+    observed records, NOT promises of contiguous integer numbering. mean_b is
+    the unweighted heavy-atom mean of the ORIGINAL full requested region (all
+    altlocs); every inserted atom, including H, receives this B, not pLDDT.
+
+    steric_hook(original_copy, fragment_copy) is advisory; its return is exposed
+    as steric, and its exceptions propagate. It receives no live objects.
+    """
+    import copy
+    import math
+    amino = dict(zip(('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL').split(),
+                    'ARNDCQEGHILKMFPSTWYV'))
+    specs = [tuple(s) for s in target_specs]
+    if not specs or len(set(specs)) != len(specs):
+        raise ValueError('Select a non-empty set of unique target residue specs.')
+    if any(len(s) != 3 or not isinstance(s[0], str) or not isinstance(s[1], int)
+           or isinstance(s[1], bool) or not isinstance(s[2], str) for s in specs):
+        raise ValueError('Invalid target author residue specs.')
+    if len({s[0] for s in specs}) != 1:
+        raise ValueError('Replacement must target one chain.')
+    if specs != sorted(specs, key=lambda s: (s[1], s[2])):
+        raise ValueError('Target specs must be in author residue order.')
+    if any(s not in original for s in specs):
+        raise ValueError('A selected residue is absent from the original snapshot.')
+    # Omitting an observed residue must not turn two disjoint selections into
+    # a single deletion interval. Truly unobserved numbering gaps are allowed.
+    if any(s[0] == specs[0][0] and specs[0] < s < specs[-1] and s not in specs for s in original):
+        raise ValueError('Selection omits observed residues inside its boundary interval.')
+    cutoff = float(ca_cutoff)
+    if not math.isfinite(cutoff) or cutoff <= 0:
+        raise ValueError('CA cutoff must be finite and positive (Angstrom).')
+    alignment = None
+    if isinstance(donor_rows, dict):
+        if mapping is not None:
+            raise ValueError('Use either target-keyed donor rows or an explicit row-index mapping.')
+        mapped = {s: donor_rows[s] for s in specs if s in donor_rows}
+        mapping_result = {s: s for s in mapped}
+    else:
+        donor_rows = list(donor_rows)
+        if mapping is None:
+            alignment = _af_replace_alignment(''.join(amino.get(original[s]['name'], 'X') for s in specs),
+                                               ''.join(amino.get(r['name'], 'X') for r in donor_rows))
+            mapping = {specs[i]: j for i, j in alignment['mapping'].items()}
+        mapping_result = {s: mapping[s] for s in specs if s in mapping}
+        if any(not isinstance(j, int) or isinstance(j, bool) or not 0 <= j < len(donor_rows)
+               for j in mapping_result.values()):
+            raise ValueError('Donor mapping contains an invalid row index.')
+        indices = list(mapping_result.values())
+        if indices != sorted(set(indices)):
+            raise ValueError('Donor mapping must be one-to-one and ordered.')
+        mapped = {s: donor_rows[j] for s, j in mapping_result.items()}
+
+    def validate(row):
+        seen = set()
+        for identity, properties, xyz in row['atoms']:
+            key = (str(identity[0]).strip(), str(identity[1] or '').strip())
+            if key in seen:
+                raise ValueError('Duplicate atom name/altloc in a residue.')
+            seen.add(key)
+            if (len(xyz) != 3 or not all(math.isfinite(float(v)) for v in xyz)
+                    or len(properties) < 2 or not math.isfinite(float(properties[0]))
+                    or float(properties[0]) < 0):
+                raise ValueError('Non-finite or invalid atom coordinates/occupancy.')
+
+    preserved, substitutions, unsupported, unmapped = {}, [], [], []
+    matching = {}
+    b_values = []
+    for s in specs:
+        row = original[s]
+        validate(row)
+        for identity, properties, xyz in row['atoms']:
+            element = str(properties[2]).strip().upper() if len(properties) > 2 else ''
+            atom_name = str(identity[0]).strip().lstrip('0123456789').upper()
+            heavy = element not in ('H', 'D', 'T') if element else not atom_name.startswith(('H', 'D'))
+            if heavy:
+                b = properties[1]
+                if isinstance(b, (list, tuple)):
+                    raise ValueError('A scalar isotropic B factor is required for original heavy atoms.')
+                b = float(b)
+                if not math.isfinite(b) or b < 0:
+                    raise ValueError('Original heavy-atom B factors must be finite and non-negative.')
+                b_values.append(b)
+        if row['name'] not in amino or (s in mapped and mapped[s]['name'] not in amino):
+            unsupported.append(s)
+            preserved[s] = 'unsupported residue'
+        elif s not in mapped:
+            unmapped.append(s)
+            preserved[s] = 'unmapped residue'
+        elif row['name'] != mapped[s]['name']:
+            substitutions.append(s)
+            if mutate_substitutions and mapped[s]['atoms']:
+                validate(mapped[s])
+                matching[s] = mapped[s]
+            else:
+                preserved[s] = 'sequence substitution'
+        else:
+            validate(mapped[s])
+            if not mapped[s]['atoms']:
+                preserved[s] = 'empty donor residue'
+            else:
+                matching[s] = mapped[s]
+    if not b_values:
+        raise ValueError('The original selection has no heavy atoms for a local mean B.')
+    mean_b = sum(b_values)/len(b_values)
+    pairs, moving, fixed = [], [], []
+    for s in specs:
+        if s not in matching:
+            continue
+        a, b = _af_replace_ca(original[s]), _af_replace_ca(matching[s])
+        if a is not None and b is not None:
+            pairs.append(s)
+            fixed.append(a)
+            moving.append(b)
+    fit = _af_replace_robust_fit(moving, fixed, cutoff)
+    operator = fit['operator']
+    distances = _af_replace_ca_distances(original, matching, operator, specs)
+    compatible = [s for s in specs if distances[s] is not None and distances[s] <= cutoff+1e-9]
+    if len(compatible) < 3:
+        raise ValueError('At least three CA pairs must be compatible with the cutoff.')
+    all_fragment = {}
+    for s in specs:
+        row = matching.get(s)
+        if row is None:
+            all_fragment[s] = copy.deepcopy(original[s])
+        else:
+            atoms = []
+            for identity, properties, xyz in row['atoms']:
+                properties = copy.deepcopy(list(properties))
+                properties[1] = mean_b
+                atoms.append([copy.deepcopy(list(identity)), properties, _ncs_transform(operator, xyz)])
+            all_fragment[s] = dict(name=row['name'], atoms=atoms)
+    first, last = specs.index(compatible[0]), specs.index(compatible[-1])
+    recommended = specs[first:last+1]
+    fragment = {s: all_fragment[s] for s in recommended}
+    runs, run = [], []
+    for s in specs:
+        if s in compatible:
+            run.append(s)
+        elif run:
+            runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    skipped_gaps = [dict(left=a, right=b, missing_numbers=list(range(a[1]+1, b[1])))
+                    for a, b in zip(specs, specs[1:]) if b[1] > a[1]+1]
+    missing_ca = [s for s in specs if s in matching and distances[s] is None]
+    clipped = specs[:first]+specs[last+1:]
+    replaced = [s for s in recommended if s in matching]
+    internal_outliers = [s for s in recommended if distances[s] is not None and distances[s] > cutoff+1e-9]
+    steric = steric_hook(copy.deepcopy(original), copy.deepcopy(fragment)) if steric_hook is not None else None
+    return dict(fragment=fragment, all_fragment=all_fragment, operator=operator,
+                mapping=mapping_result, alignment=alignment, distances=distances, fit=fit,
+                pair_specs=pairs, runs=runs, range=(recommended[0], recommended[-1]),
+                recommended_specs=recommended, selected_specs=specs, clipped_specs=clipped,
+                skipped_gaps=skipped_gaps, insertion_specs=[s for s in specs if s[2]],
+                replaced_specs=replaced, all_replaced_specs=[s for s in specs if s in matching],
+                preserved_specs=[s for s in specs if s in preserved], preserved_reasons=preserved,
+                substitutions=substitutions, unsupported_specs=unsupported, unmapped_specs=unmapped,
+                mutation_targets={s: original[s]['name'] for s in substitutions
+                                  if mutate_substitutions and s in fragment and s in matching},
+                missing_ca_specs=missing_ca, internal_outlier_specs=internal_outliers,
+                mean_b=mean_b, ca_cutoff=cutoff, steric=steric,
+                whole_chain_compatible=(len(compatible) == len(specs)),
+                requires_confirmation=bool(substitutions or preserved or missing_ca or clipped or internal_outliers
+                                           or skipped_gaps or any(s[2] for s in specs)
+                                           or fit['ambiguous_core']
+                                           or (alignment and alignment['ambiguous'])),
+                requires_explicit_replace=True)
+
+
+def _af_replace_read_model(path):
+  if globals().get("gemmi") is None:
+    raise ValueError("Replacing from AlphaFold requires Gemmi in Coot's Python environment.")
+  structure = gemmi.read_structure(str(path))
+  if len(structure) != 1:
+    raise ValueError("Choose a single-model prediction, not an ensemble.")
+  result = []
+  reverse = {name: letter for letter, name in _REGISTER_AA.items()}
+  for chain in structure[0]:
+    rows = []
+    for residue in chain:
+      if residue.name not in reverse:
+        continue
+      # Gemmi adds the leading PDB space, but not the trailing four-column padding.
+      atoms = [[[atom.padded_name().ljust(4), atom.altloc.strip("\x00 ")],
+                [float(atom.occ), float(atom.b_iso), atom.element.name.rjust(2)],
+                [atom.pos.x, atom.pos.y, atom.pos.z]] for atom in residue]
+      if not atoms:
+        continue
+      rows.append(dict(name=residue.name, atoms=atoms, number=residue.seqid.num, ins=residue.seqid.icode.strip()))
+    if rows:
+      result.append(dict(chain=chain.name, rows=rows, sequence="".join(reverse[r["name"]] for r in rows)))
+  if not result:
+    raise ValueError("The donor file contains no standard protein residues.")
+  return result
+
+
+def _af_replace_download(record, cancel=None):
+  """Cache the actual URL/version supplied by AFDB, never a guessed latest URL."""
+  import urllib.request
+  from urllib.parse import urlparse
+  url = str(record.get("cifUrl") or record.get("pdbUrl") or "")
+  parsed = urlparse(url)
+  allowed = {"alphafold.ebi.ac.uk"}
+  if record.get("provider") == "BFVD" and re.fullmatch(r"/pdb/[A-Z0-9]+(?:-\d+)?\.pdb", parsed.path):
+    allowed.add("bfvd.steineggerlab.workers.dev")
+  if parsed.scheme != "https" or parsed.hostname not in allowed or parsed.username or parsed.password:
+    raise ValueError("AFDB did not provide a supported official model URL.")
+  suffix = ".cif" if ".cif" in parsed.path else ".pdb"
+  cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "Coot", "alphafold-replace")
+  os.makedirs(cache, mode=0o700, exist_ok=True)
+  path = os.path.join(cache, hashlib.sha256(url.encode()).hexdigest()+suffix)
+  if os.path.isfile(path):
+    try:
+      _af_replace_read_model(path)
+      return path
+    except (ValueError, RuntimeError, OSError):
+      pass
+  temporary = None
+  try:
+    request = urllib.request.Request(url, headers={"User-Agent": "Coot-Trimmings-AlphaFold/1"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+      if urlparse(response.geturl()).hostname != parsed.hostname:
+        raise ValueError("Refusing a model download redirected outside its database host.")
+      with tempfile.NamedTemporaryFile(dir=cache, suffix=suffix, delete=False) as handle:
+        temporary = handle.name
+        size = 0
+        while True:
+          if cancel is not None and cancel.is_set():
+            raise RuntimeError("Download cancelled.")
+          data = response.read(256*1024)
+          if not data:
+            break
+          size += len(data)
+          if size > 64*1024*1024:
+            raise ValueError("The prediction exceeds the 64 MB model limit.")
+          handle.write(data)
+    _af_replace_read_model(temporary)
+    os.replace(temporary, path)
+    temporary = None
+    return path
+  finally:
+    if temporary and os.path.exists(temporary):
+      os.unlink(temporary)
+
+
+def _af_replace_uniprot_json(path, limit=8*1024*1024):
+  import urllib.request
+  from urllib.parse import urlparse
+  url = "https://rest.uniprot.org/"+path
+  if urlparse(url).hostname != "rest.uniprot.org" or path.startswith(("/", "\\")):
+    raise ValueError("Invalid UniProt lookup path.")
+  request = urllib.request.Request(url, headers={"User-Agent": "Coot-Trimmings-AlphaFold/1", "Accept": "application/json"})
+  with urllib.request.urlopen(request, timeout=10) as response:
+    if urlparse(response.geturl()).hostname != "rest.uniprot.org":
+      raise ValueError("UniProt redirected outside its database host.")
+    data = response.read(limit+1)
+  if len(data) > limit:
+    raise ValueError("The UniProt response is too large.")
+  return json.loads(data)
+
+
+def _af_replace_uniprot_accessions(sequence):
+  """Resolve sequence history too; current accession sequences are checked later."""
+  from urllib.parse import urlencode
+  cache = getattr(_af_replace_uniprot_accessions, "_cache", {})
+  if sequence in cache and time.monotonic()-cache[sequence][0] < 3600:
+    return list(cache[sequence][1])
+  data = _af_replace_uniprot_json("uniparc/search?"+urlencode(dict(
+      query="checksum:"+hashlib.md5(sequence.encode("ascii")).hexdigest(), format="json", size=100)))
+  accessions = []
+  for item in data.get("results", []):
+    if item.get("sequence", {}).get("value") != sequence:
+      raise ValueError("UniParc checksum lookup returned a different sequence.")
+    for value in item.get("uniProtKBAccessions", []):
+      accession = str(value).split(".", 1)[0]
+      if re.fullmatch(r"[A-Z0-9]{6,10}", accession) and accession not in accessions:
+        accessions.append(accession)
+  if len(cache) >= 64:
+    cache.pop(next(iter(cache)))
+  cache[sequence] = (time.monotonic(), list(accessions))
+  _af_replace_uniprot_accessions._cache = cache
+  return accessions
+
+
+def _af_replace_afdb_json(url, limit):
+  import urllib.request
+  from urllib.parse import urlparse
+  parsed = urlparse(url)
+  if parsed.scheme != "https" or parsed.hostname != "alphafold.ebi.ac.uk" or parsed.username or parsed.password:
+    raise ValueError("Invalid AlphaFold DB lookup URL.")
+  request = urllib.request.Request(url, headers={"User-Agent": "Coot-Trimmings-AlphaFold/1"})
+  with urllib.request.urlopen(request, timeout=10) as response:
+    if urlparse(response.geturl()).hostname != parsed.hostname:
+      raise ValueError("AlphaFold DB redirected outside its database host.")
+    data = response.read(limit+1)
+  if len(data) > limit:
+    raise ValueError("The AlphaFold DB response is too large.")
+  return json.loads(data)
+
+
+def _af_replace_bfvd_models(sequence, identifier="", progress=None, cancel=None):
+  """Resolve exact UniParc checksums or a supplied UniProt ID, then probe BFVD."""
+  import urllib.request
+  from urllib.parse import urlencode, urlparse
+  from urllib.error import HTTPError
+  records = []
+  identifier = str(identifier).strip().upper()
+  if identifier:
+    match = re.fullmatch(r"(?:BFVD-|AF-)?([A-Z0-9]{3,20}(?:-\d+)?)(?:-F\d+)?", identifier)
+    if match is None:
+      raise ValueError("Enter a UniProt accession, AFDB ID or BFVD ID.")
+    accession = match.group(1)
+    try:
+      data = _af_replace_uniprot_json("uniprotkb/"+accession+".json")
+    except HTTPError as error:
+      if error.code in (404, 410):
+        return []
+      raise
+    candidate_sequence = data.get("sequence", {}).get("value", "")
+    records = [(str(data.get("primaryAccession") or accession), candidate_sequence)]
+  else:
+    if progress:
+      progress("Checking UniProt accessions for an exact BFVD sequence match...")
+    records = [(accession, sequence) for accession in _af_replace_uniprot_accessions(sequence)]
+  from concurrent.futures import ThreadPoolExecutor, wait
+  records = list(dict(records).items())
+  def probe(accession, candidate_sequence):
+    if not candidate_sequence:
+      return None
+    if cancel is not None and cancel.is_set():
+      raise RuntimeError("Search cancelled.")
+    url = "https://bfvd.steineggerlab.workers.dev/pdb/"+accession+".pdb"
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Coot-Trimmings-AlphaFold/1"})
+    try:
+      with urllib.request.urlopen(request, timeout=5) as response:
+        if urlparse(response.geturl()).hostname != "bfvd.steineggerlab.workers.dev":
+          raise ValueError("BFVD redirected outside its database host.")
+    except HTTPError as error:
+      if error.code in (404, 410):
+        return None
+      if error.code in (403, 405, 501):
+        # Some object stores refuse HEAD while allowing their public GET URL.
+        request = urllib.request.Request(url, headers={"User-Agent": "Coot-Trimmings-AlphaFold/1", "Range": "bytes=0-0"})
+        try:
+          with urllib.request.urlopen(request, timeout=5) as response:
+            if urlparse(response.geturl()).hostname != "bfvd.steineggerlab.workers.dev":
+              raise ValueError("BFVD redirected outside its database host.")
+            response.read(1)
+        except HTTPError as missing:
+          if missing.code in (404, 410):
+            return None
+          raise
+      else:
+        raise
+    return dict(provider="BFVD", entryId="BFVD-"+accession, uniprotAccession=accession,
+                sequence=candidate_sequence, pdbUrl=url)
+  pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coot-bfvd")
+  futures = {pool.submit(probe, accession, seq): accession for accession, seq in records}
+  pending, found, errors = set(futures), {}, []
+  deadline = time.monotonic()+15
+  try:
+    while pending and time.monotonic() < deadline:
+      if cancel is not None and cancel.is_set():
+        raise RuntimeError("Search cancelled.")
+      done, pending = wait(pending, timeout=.1)
+      for future in done:
+        try:
+          record = future.result()
+          if record is not None:
+            found[futures[future]] = record
+        except (OSError, ValueError) as error:
+          errors.append(error)
+    if pending and progress:
+      progress("Some BFVD checks timed out; enter an accession to retry a specific model.")
+    if not found and (errors or pending):
+      raise ValueError("BFVD lookup incomplete; retry an accession. "+(str(errors[0]) if errors else "Service timed out."))
+  finally:
+    for future in pending:
+      future.cancel()
+    pool.shutdown(wait=False, cancel_futures=True)
+  return [found[accession] for accession, _ in records if accession in found]
+
+
+def _af_replace_find_models(sequence, identifier="", progress=None, cancel=None, include_bfvd=False):
+  from urllib.parse import urlencode
+  from urllib.error import HTTPError
+  sequence = _register_clean_sequence(sequence)
+  identifier = str(identifier).strip().upper()
+  if cancel is not None and cancel.is_set():
+    raise RuntimeError("Search cancelled.")
+  key = (sequence, identifier, bool(include_bfvd))
+  cache = getattr(_af_replace_find_models, "_cache", {})
+  if key in cache and time.monotonic()-cache[key][0] < 3600:
+    if progress:
+      progress("Using cached prediction matches...")
+    return [dict(record) for record in cache[key][1]]
+  started = time.monotonic()
+  warnings = []
+  result, seen = [], set()
+  def remember(records):
+    if len(cache) >= 64:
+      cache.pop(next(iter(cache)))
+    cache[key] = (time.monotonic(), [dict(record) for record in records])
+    _af_replace_find_models._cache = cache
+    return records
+  def predictions(identifiers):
+    # Independent metadata lookups must not serialize dozens of network waits.
+    from concurrent.futures import ThreadPoolExecutor, wait
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coot-afdb-metadata")
+    identifiers = list(dict.fromkeys(value for value in identifiers if re.fullmatch(
+        r"(?:AF-)?[A-Z0-9]+(?:-\d+)?(?:-F\d+)?", value)))
+    futures = {pool.submit(_af_replace_afdb_json,
+        "https://alphafold.ebi.ac.uk/api/prediction/"+value, 8*1024*1024): value for value in identifiers}
+    pending = set(futures)
+    received = {}
+    deadline = time.monotonic()+15
+    try:
+      while pending and time.monotonic() < deadline:
+        if cancel is not None and cancel.is_set():
+          raise RuntimeError("Search cancelled.")
+        done, pending = wait(pending, timeout=.1)
+        for future in done:
+          value = futures[future]
+          try:
+            received[value] = future.result()
+          except HTTPError as error:
+            if error.code != 404:
+              warnings.append(f"AFDB HTTP {error.code}")
+          except (OSError, ValueError) as error:
+            warnings.append(str(error))
+      if pending:
+        warnings.append("Some AFDB metadata requests timed out")
+    finally:
+      for future in pending:
+        future.cancel()
+      pool.shutdown(wait=False, cancel_futures=True)
+    for value in identifiers:
+      for record in received.get(value, []):
+        entry = str(record.get("entryId") or record.get("modelEntityId") or "")
+        if (entry in seen or not (record.get("cifUrl") or record.get("pdbUrl"))
+            or (value.startswith("AF-") and entry != value)):
+          continue
+        seen.add(entry)
+        result.append(record)
+  bfvd_only = str(identifier).strip().upper().startswith("BFVD-")
+  def bfvd_lookup():
+    try:
+      return _af_replace_bfvd_models(sequence, identifier, progress, cancel)
+    except Exception as error:
+      if bfvd_only or (cancel is not None and cancel.is_set()):
+        raise
+      warnings.append("BFVD: "+str(error))
+      return []
+  if bfvd_only:
+    bfvd = bfvd_lookup()
+    if not bfvd:
+      raise ValueError("No BFVD model is available for this UniProt accession.")
+    return remember(bfvd)
+  if not identifier.strip() and (len(sequence) < 20 or set(sequence)-set(_REGISTER_AA)):
+    raise ValueError("Sequence lookup needs at least 20 known residues. Supply an accession or a local prediction.")
+  identifiers = []
+  if identifier.strip():
+    identifier = identifier.strip().upper()
+    if not re.fullmatch(r"(?:AF-)?[A-Z0-9]{3,20}(?:-\d+)?(?:-F\d+)?", identifier):
+      raise ValueError("Enter a UniProt accession or AFDB ID, or leave it blank to search by sequence.")
+    identifiers.append(identifier)
+  else:
+    if progress:
+      progress("Looking for an exact sequence match...")
+    try:
+      data = _af_replace_afdb_json("https://alphafold.ebi.ac.uk/api/sequence/summary?"+
+          urlencode(dict(id=hashlib.md5(sequence.encode("ascii")).hexdigest(), type="md5", rows=1000)), 8*1024*1024)
+    except HTTPError as error:
+      if error.code != 404:
+        warnings.append(f"AFDB exact lookup HTTP {error.code}")
+      data = {}
+    except OSError as error:
+      warnings.append("AFDB exact lookup: "+str(error))
+      data = {}
+    if data and data.get("entry", {}).get("sequence") != sequence:
+      raise ValueError("AFDB's exact sequence response did not match the query.")
+    for item in data.get("structures", []):
+      identifier = item.get("summary", {}).get("model_identifier", "")
+      if re.fullmatch(r"AF-[A-Z0-9]+(?:-\d+)?-F\d+", str(identifier)):
+        identifiers.append(str(identifier))
+    predictions(identifiers)
+    if result:
+      return remember(result)
+    if progress:
+      progress("Resolving UniProt accessions by sequence checksum...")
+    try:
+      identifiers = _af_replace_uniprot_accessions(sequence)
+    except (OSError, ValueError) as error:
+      warnings.append("UniParc: "+str(error))
+      identifiers = []
+    predictions(identifiers)
+    if result:
+      return remember(result)
+    if include_bfvd:
+      bfvd = bfvd_lookup()
+      if bfvd:
+        return remember(bfvd)
+    if not result:
+      if progress:
+        progress("Searching AFDB for close sequences (up to 30 seconds)...")
+      url = "https://alphafold.ebi.ac.uk/api/search?"+urlencode(dict(q=sequence, type="sequence", start=0, rows=50))
+      deadline = time.monotonic()+30
+      while True:
+        if cancel is not None and cancel.is_set():
+          raise RuntimeError("Search cancelled.")
+        try:
+          data = _af_replace_afdb_json(url, 16*1024*1024)
+        except (OSError, ValueError) as error:
+          raise ValueError("AFDB sequence search is unavailable. Enter a UniProt accession or use a local prediction. "
+                           "Details: "+str(error)) from error
+        if not str(data.get("message", "")).startswith(("Job for sequence", "Search in progress")):
+          break
+        if time.monotonic() >= deadline:
+          raise RuntimeError("AFDB is still searching. Retry shortly to use its cached result, or enter a UniProt accession.")
+        if cancel is not None:
+          cancel.wait(2)
+        else:
+          time.sleep(2)
+      identifiers = [str(r.get("entryId") or r.get("modelEntityId") or r.get("uniprotAccession") or "")
+                     for r in data.get("docs", []) if not r.get("isComplex")]
+      if int(data.get("numFound", 0) or 0) > 50 and progress:
+        progress("Checking the first 50 AFDB hits. Use an accession if the desired model is not listed.")
+  predictions(identifiers)
+  if not result and include_bfvd and identifier:
+    result = bfvd_lookup()
+  if not result:
+    detail = " ("+warnings[-1]+")" if warnings else ""
+    raise ValueError("No prediction found. Try a UniProt accession or a local prediction."+detail)
+  if progress:
+    progress(f"Found {len(result)} prediction(s) in {time.monotonic()-started:.1f}s.")
+  return remember(result)
+
+
+def _af_replace_target(model, chain, specs=None):
+  _ncs_require_idle(model)
+  if coot.n_models(model) != 1:
+    raise ValueError("Choose a single-model molecule, not an ensemble.")
+  snapshot = _model_coordinate_snapshot(model)
+  reverse = {name: letter for letter, name in _REGISTER_AA.items()}
+  reverse["MSE"] = "M"
+  ordered = sorted(s for s, row in snapshot.items() if s[0] == chain and row["name"] in reverse)
+  selected = ordered if specs is None else sorted(tuple(s) for s in specs)
+  if not selected or len(set(selected)) != len(selected) or any(s not in ordered for s in selected):
+    raise ValueError("Select protein residues with assigned identities in one chain.")
+  numbered = [dict(number=s[1], ins=s[2], name=snapshot[s]["name"]) for s in ordered]
+  sequence = "".join(reverse[snapshot[s]["name"]] for s in ordered)
+  reference, description = _register_reference_sequence(model, chain, numbered)
+  if description.startswith("Model-derived"):
+    try:
+      full = _pae_reference_sequences(model, snapshot).get(chain)
+      if full:
+        reference, description = full, "mmCIF reference sequence loaded."
+    except (ValueError, OSError, RuntimeError):
+      pass
+  row_map = {spec: i for i, spec in enumerate(ordered)}
+  alignment_sequence = sequence
+  if reference and not set(reference)-set(_REGISTER_AA) and not description.startswith("Model-derived"):
+    try:
+      mapped, changes = _pae_sequence_rows([dict(spec=s, letter=reverse[snapshot[s]["name"]]) for s in ordered], reference)
+      row_map = dict(zip(ordered, mapped))
+      alignment_sequence = reference
+    except ValueError:
+      pass
+  query = reference if reference and not set(reference)-set(_REGISTER_AA) else sequence
+  if query == sequence and any(b[1] != a[1]+1 or a[2] or b[2] for a, b in zip(ordered, ordered[1:])):
+    runs = [[]]
+    for spec in ordered:
+      if runs[-1] and (spec[1] != runs[-1][-1][1]+1 or spec[2] or runs[-1][-1][2]):
+        runs.append([])
+      runs[-1].append(spec)
+    run = max(runs, key=lambda row: (len(set(row).intersection(selected)), len(row)))
+    query = "".join(reverse[snapshot[s]["name"]] for s in run)
+  return dict(model=model, chain=chain, specs=selected, ordered=ordered, sequence=sequence, query=query,
+              snapshot=snapshot, signature=_register_shift_model_signature(model), name=coot.molecule_name(model),
+              description=description, alignment_sequence=alignment_sequence, row_map=row_map,
+              has_reference=bool(reference and not description.startswith("Model-derived") and alignment_sequence == reference),
+              sequences=[list(item) for item in coot.sequence_info_py(model) or []])
+
+
+def _af_replace_assess(target, sequence):
+  alignment = _af_replace_alignment(target.get("alignment_sequence", target["sequence"]), sequence)
+  if alignment["ambiguous"]:
+    raise ValueError("Sequence mapping is ambiguous. Use a complete reference sequence or a larger unique region.")
+  mapping = alignment["mapping"]
+  indices = {spec: i for i, spec in enumerate(target["ordered"])}
+  selected = [(spec, indices[spec]) for spec in target["specs"]]
+  row_map = target.get("row_map", indices)
+  covered = [(spec, i, mapping[row_map[spec]]) for spec, i in selected if row_map[spec] in mapping]
+  if not covered:
+    raise ValueError("The prediction does not cover the selected residues.")
+  changes = [(spec, target["sequence"][i], sequence[j]) for spec, i, j in covered
+             if target["sequence"][i] != sequence[j]]
+  identity = 1.-len(changes)/len(covered)
+  coverage = len(covered)/len(selected)
+  close_enough = identity >= .99-1e-10 or len(changes) <= 2
+  if not close_enough or coverage < 1.-1e-10:
+    raise ValueError("A match must cover every selected residue and have at least 99% identity or at most two substitutions.")
+  return dict(identity=identity, coverage=coverage, changes=changes, alignment=alignment,
+              mapping={spec: mapping[row_map[spec]] for spec, i in selected if row_map[spec] in mapping})
+
+
+def _af_replace_prepare(target, donors, cutoff=2.):
+  candidates = []
+  errors = []
+  for donor in donors:
+    try:
+      assessed = _af_replace_assess(target, donor["sequence"])
+      result = _af_replace_fragment(target["snapshot"], target["specs"], donor["rows"],
+                                    mapping=assessed["mapping"], ca_cutoff=float(cutoff), mutate_substitutions=True)
+      result["rmsd"], result["b_factor"] = result["fit"]["rmsd"], result["mean_b"]
+      if result["fit"]["core_fraction"] < .5:
+        raise ValueError("Less than half the selected C-alpha sites agree. Select a smaller domain or adjust the cutoff.")
+      if result["fit"]["ambiguous_core"]:
+        raise ValueError("Several structural cores match equally well. Select a smaller region.")
+      candidates.append((result, assessed, donor))
+    except ValueError as error:
+      errors.append(str(error))
+  if not candidates:
+    raise ValueError(errors[0] if errors else "No usable donor chain found.")
+  candidates.sort(key=lambda item: (-len(item[0]["fragment"]), item[0]["rmsd"]))
+  if len(candidates) > 1 and len(candidates[0][0]["fragment"]) == len(candidates[1][0]["fragment"]) and abs(candidates[0][0]["rmsd"]-candidates[1][0]["rmsd"]) < .05:
+    raise ValueError("Several donor chains match equally well. Supply a single-chain prediction.")
+  result, assessed, donor = candidates[0]
+  result.update(assessment=assessed, donor_chain=donor["chain"], donor_sequence=donor["sequence"])
+  result["source"] = os.path.basename(donor["source_path"])+" / "+donor["chain"] if donor.get("source_path") else "prediction chain "+donor["chain"]
+  return result
+
+
+def _af_replace_provenance(hit):
+  record = hit.get("record")
+  if record is None:
+    return str(hit.get("label") or "local prediction")
+  entry = str(record.get("entryId") or record.get("modelEntityId") or hit.get("label") or "prediction")
+  accession = str(record.get("uniprotAccession") or "")
+  if not accession:
+    match = re.fullmatch(r"(?:AF-|BFVD-)([A-Z0-9]+(?:-\d+)?)(?:-F\d+)?", entry)
+    accession = match.group(1) if match else ""
+  version = record.get("latestVersion")
+  downloaded_version = re.search(r"_v(\d+)\.(?:cif|pdb)(?:\.gz)?(?:$|\?)", str(record.get("cifUrl") or record.get("pdbUrl") or ""))
+  if downloaded_version:
+    version = downloaded_version.group(1)
+  if version is not None:
+    entry += " v"+str(version)
+  return entry+(" (UniProt "+accession+")" if accession else "")
+
+
+def _af_replace_reference(target, result):
+  """Full target sequence, overlaying every observed identity, never donor mutations."""
+  ordered = target["ordered"]
+  if target.get("has_reference"):
+    sequence = target["alignment_sequence"]
+    positions = dict(target["row_map"])
+  else:
+    sequence = result.get("reference_sequence") or result.get("donor_sequence") or ""
+    aligned = _af_replace_alignment(target["sequence"], sequence) if sequence else None
+    if (aligned and not aligned["ambiguous"] and aligned["coverage"] == 1.
+        and (aligned["identity"] >= .99-1e-10 or
+             len(aligned["substitutions"]) <= 2)):
+      positions = {spec: aligned["mapping"][i] for i, spec in enumerate(ordered)}
+    else:
+      # Keep known target identities and unknown-numbered gaps, rather than inventing them.
+      if any(spec[2] for spec in ordered):
+        sequence = target["sequence"]
+        positions = {spec: i for i, spec in enumerate(ordered)}
+      else:
+        first, last = min(s[1] for s in ordered), max(s[1] for s in ordered)
+        if last-first >= 100000:
+          raise ValueError("Target numbering is too sparse for a safe sequence association.")
+        sequence = "X"*(last-first+1)
+        positions = {spec: spec[1]-first for spec in ordered}
+  letters = list(_register_clean_sequence(sequence))
+  if len(set(positions.values())) != len(positions) or set(positions) != set(ordered):
+    raise ValueError("Cannot associate the target sequence with an ambiguous residue mapping.")
+  for index, spec in enumerate(ordered):
+    position = positions[spec]
+    if not isinstance(position, int) or not 0 <= position < len(letters):
+      raise ValueError("Target sequence mapping lies outside its reference.")
+    letters[position] = target["sequence"][index]
+  origins = {spec[1]-position for spec, position in positions.items() if not spec[2]}
+  origin = next(iter(origins)) if len(origins) == 1 else None
+  return "".join(letters), origin
+
+
+def _af_replace_validate_atoms(fragment, dictionaries=None):
+  """Check exact native dictionary identifiers before any source-model edit."""
+  dictionaries = {} if dictionaries is None else dictionaries
+  getter = getattr(coot, "monomer_restraints_py", None)
+  if not callable(getter):
+    raise ValueError("This Coot build cannot validate prediction atom names safely.")
+  for spec, residue in fragment.items():
+    name = residue["name"]
+    if name not in dictionaries:
+      restraints = getter(name)
+      rows = restraints.get("_chem_comp_atom", []) if isinstance(restraints, dict) else []
+      dictionaries[name] = {row[0]: str(row[1]).strip().upper() for row in rows}
+      if not dictionaries[name]:
+        raise ValueError("No atom dictionary available for "+name+"; original unchanged.")
+    expected = dictionaries[name]
+    for identity, properties, _xyz in residue["atoms"]:
+      atom_name = identity[0]
+      if atom_name not in expected:
+        raise ValueError(f"Prediction atom {spec} {name} {atom_name!r} does not match Coot's dictionary; original unchanged.")
+      if str(properties[2]).strip().upper() != expected[atom_name]:
+        raise ValueError(f"Prediction atom {spec} {atom_name!r} has the wrong element; original unchanged.")
+  return dictionaries
+
+
+def _af_replace_mutate_candidate(candidate, mutations, b_factor):
+  if not mutations:
+    return
+  before = _model_coordinate_snapshot(candidate)
+  for spec, name in mutations.items():
+    if spec not in before or name not in set(_REGISTER_AA.values()):
+      raise ValueError("Invalid target residue for prediction mutation.")
+    if coot.mutate(candidate, *spec, name) != 1:
+      raise ValueError(f"Could not mutate prediction residue {spec} to {name}; original unchanged.")
+  after = _model_coordinate_snapshot(candidate)
+  changes = []
+  for spec, name in mutations.items():
+    row = after.get(spec)
+    if row is None or row["name"] != name:
+      raise ValueError("Prediction mutation did not produce the target residue type.")
+    old_atoms = {tuple(a[0]): a for a in before[spec]["atoms"]}
+    new_atoms = {tuple(a[0]): a for a in row["atoms"]}
+    for identity, atom in old_atoms.items():
+      if identity[0].strip() in {"N", "CA", "C", "O"}:
+        updated = new_atoms.get(identity)
+        if updated is None or max(abs(a-b) for a, b in zip(atom[2], updated[2])) > 1e-5:
+          raise ValueError("Mutation changed the prediction backbone; original unchanged.")
+    changes.extend([candidate, *spec, *atom[0], "B", float(b_factor)] for atom in row["atoms"])
+  coot.set_atom_attributes_py(changes)
+
+
+def _af_replace_apply(target, result, rigid_map=None):
+  model, chain = target["model"], target["chain"]
+  _ncs_require_idle(model)
+  if coot.molecule_name(model) != target["name"] or _model_coordinate_snapshot(model) != target["snapshot"]:
+    raise ValueError("The original model changed. Close this tool and select the region again.")
+  if "sequences" in target and sorted(coot.sequence_info_py(model) or []) != sorted(target["sequences"]):
+    raise ValueError("The model's sequence association changed. Close this tool and select the region again.")
+  if coot.backup_state(model) != 1:
+    raise ValueError("Enable Coot backups before replacing coordinates.")
+  if any(len(s[0]) > 1 for s in target["snapshot"]) and not target["name"].endswith((".cif", ".mmcif", ".mmCIF")):
+    raise ValueError("Save the target as mmCIF and reopen this tool first. PDB backups cannot safely preserve multi-character chain IDs.")
+  reference = _af_replace_reference(target, result)
+  fragment = result["fragment"]
+  dictionaries = _af_replace_validate_atoms(fragment)
+  expression, _ = _ncs_symmetry_expression(fragment, dict(groups=[], missing=[]))
+  view = _capture_view_state()
+  candidate = coot.add_molecule_py(expression, "AlphaFold replacement (temporary).cif")
+  _restore_view_state(view)
+  if candidate == model or not valid_model_molecule_qm(candidate):
+    raise RuntimeError("Could not create the replacement fragment.")
+  try:
+    coot.set_mol_displayed(candidate, 0)
+    mutations = result.get("mutation_targets", {})
+    _af_replace_mutate_candidate(candidate, mutations, result["b_factor"])
+    if rigid_map is not None:
+      if not coot.is_valid_map_molecule(rigid_map):
+        raise ValueError("The refinement map was closed. Disable rigid fitting or reopen the tool.")
+      previous_map = coot.imol_refinement_map()
+      previous_replacement = coot.refinement_immediate_replacement_state()
+      try:
+        coot.set_imol_refinement_map(rigid_map)
+        coot.set_refinement_immediate_replacement(1)
+        coot.rigid_body_refine_by_atom_selection(candidate, "//")
+        coot.accept_regularizement()
+      finally:
+        if coot.refinement_already_ongoing_p():
+          coot.clear_up_moving_atoms()
+        coot.set_imol_refinement_map(previous_map)
+        coot.set_refinement_immediate_replacement(previous_replacement)
+    actual = _model_coordinate_snapshot(candidate)
+    _af_replace_validate_atoms(actual, dictionaries)
+    if rigid_map is not None:
+      # Unsupported or unmapped residues retain their original coordinates.
+      for spec in result.get("preserved_specs", []):
+        if spec in actual:
+          original_row = fragment[spec]
+          for atom in original_row["atoms"]:
+            coot.set_atom_attributes_py([[candidate, *spec, *atom[0], axis, atom[2][i]] for i, axis in enumerate("xyz")])
+      actual = _model_coordinate_snapshot(candidate)
+    if actual.keys() != fragment.keys() or any(actual[s]["name"] != mutations.get(s, fragment[s]["name"]) for s in actual):
+      raise ValueError("The replacement fragment's residue identities changed unexpectedly.")
+    specs = sorted(actual)
+    plan = _register_merge_plan(target["snapshot"], actual, chain, specs[0][1], specs[-1][1], 0,
+                                selected_specs=specs)
+    _apply_register_comparison_merge(model, dict(model=candidate), chain, plan, target["signature"],
+                                     _register_shift_model_signature(candidate), reference=reference, preserve_sequences=True)
+    kept = len(set(specs).intersection(result.get("preserved_specs", [])))
+    return dict(replaced=len(specs), donor_replaced=len(specs)-kept, kept=kept, trimmed=len(plan["trim"]),
+                first=specs[0], last=specs[-1], b_factor=result["b_factor"], source=result.get("source", "prediction"),
+                sequence_associated=True, sequence_origin=reference[1], mutated=len(mutations))
+  finally:
+    if valid_model_molecule_qm(candidate):
+      coot.close_molecule(candidate)
+
+
+def _af_replace_wire(value, decode=False):
+  """JSON-only IPC, preserving author-spec tuple keys without executable data."""
+  if decode:
+    if isinstance(value, list):
+      return [_af_replace_wire(v, True) for v in value]
+    if isinstance(value, dict):
+      if "tuple" in value:
+        return tuple(_af_replace_wire(v, True) for v in value["tuple"])
+      return {_af_replace_wire(k, True): _af_replace_wire(v, True) for k, v in value["dict"]}
+    return value
+  if isinstance(value, dict):
+    return {"dict": [[_af_replace_wire(k), _af_replace_wire(v)] for k, v in value.items()]}
+  if isinstance(value, tuple):
+    return {"tuple": [_af_replace_wire(v) for v in value]}
+  if isinstance(value, list):
+    return [_af_replace_wire(v) for v in value]
+  return value
+
+
+def _af_replace_job(operation, payload, progress=None):
+  target = payload["target"]
+  if operation == "find":
+    records = _af_replace_find_models(target["query"], payload["identifier"], progress,
+                                      include_bfvd=payload["include_bfvd"])
+    hits = []
+    for record in records:
+      sequence = str(record.get("sequence") or record.get("uniprotSequence") or "").upper()
+      try:
+        assessed = _af_replace_assess(target, sequence)
+      except ValueError:
+        continue
+      hits.append(dict(label=str(record.get("entryId") or record.get("modelEntityId")),
+                       record=record, assessment=assessed))
+    return sorted(hits, key=lambda h: (-h["assessment"]["identity"], h["label"]))
+  if operation == "local":
+    path = payload["path"]
+    if os.path.getsize(path) > 64*1024*1024:
+      raise ValueError("Choose a prediction smaller than 64 MB.")
+    hits = []
+    for donor in _af_replace_read_model(path):
+      try:
+        assessed = _af_replace_assess(target, donor["sequence"])
+      except ValueError:
+        continue
+      hits.append(dict(label=f"{os.path.basename(path)} / {donor['chain']}", donor=donor, assessment=assessed))
+    return hits
+  if operation != "prepare":
+    raise ValueError("Unknown prediction task.")
+  hit = payload["hit"]
+  source = _af_replace_provenance(hit)
+  started = time.monotonic()
+  if "donor" in hit:
+    donors = [hit["donor"]]
+  else:
+    if progress:
+      progress("Downloading "+source+"...")
+    path = _af_replace_download(hit["record"])
+    if progress:
+      progress("Reading "+source+"...")
+    donors = _af_replace_read_model(path)
+  downloaded = time.monotonic()
+  if progress:
+    progress("Aligning "+source+"...")
+  result = _af_replace_prepare(target, donors, payload["cutoff"])
+  result["source"] = source
+  record = hit.get("record", {})
+  result["reference_sequence"] = record.get("sequence") or record.get("uniprotSequence") or result["donor_sequence"]
+  result["timings"] = dict(download_and_read=downloaded-started, alignment=time.monotonic()-downloaded)
+  if result["assessment"]["identity"] < 1.-1e-10 and not payload["accepted_close"]:
+    raise ValueError("The downloaded model has substitutions. Confirm the close match before replacing.")
+  return result
+
+
+def _af_replace_worker_main():
+  import sys
+  with open(sys.argv[1]) as handle:
+    request = _af_replace_wire(json.load(handle), True)
+  def progress(message):
+    print(json.dumps(dict(progress=str(message))), flush=True)
+  try:
+    value = _af_replace_job(request["operation"], request["payload"], progress)
+    response = dict(result=_af_replace_wire(value))
+  except Exception as error:
+    response = dict(error=str(error))
+  with open(sys.argv[2], "w") as handle:
+    json.dump(response, handle)
+
+
+def _af_replace_start_job(operation, payload):
+  """No Python worker thread: Coot's native GTK loop can starve its interpreter."""
+  import inspect
+  import shutil
+  import subprocess
+  import sys
+  names = ("_register_clean_sequence", "_ncs_operator", "_ncs_transform", "_ncs_rigid_fit",
+           "_af_replace_alignment", "_af_replace_ca", "_af_replace_robust_fit", "_af_replace_ca_distances",
+           "_af_replace_fragment", "_af_replace_read_model", "_af_replace_download",
+           "_af_replace_uniprot_json", "_af_replace_uniprot_accessions", "_af_replace_afdb_json",
+           "_af_replace_bfvd_models", "_af_replace_find_models", "_af_replace_assess", "_af_replace_prepare",
+           "_af_replace_provenance", "_af_replace_wire", "_af_replace_job", "_af_replace_worker_main")
+  source = "import copy, hashlib, json, math, os, re, tempfile, time\nimport gemmi\n"
+  source += "_REGISTER_AA = "+repr(_REGISTER_AA)+"\n"
+  source += "\n\n".join(inspect.getsource(globals()[name]) for name in names)
+  source += "\n_af_replace_worker_main()\n"
+  version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+  candidates = [os.path.join(prefix, "bin", name) for prefix in (sys.prefix, sys.base_prefix)
+                for name in (version, "python3")]
+  candidates.extend((shutil.which(version), shutil.which("python3")))
+  python = next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
+  if python is None:
+    raise ValueError("No standalone Python found for prediction lookup.")
+  directory = tempfile.TemporaryDirectory(prefix="coot-alphafold-task-")
+  folder = directory.name
+  request, response, log_path = [os.path.join(folder, name) for name in ("request.json", "result.json", "progress.jsonl")]
+  log = reader = process = None
+  try:
+    with open(request, "w") as handle:
+      json.dump(_af_replace_wire(dict(operation=operation, payload=payload)), handle)
+    log = open(log_path, "w")
+    reader = open(log_path)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+      env.pop(name, None)
+    process = subprocess.Popen([python, "-u", "-c", source, request, response],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
+    return dict(process=process, directory=directory, log=log, reader=reader, response=response,
+                deadline=time.monotonic()+(90 if operation == "find" else 60), tail="")
+  except Exception:
+    if process is not None:
+      process.kill()
+      process.wait()
+    for handle in (log, reader):
+      if handle is not None:
+        handle.close()
+    directory.cleanup()
+    raise
+
+
+def _af_replace_stop_job(job):
+  if job is None:
+    return
+  process = job.get("process")
+  if process is not None and process.poll() is None:
+    process.kill()
+    process.wait()
+  for name in ("reader", "log"):
+    if job.get(name) is not None:
+      job[name].close()
+  if job.get("directory") is not None:
+    job["directory"].cleanup()
+
+
+def _af_replace_dialog(model, chain, specs=None):
+  try:
+    if globals().get("gemmi") is None:
+      raise ValueError("Gemmi is required to read AlphaFold predictions.")
+    target = _af_replace_target(model, chain, specs)
+  except Exception as error:
+    info_dialog(str(error))
+    return None
+  previous = getattr(coot, "_trimmings_af_replace_window", None)
+  if previous is not None:
+    previous._af_cancel()
+  glib = _coot_gui_repository_module("GLib")
+  title = "Replace chain from AlphaFold" if specs is None else "Replace region from AlphaFold"
+  window = Gtk.Window(title=title)
+  window.set_default_size(620, 300)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  window.set_child(box)
+  first, last = target["specs"][0], target["specs"][-1]
+  label = Gtk.Label(label=f"#{model} {os.path.basename(target['name'])}\n{chain}:{first[1]}{first[2]}-{last[1]}{last[2]} ({len(target['specs'])} residues)", xalign=0)
+  label.set_wrap(True)
+  box.append(label)
+  query_row = Gtk.Box(spacing=8)
+  accession = Gtk.Entry()
+  accession.set_placeholder_text("UniProt / AFDB / BFVD ID (optional)")
+  accession.set_hexpand(True)
+  query_row.append(accession)
+  search = Gtk.Button(label="Find model")
+  search.set_tooltip_text("Looks up AFDB by sequence and BFVD via UniProt accessions. Exact UniParc lookup sends a sequence checksum, not coordinates. AFDB similarity discovery checks up to 50 hits.")
+  query_row.append(search)
+  box.append(query_row)
+  choices = Gtk.ComboBoxText()
+  choices.set_hexpand(True)
+  box.append(choices)
+  differences = Gtk.CheckButton(label="Use close match; mutate prediction to model sequence")
+  differences.set_visible(False)
+  box.append(differences)
+  advanced = Gtk.Expander(label="Options / local prediction")
+  grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+  advanced.set_child(grid)
+  grid.attach(Gtk.Label(label="C-alpha cutoff (A)", xalign=0), 0, 0, 1, 1)
+  cutoff = Gtk.Entry()
+  cutoff.set_text("2")
+  cutoff.set_tooltip_text("The fitted C-alpha overlap sets the outer graft boundaries. Internal divergent loops can still be replaced. New atoms use the original region's mean B factor.")
+  grid.attach(cutoff, 1, 0, 1, 1)
+  rigid = Gtk.CheckButton(label="Quick rigid fit to refinement map")
+  map_id = coot.imol_refinement_map()
+  rigid.set_sensitive(coot.is_valid_map_molecule(map_id) and callable(getattr(coot, "rigid_body_refine_by_atom_selection", None)))
+  grid.attach(rigid, 0, 1, 2, 1)
+  bfvd = Gtk.CheckButton(label="Try BFVD if no AFDB model is found")
+  bfvd.set_active(True)
+  bfvd.set_tooltip_text("Exact full-sequence checksum -> UniProt accessions -> available BFVD models. An accession can also be entered directly. Partial/near-match discovery still uses AFDB.")
+  grid.attach(bfvd, 0, 2, 2, 1)
+  local = Gtk.Button(label="Use local prediction...")
+  local.set_tooltip_text("Choose an AlphaFold, BFVD or other PDB/mmCIF prediction.")
+  grid.attach(local, 0, 3, 2, 1)
+  box.append(advanced)
+  status = Gtk.Label(label="Find a model or choose a local prediction.", xalign=0)
+  status.set_wrap(True)
+  box.append(status)
+  actions = Gtk.Box(spacing=8)
+  replace = Gtk.Button(label="Replace")
+  replace.set_tooltip_text("Automatically align, cut and merge with one Coot Undo. The register tool's safeguards may trim up to five adjacent residues per end; joins are not rebuilt or flexibly refined.")
+  replace.set_sensitive(False)
+  actions.append(replace)
+  close_button = Gtk.Button(label="Close")
+  actions.append(close_button)
+  box.append(actions)
+  search_cache = getattr(_af_replace_dialog, "_search_cache", {})
+  _af_replace_dialog._search_cache = search_cache
+  state = dict(closed=False, busy=False, job=0, worker=None, hits=[], completed=False,
+               started=0., message="", chooser=None, applying=False, search_cache=search_cache)
+  def show_message(message):
+    state["message"] = str(message)
+    status.set_text(str(message))
+  def selected():
+    index = choices.get_active_id()
+    return state["hits"][int(index)] if index is not None else None
+  def update(*_):
+    hit = selected()
+    close_match = hit is not None and hit["assessment"]["identity"] < 1.-1e-10
+    differences.set_visible(close_match)
+    differences.set_tooltip_text("\n".join(f"{s[0]}:{s[1]}{s[2]} {a} -> {b}" for s, a, b in hit["assessment"]["changes"]) if hit else "")
+    replace.set_sensitive(not state["busy"] and not state["completed"] and hit is not None
+                          and (not close_match or differences.get_active()))
+  def choose(*_):
+    differences.set_active(False)
+    update()
+  choices.connect("changed", choose)
+  differences.connect("toggled", update)
+  def background(operation, payload, finished):
+    _af_replace_stop_job(state["worker"])
+    state.update(worker=None, busy=True, job=state["job"]+1, started=time.monotonic())
+    token = state["job"]
+    for widget in (search, accession, choices, local, cutoff, rigid, bfvd, differences):
+      widget.set_sensitive(False)
+    update()
+    def complete(value, error):
+      if state["closed"] or state["job"] != token:
+        return False
+      if error is not None:
+        show_message(str(error))
+      else:
+        try:
+          finished(value)
+        except Exception as problem:
+          show_message(str(problem))
+      state["busy"] = False
+      for widget in (search, accession, choices, local, cutoff, bfvd, differences):
+        widget.set_sensitive(not state["completed"])
+      rigid.set_sensitive(not state["completed"] and coot.is_valid_map_molecule(map_id))
+      update()
+      return False
+    try:
+      keys = ("query", "ordered", "specs", "sequence", "alignment_sequence", "row_map")
+      worker_target = {key: target[key] for key in keys if key in target}
+      if operation == "prepare":
+        worker_target["snapshot"] = target["snapshot"]
+      state["worker"] = _af_replace_start_job(operation, dict(payload, target=worker_target))
+    except Exception as error:
+      complete(None, error)
+      return
+    def tick():
+      if state["closed"] or not state["busy"] or state["job"] != token:
+        return False
+      job = state["worker"]
+      try:
+        if "value" in job:
+          value, error, done = job["value"], None, True
+        else:
+          job["tail"] = (job["tail"]+job["reader"].read())[-16000:]
+          for line in job["tail"].splitlines():
+            try:
+              event = json.loads(line)
+              if "progress" in event:
+                show_message(event["progress"])
+            except (ValueError, TypeError):
+              pass
+          done = job["process"].poll() is not None
+          if not done and time.monotonic() > job["deadline"]:
+            raise RuntimeError("Prediction task timed out. Retry or use a local prediction.")
+          if done:
+            if not os.path.isfile(job["response"]):
+              raise RuntimeError("Prediction worker failed: "+job["tail"][-1500:])
+            with open(job["response"]) as handle:
+              response = json.load(handle)
+            error = response.get("error")
+            value = _af_replace_wire(response["result"], True) if error is None else None
+        if done:
+          _af_replace_stop_job(job)
+          state["worker"] = None
+          return complete(value, error)
+      except Exception as error:
+        _af_replace_stop_job(job)
+        state["worker"] = None
+        return complete(None, error)
+      status.set_text(f"{state['message']} ({time.monotonic()-state['started']:.0f}s)")
+      return True
+    glib.timeout_add(50, tick)
+  def accept_hits(hits):
+    state["hits"] = hits
+    choices.remove_all()
+    for index, hit in enumerate(hits):
+      identity = 100.*hit["assessment"]["identity"]
+      choices.append(str(index), f"{hit['label']} | {identity:.2f}% identity")
+    if hits:
+      choices.set_active(0)
+      show_message("Select a prediction, then Replace. Merging and boundary trimming are automatic.")
+    else:
+      show_message("No qualifying match in the returned hits. Try an accession or a local prediction.")
+  def find(*_):
+    if state["busy"] or state["completed"]:
+      return
+    identifier = accession.get_text().strip()
+    include_bfvd = bfvd.get_active()
+    key = (identifier, include_bfvd, target["query"], target["sequence"],
+           target["alignment_sequence"], tuple(target["ordered"]), tuple(target["specs"]),
+           tuple(sorted(target["row_map"].items())))
+    cached = state["search_cache"].get(key)
+    if cached is not None and time.monotonic()-cached[0] < 3600:
+      accept_hits(cached[1])
+      return
+    def found(hits):
+      if hits:
+        if len(state["search_cache"]) >= 32:
+          state["search_cache"].pop(next(iter(state["search_cache"])))
+        state["search_cache"][key] = (time.monotonic(), hits)
+      accept_hits(hits)
+    show_message("Finding predictions...")
+    background("find", dict(identifier=identifier, include_bfvd=include_bfvd), found)
+  def local_file(*_):
+    if state["busy"] or state["completed"]:
+      return
+    chooser = Gtk.FileChooserNative.new("Choose prediction", window, Gtk.FileChooserAction.OPEN, "Open", "Cancel")
+    state["chooser"] = chooser
+    def response(dialog, response_id):
+      path = dialog.get_file().get_path() if response_id == Gtk.ResponseType.ACCEPT else None
+      dialog.destroy()
+      state["chooser"] = None
+      if path is None or state["closed"]:
+        return
+      show_message("Reading local prediction...")
+      background("local", dict(path=path), accept_hits)
+    chooser.connect("response", response)
+    chooser.show()
+  def apply(*_):
+    if state["busy"] or state["completed"] or selected() is None:
+      return
+    hit = selected()
+    accepted_close = differences.get_active()
+    cutoff_text, fit_map = cutoff.get_text(), map_id if rigid.get_active() else None
+    def finished(result):
+      state["applying"] = True
+      close_button.set_sensitive(False)
+      show_message("Merging replacement...")
+      merge_started = time.monotonic()
+      try:
+        outcome = _af_replace_apply(target, result, fit_map)
+      finally:
+        state["applying"] = False
+        close_button.set_sensitive(True)
+      state["completed"] = True
+      for widget in (search, accession, choices, local, cutoff, rigid, bfvd, differences):
+        widget.set_sensitive(False)
+      a, b = outcome["first"], outcome["last"]
+      show_message(f"Used {outcome['source']}.\nReplaced {outcome['donor_replaced']}/{len(target['specs'])} residues at {chain}:{a[1]}{a[2]}-{b[1]}{b[2]}; "
+                   f"trimmed {outcome['trimmed']}. B = {outcome['b_factor']:.2f}. Sequence associated. Undo available.")
+      state["outcome"] = outcome
+      print("AlphaFold replacement timings:", dict(result.get("timings", {}), merge=time.monotonic()-merge_started))
+      print("AlphaFold replacement:", state["message"].replace("\n", " "))
+      add_status_bar_text(state["message"])
+    show_message("Preparing replacement...")
+    background("prepare", dict(hit=hit, cutoff=cutoff_text, accepted_close=accepted_close), finished)
+  def close(*_):
+    if state["closed"]:
+      return True
+    if state["applying"]:
+      show_message("Finishing replacement...")
+      return True
+    state["closed"] = True
+    _af_replace_stop_job(state["worker"])
+    state["worker"] = None
+    if state["chooser"] is not None:
+      state["chooser"].destroy()
+    if getattr(coot, "_trimmings_af_replace_window", None) is window:
+      coot._trimmings_af_replace_window = None
+    window.destroy()
+    return True
+  search.connect("clicked", find)
+  local.connect("clicked", local_file)
+  replace.connect("clicked", apply)
+  close_button.connect("clicked", close)
+  window.connect("close-request", close)
+  window._af_cancel = close
+  window.af_replace_state = state
+  state["widgets"] = dict(search=search, accession=accession, choices=choices, differences=differences,
+                          cutoff=cutoff, rigid=rigid, replace=replace, status=status, close=close_button)
+  coot._trimmings_af_replace_window = window
+  window.present()
+  return window
+
+
+def replace_chain_from_alphafold():
+  context = _active_chain_context_or_status()
+  if context:
+    return _af_replace_dialog(context["mol_id"], context["chain_id"])
+
+
+def replace_region_from_alphafold():
+  markers = []
+  def clear():
+    while markers:
+      coot.close_generic_object(markers.pop())
+  def picked(spec, count):
+    _mark_register_endpoint(spec, "cyan" if count == 1 else "orange", markers, "AlphaFold replacement endpoint")
+  def selected(first, last):
+    try:
+      if _clicked_same_chain_residue_range(first, last) is not None:
+        specs = _clicked_residue_specs(first, last)
+        if specs:
+          return _af_replace_dialog(_click_spec_imol(first), _click_spec_chain_id(first), specs)
+    finally:
+      clear()
+  return _script_user_defined_click(2, selected, on_pick=picked, cleanup=clear,
+      prompt="Replace region from AlphaFold: click start (cyan), then end (orange). Tab cancels.")
 
 
 def _register_worker_settings():
@@ -26736,16 +28219,2159 @@ def reload_model():
   filename=molecule_name(mol_id)
   clear_and_update_model_molecule_from_file(mol_id,filename)
 
-#Copy changes from active chain to NCS equivalents.
-def copy_ncs_chain_from_active():
-  chain_context = _active_chain_context_or_status()
+def _ncs_operator(operator):
+  if not isinstance(operator, (tuple, list)) or len(operator) != 2:
+    raise ValueError("Missing NCS operator; define the groups again.")
+  r, t = [list(map(float, part)) for part in operator]
+  if len(r) != 9 or len(t) != 3 or not all(math.isfinite(v) for v in r+t):
+    raise ValueError("Invalid NCS operator.")
+  error = max(abs(sum(r[3*k+i]*r[3*k+j] for k in range(3))-(i == j)) for i in range(3) for j in range(3))
+  determinant = r[0]*(r[4]*r[8]-r[5]*r[7])-r[1]*(r[3]*r[8]-r[5]*r[6])+r[2]*(r[3]*r[7]-r[4]*r[6])
+  if error > 1e-5 or abs(determinant-1.) > 1e-5:
+    raise ValueError("NCS operator is not a proper rigid rotation.")
+  return [r, t]
+
+
+def _ncs_transform(operator, point):
+  r, t = operator
+  return [sum(r[3*i+j]*point[j] for j in range(3))+t[i] for i in range(3)]
+
+
+def _ncs_inverse(operator):
+  r, t = _ncs_operator(operator)
+  # Native add_ncs_matrix takes floats. Invert the stored matrix rather than
+  # assuming it remains exactly orthogonal after that conversion.
+  determinant = r[0]*(r[4]*r[8]-r[5]*r[7])-r[1]*(r[3]*r[8]-r[5]*r[6])+r[2]*(r[3]*r[7]-r[4]*r[6])
+  inverse = [v/determinant for v in (r[4]*r[8]-r[5]*r[7], r[2]*r[7]-r[1]*r[8], r[1]*r[5]-r[2]*r[4],
+      r[5]*r[6]-r[3]*r[8], r[0]*r[8]-r[2]*r[6], r[2]*r[3]-r[0]*r[5],
+      r[3]*r[7]-r[4]*r[6], r[1]*r[6]-r[0]*r[7], r[0]*r[4]-r[1]*r[3])]
+  return [inverse, [-sum(inverse[3*i+j]*t[j] for j in range(3)) for i in range(3)]]
+
+
+def _ncs_compose(a, b):
+  """Return a after b, with column-vector rotation convention."""
+  ar, _at = a
+  br, bt = b
+  return [[sum(ar[3*i+k]*br[3*k+j] for k in range(3)) for i in range(3) for j in range(3)],
+          _ncs_transform(a, bt)]
+
+
+def _ncs_identity():
+  return [[1., 0., 0., 0., 1., 0., 0., 0., 1.], [0., 0., 0.]]
+
+
+def _ncs_rigid_fit(moving, target):
+  """Horn fit using a small symmetric Jacobi eigensolver; no NumPy dependency."""
+  if len(moving) < 3 or len(moving) != len(target):
+    raise ValueError("At least three matched backbone atoms are required.")
+  if not all(len(p) == 3 and all(math.isfinite(v) for v in p) for p in moving+target):
+    raise ValueError("Invalid NCS fit coordinates.")
+  centres = [[sum(p[j] for p in points)/len(points) for j in range(3)] for points in (moving, target)]
+  x, y = [[[p[j]-centre[j] for j in range(3)] for p in points] for points, centre in zip((moving, target), centres)]
+  for points in (x, y):
+    axis = max(points, key=lambda p: sum(v*v for v in p))
+    cross = max(sum((axis[(j+1)%3]*p[(j+2)%3]-axis[(j+2)%3]*p[(j+1)%3])**2 for j in range(3)) for p in points)
+    if cross < 1e-10:
+      raise ValueError("Matched NCS atoms are collinear or coincident.")
+  h = [[sum(a[i]*b[j] for a, b in zip(x, y)) for j in range(3)] for i in range(3)]
+  xx, xy, xz, yx, yy, yz, zx, zy, zz = [v for row in h for v in row]
+  a = [[xx+yy+zz, yz-zy, zx-xz, xy-yx],
+       [yz-zy, xx-yy-zz, xy+yx, zx+xz],
+       [zx-xz, xy+yx, -xx+yy-zz, yz+zy],
+       [xy-yx, zx+xz, yz+zy, -xx-yy+zz]]
+  vectors = [[float(i == j) for j in range(4)] for i in range(4)]
+  for _ in range(100):
+    p, q = max(((i, j) for i in range(4) for j in range(i+1, 4)), key=lambda ij: abs(a[ij[0]][ij[1]]))
+    if abs(a[p][q]) <= 1e-14*max(1., max(abs(a[i][i]) for i in range(4))):
+      break
+    tau = (a[q][q]-a[p][p])/(2.*a[p][q])
+    tangent = (1. if tau >= 0 else -1.)/(abs(tau)+math.sqrt(1.+tau*tau))
+    c = 1./math.sqrt(1.+tangent*tangent)
+    s = tangent*c
+    app, aqq, apq = a[p][p], a[q][q], a[p][q]
+    for k in range(4):
+      if k not in (p, q):
+        akp, akq = a[k][p], a[k][q]
+        a[k][p] = a[p][k] = c*akp-s*akq
+        a[k][q] = a[q][k] = s*akp+c*akq
+      vkp, vkq = vectors[k][p], vectors[k][q]
+      vectors[k][p], vectors[k][q] = c*vkp-s*vkq, s*vkp+c*vkq
+    a[p][p], a[q][q] = app-tangent*apq, aqq+tangent*apq
+    a[p][q] = a[q][p] = 0.
+  index = max(range(4), key=lambda i: a[i][i])
+  w, qx, qy, qz = [vectors[i][index] for i in range(4)]
+  r = [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*w), 2*(qx*qz+qy*w),
+       2*(qx*qy+qz*w), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*w),
+       2*(qx*qz-qy*w), 2*(qy*qz+qx*w), 1-2*(qx*qx+qy*qy)]
+  t = [centres[1][i]-sum(r[3*i+j]*centres[0][j] for j in range(3)) for i in range(3)]
+  return _ncs_operator([r, t])
+
+
+def _ncs_backbone_sites(snapshot, chain):
+  sites = {}
+  for (ch, number, ins), record in snapshot.items():
+    if ch != chain:
+      continue
+    candidates = {}
+    for identity, properties, xyz in record["atoms"]:
+      name, alt = identity[0].strip(), str(identity[1] or "").strip()
+      element = str(properties[2]).strip().upper() if len(properties) > 2 else ""
+      if ((name == "CA" and element == "C") or (name == "P" and element == "P")) and float(properties[0]) > 0:
+        rank = (not alt, float(properties[0]), alt == "A")
+        if name not in candidates or rank > candidates[name][0]:
+          candidates[name] = (rank, tuple(map(float, xyz)))
+    for name in ("CA", "P"):
+      if name in candidates:
+        sites[(number, ins, name)] = candidates[name][1]
+        break
+  return sites
+
+
+def _ncs_fit_operator(snapshot, peer, master):
+  source, target = _ncs_backbone_sites(snapshot, peer), _ncs_backbone_sites(snapshot, master)
+  keys = sorted(source.keys() & target.keys())
+  if len(keys) < 3:
+    raise ValueError(f"Chains {master!r}/{peer!r} need at least three matching CA/P sites (including insertion codes).")
+  moving, fixed = [source[k] for k in keys], [target[k] for k in keys]
+  keep = list(range(len(keys)))
+  for _ in range(5):
+    operator = _ncs_rigid_fit([moving[i] for i in keep], [fixed[i] for i in keep])
+    errors = [math.sqrt(sum((a-b)**2 for a, b in zip(_ncs_transform(operator, moving[i]), fixed[i]))) for i in range(len(keys))]
+    ordered = sorted(errors[i] for i in keep)
+    median = ordered[len(ordered)//2]
+    selected = [i for i, error in enumerate(errors) if error <= max(.1, 3.*median)]
+    if len(selected) < max(3, math.ceil(.6*len(keys))) or selected == keep:
+      break
+    keep = selected
+  return _ncs_rigid_fit([moving[i] for i in keep], [fixed[i] for i in keep])
+
+
+def _ncs_validate_groups(groups, snapshot):
+  available = {spec[0] for spec in snapshot}
+  seen, result = set(), []
+  if not isinstance(groups, list) or not groups:
+    raise ValueError("Enter at least one NCS group.")
+  for group in groups:
+    if not isinstance(group, (list, tuple)) or len(group) < 2 or any(not isinstance(ch, str) for ch in group):
+      raise ValueError("Each group needs a master and at least one peer chain.")
+    for chain in group:
+      if chain not in available:
+        raise ValueError(f"Chain {chain!r} is not present in this model.")
+      if chain in seen:
+        raise ValueError(f"Chain {chain!r} occurs more than once. NCS groups must not overlap.")
+      seen.add(chain)
+    result.append(list(group))
+  return result
+
+
+def _ncs_parse_groups(text):
+  result = []
+  for line in text.splitlines():
+    line = line.strip()
+    if line and not line.startswith("#"):
+      result.append(json.loads(line) if line.startswith("[") else re.split(r"[\s,]+", line))
+  return result
+
+
+def _ncs_groups_text(groups):
+  return "\n".join(" ".join(group) if all(chain and not re.search(r"[\s,]", chain) for chain in group)
+                   else json.dumps(group) for group in groups)
+
+
+def _ncs_read_groups(mol_id, snapshot, initialize=True):
+  groups = {}
+  for ghost in coot.ncs_ghosts_py(mol_id) or []:
+    if len(ghost) < 5:
+      raise ValueError("Coot returned an invalid NCS group.")
+    peer, master, operator, shown = ghost[1:5]
+    group = groups.setdefault(master, dict(chains=[master], operators={}, display={}))
+    if peer in group["chains"]:
+      raise ValueError("Coot returned duplicate NCS peers.")
+    group["chains"].append(peer)
+    group["display"][peer] = bool(shown)
+    group["operators"][peer] = (_ncs_operator(operator) if operator else
+        _ncs_fit_operator(snapshot, peer, master) if initialize else None)
+  result = list(groups.values())
+  if result:
+    _ncs_validate_groups([g["chains"] for g in result], snapshot)
+  return result
+
+
+def _ncs_install_groups(mol_id, groups):
+  required = ("clear_ncs_ghost_matrices", "add_ncs_matrix", "set_draw_ncs_ghosts", "draw_ncs_ghosts_state")
+  if not all(callable(getattr(coot, name, None)) for name in required):
+    raise ValueError("This Coot build cannot install NCS operators safely.")
+  operators = [(peer, g["chains"][0], _ncs_operator(g["operators"][peer]), g["display"].get(peer, True))
+               for g in groups for peer in g["chains"][1:]]
+  visible = coot.draw_ncs_ghosts_state(mol_id)
+  if visible not in (0, 1):
+    raise ValueError("Cannot determine NCS display state.")
+  coot.clear_ncs_ghost_matrices(mol_id)
+  for peer, master, (rotation, translation), _shown in operators:
+    coot.add_ncs_matrix(mol_id, peer, master, *rotation, *translation)
+  chains = [chain for chain, _residues in coot.python_representation_kk(mol_id)[0]]
+  try:
+    for peer, _master, _operator, shown in operators:
+      if not shown and callable(getattr(coot, "ncs_control_display_chain", None)):
+        coot.ncs_control_display_chain(mol_id, chains.index(peer), 0)
+  finally:
+    coot.set_draw_ncs_ghosts(mol_id, visible)
+
+
+def _ncs_rebase_group(group, source):
+  operators = dict(group["operators"])
+  operators[group["chains"][0]] = _ncs_identity()
+  to_source = _ncs_inverse(operators[source])
+  chains = [source]+[ch for ch in group["chains"] if ch != source]
+  return dict(chains=chains, operators={peer: _ncs_compose(to_source, operators[peer]) for peer in chains[1:]},
+              display=dict(group["display"]))
+
+
+def _ncs_require_idle(mol_id):
+  if not coot.is_valid_model_molecule(mol_id):
+    raise ValueError("The model was closed.")
+  busy = getattr(coot, "refinement_already_ongoing_p", None)
+  if callable(busy) and busy():
+    raise ValueError("Finish the current refinement/moving-atoms operation first.")
+
+
+def _ncs_validate_source(snapshot, source):
+  for (chain, _number, _ins), record in snapshot.items():
+    if chain != source:
+      continue
+    identities = set()
+    for identity, _properties, point in record["atoms"]:
+      if tuple(identity) in identities or len(point) != 3 or not all(math.isfinite(v) for v in point):
+        raise ValueError("The NCS source contains duplicate atom identities or invalid coordinates.")
+      identities.add(tuple(identity))
+
+
+def define_ncs_groups(mol_id, groups):
+  """Explicitly fit disjoint groups now; subsequent copies preserve these operators."""
+  _ncs_require_idle(mol_id)
+  snapshot = _model_coordinate_snapshot(mol_id)
+  groups = _ncs_validate_groups(groups, snapshot)
+  prepared = [dict(chains=group, operators={peer: _ncs_fit_operator(snapshot, peer, group[0]) for peer in group[1:]},
+                   display={peer: True for peer in group[1:]}) for group in groups]
+  _ncs_install_groups(mol_id, prepared)
+  return prepared
+
+
+def _ncs_verify_copy(snapshot, source, peer, operator):
+  expected = {(number, ins): record for (chain, number, ins), record in snapshot.items() if chain == source}
+  actual = {(number, ins): record for (chain, number, ins), record in snapshot.items() if chain == peer}
+  if actual.keys() != expected.keys():
+    raise ValueError(f"NCS copy to chain {peer!r} did not copy all residues.")
+  for key, record in expected.items():
+    target = actual[key]
+    atoms = {(tuple(atom[0])): atom for atom in target["atoms"]}
+    if target["name"] != record["name"] or len(atoms) != len(record["atoms"]):
+      raise ValueError(f"NCS copy to chain {peer!r} has different atom identities.")
+    for atom in record["atoms"]:
+      other = atoms.get(tuple(atom[0]))
+      if other is None or max(abs(a-b) for a, b in zip(_ncs_transform(operator, atom[2]), other[2])) > 2e-4:
+        raise ValueError(f"NCS copy to chain {peer!r} did not preserve the fixed operator.")
+
+
+# Copy using preserved operators, refreshing native selections before each peer.
+def copy_ncs_chain_from_active(_group=None, _context=None):
+  chain_context = _context or _active_chain_context_or_status()
   if not chain_context:
     return None
   mol_id = chain_context["mol_id"]
   ch_id = chain_context["chain_id"]
-  with _grouped_model_edit(mol_id):
-    ncs_control_change_ncs_master_to_chain_id(mol_id, ch_id)
-    copy_from_ncs_master_to_others(mol_id, ch_id)
+  copied = []
+  attempted = []
+  undo_available = False
+  try:
+    _ncs_require_idle(mol_id)
+    snapshot = _model_coordinate_snapshot(mol_id)
+    groups = _ncs_read_groups(mol_id, snapshot)
+    if _group is None:
+      if not any(spec[0] == ch_id for spec in snapshot):
+        raise ValueError("The active residue's chain is no longer in this model.")
+      if not groups:
+        raise ValueError("This model has no NCS groups. Use Define NCS groups first.")
+      return _ncs_symmetry_copy_dialog(chain_context, snapshot, groups)
+    _ncs_validate_source(snapshot, ch_id)
+    group = _group or next((g for g in groups if ch_id in g["chains"]), None)
+    if ch_id not in group["chains"]:
+      raise ValueError("The master chain is not in the selected NCS relationship.")
+    copier = getattr(coot, "copy_from_ncs_master_to_specific_other_chains_py", None)
+    if not callable(copier):
+      raise ValueError("This Coot build cannot copy specific NCS peers safely.")
+    rebased = _ncs_rebase_group(group, ch_id)
+    undo_available = coot.backup_state(mol_id) == 1
+    with _grouped_model_edit(mol_id):
+      try:
+        for peer in rebased["chains"][1:]:
+          # Reinstalling unchanged matrices creates current selection handles;
+          # native whole-chain replacement invalidates the previous handles.
+          temporary = dict(chains=[ch_id, peer], operators={peer: rebased["operators"][peer]},
+                           display=dict(rebased["display"]))
+          _ncs_install_groups(mol_id, [temporary])
+          attempted.append(peer)
+          copier(mol_id, ch_id, [peer])
+          result = _model_coordinate_snapshot(mol_id)
+          if {key: value for key, value in result.items() if key[0] == ch_id} != {
+              key: value for key, value in snapshot.items() if key[0] == ch_id}:
+            raise ValueError("The NCS source chain unexpectedly changed.")
+          combined = dict(result)
+          combined.update({key: value for key, value in snapshot.items() if key[0] == ch_id})
+          _ncs_verify_copy(combined, ch_id, peer, _ncs_inverse(rebased["operators"][peer]))
+          copied.append(peer)
+      finally:
+        _ncs_install_groups(mol_id, groups)
+    add_status_bar_text(f"Copied chain {ch_id} to {', '.join(copied)} using fixed NCS operators.")
+    return copied
+  except Exception as error:
+    suffix = ""
+    if attempted:
+      suffix = f"\nSome copies may have been applied. Completed peers: {', '.join(copied) or 'none'}."
+      suffix += " Undo before retrying." if undo_available else " Inspect the model before retrying (backups were disabled)."
+    info_dialog(f"Cannot complete NCS copy: {error}{suffix}")
+    return None
+
+
+def _ncs_group_file(path, groups=None):
+  if groups is None:
+    if os.path.getsize(path) > 1024*1024:
+      raise ValueError("NCS group file is too large.")
+    with open(path, encoding="utf-8") as handle:
+      data = json.load(handle)
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("groups"), list):
+      raise ValueError("Not a supported NCS group file.")
+    return data["groups"]
+  directory = os.path.dirname(os.path.abspath(path))
+  fd, temporary = tempfile.mkstemp(prefix=".ncs-groups-", suffix=".json", dir=directory)
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump(dict(version=1, groups=groups), handle, indent=2)
+      handle.write("\n")
+    os.replace(temporary, path)
+  finally:
+    if os.path.exists(temporary):
+      os.unlink(temporary)
+
+
+def _ncs_symmetry_rotations(symbol):
+  """Proper point groups only. Canonical T/O/I have a 2/4/2-fold Z axis."""
+  symbol = str(symbol).strip().upper()
+  if symbol.endswith("H") or symbol in ("CI", "CS"):
+    raise ValueError("Reflections/inversion reverse molecular chirality. Use O, not Oh, for octahedral protein symmetry.")
+  identity = _ncs_identity()[0]
+  if symbol == "C1":
+    return [identity]
+  if re.fullmatch(r"[CD][1-9][0-9]*", symbol):
+    order = int(symbol[1:])
+    if order < 2 or order > 360:
+      raise ValueError("Use C1, C2-C360 or D2-D360.")
+    rotations = [_rotation_matrix_about_axis([0., 0., 1.], k*2.*math.pi/order) for k in range(order)]
+    if symbol[0] == "D":
+      rotations += [_rotation_c2_xy(k*math.pi/order) for k in range(order)]
+    return rotations
+  if symbol not in ("T", "O", "I"):
+    raise ValueError("Point group must be Cn, Dn, T, O or I.")
+  phi = .5*(1.+math.sqrt(5.))
+  generators = {
+    "T": ([0., 0., 1.], math.pi, [1., 1., 1.], 2.*math.pi/3.),
+    "O": ([0., 0., 1.], math.pi/2., [1., 0., 0.], math.pi/2.),
+    "I": ([0., 0., 1.], math.pi, [0., 1., phi], 2.*math.pi/5.),
+  }[symbol]
+  a, angle_a, b, angle_b = generators
+  generators = [_rotation_matrix_about_axis(a, angle_a), _rotation_matrix_about_axis(b, angle_b)]
+  rotations, seen = [identity], {tuple(identity)}
+  expected = {"T": 12, "O": 24, "I": 60}[symbol]
+  for rotation in rotations:
+    for generator in generators:
+      product = _ncs_compose([generator, [0., 0., 0.]], [rotation, [0., 0., 0.]])[0]
+      key = tuple(round(v, 7) for v in product)
+      if key not in seen:
+        seen.add(key)
+        rotations.append(product)
+        if len(rotations) > expected:
+          raise ValueError("Point-group generation did not close.")
+  if len(rotations) != expected:
+    raise ValueError("Incomplete point group.")
+  return rotations
+
+
+def _ncs_symmetry_helical_extent(first, count):
+  try:
+    first_value, count_value = float(first), float(count)
+    first, count = int(first_value), int(count_value)
+    if first != first_value or count != count_value:
+      raise ValueError()
+  except (ValueError, OverflowError, TypeError):
+    raise ValueError("First repeat and total repeats must be whole numbers.") from None
+  last = first+count-1
+  if not 2 <= count <= 720 or not first <= 0 <= last:
+    raise ValueError("Use 2-720 total repeats, including repeat 0 (the picked ASU).")
+  return first, last
+
+
+def _ncs_symmetry_operators(kind, centre, axis=(0., 0., 1.), symbol="C2", twist=30., rise=5., first=-3, last=3, phase=0., axial="C1"):
+  centre, axis = list(map(float, centre)), list(map(float, axis))
+  if len(centre) != 3 or len(axis) != 3 or not all(math.isfinite(v) for v in centre+axis+[float(phase)]):
+    raise ValueError("Centre, axis and phase must be finite numbers.")
+  length = math.sqrt(sum(v*v for v in axis))
+  if length < 1e-8:
+    raise ValueError("Symmetry axis must be nonzero.")
+  z = [v/length for v in axis]
+  # Choose a deterministic transverse X direction; phase rotates it about Z.
+  seed = [1., 0., 0.] if abs(z[0]) < .9 else [0., 1., 0.]
+  x = [seed[i]-sum(seed[j]*z[j] for j in range(3))*z[i] for i in range(3)]
+  length = math.sqrt(sum(v*v for v in x))
+  x = [v/length for v in x]
+  y = [z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]]
+  frame = [[x[i], y[i], z[i]][j] for i in range(3) for j in range(3)]
+  frame = _ncs_compose([frame, [0., 0., 0.]],
+      [_rotation_matrix_about_axis([0., 0., 1.], math.radians(float(phase))), [0., 0., 0.]])
+  if kind == "point":
+    local = [(k, [r, [0., 0., 0.]]) for k, r in enumerate(_ncs_symmetry_rotations(symbol))]
+  elif kind == "helical":
+    twist, rise = float(twist), float(rise)
+    if not all(math.isfinite(v) for v in (twist, rise)) or abs(rise) < 1e-6:
+      raise ValueError("Helical twist/rise must be finite, with nonzero rise (A).")
+    if int(first) != first or int(last) != last or not first <= 0 <= last or not 2 <= last-first+1 <= 720:
+      raise ValueError("Helical repeat range must include 0 and contain 2-720 repeats.")
+    local = [(k, [_rotation_matrix_about_axis([0., 0., 1.], math.radians(k*twist)), [0., 0., k*rise]])
+             for k in [0]+[k for k in range(int(first), int(last)+1) if k]]
+    axial = str(axial).strip().upper()
+    if not re.fullmatch(r"[CD][1-9][0-9]*", axial):
+      raise ValueError("Helical point group must be Cn or Dn (C1 for a simple screw).")
+    rotations = ([_ncs_identity()[0], _rotation_c2_xy(0.)] if axial == "D1"
+                 else _ncs_symmetry_rotations(axial))
+    if len(local)*len(rotations) > 2000:
+      raise ValueError("Too many helical positions; reduce the point-group order or repeats (maximum 2000).")
+    if axial != "C1":
+      # Normal form H^k P. Perpendicular dyads reverse H, rather than commute
+      # with it; enumerating this coset once avoids an unbounded closure search.
+      local = [(0 if k == 0 and j == 0 else f"{k}/{j}", _ncs_compose(h, [r, [0., 0., 0.]]))
+               for k, h in local for j, r in enumerate(rotations)]
+  else:
+    raise ValueError("Unknown symmetry type.")
+  inverse = _ncs_inverse(frame)
+  result = []
+  for repeat, operator in local:
+    rotation, shift = _ncs_compose(_ncs_compose(frame, operator), inverse)
+    translation = [centre[i]+shift[i]-sum(rotation[3*i+j]*centre[j] for j in range(3)) for i in range(3)]
+    result.append((repeat, _ncs_operator([rotation, translation])))
+  return result
+
+
+def _ncs_symmetry_plan(snapshot, asu, operators, tolerance=2., scope=None):
+  """Match whole chains in absolute coordinates, never by a free superposition."""
+  tolerance = float(tolerance)
+  if not math.isfinite(tolerance) or tolerance <= 0:
+    raise ValueError("Match tolerance must be positive (A RMSD).")
+  chains = list(dict.fromkeys(spec[0] for spec in snapshot))
+  asu = list(asu)
+  if not asu or len(set(asu)) != len(asu) or any(ch not in chains for ch in asu):
+    raise ValueError("Pick one or more distinct ASU chains in the target model.")
+  if scope is not None:
+    scope = set(scope)
+    if not scope or not scope.issubset(chains) or not set(asu).issubset(scope):
+      raise ValueError("The local chain selection must include every ASU chain and exist in the model.")
+  by_chain = {ch: {} for ch in chains}
+  for spec, record in snapshot.items():
+    by_chain[spec[0]][spec] = record
+  sites = {ch: _ncs_backbone_sites(records, ch) for ch, records in by_chain.items()}
+  if any(len(xyz) != 3 or not all(math.isfinite(v) for v in xyz) for points in sites.values() for xyz in points.values()):
+    raise ValueError("Non-finite or malformed backbone coordinates in the model.")
+  if any(len(sites[ch]) < 3 for ch in asu):
+    raise ValueError("Each ASU chain needs at least three CA/P sites.")
+  for chain in asu:
+    _ncs_validate_source(snapshot, chain)
+  names = {ch: {spec[1:]: row["name"] for spec, row in records.items()} for ch, records in by_chain.items()}
+  if not operators or operators[0][0] != 0:
+    raise ValueError("Symmetry operators must start with the identity repeat.")
+  if len(asu)*len(operators) > 2000:
+    raise ValueError("Too many chains requested; reduce the ASU or repeat range (maximum 2000).")
+  checked = [(repeat, _ncs_operator(op)) for repeat, op in operators]
+  groups = {ch: dict(chains=[ch], operators={}, display={}) for ch in asu}
+  rows, used = [], set(asu)
+  for master in asu:
+    source = sites[master]
+    compatible = []
+    for peer in chains:
+      if scope is not None and peer not in scope:
+        continue
+      keys = tuple(source.keys() & sites[peer].keys())
+      if len(keys) < max(3, math.ceil(.6*len(source))):
+        continue
+      if sum(names[master][key[:2]] == names[peer][key[:2]] for key in keys)/len(keys) >= .95:
+        compatible.append((peer, keys))
+    for repeat, op in checked[1:]:
+      transformed = {key: _ncs_transform(op, xyz) for key, xyz in source.items()}
+      matches = []
+      for peer, keys in compatible:
+        squared = 0.
+        for key in keys:
+          squared += sum((a-b)**2 for a, b in zip(transformed[key], sites[peer][key]))
+          if squared > tolerance*tolerance*len(keys):
+            break
+        else:
+          matches.append((math.sqrt(squared/len(keys)), peer))
+      matches.sort()
+      if any(peer in asu for _rmsd, peer in matches):
+        raise ValueError("The picked ASU contains symmetry-equivalent/overlapping chains; select only one asymmetric unit.")
+      if len(matches) > 1 and matches[1][0]-matches[0][0] < max(.1, .1*tolerance):
+        raise ValueError(f"Ambiguous copy of {master!r} at repeat {repeat}; reduce the tolerance or check the symmetry frame.")
+      peer, rmsd = (matches[0][1], matches[0][0]) if matches else (None, None)
+      if peer in used:
+        raise ValueError(f"Chain {peer!r} matches more than one symmetry position; check the ASU, axis and parameters.")
+      if peer is not None:
+        used.add(peer)
+        groups[master]["chains"].append(peer)
+        groups[master]["operators"][peer] = _ncs_inverse(op)
+        groups[master]["display"][peer] = False
+      rows.append(dict(master=master, repeat=repeat, peer=peer, rmsd=rmsd, operator=op))
+  return dict(groups=list(groups.values()), rows=rows, unassigned=[ch for ch in chains if ch not in used],
+              missing=[row for row in rows if row["peer"] is None], asu=asu, operators=checked)
+
+
+def _ncs_symmetry_expression(snapshot, plan):
+  """Build a separate assembly; never delete or move an existing chain."""
+  import copy
+  counts = {}
+  for spec, record in snapshot.items():
+    counts[spec[0]] = counts.get(spec[0], 0)+len(record["atoms"])
+  atom_count = sum(counts.values())+sum(counts[row["master"]] for row in plan["missing"])
+  if atom_count > 2000000:
+    raise ValueError("Assembly would exceed two million atoms; reduce the repeat range.")
+  chains = {}
+  for (chain, number, ins), record in snapshot.items():
+    chains.setdefault(chain, []).append([number, ins, record["name"], copy.deepcopy(record["atoms"])])
+  groups = copy.deepcopy(plan["groups"])
+  by_master = {g["chains"][0]: g for g in groups}
+  suffix = 1
+  for row in plan["missing"]:
+    while "S"+str(suffix) in chains:
+      suffix += 1
+    peer = "S"+str(suffix)
+    chains[peer] = copy.deepcopy(chains[row["master"]])
+    for residue in chains[peer]:
+      for atom in residue[3]:
+        atom[2] = _ncs_transform(row["operator"], atom[2])
+    group = by_master[row["master"]]
+    group["chains"].append(peer)
+    group["operators"][peer] = _ncs_inverse(row["operator"])
+    group["display"][peer] = False
+    suffix += 1
+  return [[list(item) for item in chains.items()]], [g for g in groups if len(g["chains"]) > 1]
+
+
+def _ncs_symmetry_box_centre(map_id):
+  """Use the box, not the density centroid; do not guess at MRC ORIGIN handling."""
+  cell = list(map(float, map_cell(map_id)))
+  if len(cell) < 6 or any(abs(v-90.) > .01 for v in cell[3:6]):
+    raise ValueError("Automatic box centre requires an orthogonal EM map.")
+  for path in _candidate_map_file_paths(map_id):
+    with open(path, "rb") as handle:
+      header = handle.read(1024)
+    if len(header) != 1024:
+      continue
+    for endian in ("<", ">"):
+      fields = struct.unpack(endian+"256i", header)
+      if not all(0 < v < 1000000 for v in fields[:3]+fields[7:10]) or sorted(fields[16:19]) != [1, 2, 3]:
+        continue
+      stored_cell = struct.unpack(endian+"6f", header[40:64])
+      if any(abs(stored_cell[i]-cell[i]) > max(.01, .0001*cell[i]) for i in range(6)):
+        continue
+      origin = list(struct.unpack(endian+"3f", header[196:208]))
+      if not all(math.isfinite(v) for v in origin):
+        continue
+      if any(abs(v) > 1e-6 for v in origin):
+        raise ValueError("This map has an ORIGIN offset; enter the centre explicitly in Coot coordinates.")
+      result = [0., 0., 0.]
+      for j, axis in enumerate(fields[16:19]):
+        result[axis-1] += (fields[4+j]+fields[j]/2.)*cell[axis-1]/fields[7+axis-1]
+      return result
+  return [v/2. for v in cell[:3]]
+
+
+def _ncs_preview_chain_colours(model, snapshot, colours):
+  """Use native colours without changing Coot's shared user-colour palette."""
+  simple = {ch: index for ch, index in colours.items() if re.fullmatch(r"[A-Za-z0-9]+", ch)}
+  if simple:
+    coot.set_user_defined_atom_colour_by_selection_py(model, [("//"+ch, index) for ch, index in simple.items()])
+  atom_rows = [([model, *spec, *atom[0][:2]], colours[spec[0]])
+               for spec, record in snapshot.items() if spec[0] in colours and spec[0] not in simple
+               for atom in record["atoms"]]
+  if atom_rows:
+    coot.set_user_defined_atom_colour_py(model, atom_rows)
+  # CA-mode colours depend on the global palette and can all become grey.
+  coot.graphics_to_user_defined_atom_colours_all_atoms_representation(model)
+
+
+def _ncs_pick_chains(mol_id, accepted, parent=None, finished=None,
+                     title="Pick asymmetric unit", accept_label="Use ASU", purpose="ASU"):
+  """Pick ASU chains on a disposable model; leave all source colouring intact."""
+  _ncs_require_idle(mol_id)
+  _cancel_script_clicks()
+  snapshot = _model_coordinate_snapshot(mol_id)
+  chains = list(dict.fromkeys(spec[0] for spec in snapshot))
+  eligible = {ch for ch in chains if len(_ncs_backbone_sites(snapshot, ch)) >= 3}
+  if not eligible:
+    raise ValueError("No chains with at least three CA/P sites.")
+  state = dict(closed=False, selected=[], preview=None, token=None, hidden=False)
+  source_name, visible = coot.molecule_name(mol_id), coot.mol_is_displayed(mol_id)
+  window = Gtk.Window(title=title)
+  if parent is not None:
+    window.set_transient_for(parent)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  window.set_child(box)
+  label = Gtk.Label(label=f"Click one atom per {purpose} chain. Yellow: available. Cyan: picked. Tab cancels.", xalign=0)
+  label.set_wrap(True)
+  box.append(label)
+  status = Gtk.Label(label="No chains picked", xalign=0)
+  status.set_wrap(True)
+  box.append(status)
+  def owned():
+    return (state["preview"] is not None and coot.is_valid_model_molecule(state["preview"])
+            and coot.molecule_name(state["preview"]) == state.get("name"))
+  def close(*_):
+    if state["closed"]:
+      return True
+    state["closed"] = True
+    if _SCRIPT_CLICK_STATE.get("token") is state["token"] and state["token"] is not None:
+      _cancel_script_clicks()
+    try:
+      if owned():
+        moving = getattr(coot, "refinement_already_ongoing_p", lambda: False)()
+        try:
+          unchanged = _model_coordinate_snapshot(state["preview"]) == state.get("snapshot")
+        except Exception:
+          unchanged = False
+        if not moving and unchanged:
+          coot.close_molecule(state["preview"])
+        else:
+          add_status_bar_text("Edited/refining ASU preview kept as a separate model.")
+      if state["hidden"] and coot.is_valid_model_molecule(mol_id) and coot.molecule_name(mol_id) == source_name:
+        coot.set_mol_displayed(mol_id, visible)
+    finally:
+      window.destroy()
+      if callable(finished):
+        finished()
+    return True
+  def colour(changed):
+    colours = {ch: 8 if ch in state["selected"] else (1 if ch in eligible else 6) for ch in changed}
+    _ncs_preview_chain_colours(state["preview"], snapshot, colours)
+    status.set_text(purpose+": "+(", ".join(repr(ch) for ch in state["selected"]) or "none")+
+                    f" | {len(eligible)-len(state['selected'])} remaining")
+  def picked(spec, _count):
+    try:
+      if not owned() or not coot.is_valid_model_molecule(mol_id):
+        close()
+        return
+      if _click_spec_imol(spec) != state["preview"]:
+        raise ValueError("Click a chain on the coloured ASU preview.")
+      chain = _click_spec_chain_id(spec)
+      if chain not in eligible:
+        raise ValueError("That chain has fewer than three CA/P sites.")
+      if chain in state["selected"]:
+        state["selected"].remove(chain)
+      else:
+        state["selected"].append(chain)
+      colour({chain})
+    except Exception as error:
+      status.set_text(str(error))
+  def undo(*_):
+    if state["selected"] and owned():
+      colour({state["selected"].pop()})
+  def use(*_):
+    try:
+      _ncs_require_idle(mol_id)
+      if not state["selected"]:
+        raise ValueError("Pick at least one chain.")
+      if not owned() or snapshot != _model_coordinate_snapshot(mol_id):
+        raise ValueError("The model changed; cancel and pick the ASU again.")
+      accepted(list(state["selected"]))
+      close()
+    except Exception as error:
+      status.set_text(str(error))
+  buttons = Gtk.Box(spacing=8)
+  for title, callback in (("Undo pick", undo), (accept_label, use), ("Cancel", close)):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    buttons.append(button)
+  box.append(buttons)
+  window.connect("close-request", close)
+  # Let a parent close cancel its owned picker, without touching other pickers.
+  window._ncs_cancel = close
+  try:
+    view = _capture_view_state()
+    state["preview"] = coot.copy_molecule(mol_id)
+    if not coot.is_valid_model_molecule(state["preview"]) or state["preview"] == mol_id:
+      state["preview"] = None
+      raise ValueError("Could not create the ASU picking preview.")
+    state["name"] = f"ASU picking preview [{id(state):x}]"
+    coot.set_molecule_name(state["preview"], state["name"])
+    state["snapshot"] = _model_coordinate_snapshot(state["preview"])
+    _restore_view_state(view)
+    coot.set_draw_ncs_ghosts(state["preview"], 0)
+    coot.clear_user_defined_atom_colours(state["preview"])
+    coot.set_bond_colour_rotation_for_molecule(state["preview"], 0.)
+    colour(set(chains))
+    coot.set_mol_active(state["preview"], 1)
+    coot.set_mol_displayed(state["preview"], 1)
+    coot.set_mol_displayed(mol_id, 0)
+    state["hidden"] = True
+    state["token"] = _script_user_defined_click(None, lambda *_: None, on_pick=picked, cleanup=close,
+        prompt="Pick ASU chains on the coloured model; click again to deselect. Tab cancels.")
+    window.present()
+    return window
+  except Exception:
+    close()
+    raise
+
+
+def _ncs_symmetry_combine_groups(group_sets):
+    """Merge fixed peer->master edges into ordered, disjoint components.
+
+    The first encountered master roots each component. Closed loops must have
+    max rotation-matrix error <= 2e-5 and translation length <= 0.002 A.
+    Missing operators are errors: this operation never fits coordinates.
+    """
+    import math
+
+    graph, order, display = {}, {}, {}
+    for groups in group_sets:
+        for group in groups:
+            chains = list(group['chains'])
+            if not chains:
+                continue
+            master = group.get('master', chains[0])
+            if master not in chains or len(set(chains)) != len(chains):
+                raise ValueError('Invalid symmetry group master or duplicate chains.')
+            chains = [master] + [ch for ch in chains if ch != master]
+            for chain in chains:
+                if chain not in graph:
+                    order[chain] = len(order)
+                    graph[chain] = []
+                    if len(graph) > 2000:
+                        raise ValueError('Too many symmetry chains (maximum 2000).')
+                if chain in group.get('display', {}):
+                    display.setdefault(chain, bool(group['display'][chain]))
+            for peer in chains[1:]:
+                op = _ncs_operator(group.get('operators', {}).get(peer))
+                graph[master].append((peer, op))
+                graph[peer].append((master, _ncs_inverse(op)))
+
+    result, visited = [], set()
+    for master in graph:
+        if master in visited:
+            continue
+        transforms = {master: _ncs_identity()}
+        queue = [master]
+        for chain in queue:
+            for peer, peer_to_chain in graph[chain]:
+                candidate = _ncs_compose(transforms[chain], peer_to_chain)
+                if peer not in transforms:
+                    transforms[peer] = candidate
+                    queue.append(peer)
+                    continue
+                loop = _ncs_compose(_ncs_inverse(transforms[peer]), candidate)
+                rotation_error = max(abs(a-b) for a, b in zip(loop[0], _ncs_identity()[0]))
+                translation_error = math.sqrt(sum(v*v for v in loop[1]))
+                if rotation_error > 2e-5 or translation_error > .002:
+                    raise ValueError(
+                        f'Inconsistent closed symmetry transform loop at {chain!r}/{peer!r}: '
+                        f'rotation error {rotation_error:.6g}, translation {translation_error:.6g} A '
+                        '(limits 2e-5 and 0.002 A).')
+        visited.update(transforms)
+        chains = [master] + sorted((ch for ch in transforms if ch != master), key=order.__getitem__)
+        result.append(dict(chains=chains, master=master,
+                           operators={ch: transforms[ch] for ch in chains[1:]},
+                           display={ch: display.get(ch, False) for ch in chains[1:]}))
+    return result
+
+
+def _ncs_symmetry_relation_groups(relations):
+    """Flatten named relationships through the same checked transform graph."""
+    return _ncs_symmetry_combine_groups([relation['groups'] for relation in relations])
+
+
+def _ncs_symmetry_extend_relations(relations, plan, expanded_snapshot, strict=True):
+    """Clone ASU-local groups into every outer repeat, preserving relation IDs.
+
+    Rows use master->peer operators, whereas local groups use peer->master.
+    Each local operator L is therefore transferred as G L G^-1. Repeat zero
+    maps every ASU master to itself, even though plan rows normally omit it.
+    Prefer row['built_peer']; legacy plans use the expression's S1, S2, ...
+    allocation in missing-row order, skipping original chain names. Inputs
+    are never modified. Unbuilt positions may be absent when assigning an
+    incomplete assembly; skip wholly absent local copies, not partial ones.
+    Groups crossing the ASU boundary cannot be cloned.
+    """
+    import copy
+    import math
+
+    rows = plan.get('rows', [])
+    asu = list(plan.get('asu', []))
+    if not asu:
+        asu = list(dict.fromkeys(
+            [g.get('master', g['chains'][0]) for g in plan.get('groups', []) if g['chains']]
+            + [row['master'] for row in rows]))
+    if len(asu) != len(set(asu)):
+        raise ValueError('Duplicate ASU chains in symmetry plan.')
+    available = {spec[0] for spec in expanded_snapshot}
+    if not set(asu) <= available:
+        raise ValueError('An ASU master is absent from the expanded snapshot.')
+    if len(available) > 2000:
+        raise ValueError('Too many symmetry chains (maximum 2000).')
+    repeats = list(dict.fromkeys([0] + [label for label, _ in plan.get('operators', [])]
+                                 + [row['repeat'] for row in rows]))
+    positions = {(master, 0): (master, _ncs_identity()) for master in asu}
+
+    # Reconstruct legacy generated names using exactly the expression order.
+    occupied = set(asu) | set(plan.get('unassigned', []))
+    occupied.update(ch for g in plan.get('groups', []) for ch in g['chains'])
+    occupied.update(row['peer'] for row in rows if row.get('peer') is not None)
+    missing = list(plan.get('missing', []))
+    missing_keys = {(row['master'], row['repeat']) for row in missing}
+    missing += [row for row in rows if row.get('peer') is None
+                and (row['master'], row['repeat']) not in missing_keys]
+    built, suffix = {}, 1
+    for row in missing:
+        key = (row['master'], row['repeat'])
+        if key in built:
+            raise ValueError('Duplicate missing symmetry position.')
+        peer = row.get('built_peer')
+        if peer is None:
+            while 'S'+str(suffix) in occupied:
+                suffix += 1
+            peer = 'S'+str(suffix)
+            suffix += 1
+        built[key] = peer
+        occupied.add(peer)
+
+    owners = {master: (master, 0) for master in asu}
+    for row in rows:
+        key = (row['master'], row['repeat'])
+        if row['master'] not in asu:
+            raise ValueError('A symmetry row master is outside the ASU.')
+        peer = row.get('peer')
+        if peer is None:
+            peer = row.get('built_peer', built.get(key))
+        if peer not in available:
+            if row.get('peer') is not None or row.get('built_peer') is not None:
+                raise ValueError(f'Symmetry position {key!r} has no built chain in the expanded snapshot.')
+            peer = None
+        op = _ncs_operator(row['operator'])
+        if key in positions:
+            old_peer, old_op = positions[key]
+            if old_peer != peer or old_op != op:
+                raise ValueError(f'Duplicate or inconsistent symmetry position {key!r}.')
+        if peer is not None and peer in owners and owners[peer] != key:
+            raise ValueError(f'Chain {peer!r} occupies more than one symmetry position.')
+        positions[key] = (peer, op)
+        if peer is not None:
+            owners[peer] = key
+    for master in asu:
+        for repeat in repeats:
+            if (master, repeat) not in positions:
+                raise ValueError(f'Incomplete symmetry plan: missing position {(master, repeat)!r}.')
+
+    scope, expanded = set(asu), []
+    for relation in relations:
+        cloned = copy.deepcopy(relation)
+        additions = []
+        for group in relation['groups']:
+            chains = list(group['chains'])
+            inside = set(chains) & scope
+            if not inside or not chains:
+                continue
+            if not set(chains) <= scope:
+                if len(repeats) > 1 and strict:
+                    raise ValueError(
+                        f'Cannot replicate partial group in relationship {relation["name"]!r}: '
+                        'the group spans the ASU boundary. Include its whole group or exclude it.')
+                continue
+            master = group.get('master', chains[0])
+            for repeat in repeats:
+                if repeat == 0:
+                    continue
+                names = {ch: positions[(ch, repeat)][0] for ch in chains}
+                if all(peer is None for peer in names.values()):
+                    continue
+                if any(peer is None for peer in names.values()):
+                    raise ValueError(
+                        f'Cannot replicate partial local group in relationship {relation["name"]!r} '
+                        f'at repeat {repeat!r}: only part of the group is constructed.')
+                outer = positions[(master, repeat)][1]
+                inverse = _ncs_inverse(outer)
+                for chain in chains:
+                    other = positions[(chain, repeat)][1]
+                    delta = _ncs_compose(inverse, other)
+                    if (max(abs(a-b) for a, b in zip(delta[0], _ncs_identity()[0])) > 2e-5
+                            or math.sqrt(sum(v*v for v in delta[1])) > .002):
+                        raise ValueError('Inconsistent outer transforms within a local symmetry group.')
+                local = copy.deepcopy(group)
+                local['chains'] = [names[ch] for ch in chains]
+                local['master'] = names[master]
+                local['operators'] = {
+                    names[ch]: _ncs_compose(_ncs_compose(outer, _ncs_operator(group['operators'][ch])), inverse)
+                    for ch in chains if ch != master}
+                local['display'] = {names[ch]: group.get('display', {}).get(ch, False)
+                                    for ch in chains if ch != master}
+                additions.append(local)
+        # Keep untouched group metadata, while validating every relationship.
+        checked = _ncs_symmetry_combine_groups([cloned['groups'], additions])
+        all_groups = cloned['groups'] + additions
+        if len(checked) == len(all_groups):
+            cloned['groups'] = all_groups
+        else:
+            cloned['groups'] = checked
+        expanded.append(cloned)
+    _ncs_symmetry_relation_groups(expanded)
+    return expanded
+
+
+def _ncs_symmetry_frame_from_chains(snapshot, master, peer):
+  """Estimate a local screw axis once, from a user-picked pair of chains."""
+  if master == peer:
+    raise ValueError("Pick two different, corresponding chains.")
+  # The stored NCS convention is peer -> master; the frame uses master -> peer.
+  rotation, translation = _ncs_fit_operator(snapshot, master, peer)
+  cosine = max(-1., min(1., (sum(rotation[4*i] for i in range(3))-1.)/2.))
+  angle = math.acos(cosine)
+  if angle < 1e-4:
+    raise ValueError("The chains have almost no relative rotation; enter the axis explicitly.")
+  if math.pi-angle < 1e-4:
+    diagonal = [max(0., .5*(rotation[4*i]+1.)) for i in range(3)]
+    largest = max(range(3), key=diagonal.__getitem__)
+    axis = [0., 0., 0.]
+    axis[largest] = math.sqrt(diagonal[largest])
+    for j in range(3):
+      if j != largest:
+        axis[j] = (rotation[3*largest+j]+rotation[3*j+largest])/(4.*axis[largest])
+  else:
+    axis = [rotation[7]-rotation[5], rotation[2]-rotation[6], rotation[3]-rotation[1]]
+  length = math.sqrt(sum(v*v for v in axis))
+  axis = [v/length for v in axis]
+  rise = sum(a*b for a, b in zip(axis, translation))
+  perpendicular = [translation[i]-rise*axis[i] for i in range(3)]
+  cross = [axis[1]*perpendicular[2]-axis[2]*perpendicular[1],
+           axis[2]*perpendicular[0]-axis[0]*perpendicular[2],
+           axis[0]*perpendicular[1]-axis[1]*perpendicular[0]]
+  centre = [.5*(perpendicular[i]+cross[i]/math.tan(angle/2.)) for i in range(3)]
+  points = list(_ncs_backbone_sites(snapshot, master).values())
+  # Place the origin near the selected unit, not at an arbitrary point on its axis.
+  height = sum(sum(p[i]*axis[i] for i in range(3)) for p in points)/len(points)
+  centre = [centre[i]+height*axis[i] for i in range(3)]
+  return dict(centre=centre, axis=axis, twist=math.degrees(angle), rise=rise)
+
+
+def _ncs_symmetry_group_signature(groups):
+  return tuple(sorted((peer, group["chains"][0], tuple(round(v, 5) for row in group["operators"][peer] for v in row))
+                      for group in groups for peer in group["chains"][1:]))
+
+
+def _ncs_symmetry_get_relations(model, snapshot=None):
+  """Session metadata is valid only while the native matrices remain unchanged."""
+  import copy
+  if not callable(getattr(coot, "ncs_ghosts_py", None)):
+    return []
+  if snapshot is None:
+    snapshot = _model_coordinate_snapshot(model)
+  groups = _ncs_symmetry_existing_operators(model, snapshot)
+  registry = getattr(coot, "_trimmings_symmetry_relations", {})
+  record = registry.get(model)
+  if record and record["signature"] == _ncs_symmetry_group_signature(groups):
+    return copy.deepcopy(record["relations"])
+  return [dict(id="existing", name="Existing NCS", groups=groups, untracked=True)] if groups else []
+
+
+def _ncs_symmetry_store_relations(model, relations):
+  import copy
+  registry = getattr(coot, "_trimmings_symmetry_relations", None)
+  if registry is None:
+    registry = {}
+    coot._trimmings_symmetry_relations = registry
+  groups = _ncs_symmetry_existing_operators(model, _model_coordinate_snapshot(model))
+  registry[model] = dict(relations=copy.deepcopy(relations), signature=_ncs_symmetry_group_signature(groups))
+
+
+def _ncs_symmetry_replace_relation(relations, relation):
+  return [r for r in relations if r["id"] != relation["id"]]+[relation]
+
+
+def _ncs_symmetry_base_relations(relations, relation_id, groups):
+  """Replace overlapping legacy/automatic ghosts, not named relationships."""
+  result = []
+  covered = {ch for group in groups for ch in group["chains"]}
+  for relation in relations:
+    if relation["id"] == relation_id:
+      continue
+    if relation.get("untracked"):
+      relation = dict(relation, groups=[g for g in relation["groups"] if not covered.intersection(g["chains"])])
+    if relation["groups"]:
+      result.append(relation)
+  return result
+
+
+def _ncs_symmetry_preserve_instances(groups, relation):
+  """Editing one local unit must not erase the same relation in other units."""
+  covered = {ch for group in groups for ch in group["chains"]}
+  return groups+[g for g in (relation or {}).get("groups", []) if not covered.intersection(g["chains"])]
+
+
+def _ncs_symmetry_copy_choices(relations, chain, all_group):
+  choices = [("All relationships", all_group)]
+  seen = {_ncs_symmetry_group_signature([_ncs_rebase_group(all_group, chain)])}
+  for relation in relations:
+    group = next((g for g in _ncs_symmetry_relation_groups([relation]) if chain in g["chains"]), None)
+    if group is not None and len(group["chains"]) > 1:
+      signature = _ncs_symmetry_group_signature([_ncs_rebase_group(group, chain)])
+      if signature not in seen:
+        seen.add(signature)
+        choices.append((relation["name"], group))
+  return choices
+
+
+def _ncs_symmetry_copy_dialog(context, snapshot, groups):
+  previous = getattr(coot, "_trimmings_symmetry_copy_window", None)
+  if previous is not None:
+    previous._ncs_cancel()
+  context = dict(context)
+  model = context["mol_id"]
+  name = coot.molecule_name(model)
+  relations = _ncs_symmetry_get_relations(model, snapshot)
+  state = dict(choices=[], closed=False)
+  window = Gtk.Window(title="Copy symmetry changes")
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  window.set_child(box)
+  box.append(Gtk.Label(label=f"Model #{model}: {os.path.basename(name)}", xalign=0))
+  if context.get("resno") is not None:
+    box.append(Gtk.Label(label=f"Active residue: {context['chain_id']}:{context['resno']}{context.get('ins_code', '')}", xalign=0))
+  controls = Gtk.Grid(column_spacing=10, row_spacing=8)
+  box.append(controls)
+  controls.attach(Gtk.Label(label="Master chain", xalign=0), 0, 0, 1, 1)
+  source = Gtk.ComboBoxText()
+  source.set_hexpand(True)
+  available = {ch for group in groups for ch in group["chains"]} | {context["chain_id"]}
+  for chain in dict.fromkeys(spec[0] for spec in snapshot):
+    if chain in available:
+      label = chain or "(blank)"
+      if chain == context["chain_id"]:
+        label += " (active residue)"
+      source.append(chain, label)
+  source.set_tooltip_text("Defaults to Coot's active residue when this dialog opens. Coot uses the nearest displayed, pickable atom "
+                          "to the view centre, which can belong to a neighbouring chain. This chain supplies the coordinates.")
+  controls.attach(source, 1, 0, 1, 1)
+  controls.attach(Gtk.Label(label="Copy within", xalign=0), 0, 1, 1, 1)
+  combo = Gtk.ComboBoxText()
+  combo.set_hexpand(True)
+  controls.attach(combo, 1, 1, 1, 1)
+  status = Gtk.Label(xalign=0)
+  status.set_wrap(True)
+  box.append(status)
+  def targets_changed(*_):
+    index = combo.get_active_id()
+    ready = index is not None and source.get_active_id() is not None
+    copy_button.set_sensitive(ready)
+    if ready:
+      group = state["choices"][int(index)][1]
+      peers = [ch for ch in group["chains"] if ch != source.get_active_id()]
+      status.set_text("Targets: "+(", ".join(ch or "(blank)" for ch in peers) if len(peers) <= 8 else f"{len(peers)} chains"))
+      status.set_tooltip_text(", ".join(repr(ch) for ch in peers))
+  def source_changed(*_):
+    old = combo.get_active_id()
+    preferred = state["choices"][int(old)][0] if old is not None else None
+    chain = source.get_active_id()
+    group = next((g for g in groups if chain in g["chains"]), None)
+    combo.remove_all()
+    state["choices"] = _ncs_symmetry_copy_choices(relations, chain, group) if group is not None else []
+    for i, (title, group) in enumerate(state["choices"]):
+      combo.append(str(i), f"{title} ({len(group['chains'])-1} copies)")
+    if state["choices"]:
+      index = next((i for i, (title, _) in enumerate(state["choices"]) if title == preferred), 0)
+      combo.set_active_id(str(index))
+    else:
+      copy_button.set_sensitive(False)
+      status.set_text("This chain has no NCS partners. Choose another master chain.")
+      status.set_tooltip_text("")
+  def apply(*_):
+    if state["closed"]:
+      return
+    try:
+      _ncs_require_idle(model)
+      if coot.molecule_name(model) != name or _model_coordinate_snapshot(model) != snapshot:
+        raise ValueError("The model changed; close this dialog and choose Copy again.")
+      if _ncs_symmetry_group_signature(_ncs_read_groups(model, snapshot)) != _ncs_symmetry_group_signature(groups):
+        raise ValueError("NCS changed; close this dialog and choose Copy again.")
+      if combo.get_active_id() is None or source.get_active_id() is None:
+        raise ValueError("Choose a master chain and copying relationship.")
+      selected = dict(context, chain_id=source.get_active_id())
+      copied = copy_ncs_chain_from_active(_group=state["choices"][int(combo.get_active_id())][1], _context=selected)
+      if copied is not None:
+        close()
+    except Exception as error:
+      status.set_text(str(error))
+  def close(*_):
+    if state["closed"]:
+      return True
+    state["closed"] = True
+    if getattr(coot, "_trimmings_symmetry_copy_window", None) is window:
+      coot._trimmings_symmetry_copy_window = None
+    window.destroy()
+    return True
+  actions = Gtk.Box(spacing=8)
+  copy_button = Gtk.Button(label="Copy")
+  copy_button.set_sensitive(False)
+  copy_button.connect("clicked", apply)
+  actions.append(copy_button)
+  for title, callback in (("Cancel", close),):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    actions.append(button)
+  box.append(actions)
+  combo.connect("changed", targets_changed)
+  source.connect("changed", source_changed)
+  source.set_active_id(context["chain_id"])
+  window._ncs_cancel = close
+  window.connect("close-request", close)
+  coot._trimmings_symmetry_copy_window = window
+  window.present()
+  return window
+
+
+def _ncs_symmetry_make_model(snapshot, plan, source=None):
+  expression, groups = _ncs_symmetry_expression(snapshot, plan)
+  existing = {spec[0] for spec in snapshot}
+  if source is not None and _model_coordinate_snapshot(source) != snapshot:
+    raise ValueError("The source changed; preview again before building.")
+  model = coot.copy_molecule(source) if source is not None else coot.add_molecule_py(expression, "Molecular symmetry assembly.cif")
+  if model == source or not coot.is_valid_model_molecule(model):
+    raise ValueError("Coot could not create the assembly.")
+  temporary = None
+  try:
+    coot.set_molecule_name(model, "Molecular symmetry assembly.cif")
+    if source is not None:
+      # Keep source metadata/links on the working copy; merge only new chains.
+      new_chains = [item for item in expression[0] if item[0] not in existing]
+      if new_chains:
+        temporary = coot.add_molecule_py([new_chains], "Symmetry copies (temporary)")
+        if not coot.is_valid_model_molecule(temporary):
+          raise ValueError("Could not create the missing copies.")
+        outcome = coot.merge_molecules_py([temporary], model)
+        if not outcome or outcome[0] != 1:
+          raise ValueError("Could not merge the missing copies into the new assembly.")
+    actual = _model_coordinate_snapshot(model)
+    if source is not None and any(actual.get(spec) != record for spec, record in snapshot.items()):
+      raise ValueError("Creating the assembly unexpectedly changed an existing chain; the new model was discarded.")
+    expected_count = sum(len(r[3]) for _ch, residues in expression[0] for r in residues)
+    if sum(len(r["atoms"]) for r in actual.values()) != expected_count:
+      raise ValueError("Assembly atom-count verification failed.")
+    for group in groups:
+      for peer in group["chains"][1:]:
+        # Existing matches need not be exact; verify newly generated chains only.
+        if peer not in existing:
+          _ncs_verify_copy(actual, group["chains"][0], peer, _ncs_inverse(group["operators"][peer]))
+    if source is not None:
+      sequences = dict(coot.sequence_info_py(source) or [])
+      sources = {ch: ch for ch in existing}
+      sources.update({peer: g["chains"][0] for g in groups for peer in g["chains"][1:] if peer not in existing})
+      for chain, template in sources.items():
+        if template in sequences:
+          for _ in range(sum(item[0] == chain for item in coot.sequence_info_py(model) or [])):
+            coot.delete_sequence_by_chain_id(model, chain)
+          coot.assign_fasta_sequence(model, chain, ">symmetry-reference\n"+sequences[template]+"\n")
+          cache = globals().get("_REGISTER_REFERENCE_ORIGINS", {})
+          if (source, template) in cache:
+            cache[(model, chain)] = cache[(source, template)]
+    if "relations" in plan:
+      relations = _ncs_symmetry_extend_relations(plan["relations"], plan, actual)
+      relation = dict(plan["relationship"], groups=groups)
+      relations = _ncs_symmetry_replace_relation(relations, relation)
+      groups = _ncs_symmetry_relation_groups(relations)
+    _ncs_install_groups(model, groups)
+    if "relations" in plan:
+      _ncs_symmetry_store_relations(model, relations)
+    return model
+  except Exception:
+    coot.close_molecule(model)
+    raise
+  finally:
+    if temporary is not None and coot.is_valid_model_molecule(temporary):
+      coot.close_molecule(temporary)
+
+
+def _ncs_symmetry_merge_record(source, assembly, before):
+  snapshot = _model_coordinate_snapshot(assembly)
+  added = {s[0] for s in snapshot}-{s[0] for s in before}
+  if not added:
+    raise ValueError("The built assembly has no new chains to merge.")
+  return dict(source=source, source_name=coot.molecule_name(source), before=before,
+              assembly=assembly, assembly_name=coot.molecule_name(assembly), added=added,
+              groups=_ncs_read_groups(assembly, snapshot, initialize=False),
+              relations=_ncs_symmetry_get_relations(assembly, snapshot),
+              source_relations=_ncs_symmetry_get_relations(source, before))
+
+
+def _ncs_symmetry_existing_operators(model, snapshot):
+  """Keep usable existing matrices, without fitting automatic/stale ghost groups."""
+  available = {s[0] for s in snapshot}
+  groups = {}
+  for ghost in coot.ncs_ghosts_py(model) or []:
+    if len(ghost) < 5:
+      raise ValueError("Coot returned an invalid NCS description.")
+    peer, master, operator, shown = ghost[1:5]
+    if not operator or peer not in available or master not in available or peer == master:
+      continue
+    group = groups.setdefault(master, dict(chains=[master], operators={}, display={}))
+    if peer in group["chains"]:
+      raise ValueError("Coot returned duplicate NCS peers.")
+    group["chains"].append(peer)
+    group["operators"][peer] = _ncs_operator(operator)
+    group["display"][peer] = bool(shown)
+  return list(groups.values())
+
+
+def _ncs_symmetry_undo_snapshot_matches(expected, actual):
+  """Native backup formats round coordinates and numeric atom properties."""
+  if expected.keys() != actual.keys():
+    return False
+  for spec, row in expected.items():
+    other = actual[spec]
+    if row["name"] != other["name"] or len(row["atoms"]) != len(other["atoms"]):
+      return False
+    atoms = {tuple(a[0]): a for a in other["atoms"]}
+    if len(atoms) != len(other["atoms"]):
+      return False
+    for identity, properties, xyz in row["atoms"]:
+      match = atoms.get(tuple(identity))
+      if (match is None or properties[2:] != match[1][2:] or len(xyz) != 3 or len(match[2]) != 3
+          or len(properties) != len(match[1])):
+        return False
+      if any(not math.isfinite(b) or abs(a-b) > .00051 for a, b in zip(xyz, match[2])):
+        return False
+      if any(not math.isfinite(b) or abs(a-b) > .0051 for a, b in zip(properties[:2], match[1][:2])):
+        return False
+  return True
+
+
+def _ncs_symmetry_cif_path(path):
+  if not str(path).strip():
+    raise ValueError("Choose an mmCIF file name.")
+  path = os.path.abspath(os.path.expanduser(str(path).strip()))
+  lower = path.lower()
+  for suffix in (".mmcif", ".cif"):
+    if lower.endswith(suffix):
+      return path[:-len(suffix)]+suffix
+  return path+".cif"
+
+
+def _ncs_symmetry_needs_conversion(record):
+  long_ids = any(len(s[0]) != 1 for s in record["before"]) or any(len(ch) != 1 for ch in record["added"])
+  return long_ids and not coot.molecule_name(record["source"]).endswith((".cif", ".mmcif", ".mmCIF"))
+
+
+def _ncs_symmetry_convert_to_mmcif(record, path, allow_overwrite=False):
+  """Save and validate an actual mmCIF before changing the in-session file name."""
+  if gemmi is None:
+    raise ValueError("Saving mmCIF requires Gemmi in Coot's Python.")
+  source = record["source"]
+  _ncs_require_idle(source)
+  before = _model_coordinate_snapshot(source)
+  if before != record["before"]:
+    raise ValueError("The original model changed; preview/build again before conversion.")
+  if os.path.isdir(os.path.expanduser(str(path))):
+    raise ValueError("Choose an mmCIF file, not a directory.")
+  path = _ncs_symmetry_cif_path(path)
+  def stamp():
+    try:
+      stat = os.lstat(path)
+      return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    except FileNotFoundError:
+      return None
+  previous = stamp()
+  if previous is not None and not allow_overwrite:
+    raise FileExistsError("That mmCIF file already exists; confirm overwriting it.")
+  fd, temporary = tempfile.mkstemp(prefix=".coot-convert-", suffix=".cif", dir=os.path.dirname(path))
+  os.close(fd)
+  try:
+    _write_model_with_embedded_annotations(source, temporary)
+    structure = gemmi.read_structure(temporary)
+    if len(structure) != 1:
+      raise ValueError("The mmCIF did not preserve the single-model structure.")
+    exported = {}
+    for chain in structure[0]:
+      for residue in chain:
+        spec = (chain.name, residue.seqid.num, residue.seqid.icode.strip())
+        if spec not in before or spec in exported:
+          raise ValueError("The mmCIF changed or duplicated residue identifiers.")
+        references = {(a[0][0].strip(), str(a[0][1]).strip()): a for a in before[spec]["atoms"]}
+        if len(references) != len(before[spec]["atoms"]):
+          raise ValueError("Ambiguous atom identifiers in the original model.")
+        atoms = []
+        for atom in residue:
+          identity = (atom.name.strip(), atom.altloc.strip("\0 "))
+          reference = references.get(identity)
+          if reference is None or atom.element.name.upper() != reference[1][2].strip().upper():
+            raise ValueError("The mmCIF changed atom identifiers or elements.")
+          properties = list(reference[1])
+          properties[:2] = [atom.occ, atom.b_iso]
+          atoms.append([list(reference[0]), properties, list(atom.pos)])
+        exported[spec] = dict(name=residue.name, atoms=atoms)
+    if not _ncs_symmetry_undo_snapshot_matches(before, exported):
+      raise ValueError("The mmCIF did not preserve the original atoms/coordinates.")
+    if _model_coordinate_snapshot(source) != before:
+      raise ValueError("The original changed during conversion; no mmCIF was saved.")
+    if stamp() != previous:
+      raise ValueError("The output file changed during conversion; it was not overwritten.")
+    if previous is None:
+      os.link(temporary, path)  # Exclusive publication: never clobber a newly appeared file.
+    else:
+      os.replace(temporary, path)
+    try:
+      coot.set_molecule_name(source, path)
+    except Exception as error:
+      raise RuntimeError(f"The mmCIF was saved at {path}, but Coot could not update the model name: {error}") from error
+    if coot.molecule_name(source) != path:
+      raise ValueError("The mmCIF was saved, but Coot could not update the model's file name.")
+    saved = globals().get("_recent_saved_file")
+    if callable(saved):
+      saved(path, "models")
+    return path
+  finally:
+    if os.path.exists(temporary):
+      os.unlink(temporary)
+
+
+def _ncs_symmetry_conversion_dialog(parent, record, ready, finished, alive):
+  """Confirm an actual save, with a second explicit confirmation for overwrites."""
+  window = Gtk.Window(title="Convert original to mmCIF?")
+  window.set_default_size(620, 180)
+  window.set_transient_for(parent)
+  window.set_modal(True)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  window.set_child(box)
+  message = Gtk.Label(label="Safe Undo requires mmCIF for these chain IDs. Save the original as mmCIF, then merge?", xalign=0)
+  message.set_wrap(True)
+  box.append(message)
+  row = Gtk.Box(spacing=8)
+  entry = Gtk.Entry()
+  name = coot.molecule_name(record["source"])
+  if name.lower().endswith(".gz"):
+    name = name[:-3]
+  for suffix in (".pdb", ".ent", ".mmcif", ".cif"):
+    if name.lower().endswith(suffix):
+      name = name[:-len(suffix)]
+      break
+  entry.set_text(os.path.abspath(name+".cif"))
+  entry.set_hexpand(True)
+  row.append(entry)
+  box.append(row)
+  status = Gtk.Label(label="", xalign=0)
+  status.set_wrap(True)
+  box.append(status)
+  state = dict(closed=False, overwrite=None, chooser=None, busy=False)
+  def close(*_):
+    if not state["closed"]:
+      state["closed"] = True
+      if state["chooser"] is not None:
+        state["chooser"].destroy()
+      window.destroy()
+      finished()
+    return True
+  def browse(*_):
+    chooser = Gtk.FileChooserNative.new("Save original as mmCIF", window, Gtk.FileChooserAction.SAVE, "Select", "Cancel")
+    chooser.set_current_name(os.path.basename(entry.get_text()))
+    state["chooser"] = chooser
+    def response(dialog, response_id):
+      if not state["closed"] and response_id == Gtk.ResponseType.ACCEPT:
+        file = dialog.get_file()
+        if file is not None and file.get_path():
+          entry.set_text(file.get_path())
+      state["chooser"] = None
+      dialog.destroy()
+    chooser.connect("response", response)
+    chooser.show()
+  button = Gtk.Button(label="Browse...")
+  button.connect("clicked", browse)
+  row.append(button)
+  actions = Gtk.Box(spacing=8)
+  cancel = Gtk.Button(label="Cancel")
+  submit = Gtk.Button(label="Save mmCIF and merge")
+  cancel.connect("clicked", close)
+  def changed(*_):
+    state["overwrite"] = None
+    submit.set_label("Save mmCIF and merge")
+    status.set_text("")
+  entry.connect("changed", changed)
+  def save(*_):
+    if state["busy"] or state["closed"]:
+      return
+    if not alive():
+      close()
+      return
+    try:
+      if not entry.get_text().strip():
+        raise ValueError("Choose an mmCIF file name.")
+      if os.path.isdir(os.path.expanduser(entry.get_text())):
+        raise ValueError("Choose an mmCIF file, not a directory.")
+      path = _ncs_symmetry_cif_path(entry.get_text())
+      if os.path.lexists(path) and state["overwrite"] != path:
+        state["overwrite"] = path
+        status.set_text(f"{os.path.basename(path)} already exists. Overwrite it?")
+        submit.set_label("Overwrite and merge")
+        return
+      state["busy"] = True
+      _ncs_symmetry_convert_to_mmcif(record, path, allow_overwrite=state["overwrite"] == path)
+      close()
+      ready()
+    except Exception as error:
+      status.set_text(str(error))
+    finally:
+      state["busy"] = False
+  submit.connect("clicked", save)
+  actions.append(cancel)
+  actions.append(submit)
+  box.append(actions)
+  window.connect("close-request", close)
+  window._ncs_cancel = close
+  window.present()
+  return window
+
+
+def _ncs_symmetry_merge_copies(record):
+  """Append only generated chains, validating on a copy before the undoable edit."""
+  source, assembly = record["source"], record["assembly"]
+  _ncs_require_idle(source)
+  _ncs_require_idle(assembly)
+  if coot.molecule_name(assembly) != record["assembly_name"]:
+    raise ValueError("The built assembly was renamed/replaced; build again before merging.")
+  if source == assembly:
+    raise ValueError("Cannot merge a model into itself.")
+  before = _model_coordinate_snapshot(source)
+  if {s[0] for s in before} & record["added"]:
+    raise ValueError("Generated chain IDs are already present in the original; nothing was merged.")
+  if before != record["before"]:
+    raise ValueError("The original model changed since building; preview/build again before merging.")
+  if "source_relations" in record and _ncs_symmetry_get_relations(source, before) != record["source_relations"]:
+    raise ValueError("The original NCS relationships changed since building; preview/build again before merging.")
+  if coot.backup_state(source) != 1:
+    raise ValueError("Enable Coot backups for the original model before merging.")
+  donor = _model_coordinate_snapshot(assembly)
+  if _ncs_symmetry_group_signature(_ncs_symmetry_existing_operators(assembly, donor)) != _ncs_symmetry_group_signature(record["groups"]):
+    raise ValueError("The built assembly's NCS relationships changed; build again before merging.")
+  fragment = {s: row for s, row in donor.items() if s[0] in record["added"]}
+  if {s[0] for s in fragment} != record["added"]:
+    raise ValueError("A generated chain was deleted or renamed; build again before merging.")
+  for chain in record["added"]:
+    _ncs_validate_source(fragment, chain)
+  if _ncs_symmetry_needs_conversion(record):
+    raise ValueError("Coot needs an mmCIF model name for safe backups of multi-character chain IDs. "
+                     "Save the original as mmCIF before merging.")
+  old_groups = _ncs_symmetry_existing_operators(source, before)
+  groups = record["groups"]
+  covered = {chain for group in groups for chain in group["chains"]}
+  # Keep wholly unrelated groups, but replace any overlapping old orbit.
+  groups = groups+[g for g in old_groups if not covered.intersection(g["chains"])]
+  combined = dict(before)
+  combined.update(fragment)
+  _ncs_validate_groups([g["chains"] for g in groups], combined)
+  expression, _ = _ncs_symmetry_expression(fragment, dict(groups=[], missing=[]))
+  previous_sequences = list(coot.sequence_info_py(source) or [])
+  donor_sequences = dict(coot.sequence_info_py(assembly) or [])
+  cache = globals().get("_REGISTER_REFERENCE_ORIGINS", {})
+  previous_origins = {key: value for key, value in cache.items() if key[0] == source}
+  getters = {name: getattr(coot, name, None) for name in ("list_extra_restraints_py", "link_info_py")}
+  metadata = {name: getter(source) for name, getter in getters.items() if callable(getter)}
+  temporary = []
+  def payload():
+    model = coot.add_molecule_py(expression, "Generated symmetry chains (merge temporary)")
+    if model in (source, assembly) or not coot.is_valid_model_molecule(model):
+      raise RuntimeError("Could not prepare the generated chains for merging.")
+    temporary.append(model)
+    coot.set_mol_displayed(model, 0)
+    return model
+  def merge(target, model, expected):
+    outcome = coot.merge_molecules_py([model], target)
+    if not outcome or outcome[0] != 1:
+      raise RuntimeError("Coot rejected the symmetry-copy merge.")
+    if _model_coordinate_snapshot(target) != expected:
+      raise RuntimeError("Coot changed existing atoms or renamed/omitted generated chains during merging.")
+  attempted = False
+  try:
+    stage = coot.copy_molecule(source)
+    if stage in (source, assembly) or not coot.is_valid_model_molecule(stage):
+      raise RuntimeError("Could not create an independent merge-validation copy.")
+    temporary.append(stage)
+    coot.set_mol_displayed(stage, 0)
+    model = payload()
+    expected = dict(before)
+    expected.update(_model_coordinate_snapshot(model))
+    merge(stage, model, expected)
+    _ncs_install_groups(stage, groups)
+    model = payload()  # Native merge hides/deactivates its donor.
+    expected = dict(before)
+    expected.update(_model_coordinate_snapshot(model))
+    with _grouped_model_edit(source):
+      attempted = True
+      merge(source, model, expected)
+      for name, original in metadata.items():
+        if getters[name](source) != original:
+          raise RuntimeError("Coot changed the original restraints or links during merging.")
+      for chain in record["added"]:
+        if chain in donor_sequences:
+          coot.assign_fasta_sequence(source, chain, ">symmetry-reference\n"+donor_sequences[chain]+"\n")
+        if (assembly, chain) in cache:
+          cache[(source, chain)] = cache[(assembly, chain)]
+      _ncs_install_groups(source, groups)
+  except Exception as error:
+    if not attempted:
+      raise RuntimeError(f"Merge stopped; original unchanged. {error}") from error
+    try:
+      coot.set_undo_molecule(source)
+      recovered = coot.apply_undo()
+      current = list(coot.sequence_info_py(source) or [])
+      for chain in {row[0] for row in current+previous_sequences}:
+        for _ in range(sum(row[0] == chain for row in current)):
+          coot.delete_sequence_by_chain_id(source, chain)
+      for chain, sequence in previous_sequences:
+        coot.assign_fasta_sequence(source, chain, ">restored-reference\n"+sequence+"\n")
+      for key in list(cache):
+        if key[0] == source:
+          del cache[key]
+      cache.update(previous_origins)
+      _ncs_install_groups(source, old_groups)
+      if not recovered or not _ncs_symmetry_undo_snapshot_matches(before, _model_coordinate_snapshot(source)):
+        raise RuntimeError("Could not verify coordinate recovery.")
+      if sorted(coot.sequence_info_py(source) or []) != sorted(previous_sequences):
+        raise RuntimeError("Could not verify reference-sequence recovery.")
+      if any(getters[name](source) != original for name, original in metadata.items()):
+        raise RuntimeError("Could not verify restraint/link recovery.")
+    except Exception as recovery_error:
+      raise RuntimeError(f"Merge failed; recovery could not be verified. Inspect/Undo the original before further edits. "
+                         f"The separate assembly was retained. {recovery_error}") from error
+    raise RuntimeError(f"Merge failed and was undone; the separate assembly was retained. {error}") from error
+  finally:
+    for model in temporary:
+      if coot.is_valid_model_molecule(model):
+        coot.close_molecule(model)
+  coot.set_mol_displayed(source, 1)
+  coot.set_mol_displayed(assembly, 0)
+  if record.get("relations"):
+    _ncs_symmetry_store_relations(source, record["relations"])
+  return len(record["added"])
+
+
+def molecular_symmetry_dialog():
+  existing = getattr(coot, "_trimmings_molecular_symmetry_window", None)
+  if existing is not None:
+    existing.present()
+    return existing
+  context = _active_chain_context_or_status()
+  if not context:
+    return None
+  mol_id = context["mol_id"]
+  try:
+    _ncs_require_idle(mol_id)
+    _model_coordinate_snapshot(mol_id)
+    initial_relations = _ncs_symmetry_get_relations(mol_id)
+  except Exception as error:
+    info_dialog(str(error))
+    return None
+  state = dict(asu=[], scope=None, picker=None, plan=None, preview=None, conversion=None, closed=False,
+               relations=initial_relations, relation_id="new")
+  builds = getattr(coot, "_trimmings_symmetry_builds", None)
+  if builds is None:
+    builds = {}
+    coot._trimmings_symmetry_builds = builds
+  for key, record in list(builds.items()):
+    if not all(coot.is_valid_model_molecule(record[field]) for field in ("source", "assembly")):
+      builds.pop(key, None)
+  window = Gtk.Window(title="Molecular symmetry")
+  window.set_default_size(700, 740)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  outer_scroll = Gtk.ScrolledWindow()
+  outer_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+  outer_scroll.set_child(box)
+  window.set_child(outer_scroll)
+  model_label = Gtk.Label(label=f"Model #{mol_id}: {os.path.basename(coot.molecule_name(mol_id))}", xalign=0)
+  box.append(model_label)
+  status = Gtk.Label(label="Pick the member chains of one asymmetric unit, then preview.", xalign=0)
+  status.set_wrap(True)
+  relationship_box = Gtk.Box(spacing=8)
+  relationship_box.append(Gtk.Label(label="Relationship", xalign=0))
+  relationships = Gtk.ComboBoxText()
+  relationships.set_hexpand(True)
+  relationship_box.append(relationships)
+  box.append(relationship_box)
+  name_box = Gtk.Box(spacing=8)
+  name_box.append(Gtk.Label(label="Name", xalign=0))
+  relationship_name = Gtk.Entry()
+  relationship_name.set_text("Symmetry 1")
+  relationship_name.set_hexpand(True)
+  relationship_name.set_tooltip_text("For example: AQP tetramer, local trimer, or outer helix.")
+  name_box.append(relationship_name)
+  box.append(name_box)
+  asu_label = Gtk.Label(label="ASU: not selected", xalign=0)
+  asu_label.set_wrap(True)
+  def accept_asu(chains):
+    state["asu"] = chains
+    asu_label.set_text("ASU: "+", ".join(repr(ch) for ch in chains))
+    status.set_text("ASU selected. Preview the symmetry matches.")
+  def pick(*_):
+    try:
+      if state["picker"] is not None:
+        state["picker"].present()
+      else:
+        clear_preview()
+        state["picker"] = _ncs_pick_chains(mol_id, accept_asu, window,
+            finished=lambda: state.update(picker=None))
+    except Exception as error:
+      status.set_text(str(error))
+  button = Gtk.Button(label="Pick ASU chains...")
+  button.connect("clicked", pick)
+  box.append(button)
+  box.append(asu_label)
+  controls = Gtk.Grid(column_spacing=10, row_spacing=8)
+  box.append(controls)
+  entries = {}
+  def entry(grid, row, key, title, value):
+    grid.attach(Gtk.Label(label=title, xalign=0), 0, row, 1, 1)
+    widget = Gtk.Entry()
+    widget.set_text(str(value))
+    widget.set_hexpand(True)
+    grid.attach(widget, 1, row, 1, 1)
+    entries[key] = widget
+    return widget
+  kind = Gtk.ComboBoxText()
+  kind.append("point", "Point group")
+  kind.append("helical", "Helical")
+  kind.set_active_id("point")
+  controls.attach(Gtk.Label(label="Symmetry", xalign=0), 0, 0, 1, 1)
+  controls.attach(kind, 1, 0, 1, 1)
+  point_box = Gtk.Grid(column_spacing=10, row_spacing=8)
+  entry(point_box, 0, "symbol", "Point group (Cn, Dn, T, O, I)", "C2")
+  box.append(point_box)
+  helix_box = Gtk.Grid(column_spacing=10, row_spacing=8)
+  for row, (key, title, value) in enumerate((("twist", "Twist (degrees)", 30), ("rise", "Rise (A)", 5),
+      ("count", "Total repeats (including ASU)", 7), ("first", "First repeat", 0))):
+    entry(helix_box, row, key, title, value)
+  entry(helix_box, 4, "axial", "Point group about helix (Cn, Dn)", "C1").set_tooltip_text(
+      "C1: screw only. Cn: n copies around the axis. Dn also includes perpendicular two-fold axes. "
+      "Do not add C2 if a near-180-degree screw already generates both protofilaments.")
+  helix_summary = Gtk.Label(xalign=0)
+  helix_summary.set_wrap(True)
+  helix_box.attach(helix_summary, 0, 5, 2, 1)
+  def summarize_helix(*_):
+    try:
+      first, last = _ncs_symmetry_helical_extent(entries["first"].get_text(), entries["count"].get_text())
+      axial = entries["axial"].get_text().strip().upper()
+      if not re.fullmatch(r"[CD][1-9][0-9]*", axial) or int(axial[1:]) > 360:
+        raise ValueError()
+      copies = (last-first+1)*int(axial[1:])*(2 if axial.startswith("D") else 1)
+      helix_summary.set_text(f"{copies} positions per ASU chain; repeats {first} to {last}.")
+    except (ValueError, TypeError):
+      helix_summary.set_text("")
+  for key in ("first", "count", "axial"):
+    entries[key].connect("changed", summarize_helix)
+  summarize_helix()
+  box.append(helix_box)
+  helix_box.set_visible(False)
+  helix_box.set_tooltip_text("The total includes the picked ASU and existing matches. First repeat 0 builds in the positive-axis direction; "
+                            "a negative first repeat also extends the other way. The range must contain repeat 0.")
+  def mode_changed(*_):
+    helix_box.set_visible(kind.get_active_id() == "helical")
+    point_box.set_visible(kind.get_active_id() == "point")
+  kind.connect("changed", mode_changed)
+  advanced = Gtk.Expander(label="Local symmetry / centre and axis")
+  advanced.set_tooltip_text("Default: Z through the map-box centre. For a local unit, limit the chain selection and estimate its own axis.")
+  grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+  advanced.set_child(grid)
+  box.append(advanced)
+  maps = Gtk.ComboBoxText()
+  for imol in molecule_number_list():
+    if coot.is_valid_map_molecule(imol):
+      maps.append(str(imol), f"#{imol}: {os.path.basename(coot.molecule_name(imol))}")
+  grid.attach(Gtk.Label(label="Map for box centre", xalign=0), 0, 0, 1, 1)
+  grid.attach(maps, 1, 0, 1, 1)
+  for row, axis in enumerate("xyz", 1):
+    entry(grid, row, "centre_"+axis, "Centre "+axis.upper()+" (A)", "")
+  for row, axis in enumerate("xyz", 4):
+    entry(grid, row, "axis_"+axis, "Axis "+axis.upper(), int(axis == "z"))
+  entry(grid, 7, "phase", "Orientation about axis (degrees)", 0)
+  entry(grid, 8, "tolerance", "Chain match tolerance (A RMSD)", 2)
+  local_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  grid.attach(local_box, 0, 9, 2, 1)
+  scope_label = Gtk.Label(label="Match: all chains", xalign=0)
+  scope_label.set_wrap(True)
+  local_box.append(scope_label)
+  def choose_chains(accepted, title, accept_label, purpose):
+    if state["picker"] is not None:
+      state["picker"].present()
+      return
+    clear_preview()
+    state["picker"] = _ncs_pick_chains(mol_id, accepted, window,
+        finished=lambda: state.update(picker=None), title=title, accept_label=accept_label, purpose=purpose)
+  def limit_scope(*_):
+    def accepted(chains):
+      state["scope"] = chains
+      scope_label.set_text("Match only: "+", ".join(chains))
+      status.set_text("Local chains selected. Other chains will not be matched.")
+    try:
+      choose_chains(accepted, "Pick local chains", "Use local chains", "local")
+    except Exception as error:
+      status.set_text(str(error))
+  def all_chains(*_):
+    state["scope"] = None
+    scope_label.set_text("Match: all chains")
+  scope_buttons = Gtk.Box(spacing=8)
+  for title, callback in (("Limit to picked chains...", limit_scope), ("All chains", all_chains)):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    scope_buttons.append(button)
+  local_box.append(scope_buttons)
+  def frame_from_chains(*_):
+    def accepted(chains):
+      if len(chains) != 2:
+        raise ValueError("Pick two corresponding chains to estimate their local axis.")
+      frame = _ncs_symmetry_frame_from_chains(_model_coordinate_snapshot(mol_id), *chains)
+      for key in ("centre", "axis"):
+        for axis, value in zip("xyz", frame[key]):
+          entries[key+"_"+axis].set_text(f"{value:.9g}")
+      status.set_text(f"Local axis estimated from {chains[0]}/{chains[1]}. Preview to check the matches.")
+    try:
+      choose_chains(accepted, "Pick axis reference chains", "Use two chains", "reference")
+    except Exception as error:
+      status.set_text(str(error))
+  def centre_at_view(*_):
+    try:
+      for axis, value in zip("xyz", _capture_view_state()["rotation_centre"]):
+        entries["centre_"+axis].set_text(f"{value:.9g}")
+    except Exception as error:
+      status.set_text(str(error))
+  frame_buttons = Gtk.Box(spacing=8)
+  for title, callback in (("Axis from two chains...", frame_from_chains), ("Centre at view", centre_at_view)):
+    button = Gtk.Button(label=title)
+    if callback is frame_from_chains:
+      button.set_tooltip_text("Pick two members related by rotation about the principal axis, e.g. two members of a cyclic ring. "
+                              "For Dn, do not pick a pair related by a perpendicular dyad.")
+    button.connect("clicked", callback)
+    frame_buttons.append(button)
+  local_box.append(frame_buttons)
+  def map_changed(*_):
+    try:
+      if maps.get_active_id() is None:
+        raise ValueError("No map loaded: enter the symmetry centre explicitly.")
+      for axis, value in zip("xyz", _ncs_symmetry_box_centre(int(maps.get_active_id()))):
+        entries["centre_"+axis].set_text(f"{value:.6g}")
+    except Exception as error:
+      advanced.set_expanded(True)
+      status.set_text(str(error))
+  maps.connect("changed", map_changed)
+  active_map = getattr(coot, "imol_refinement_map", lambda: -1)()
+  if not maps.set_active_id(str(active_map)):
+    maps.set_active(0)
+  if maps.get_active_id() is None:
+    map_changed()
+  instructions = Gtk.Label(label="Assign adds this relationship without moving atoms. Build makes a separate model.", xalign=0)
+  instructions.set_wrap(True)
+  instructions.set_tooltip_text("Named relationships are retained; overlapping unlabelled/automatic NCS is replaced. "
+                                "Copies use the entered operators without refitting. Check the RMSDs before assigning.")
+  box.append(instructions)
+  table = Gtk.TextView()
+  table.set_editable(False)
+  table.set_monospace(True)
+  scroll = Gtk.ScrolledWindow()
+  scroll.set_vexpand(True)
+  scroll.set_min_content_height(130)
+  scroll.set_child(table)
+  box.append(scroll)
+  box.append(status)
+  def refresh_relationships(active="new"):
+    relationships.remove_all()
+    relationships.append("new", "New relationship")
+    for relation in state["relations"]:
+      relationships.append(relation["id"], relation["name"])
+    relationships.set_active_id(active)
+  def selected_relation():
+    return next((r for r in state["relations"] if r["id"] == state["relation_id"]), None)
+  def select_relationship(*_):
+    if state["picker"] is not None:
+      relationships.set_active_id(state["relation_id"])
+      status.set_text("Finish picking the chains first.")
+      return
+    if state["preview"] is not None:
+      clear_preview()
+    state["plan"] = None
+    state["relation_id"] = relationships.get_active_id() or "new"
+    relation = selected_relation()
+    if relation is None:
+      relationship_name.set_text(f"Symmetry {len(state['relations'])+1}")
+      return
+    relationship_name.set_text(relation["name"])
+    config = relation.get("config")
+    if config:
+      kind.set_active_id(config["kind"])
+      for key, value in config["entries"].items():
+        if key in entries:
+          entries[key].set_text(value)
+      accept_asu(list(config["asu"]))
+      state["scope"] = config["scope"]
+      scope_label.set_text("Match: all chains" if state["scope"] is None else "Match only: "+", ".join(state["scope"]))
+    else:
+      status.set_text("Existing NCS retained. Add a new relationship, or use these chains as an outer ASU.")
+  relationships.connect("changed", select_relationship)
+  refresh_relationships()
+  def new_relationship(*_):
+    if state["picker"] is not None:
+      status.set_text("Finish picking the chains first.")
+      return
+    clear_preview()
+    state["plan"] = None
+    relationships.set_active_id("new")
+    state["asu"] = []
+    asu_label.set_text("ASU: not selected")
+    all_chains()
+    status.set_text("Pick an ASU and set the new symmetry. Existing relationships are retained.")
+  def outer_relationship(*_):
+    try:
+      if state["picker"] is not None:
+        raise ValueError("Finish picking the chains first.")
+      relation = selected_relation()
+      if relation is None:
+        raise ValueError("Select an assigned relationship first.")
+      seeds = relation.get("config", {}).get("asu")
+      members = list(dict.fromkeys(ch for g in relation["groups"]
+                                  if not seeds or set(seeds).intersection(g["chains"]) for ch in g["chains"]))
+      new_relationship()
+      accept_asu(members)
+      status.set_text("Local unit used as the outer ASU. Pick ASU chains again to include any other subunits.")
+    except Exception as error:
+      status.set_text(str(error))
+  def remove_relationship(*_):
+    try:
+      if state["picker"] is not None:
+        raise ValueError("Finish picking the chains first.")
+      _ncs_require_idle(mol_id)
+      relation = selected_relation()
+      if relation is None:
+        raise ValueError("Select an assigned relationship to remove.")
+      current = _ncs_symmetry_get_relations(mol_id)
+      if current != state["relations"]:
+        raise ValueError("NCS changed; close and reopen this dialog.")
+      remaining = [r for r in current if r["id"] != relation["id"]]
+      _ncs_install_groups(mol_id, _ncs_symmetry_relation_groups(remaining))
+      _ncs_symmetry_store_relations(mol_id, remaining)
+      state["relations"] = remaining
+      clear_preview()
+      state["plan"] = None
+      refresh_relationships()
+      status.set_text("Relationship removed. Coordinates unchanged.")
+    except Exception as error:
+      status.set_text(str(error))
+  relation_actions = Gtk.Box(spacing=8)
+  for title, callback in (("New relationship", new_relationship), ("Use as outer ASU", outer_relationship),
+                          ("Remove relationship", remove_relationship)):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    relation_actions.append(button)
+  box.append(relation_actions)
+  def settings():
+    values = {key: widget.get_text().strip() for key, widget in entries.items()}
+    return (kind.get_active_id(), tuple(state["asu"]), tuple(sorted(values.items())),
+            None if state["scope"] is None else tuple(state["scope"]),
+            state["relation_id"], relationship_name.get_text().strip())
+  def clear_preview(*_):
+    preview = state["preview"]
+    state["preview"] = None
+    if preview is None:
+      return
+    model = preview["model"]
+    if coot.is_valid_model_molecule(model) and coot.molecule_name(model) == preview["name"]:
+      moving = getattr(coot, "refinement_already_ongoing_p", lambda: False)()
+      try:
+        unchanged = _model_coordinate_snapshot(model) == preview["snapshot"]
+      except Exception:
+        unchanged = False
+      if not moving and unchanged:
+        coot.close_molecule(model)
+      else:
+        status.set_text("Edited/refining preview kept as a separate model.")
+    if coot.is_valid_model_molecule(mol_id) and coot.molecule_name(mol_id) == preview["source_name"]:
+      coot.set_mol_displayed(mol_id, preview["source_visible"])
+  def preview(*_):
+    try:
+      if state["picker"] is not None:
+        raise ValueError("Finish picking the ASU first.")
+      _ncs_require_idle(mol_id)
+      clear_preview()
+      state["plan"] = None
+      saved_settings = settings()
+      snapshot = _model_coordinate_snapshot(mol_id)
+      if any(not entries["centre_"+a].get_text().strip() for a in "xyz"):
+        raise ValueError("Choose a map or enter the symmetry centre first.")
+      mode = kind.get_active_id()
+      if mode == "point":
+        extra = dict(symbol=entries["symbol"].get_text())
+      else:
+        first, last = _ncs_symmetry_helical_extent(entries["first"].get_text(), entries["count"].get_text())
+        extra = dict(twist=float(entries["twist"].get_text()), rise=float(entries["rise"].get_text()),
+                     first=first, last=last, axial=entries["axial"].get_text())
+      operators = _ncs_symmetry_operators(mode,
+          [float(entries["centre_"+a].get_text()) for a in "xyz"],
+          [float(entries["axis_"+a].get_text()) for a in "xyz"], phase=float(entries["phase"].get_text()), **extra)
+      plan = _ncs_symmetry_plan(snapshot, state["asu"], operators, float(entries["tolerance"].get_text()), scope=state["scope"])
+      state["relations"] = _ncs_symmetry_get_relations(mol_id, snapshot)
+      relation_id = state["relation_id"]
+      if relation_id == "new":
+        number = 1
+        while any(r["id"] == f"symmetry-{number}" for r in state["relations"]):
+          number += 1
+        relation_id = f"symmetry-{number}"
+      name = relationship_name.get_text().strip()
+      if not name:
+        raise ValueError("Give this relationship a short name.")
+      if any(r["name"] == name and r["id"] != relation_id for r in state["relations"]):
+        raise ValueError("Use a different name for each relationship.")
+      plan["relations"] = _ncs_symmetry_base_relations(state["relations"], relation_id, plan["groups"])
+      previous = next((r for r in state["relations"] if r["id"] == relation_id), None)
+      plan["groups"] = _ncs_symmetry_preserve_instances(plan["groups"], previous)
+      plan["relationship"] = dict(id=relation_id, name=name,
+          config=dict(kind=mode, entries={key: w.get_text() for key, w in entries.items()},
+                      asu=list(state["asu"]), scope=state["scope"]))
+      _ncs_symmetry_relation_groups(plan["relations"]+[dict(plan["relationship"], groups=plan["groups"])])
+      state["native_signature"] = _ncs_symmetry_group_signature(_ncs_symmetry_existing_operators(mol_id, snapshot))
+      lines = ["ASU chain   Repeat   Copy       CA/P RMSD (A)"]
+      for row in plan["rows"]:
+        lines.append(f"{row['master']!r:11} {str(row['repeat']):>6}   {row['peer'] if row['peer'] is not None else 'MISSING':10} "
+                     +(f"{row['rmsd']:.3f}" if row['rmsd'] is not None else ""))
+      table.get_buffer().set_text("\n".join(lines))
+      state.update(plan=plan, snapshot=snapshot, settings=saved_settings)
+      source_visible, source_name = coot.mol_is_displayed(mol_id), coot.molecule_name(mol_id)
+      view = _capture_view_state()
+      model = coot.copy_molecule(mol_id)
+      _restore_view_state(view)
+      if model == mol_id or not coot.is_valid_model_molecule(model):
+        raise ValueError("Could not create the symmetry preview.")
+      name = f"Molecular symmetry matches [{id(plan):x}]"
+      coot.set_molecule_name(model, name)
+      state["preview"] = dict(model=model, name=name, snapshot=_model_coordinate_snapshot(model),
+                              source_visible=source_visible, source_name=source_name)
+      coot.clear_user_defined_atom_colours(model)
+      coot.set_draw_ncs_ghosts(model, 0)
+      coot.set_bond_colour_rotation_for_molecule(model, 0.)
+      palette = (8, 4, 5, 3, 7, 1)
+      colours = {ch: palette[i % len(palette)] for i, group in enumerate(plan["groups"]) for ch in group["chains"]}
+      _ncs_preview_chain_colours(model, snapshot, {spec[0]: colours.get(spec[0], 6) for spec in snapshot})
+      coot.set_mol_displayed(mol_id, 0)
+      coot.set_mol_displayed(model, 1)
+      status.set_text(f"Matched {len(plan['rows'])-len(plan['missing'])} copies; {len(plan['missing'])} missing; "
+                      f"{len(plan['unassigned'])} unassigned chains (grey). Each ASU-chain orbit has its own colour.")
+    except Exception as error:
+      status.set_text(str(error))
+  def current_plan():
+    _ncs_require_idle(mol_id)
+    if (state["plan"] is None or state["settings"] != settings()
+        or state["snapshot"] != _model_coordinate_snapshot(mol_id)):
+      raise ValueError("Preview again: the settings or model changed.")
+    if state["picker"] is not None:
+      raise ValueError("Finish picking the ASU first.")
+    if state["native_signature"] != _ncs_symmetry_group_signature(
+        _ncs_symmetry_existing_operators(mol_id, state["snapshot"])):
+      raise ValueError("NCS relationships changed; preview again.")
+    return state["plan"]
+  def assign(*_):
+    try:
+      plan = current_plan()
+      groups = [g for g in plan["groups"] if len(g["chains"]) > 1]
+      if not any(row["peer"] is not None for row in plan["rows"]):
+        raise ValueError("No existing copies matched. Check the frame or build missing copies.")
+      relations = _ncs_symmetry_extend_relations(plan["relations"], plan, state["snapshot"], strict=False)
+      relations = _ncs_symmetry_replace_relation(relations, dict(plan["relationship"], groups=groups))
+      combined = _ncs_symmetry_relation_groups(relations)
+      _ncs_install_groups(mol_id, combined)
+      _ncs_symmetry_store_relations(mol_id, relations)
+      state["relations"] = relations
+      refresh_relationships(plan["relationship"]["id"])
+      clear_preview()
+      status.set_text(f"Assigned {len(groups)} NCS groups using fixed symmetry operators. No atoms moved. "
+                      f"{len(plan['missing'])} missing copies were not created.")
+    except Exception as error:
+      status.set_text(str(error))
+  def build(*_):
+    try:
+      plan = current_plan()
+      if not plan["missing"]:
+        raise ValueError("No missing copies to build.")
+      model = _ncs_symmetry_make_model(state["snapshot"], plan, source=mol_id)
+      builds[mol_id] = _ncs_symmetry_merge_record(mol_id, model, state["snapshot"])
+      merge_button.set_sensitive(True)
+      clear_preview()
+      status.set_text(f"Created assembly #{model} with {len(plan['missing'])} new chains. Original unchanged. "
+                      "Use Merge built copies to add only the new chains to the original.")
+    except Exception as error:
+      status.set_text(str(error))
+  def finish_merge(record):
+    if state["closed"] or builds.get(mol_id) is not record:
+      return
+    model_label.set_text(f"Model #{mol_id}: {os.path.basename(coot.molecule_name(mol_id))}")
+    count = _ncs_symmetry_merge_copies(record)
+    clear_preview()
+    coot.set_mol_displayed(mol_id, 1)
+    builds.pop(mol_id, None)
+    merge_button.set_sensitive(False)
+    state["plan"] = None
+    state["relations"] = _ncs_symmetry_get_relations(mol_id)
+    refresh_relationships()
+    status.set_text(f"Merged {count} new chains into original #{mol_id}; NCS groups updated. "
+                    f"Assembly #{record['assembly']} retained, hidden.")
+  def merge_built(*_):
+    try:
+      if state["conversion"] is not None:
+        state["conversion"].present()
+        return
+      if state["picker"] is not None:
+        raise ValueError("Finish picking the ASU first.")
+      record = builds.get(mol_id)
+      if record is None:
+        raise ValueError("Build the missing copies first.")
+      _ncs_require_idle(mol_id)
+      if _model_coordinate_snapshot(mol_id) != record["before"]:
+        raise ValueError("The original changed since building; preview/build again before merging.")
+      if _ncs_symmetry_needs_conversion(record):
+        def finished():
+          state["conversion"] = None
+          if not state["closed"]:
+            merge_button.set_sensitive(mol_id in builds)
+        def ready():
+          try:
+            finish_merge(record)
+          except Exception as error:
+            status.set_text(str(error))
+        state["conversion"] = _ncs_symmetry_conversion_dialog(window, record, ready, finished,
+            lambda: not state["closed"] and builds.get(mol_id) is record)
+        merge_button.set_sensitive(False)
+        return
+      finish_merge(record)
+    except Exception as error:
+      status.set_text(str(error))
+  def close(*_):
+    if state["closed"]:
+      return True
+    state["closed"] = True
+    if state["conversion"] is not None:
+      state["conversion"]._ncs_cancel()
+    if state["picker"] is not None:
+      state["picker"]._ncs_cancel()
+    clear_preview()
+    if getattr(coot, "_trimmings_molecular_symmetry_window", None) is window:
+      coot._trimmings_molecular_symmetry_window = None
+    window.destroy()
+    return True
+  actions = Gtk.Box(spacing=8)
+  for title, callback in (("Preview matches", preview), ("Assign NCS", assign), ("Build missing copies", build)):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    actions.append(button)
+  box.append(actions)
+  actions = Gtk.Box(spacing=8)
+  merge_button = Gtk.Button(label="Merge built copies")
+  merge_button.set_sensitive(mol_id in builds)
+  merge_button.set_tooltip_text("Add only the generated chains to the original model; keep its existing atoms and restraints. "
+                               "The separate assembly is retained. Backups must be enabled.")
+  merge_button.connect("clicked", merge_built)
+  actions.append(merge_button)
+  for title, callback in (("Clear preview", clear_preview), ("Close", close)):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    actions.append(button)
+  box.append(actions)
+  window.connect("close-request", close)
+  coot._trimmings_molecular_symmetry_window = window
+  window.present()
+  return window
+
+
+def ncs_groups_dialog():
+  context = _active_chain_context_or_status()
+  if not context:
+    return None
+  mol_id = context["mol_id"]
+  try:
+    snapshot = _model_coordinate_snapshot(mol_id)
+    initial = [g["chains"] for g in _ncs_read_groups(mol_id, snapshot, initialize=False)]
+  except Exception as error:
+    info_dialog(str(error))
+    return None
+  window = Gtk.Window(title="Define NCS groups")
+  window.set_default_size(560, 360)
+  box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  for side in ("top", "bottom", "start", "end"):
+    getattr(box, "set_margin_"+side)(12)
+  window.set_child(box)
+  box.append(Gtk.Label(label=f"Model #{mol_id}: {os.path.basename(coot.molecule_name(mol_id))}", xalign=0))
+  label = Gtk.Label(label="One group per line; first chain is the master. Omitted chains are not copied.", xalign=0)
+  label.set_wrap(True)
+  box.append(label)
+  view = Gtk.TextView()
+  view.set_monospace(True)
+  buffer = view.get_buffer()
+  buffer.set_text(_ncs_groups_text(initial))
+  scroll = Gtk.ScrolledWindow()
+  scroll.set_vexpand(True)
+  scroll.set_child(view)
+  box.append(scroll)
+  status = Gtk.Label(label="Fit operators once here; copying keeps them fixed.", xalign=0)
+  status.set_wrap(True)
+  box.append(status)
+  def read_groups():
+    _ncs_require_idle(mol_id)
+    text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+    return _ncs_validate_groups(_ncs_parse_groups(text), _model_coordinate_snapshot(mol_id))
+  def apply_groups(*_):
+    try:
+      groups = read_groups()
+      define_ncs_groups(mol_id, groups)
+      status.set_text(f"Applied {len(groups)} groups. Operators remain fixed until explicitly refitted.")
+    except Exception as error:
+      status.set_text(str(error))
+  def choose_file(save):
+    chooser = Gtk.FileChooserNative.new("Save NCS groups" if save else "Load NCS groups", window,
+        Gtk.FileChooserAction.SAVE if save else Gtk.FileChooserAction.OPEN, "Save" if save else "Open", "Cancel")
+    if save:
+      chooser.set_current_name("ncs-groups.json")
+    def response(dialog, response_id):
+      try:
+        if response_id == Gtk.ResponseType.ACCEPT:
+          path = dialog.get_file().get_path()
+          if save:
+            _ncs_group_file(path, read_groups())
+            status.set_text("Saved chain assignments (not operators).")
+          else:
+            groups = _ncs_validate_groups(_ncs_group_file(path), _model_coordinate_snapshot(mol_id))
+            buffer.set_text(_ncs_groups_text(groups))
+            status.set_text("Loaded assignments. Click Fit / apply groups to estimate operators.")
+      except Exception as error:
+        status.set_text(str(error))
+      finally:
+        dialog.destroy()
+    chooser.connect("response", response)
+    chooser.show()
+  actions = Gtk.Box(spacing=8)
+  for title, callback in (("Fit / apply groups", apply_groups), ("Load...", lambda *_: choose_file(False)),
+                          ("Save...", lambda *_: choose_file(True)), ("Close", lambda *_: window.destroy())):
+    button = Gtk.Button(label=title)
+    button.connect("clicked", callback)
+    actions.append(button)
+  box.append(actions)
+  window.present()
+  return window
 
 def return_seq_as_string(mol_id,ch_id):
   seq_chars=[]
@@ -30742,6 +34368,8 @@ def _build_custom_mutate_menu(submenu_mutate):
 
 
 def _build_custom_modify_menu(submenu_modify):
+  add_simple_coot_menu_menuitem(submenu_modify, "Replace region from AlphaFold...", lambda *_: replace_region_from_alphafold())
+  add_simple_coot_menu_menuitem(submenu_modify, "Replace chain from AlphaFold...", lambda *_: replace_chain_from_alphafold())
   add_simple_coot_menu_menuitem(submenu_modify, "Copy current chain", lambda func: copy_active_chain())
   add_simple_coot_menu_menuitem(submenu_modify, "Cut current chain", lambda func: cut_active_chain())
   add_simple_coot_menu_menuitem(submenu_modify, "Copy active segment", lambda func: copy_active_segment())
@@ -30770,6 +34398,16 @@ def _build_custom_modify_menu(submenu_modify):
     submenu_modify,
     "Copy active chain to NCS equivs",
     lambda func: copy_ncs_chain_from_active(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Molecular symmetry...",
+    lambda func: molecular_symmetry_dialog(),
+  )
+  add_simple_coot_menu_menuitem(
+    submenu_modify,
+    "Define NCS groups...",
+    lambda func: ncs_groups_dialog(),
   )
   add_simple_coot_menu_menuitem(
     submenu_modify,
