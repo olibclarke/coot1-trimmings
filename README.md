@@ -1,6 +1,6 @@
 # coot1-trimmings - Customizations & scripts for Coot 1.x
 
-`coot1_trimmings.py` is a Coot startup script for Coot 1.3.x, ported from `coot-trimmings` for Coot 0.9.x with the assistance of the Codex LLM. It adds custom keybindings, map-display presets, model-editing shortcuts, and a small set of startup preferences.
+[`coot1_trimmings.py`](https://raw.githubusercontent.com/olibclarke/coot1-trimmings/refs/heads/main/coot1_trimmings.py) is a Coot startup script for Coot 1.3.x, ported from `coot-trimmings` for Coot 0.9.x with the assistance of the Codex LLM. It adds custom keybindings, map-display presets, model-editing shortcuts, and a small set of startup preferences.
 
 A quick demo of some of the keyboard actions is here:
 
@@ -14,7 +14,7 @@ _Note: if you are looking for trimmings for Coot 0.9, you are in the wrong place
 
 ## Install
 
-Copy ￼`coot1_trimmings.py`￼ into Coot's startup-script directory (e.g. ~/.config/Coot/ on Mac) and restart Coot.
+Copy ￼[`coot1_trimmings.py`](https://raw.githubusercontent.com/olibclarke/coot1-trimmings/refs/heads/main/coot1_trimmings.py)￼ into Coot's startup-script directory (e.g. ~/.config/Coot/ on Mac) and restart Coot.
 
 Example:
 
