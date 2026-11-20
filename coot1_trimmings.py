@@ -1791,6 +1791,38 @@ def _navigation_reference_residue():
   return None
 
 
+def _coordinate_file_from_label(label, mmcif_only=False):
+  """Use the complete name only; never infer a source file from a fragment or stub."""
+  if not isinstance(label, str) or not label or label.startswith(("Atom selection ", "Copy_of_")):
+    return None
+  path = os.path.abspath(os.path.expanduser(label))
+  suffixes = (".cif", ".mmcif") if mmcif_only else (".pdb", ".ent", ".cif", ".mmcif", ".ins", ".res")
+  name = path.lower().removesuffix(".gz")
+  return path if name.endswith(suffixes) and os.path.isfile(path) else None
+
+
+def _coordinate_file_stem(label):
+  if label.lower().endswith(".gz"):
+    label = label[:-3]
+  for suffix in (".pdb", ".ent", ".mmcif", ".cif", ".ins", ".res"):
+    if label.lower().endswith(suffix):
+      return label[:-len(suffix)]
+  return label
+
+
+def _coordinate_file_export_stem(label, fallback="model"):
+  """Turn an in-memory name into a single, portable filename component."""
+  def safe(value):
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip(".-")[:100]
+  name = str(label or "")
+  prefix = "Atom selection "
+  if name.startswith(prefix):
+    selection, _, parent = name[len(prefix):].partition(" from ")
+    origin = safe(_coordinate_file_stem(os.path.basename(parent))) or fallback
+    return origin+"-"+(safe(selection) or "selection")
+  return safe(_coordinate_file_stem(name)) or fallback
+
+
 def _molecule_id_name_label(mol_id):
   molecule_label = molecule_name_stub_py(mol_id, 0) or molecule_name(mol_id) or ""
   molecule_label = os.path.basename(str(molecule_label).strip()) or f"molecule_{mol_id}"
@@ -8622,22 +8654,7 @@ def _annotation_residue_key(chain_id, resno, ins_code, residue_name_here=""):
 
 
 def _annotation_source_path(mol_id, mmcif_only=False):
-  candidates = []
-  for candidate in (
-    molecule_name_stub_py(mol_id, 0),
-    molecule_name_stub_py(mol_id, 1),
-    molecule_name(mol_id),
-  ):
-    if isinstance(candidate, str) and candidate:
-      expanded = os.path.abspath(os.path.expanduser(candidate))
-      if expanded not in candidates:
-        candidates.append(expanded)
-  for candidate in candidates:
-    if os.path.isfile(candidate):
-      if mmcif_only and not candidate.lower().endswith((".cif", ".mmcif")):
-        continue
-      return candidate
-  return None
+  return _coordinate_file_from_label(molecule_name(mol_id), mmcif_only=mmcif_only)
 
 
 def _annotation_source_display_name(mol_id):
@@ -9686,24 +9703,19 @@ def _write_model_with_embedded_annotations(mol_id, file_path):
         pass
 
 
-def _default_annotation_export_path(mol_id):
-  export_directory = _annotation_export_directory()
+def _annotation_export_stem(mol_id):
   source_path = _annotation_source_path(mol_id)
   if source_path:
-    source_stem = os.path.splitext(os.path.basename(source_path))[0]
-    return os.path.join(export_directory, f"{source_stem}.annotated.cif")
-  source_stub = molecule_name_stub_py(mol_id, 0) or f"molecule_{mol_id}"
-  return os.path.join(export_directory, f"{source_stub}.annotated.cif")
+    return _coordinate_file_stem(os.path.basename(source_path)) or f"molecule_{mol_id}"
+  return _coordinate_file_export_stem(molecule_name(mol_id), f"molecule_{mol_id}")
+
+
+def _default_annotation_export_path(mol_id):
+  return os.path.join(_annotation_export_directory(), _annotation_export_stem(mol_id)+".annotated.cif")
 
 
 def _default_annotation_markdown_export_path(mol_id):
-  export_directory = _annotation_export_directory()
-  source_path = _annotation_source_path(mol_id)
-  if source_path:
-    source_stem = os.path.splitext(os.path.basename(source_path))[0]
-    return os.path.join(export_directory, f"{source_stem}.annotations.md")
-  source_stub = molecule_name_stub_py(mol_id, 0) or f"molecule_{mol_id}"
-  return os.path.join(export_directory, f"{source_stub}.annotations.md")
+  return os.path.join(_annotation_export_directory(), _annotation_export_stem(mol_id)+".annotations.md")
 
 
 def _annotation_normalize_export_path(raw_output_path, allowed_suffixes, default_suffix, path_label):
@@ -9717,6 +9729,9 @@ def _annotation_normalize_export_path(raw_output_path, allowed_suffixes, default
     return None
   if not normalized_path.lower().endswith(tuple(allowed_suffixes)):
     normalized_path += default_suffix
+  if os.path.isdir(normalized_path) or not os.path.isdir(os.path.dirname(normalized_path)):
+    info_dialog(f"Choose an output file in an existing folder for the {path_label} export.")
+    return None
   return normalized_path
 
 
@@ -9779,9 +9794,6 @@ def _export_residue_annotations_markdown_for_molecule(mol_id, output_path, allow
       lambda: _export_residue_annotations_markdown_for_molecule(mol_id, normalized_path, allow_overwrite=True),
     )
   try:
-    output_directory = os.path.dirname(normalized_path)
-    if output_directory:
-      os.makedirs(output_directory, exist_ok=True)
     with open(normalized_path, "w", encoding="utf-8") as handle:
       handle.write(_annotation_markdown_table_text(mol_id))
   except Exception as error:
@@ -28436,23 +28448,36 @@ def fix_active_residue():
   
 #Save and overwrite active model:
 def quicksave_active():
-  import shutil
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  filename=molecule_name(mol_id)
-  filename_bak=filename+".bak"
-  shutil.copy(filename,filename_bak)
-  save_coordinates(mol_id,filename)
-  info_dialog("Saved {filename} (molecule {mol_id}). \n If this was an accident, you can find a backup of the original file here: \n {filename_bak}".format(filename=filename,mol_id=mol_id,filename_bak=filename_bak))
+  filename = _coordinate_file_from_label(molecule_name(mol_id))
+  if filename is None or filename.lower().endswith(".gz"):
+    info_dialog("Quick Save needs an existing, uncompressed coordinate file. Use Save Coordinates to save this model to a new file.")
+    return None
+  filename_bak = filename+".bak"
+  try:
+    with tempfile.TemporaryDirectory(prefix=".coot-quicksave-", dir=os.path.dirname(filename)) as directory:
+      backup = os.path.join(directory, "backup")
+      shutil.copy2(filename, backup)
+      os.replace(backup, filename_bak)
+    if save_coordinates(mol_id, filename) != 0:
+      raise OSError(f"Coot could not write the coordinates. Backup: {filename_bak}")
+  except (OSError, RuntimeError) as error:
+    info_dialog(f"Quick Save failed: {error}")
+    return None
+  info_dialog(f"Saved {filename} (molecule {mol_id}).\nBackup: {filename_bak}")
 
 #Refresh model from file (if changed externally for example)
 def reload_model():
   mol_id = _active_molecule_or_status()
   if mol_id is None:
     return None
-  filename=molecule_name(mol_id)
-  clear_and_update_model_molecule_from_file(mol_id,filename)
+  filename = _coordinate_file_from_label(molecule_name(mol_id))
+  if filename is None:
+    info_dialog("There is no existing coordinate file for this model. Save it first before using Reload.")
+    return None
+  return clear_and_update_model_molecule_from_file(mol_id, filename)
 
 def _ncs_operator(operator):
   if not isinstance(operator, (tuple, list)) or len(operator) != 2:
@@ -29040,6 +29065,14 @@ def _ncs_preview_chain_colours(model, snapshot, colours):
   coot.graphics_to_user_defined_atom_colours_all_atoms_representation(model)
 
 
+def _ncs_symmetry_viewer_window():
+  try:
+    viewer = _coot_gui_module().coot_gui_api.main_toolbar().get_root()
+    return viewer if isinstance(viewer, Gtk.Window) else None
+  except (AttributeError, RuntimeError, TypeError):
+    return None
+
+
 def _ncs_pick_chains(mol_id, accepted, parent=None, finished=None,
                      title="Pick asymmetric unit", accept_label="Use ASU", purpose="ASU"):
   """Pick ASU chains on a disposable model; leave all source colouring intact."""
@@ -29053,8 +29086,10 @@ def _ncs_pick_chains(mol_id, accepted, parent=None, finished=None,
   state = dict(closed=False, selected=[], preview=None, token=None, hidden=False)
   source_name, visible = coot.molecule_name(mol_id), coot.mol_is_displayed(mol_id)
   window = Gtk.Window(title=title)
-  if parent is not None:
-    window.set_transient_for(parent)
+  viewer = _ncs_symmetry_viewer_window()
+  if viewer is not None or parent is not None:
+    window.set_transient_for(viewer if viewer is not None else parent)
+  window.set_modal(False)  # The viewer must still receive atom clicks.
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for side in ("top", "bottom", "start", "end"):
     getattr(box, "set_margin_"+side)(12)
@@ -29703,6 +29738,25 @@ def _ncs_symmetry_cif_path(path):
   return path+".cif"
 
 
+def _ncs_symmetry_conversion_default(name):
+  """Suggest a file name, never a directory derived from a selection label."""
+  candidate = _coordinate_file_from_label(name)
+  if candidate:
+    folder, filename = os.path.split(candidate)
+    if os.access(folder, os.W_OK):
+      return os.path.join(folder, (_coordinate_file_stem(filename) or "model")+".cif")
+  return os.path.join(os.path.expanduser("~"), _coordinate_file_export_stem(name)+".cif")
+
+
+def _ncs_symmetry_conversion_destination(path):
+  if os.path.isdir(os.path.expanduser(str(path).strip())):
+    raise ValueError("Choose an mmCIF file, not a directory.")
+  path = _ncs_symmetry_cif_path(path)
+  if not os.path.isdir(os.path.dirname(path)):
+    raise ValueError("The save folder does not exist. Use Browse to choose an existing folder.")
+  return path
+
+
 def _ncs_symmetry_needs_conversion(record):
   long_ids = any(len(s[0]) != 1 for s in record["before"]) or any(len(ch) != 1 for ch in record["added"])
   return long_ids and not coot.molecule_name(record["source"]).endswith((".cif", ".mmcif", ".mmCIF"))
@@ -29717,9 +29771,7 @@ def _ncs_symmetry_convert_to_mmcif(record, path, allow_overwrite=False):
   before = _model_coordinate_snapshot(source)
   if before != record["before"]:
     raise ValueError("The original model changed; preview/build again before conversion.")
-  if os.path.isdir(os.path.expanduser(str(path))):
-    raise ValueError("Choose an mmCIF file, not a directory.")
-  path = _ncs_symmetry_cif_path(path)
+  path = _ncs_symmetry_conversion_destination(path)
   def stamp():
     try:
       stat = os.lstat(path)
@@ -29795,14 +29847,8 @@ def _ncs_symmetry_conversion_dialog(parent, record, ready, finished, alive):
   box.append(message)
   row = Gtk.Box(spacing=8)
   entry = Gtk.Entry()
-  name = coot.molecule_name(record["source"])
-  if name.lower().endswith(".gz"):
-    name = name[:-3]
-  for suffix in (".pdb", ".ent", ".mmcif", ".cif"):
-    if name.lower().endswith(suffix):
-      name = name[:-len(suffix)]
-      break
-  entry.set_text(os.path.abspath(name+".cif"))
+  suggested = _ncs_symmetry_conversion_default(coot.molecule_name(record["source"]))
+  entry.set_text(suggested)
   entry.set_hexpand(True)
   row.append(entry)
   box.append(row)
@@ -29820,7 +29866,12 @@ def _ncs_symmetry_conversion_dialog(parent, record, ready, finished, alive):
     return True
   def browse(*_):
     chooser = Gtk.FileChooserNative.new("Save original as mmCIF", window, Gtk.FileChooserAction.SAVE, "Select", "Cancel")
-    chooser.set_current_name(os.path.basename(entry.get_text()))
+    current = os.path.abspath(os.path.expanduser(entry.get_text().strip())) if entry.get_text().strip() else suggested
+    folder, filename = os.path.split(current)
+    gio = _coot_gui_repository_module("Gio")
+    if gio is not None:
+      chooser.set_current_folder(gio.File.new_for_path(folder if os.path.isdir(folder) else os.path.dirname(suggested)))
+    chooser.set_current_name(filename or os.path.basename(suggested))
     state["chooser"] = chooser
     def response(dialog, response_id):
       if not state["closed"] and response_id == Gtk.ResponseType.ACCEPT:
@@ -29850,11 +29901,7 @@ def _ncs_symmetry_conversion_dialog(parent, record, ready, finished, alive):
       close()
       return
     try:
-      if not entry.get_text().strip():
-        raise ValueError("Choose an mmCIF file name.")
-      if os.path.isdir(os.path.expanduser(entry.get_text())):
-        raise ValueError("Choose an mmCIF file, not a directory.")
-      path = _ncs_symmetry_cif_path(entry.get_text())
+      path = _ncs_symmetry_conversion_destination(entry.get_text())
       if os.path.lexists(path) and state["overwrite"] != path:
         state["overwrite"] = path
         status.set_text(f"{os.path.basename(path)} already exists. Overwrite it?")
@@ -30034,34 +30081,71 @@ def molecular_symmetry_dialog():
     if not all(coot.is_valid_model_molecule(record[field]) for field in ("source", "assembly")):
       builds.pop(key, None)
   window = Gtk.Window(title="Molecular symmetry")
-  window.set_default_size(760, 850)
+  window.set_default_size(680, 600)
+  viewer = _ncs_symmetry_viewer_window()
+  if viewer is not None:
+    window.set_transient_for(viewer)
+  pango = _coot_gui_repository_module("Pango")
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for side in ("top", "bottom", "start", "end"):
     getattr(box, "set_margin_"+side)(12)
   outer_scroll = Gtk.ScrolledWindow()
   outer_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-  outer_scroll.set_child(box)
+  outer_scroll.set_overlay_scrolling(False)
+  outer_scroll.set_min_content_height(120)
+  viewport = Gtk.Viewport()
+  viewport.set_scroll_to_focus(True)
+  viewport.set_child(box)
+  outer_scroll.set_child(viewport)
   outer_scroll.set_vexpand(True)
   root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   root.append(outer_scroll)
   window.set_child(root)
   model_label = Gtk.Label(label=f"Model #{mol_id}: {os.path.basename(coot.molecule_name(mol_id))}", xalign=0)
   box.append(model_label)
-  def explanation(parent, text):
-    label = Gtk.Label(label=text, xalign=0)
+  def wrap(label):
     label.set_wrap(True)
+    if pango is not None:
+      label.set_wrap_mode(pango.WrapMode.WORD_CHAR)
+    return label
+  wrap(model_label)
+  def explanation(parent, text):
+    label = wrap(Gtk.Label(label=text, xalign=0))
     parent.append(label)
     return label
   def heading(text):
-    label = Gtk.Label(xalign=0)
+    label = wrap(Gtk.Label(xalign=0))
     label.set_markup("<b>"+text+"</b>")
     label.set_margin_top(6)
     box.append(label)
   explanation(box, "Preview the symmetry, then link existing chains or generate missing ones.")
   heading("1. Define the repeating unit")
   explanation(box, "Pick one repeating unit (ASU), not all symmetry copies. Include every chain in that unit.")
-  status = Gtk.Label(label="Pick a repeating unit to get started.", xalign=0)
-  status.set_wrap(True)
+  status = wrap(Gtk.Label(label="Pick a repeating unit to get started.", xalign=0))
+  def action_row(columns=2, homogeneous=False):
+    row = Gtk.FlowBox()
+    row.set_selection_mode(Gtk.SelectionMode.NONE)
+    row.set_activate_on_single_click(False)
+    row.set_min_children_per_line(1)
+    row.set_max_children_per_line(columns)
+    row.set_row_spacing(6)
+    row.set_column_spacing(8)
+    row.set_homogeneous(homogeneous)
+    row.set_focusable(False)
+    return row
+  def add_action(row, widget):
+    child = Gtk.FlowBoxChild()
+    child.set_focusable(False)
+    child.set_child(widget)
+    row.append(child)
+  def width_limited_combo():
+    combo = Gtk.ComboBoxText()
+    if pango is not None:
+      for renderer in combo.get_cells():
+        if isinstance(renderer, Gtk.CellRendererText):
+          renderer.set_property("ellipsize", pango.EllipsizeMode.END)
+          renderer.set_property("max-width-chars", 30)
+    return combo
   def update_actions(*_):
     buttons = state.get("buttons")
     if not buttons:
@@ -30100,7 +30184,7 @@ def molecular_symmetry_dialog():
   explanation(saved_box, "Manage named relationships, or use a local assembly as a larger repeating unit. Saved for this Coot session.")
   relationship_box = Gtk.Box(spacing=8)
   relationship_box.append(Gtk.Label(label="Saved setup", xalign=0))
-  relationships = Gtk.ComboBoxText()
+  relationships = width_limited_combo()
   relationships.set_hexpand(True)
   relationship_box.append(relationships)
   saved_box.append(relationship_box)
@@ -30109,11 +30193,11 @@ def molecular_symmetry_dialog():
   relationship_name = Gtk.Entry()
   relationship_name.set_text("Symmetry 1")
   relationship_name.set_hexpand(True)
+  relationship_name.set_width_chars(12)
   relationship_name.set_tooltip_text("For example: AQP tetramer, local trimer, or outer helix.")
   name_box.append(relationship_name)
   saved_box.append(name_box)
-  asu_label = Gtk.Label(label="Repeating unit: not selected", xalign=0)
-  asu_label.set_wrap(True)
+  asu_label = wrap(Gtk.Label(label="Repeating unit: not selected", xalign=0))
   def accept_asu(chains):
     state["asu"] = chains
     asu_label.set_text("Repeating unit (ASU): "+", ".join(repr(ch) for ch in chains))
@@ -30139,10 +30223,12 @@ def molecular_symmetry_dialog():
   box.append(controls)
   entries = {}
   def entry(grid, row, key, title, value):
-    grid.attach(Gtk.Label(label=title, xalign=0), 0, row, 1, 1)
+    grid.attach(wrap(Gtk.Label(label=title, xalign=0)), 0, row, 1, 1)
     widget = Gtk.Entry()
     widget.set_text(str(value))
     widget.set_hexpand(True)
+    widget.set_width_chars(9)
+    widget.set_max_width_chars(16)
     grid.attach(widget, 1, row, 1, 1)
     entries[key] = widget
     return widget
@@ -30162,8 +30248,7 @@ def molecular_symmetry_dialog():
   entry(helix_box, 4, "axial", "Point group about helix (Cn, Dn)", "C1").set_tooltip_text(
       "C1: screw only. Cn: n copies around the axis. Dn also includes perpendicular two-fold axes. "
       "Do not add C2 if a near-180-degree screw already generates both protofilaments.")
-  helix_summary = Gtk.Label(xalign=0)
-  helix_summary.set_wrap(True)
+  helix_summary = wrap(Gtk.Label(xalign=0))
   helix_box.attach(helix_summary, 0, 5, 2, 1)
   def summarize_helix(*_):
     try:
@@ -30191,7 +30276,8 @@ def molecular_symmetry_dialog():
   grid = Gtk.Grid(column_spacing=10, row_spacing=8)
   advanced.set_child(grid)
   box.append(advanced)
-  maps = Gtk.ComboBoxText()
+  maps = width_limited_combo()
+  maps.set_hexpand(True)
   for imol in molecule_number_list():
     if coot.is_valid_map_molecule(imol):
       maps.append(str(imol), f"#{imol}: {os.path.basename(coot.molecule_name(imol))}")
@@ -30205,8 +30291,7 @@ def molecular_symmetry_dialog():
   entry(grid, 8, "tolerance", "Chain match tolerance (A RMSD)", 2)
   local_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
   grid.attach(local_box, 0, 9, 2, 1)
-  scope_label = Gtk.Label(label="Match: all chains", xalign=0)
-  scope_label.set_wrap(True)
+  scope_label = wrap(Gtk.Label(label="Match: all chains", xalign=0))
   local_box.append(scope_label)
   def choose_chains(accepted, title, accept_label, purpose):
     if state["picker"] is not None:
@@ -30230,11 +30315,11 @@ def molecular_symmetry_dialog():
     state["scope"] = None
     scope_label.set_text("Match: all chains")
     update_actions()
-  scope_buttons = Gtk.Box(spacing=8)
+  scope_buttons = action_row()
   for title, callback in (("Limit to picked chains...", limit_scope), ("All chains", all_chains)):
     button = Gtk.Button(label=title)
     button.connect("clicked", callback)
-    scope_buttons.append(button)
+    add_action(scope_buttons, button)
   local_box.append(scope_buttons)
   def frame_from_chains(*_):
     def accepted(chains):
@@ -30255,14 +30340,14 @@ def molecular_symmetry_dialog():
         entries["centre_"+axis].set_text(f"{value:.9g}")
     except Exception as error:
       status.set_text(str(error))
-  frame_buttons = Gtk.Box(spacing=8)
+  frame_buttons = action_row()
   for title, callback in (("Axis from two chains...", frame_from_chains), ("Centre at view", centre_at_view)):
     button = Gtk.Button(label=title)
     if callback is frame_from_chains:
       button.set_tooltip_text("Pick two members related by rotation about the principal axis, e.g. two members of a cyclic ring. "
                               "For Dn, do not pick a pair related by a perpendicular dyad.")
     button.connect("clicked", callback)
-    frame_buttons.append(button)
+    add_action(frame_buttons, button)
   local_box.append(frame_buttons)
   def map_changed(*_):
     try:
@@ -30281,18 +30366,47 @@ def molecular_symmetry_dialog():
     map_changed()
   heading("2. Check the matches")
   explanation(box, "Preview colours existing matches on a temporary copy and lists missing chains. It changes no coordinates or NCS links.")
-  preview_actions = Gtk.Box(spacing=8)
+  preview_actions = action_row()
   box.append(preview_actions)
   preview_hint = explanation(box, "Pick a repeating unit above to enable Preview.")
-  table = Gtk.TextView()
-  table.set_editable(False)
-  table.set_monospace(True)
-  scroll = Gtk.ScrolledWindow()
-  scroll.set_vexpand(True)
-  scroll.set_min_content_height(100)
-  scroll.set_child(table)
-  scroll.set_visible(False)
-  box.append(scroll)
+  matches = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+  match_excerpt = Gtk.Label(xalign=0)
+  match_excerpt.add_css_class("monospace")
+  if pango is not None:
+    match_excerpt.set_ellipsize(pango.EllipsizeMode.END)
+  else:
+    wrap(match_excerpt)
+  matches.append(match_excerpt)
+  state.update(match_lines=[], match_window=None)
+  def close_match_table():
+    match_window = state["match_window"]
+    state["match_window"] = None
+    if match_window is not None:
+      match_window.destroy()
+  def show_match_table(*_):
+    if state["match_window"] is not None:
+      state["match_window"].present()
+      return
+    dialog = Gtk.Window(title="Symmetry match table", transient_for=window, destroy_with_parent=True)
+    dialog.set_default_size(540, 380)
+    table = Gtk.TextView(editable=False, monospace=True, cursor_visible=False)
+    table.get_buffer().set_text("\n".join(state["match_lines"]))
+    scroller = Gtk.ScrolledWindow()
+    scroller.set_overlay_scrolling(False)
+    scroller.set_child(table)
+    dialog.set_child(scroller)
+    def closed(*_):
+      close_match_table()
+      return True
+    dialog.connect("close-request", closed)
+    state["match_window"] = dialog
+    dialog.present()
+  match_details = Gtk.Button(label="View full match table...")
+  match_details.set_halign(Gtk.Align.START)
+  match_details.connect("clicked", show_match_table)
+  matches.append(match_details)
+  matches.set_visible(False)
+  box.append(matches)
   def refresh_relationships(active="new"):
     relationships.remove_all()
     relationships.append("new", "New NCS setup")
@@ -30339,7 +30453,8 @@ def molecular_symmetry_dialog():
     relationships.set_active_id("new")
     state["asu"] = []
     asu_label.set_text("Repeating unit: not selected")
-    scroll.set_visible(False)
+    matches.set_visible(False)
+    close_match_table()
     all_chains()
     status.set_text("Pick an ASU and set the new symmetry. Existing relationships are retained.")
     update_actions()
@@ -30379,12 +30494,12 @@ def molecular_symmetry_dialog():
       status.set_text("Relationship removed. Coordinates unchanged.")
     except Exception as error:
       status.set_text(str(error))
-  relation_actions = Gtk.Box(spacing=8)
+  relation_actions = action_row(3)
   for title, callback in (("New relationship", new_relationship), ("Use as outer ASU", outer_relationship),
                           ("Remove relationship", remove_relationship)):
     button = Gtk.Button(label=title)
     button.connect("clicked", callback)
-    relation_actions.append(button)
+    add_action(relation_actions, button)
   saved_box.append(relation_actions)
   def settings():
     values = {key: widget.get_text().strip() for key, widget in entries.items()}
@@ -30456,8 +30571,11 @@ def molecular_symmetry_dialog():
       for row in plan["rows"]:
         lines.append(f"{row['master']!r:11} {str(row['repeat']):>6}   {row['peer'] if row['peer'] is not None else 'MISSING':10} "
                      +(f"{row['rmsd']:.3f}" if row['rmsd'] is not None else ""))
-      table.get_buffer().set_text("\n".join(lines))
-      scroll.set_visible(True)
+      close_match_table()
+      state["match_lines"] = lines
+      match_excerpt.set_text("\n".join(lines[:7]))
+      match_details.set_label(f"View full match table ({len(lines)-1} rows)...")
+      matches.set_visible(True)
       state.update(plan=plan, snapshot=snapshot, settings=saved_settings)
       source_visible, source_name = coot.mol_is_displayed(mol_id), coot.molecule_name(mol_id)
       view = _capture_view_state()
@@ -30522,6 +30640,8 @@ def molecular_symmetry_dialog():
       builds[mol_id] = _ncs_symmetry_merge_record(mol_id, model, state["snapshot"])
       clear_preview()
       state["plan"] = None
+      matches.set_visible(False)
+      close_match_table()
       status.set_text(f"Created assembly #{model} with {len(plan['missing'])} new chains. Original unchanged. "
                       "NCS links are included. Merge the new chains below if you want them in the original model.")
       update_actions()
@@ -30577,6 +30697,7 @@ def molecular_symmetry_dialog():
     if state["closed"]:
       return True
     state["closed"] = True
+    close_match_table()
     if state["conversion"] is not None:
       state["conversion"]._ncs_cancel()
     if state["picker"] is not None:
@@ -30590,15 +30711,14 @@ def molecular_symmetry_dialog():
   preview_button.add_css_class("suggested-action")
   preview_button.set_tooltip_text("Check which existing chains match the entered symmetry. Missing chains are listed, not generated.")
   preview_button.connect("clicked", preview)
-  preview_actions.append(preview_button)
+  add_action(preview_actions, preview_button)
   clear_button = Gtk.Button(label="Clear match preview")
   clear_button.set_tooltip_text("Remove only the temporary coloured preview. Generated assemblies and assigned NCS links are kept.")
   clear_button.connect("clicked", clear_preview)
-  preview_actions.append(clear_button)
+  add_action(preview_actions, clear_button)
   heading("3. Choose an action")
   explanation(box, "Link existing chains, or generate missing ones. You do not need to do both.")
-  cards = Gtk.Box(spacing=10)
-  cards.set_homogeneous(True)
+  cards = action_row(homogeneous=True)
   box.append(cards)
   def action_card(title, detail, button_text, callback):
     frame = Gtk.Frame()
@@ -30612,7 +30732,7 @@ def molecular_symmetry_dialog():
     button = Gtk.Button(label=button_text)
     button.connect("clicked", callback)
     content.append(button)
-    cards.append(frame)
+    add_action(cards, frame)
     return button
   assign_button = action_card("Link existing chains",
       "Enable copying edits between matching chains. No atoms move or get created.",
@@ -33644,12 +33764,8 @@ def import_phenix_metal_edits_dialog():
   imol = _active_molecule_or_status()
   if imol is None:
     return
-  initial_directory = None
-  model_path = molecule_name(imol)
-  if isinstance(model_path, str) and model_path:
-    directory = os.path.dirname(os.path.abspath(os.path.expanduser(model_path)))
-    if os.path.isdir(directory):
-      initial_directory = directory
+  model_path = _coordinate_file_from_label(molecule_name(imol))
+  initial_directory = os.path.dirname(model_path) if model_path else None
   generic_single_entry_with_file_browse(
     f"Import Phenix metal edits into active molecule #{imol}", "",
     "Choose Phenix metal edits", "Import",
