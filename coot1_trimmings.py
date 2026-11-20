@@ -31,6 +31,40 @@ _GTK_REPOSITORY_WARNINGS_SHOWN = set()
 _MODEL_EDIT_EPOCHS = {}
 
 
+def _snapshot_worker_script():
+  """Keep worker source consistent with the functions loaded by this session."""
+  import tokenize
+  path = _snapshot_worker_script.__code__.co_filename
+  try:
+    with tokenize.open(path) as handle:
+      return path, tuple(handle.readlines())
+  except OSError:
+    return None
+
+
+_WORKER_SCRIPT_AT_LOAD = _snapshot_worker_script()
+
+
+def _worker_function_source(function):
+  import ast
+  import inspect
+  import textwrap
+  try:
+    snapshot = function.__globals__.get("_WORKER_SCRIPT_AT_LOAD")
+    code = function.__code__
+    if snapshot is not None and code.co_filename == snapshot[0]:
+      source = "".join(inspect.getblock(snapshot[1][code.co_firstlineno-1:]))
+    else:
+      source = inspect.getsource(function)
+    source = textwrap.dedent(source)
+    nodes = ast.parse(source).body
+    if len(nodes) == 1 and isinstance(nodes[0], ast.FunctionDef) and nodes[0].name == code.co_name:
+      return source
+  except (AttributeError, OSError, TypeError, SyntaxError, IndexError):
+    pass
+  raise RuntimeError("Could not load matching worker code. Restart Coot and try again.")
+
+
 def _mark_model_changed(mol_id):
   _MODEL_EDIT_EPOCHS[mol_id] = _MODEL_EDIT_EPOCHS.get(mol_id, 0) + 1
 
@@ -11359,7 +11393,8 @@ def _pae_find_afdb(sequence, identifier="", progress=None, cancel=None):
   return choices[:10]
 
 
-def _pae_fetch_afdb(identifier, expected_sequence, cache_dir=None, reference_version=None, allow_substitutions=False):
+def _pae_fetch_afdb(identifier, expected_sequence, cache_dir=None, reference_version=None, allow_substitutions=False,
+                    staging_directory=None):
   """Fetch a sequence-matched, current AFDB PAE document; never guess a version URL."""
   value = str(identifier).strip().upper()
   match = re.fullmatch(r"(?:AF-)?([A-Z0-9]{3,20}(?:-\d+)?)(?:-F(\d+))?", value)
@@ -11418,7 +11453,8 @@ def _pae_fetch_afdb(identifier, expected_sequence, cache_dir=None, reference_ver
   data["coot_trimmings_afdb_source"] = dict(entry=entry, version=version, url=url)
   temporary = None
   try:
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", dir=cache_dir, delete=False) as handle:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json",
+                                     dir=staging_directory or cache_dir, delete=False) as handle:
       temporary = handle.name
       json.dump(data, handle, separators=(",", ":"))
     matrix, _sequence = _pae_read_json(temporary)
@@ -11728,9 +11764,154 @@ def _pae_show_preview(plan):
   return obj, cleanup
 
 
+def _compute_worker_main(entry):
+  with open(sys.argv[1], encoding="utf-8") as handle:
+    request = json.load(handle)
+  def progress(message):
+    print(json.dumps({"progress": str(message)}), flush=True)
+  try:
+    sys.path[:0] = request["roots"]
+    if list(sys.version_info[:2]) != request["version"]:
+      raise RuntimeError("Standalone Python does not match Coot's Python version.")
+    if request["gemmi"]:
+      global gemmi
+      import gemmi
+    result = {"value": _af_replace_wire(entry(_af_replace_wire(request["payload"], True), progress))}
+  except Exception as error:
+    result = {"error": str(error)}
+  with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(result, handle, allow_nan=False)
+
+
+def _compute_start(entry, dependencies, payload, timeout, *, modules=(), constants=None):
+  """Launch file-only work on GTK's thread; no embedded Python thread is needed."""
+  import subprocess
+  roots = []
+  for module in modules:
+    filename = getattr(module, "__file__", None)
+    if filename:
+      path = os.path.abspath(filename)
+      root = os.path.dirname(path)
+      if os.path.basename(path) == "__init__.py":
+        root = os.path.dirname(root)
+      if root not in roots:
+        roots.append(root)
+  source = "import json, math, os, re, sys, tempfile, time\n"
+  source += "".join(f"{key} = {value!r}\n" for key, value in (constants or {}).items())
+  source += "\n".join(_worker_function_source(f) for f in (*dependencies, _af_replace_wire, _compute_worker_main, entry))
+  source += f"\n_compute_worker_main({entry.__name__})\n"
+  python = _global_fit_worker_python()
+  owner = tempfile.TemporaryDirectory(prefix="coot-compute-")
+  request, response, progress = (os.path.join(owner.name, p) for p in ("request.json", "result.json", "worker.log"))
+  env = dict(os.environ)
+  for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "DYLD_INSERT_LIBRARIES"):
+    env.pop(name, None)
+  for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"):
+    env[name] = "1"
+  try:
+    with open(request, "w", encoding="utf-8") as handle:
+      json.dump(dict(payload=_af_replace_wire(payload), roots=roots, version=list(sys.version_info[:2]),
+                     gemmi=any(getattr(m, "__name__", "") == "gemmi" for m in modules)), handle, allow_nan=False)
+    with open(progress, "wb") as log:
+      process = subprocess.Popen([python, "-I", "-B", "-u", "-c", source, request, response],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env)
+  except BaseException:
+    owner.cleanup()
+    raise
+  return dict(process=process, owner=owner, response=response, log=progress, offset=0, partial=b"",
+              deadline=time.monotonic()+timeout, message=None, tail="")
+
+
+def _compute_stop(job):
+  if job is None:
+    return
+  process = job["process"]
+  if process.poll() is None:
+    try:
+      process.kill()
+    except ProcessLookupError:
+      pass
+    process.wait()
+  try:
+    job["owner"].cleanup()
+  finally:
+    if job.get("staging") is not None:
+      job["staging"].cleanup()
+
+
+def _compute_poll(job):
+  """Return None while running, otherwise read the single completed response."""
+  with open(job["log"], "rb") as handle:
+    handle.seek(job["offset"])
+    chunk = handle.read(65536)
+    job["offset"] = handle.tell()
+  *lines, job["partial"] = (job["partial"]+chunk).split(b"\n")
+  job["partial"] = job["partial"][-4096:]
+  for line in lines:
+    try:
+      message = json.loads(line)["progress"]
+    except (ValueError, KeyError, TypeError):
+      job["tail"] = (job["tail"]+"\n"+line.decode(errors="replace"))[-2000:]
+    else:
+      job["message"] = message
+  code = job["process"].poll()
+  if code is None:
+    if time.monotonic() >= job["deadline"]:
+      raise RuntimeError("Calculation exceeded its time limit.")
+    return None
+  if code or not os.path.isfile(job["response"]):
+    raise RuntimeError(f"Calculation process exited with status {code}. {job['tail'].strip()}".strip())
+  with open(job["response"], encoding="utf-8") as handle:
+    result = json.load(handle)
+  if "error" in result:
+    raise RuntimeError(result["error"])
+  return _af_replace_wire(result["value"], True)
+
+
+def _pae_preview_worker(payload, progress):
+  plan = _pae_plan_from_snapshots(*payload["args"], **payload["options"])
+  for key in ("reference_snapshot", "target_snapshot"):
+    plan.pop(key)
+  return plan
+
+
+def _pae_download_worker(payload, progress):
+  sequence, chosen = payload["sequence"], payload["chosen"]
+  choices = [chosen] if chosen is not None else _pae_find_afdb(sequence, payload["identifier"], progress=progress)
+  if chosen is not None or len(choices) == 1 and not choices[0]["changes"]:
+    progress("Downloading and validating PAE...")
+    return dict(path=_pae_fetch_afdb(choices[0]["identifier"], sequence,
+               reference_version=payload["version"], allow_substitutions=chosen is not None,
+               cache_dir=payload["cache"], staging_directory=payload["staging"]))
+  return dict(choices=choices)
+
+
+def _pae_start_job(operation, payload):
+  staging = None
+  if operation == "preview":
+    dependencies = (_pae_plan_from_snapshots, _pae_read_json, _pae_json_path, _pae_protein_records,
+                    _pae_sequence_rows, _pae_substitutions, _spatial_index, _spatial_query, _distance_sq)
+    entry, timeout = _pae_preview_worker, 300
+  else:
+    dependencies = (_pae_find_afdb, _pae_fetch_afdb, _pae_substitutions, _pae_afdb_json, _pae_read_json, _pae_json_path)
+    entry, timeout = _pae_download_worker, 720
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "Coot", "pae")
+    os.makedirs(cache, exist_ok=True)
+    staging = tempfile.TemporaryDirectory(prefix=".pae-download-", dir=cache)
+    payload = dict(payload, cache=cache, staging=staging.name)
+  try:
+    job = _compute_start(entry, dependencies, payload, timeout, modules=(_tq_numpy_module(),),
+                         constants=dict(_REGISTER_AA=_REGISTER_AA, _REGISTER_PROTEIN_NAMES=_REGISTER_PROTEIN_NAMES))
+  except BaseException:
+    if staging is not None:
+      staging.cleanup()
+    raise
+  job["staging"] = staging
+  return job
+
+
 def pae_restraints_dialog():
-  """Preview off-thread; native restraint replacement stays on Coot's GUI thread."""
-  import threading
+  """Preview in a subprocess; native restraint replacement stays on Coot's GUI thread."""
   active = _active_residue_or_status()
   if not active:
     return None
@@ -11837,8 +12018,8 @@ def pae_restraints_dialog():
   box.append(buttons)
   apply.set_sensitive(False)
   preview.set_sensitive(False)
-  state = dict(closed=False, running=False, plan=None, result=None, reference=None, choices=[],
-               reference_sequences={}, cancel_search=threading.Event(), display_plan=None,
+  state = dict(closed=False, running=False, plan=None, worker=None, reference=None, choices=[],
+               reference_sequences={}, display_plan=None,
                display_object=None, display_cleanup=None)
   def update_display():
     show_restraints.set_sensitive(state["display_plan"] is not None and not state["running"])
@@ -11921,17 +12102,28 @@ def pae_restraints_dialog():
     update_apply()
     update_display()
     spinner.start() if value else spinner.stop()
-  def poll():
-    if state["closed"]:
+  def start_job(operation, payload, completed):
+    job = _pae_start_job(operation, payload)
+    state["worker"] = job
+    def poll():
+      if state["closed"] or state["worker"] is not job:
+        return False
+      try:
+        result = _compute_poll(job)
+        if result is None:
+          if job.get("message"):
+            status.set_text(job["message"])
+          return True
+        busy(False)
+        completed(result)
+      except Exception as error:
+        busy(False)
+        status.set_text(str(error))
+      _compute_stop(job)
+      state["worker"] = None
       return False
-    if state["result"] is None:
-      return True
-    plan, error = state.pop("result")
-    state["result"] = None
-    busy(False)
-    if error is not None:
-      status.set_text(error)
-      return False
+    glib.timeout_add(50, poll)
+  def show_plan(plan):
     state["plan"] = plan
     state["display_plan"] = plan
     show_drawing()
@@ -11943,8 +12135,9 @@ def pae_restraints_dialog():
       status.set_text(status.get_text()+"\nSubstitutions: "+", ".join(plan["substitutions"]))
       accept_substitutions.set_visible(True)
     update_apply()
-    return False
   def do_preview(*_args):
+    if state["running"]:
+      return
     invalidate()
     try:
       number, name, reference = state["reference"]
@@ -11955,18 +12148,13 @@ def pae_restraints_dialog():
       options = dict(pae_cutoff=float(fields[0].get_text()), distance_cutoff=float(fields[1].get_text()),
                      neighbors=float(fields[2].get_text()), strength=float(fields[3].get_text()),
                      reference_sequences=dict(state["reference_sequences"]))
-      state["result"] = None
       busy(True)
       status.set_text("Reading PAE and building a sparse restraint network...")
-      def work():
-        try:
-          plan = _pae_plan_from_snapshots(filename, reference, target, *orders, **options)
-          plan.update(model=model, model_name=model_name, reference_model=number, reference_name=name)
-          state["result"] = (plan, None)
-        except Exception as error:
-          state["result"] = (None, str(error))
-      threading.Thread(target=work, name="coot-pae-preview", daemon=True).start()
-      glib.timeout_add(50, poll)
+      def completed(plan):
+        plan.update(model=model, model_name=model_name, reference_model=number, reference_name=name,
+                    reference_snapshot=reference, target_snapshot=target)
+        show_plan(plan)
+      start_job("preview", dict(args=(filename, reference, target, *orders), options=options), completed)
     except Exception as error:
       busy(False)
       status.set_text(str(error))
@@ -12000,6 +12188,8 @@ def pae_restraints_dialog():
     except Exception as error:
       status.set_text(str(error))
   def do_fetch(*_args, selected=False):
+    if state["running"]:
+      return
     invalidate()
     try:
       records = _pae_protein_records(state["reference"][2], _pae_chain_order(ref_chains.get_text()))[0]
@@ -12010,34 +12200,10 @@ def pae_restraints_dialog():
       version_match = re.search(r"AF-[A-Za-z0-9-]+-F\d+.*?_v(\d+)\.", state["reference"][1])
       reference_version = int(version_match.group(1)) if version_match else None
       chosen = state["choices"][int(candidates_choice.get_active_id())] if selected else None
-      result = dict(done=False)
-      cancel = state["cancel_search"] = threading.Event()
       busy(True)
       status.set_text("Fetching sequence-matched PAE from AlphaFold DB...")
-      def download():
-        try:
-          choices = [chosen] if chosen is not None else _pae_find_afdb(sequence, identifier,
-              progress=lambda text: result.update(progress=text), cancel=cancel)
-          if chosen is not None or len(choices) == 1 and not choices[0]["changes"]:
-            result["path"] = _pae_fetch_afdb(choices[0]["identifier"], sequence, reference_version=reference_version,
-                                             allow_substitutions=chosen is not None)
-          else:
-            result["choices"] = choices
-        except Exception as error:
-          result["error"] = str(error)
-        finally:
-          result["done"] = True
-      def downloaded():
-        if state["closed"]:
-          return False
-        if not result["done"]:
-          if result.get("progress"):
-            status.set_text(result["progress"])
-          return True
-        busy(False)
-        if "error" in result:
-          status.set_text(result["error"])
-        elif "choices" in result:
+      def downloaded(result):
+        if "choices" in result:
           state["choices"] = result["choices"]
           candidates_choice.remove_all()
           for i, choice in enumerate(state["choices"]):
@@ -12048,9 +12214,8 @@ def pae_restraints_dialog():
         else:
           path.set_text(result["path"])
           status.set_text("Fetched PAE. Preview the residue mapping and any substitutions before replacing restraints.")
-        return False
-      threading.Thread(target=download, name="coot-pae-afdb", daemon=True).start()
-      glib.timeout_add(50, downloaded)
+      start_job("download", dict(chosen=chosen, sequence=sequence, identifier=identifier,
+                                 version=reference_version), downloaded)
     except Exception as error:
       busy(False)
       status.set_text(str(error))
@@ -12079,7 +12244,7 @@ def pae_restraints_dialog():
     if state.get("applying"):
       return True
     state["closed"] = True
-    state["cancel_search"].set()
+    _compute_stop(state.pop("worker", None))
     clear_drawing()
     window.destroy()
     return True
@@ -14250,7 +14415,7 @@ def _lowpass_export(map_id, model_id, directory, padding):
               difference=bool(coot.map_is_difference_map(map_id)))
 
 
-def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction, progress=None):
+def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction, progress=None, *, optimize_for_coot=False):
   """Pure file/FFT work: safe in a worker, no Coot or GTK calls.
 
   Preserve the exported box and its CCP4 placement. In particular, setup()
@@ -14329,13 +14494,30 @@ def _lowpass_filter_file(input_path, output_path, resolution, taper_fraction, pr
   if progress is not None:
     progress("Writing filtered map")
   # update_ccp4_header() requires setup() for partial maps. Update only mode
-  # and density statistics; retain sampling, starts, origin, axes and symmetry.
+  # and density statistics; retain sampling, starts, origin and symmetry.
   ccp4.set_header_i32(4, 2)
-  for word, value in ((20, data.min()), (21, data.max()),
+  minimum, maximum = float(data.min()), float(data.max())
+  for word, value in ((20, minimum), (21, maximum),
                       (22, data.mean(dtype=np.float64)), (55, data.std(dtype=np.float64))):
     ccp4.set_header_float(word, float(value))
+  shape = tuple(ccp4.grid.shape)
+  # Coot's faster reader accepts XYZ orthogonal P1 maps. Reorder storage only,
+  # never expand or rebase a fragment, and avoid the reader's outlier clipping.
+  reorder = getattr(getattr(gemmi, "MapSetup", None), "ReorderOnly", None)
+  if optimize_for_coot and reorder is not None and axes != [2, 1, 0] and -10000 <= minimum <= maximum <= 10000:
+    cell = ccp4.grid.unit_cell
+    labels = [ccp4.header_str(57+20*i, 80) for i in range(min(10, ccp4.header_i32(56)))]
+    if (ccp4.header_i32(23) in (0, 1) and
+        all(abs(angle-90) < 1e-5 for angle in (cell.alpha, cell.beta, cell.gamma)) and
+        all(ccp4.header_i32(i) == 0 for i in (5, 6, 7)) and
+        all(ccp4.header_float(i) == 0. for i in (50, 51, 52)) and
+        all(size == sampling[axis] for size, axis in zip(data.shape, axes)) and
+        not any(label.startswith(("PANDDA::", "APPLY-SYMMETRY::")) for label in labels)):
+      del data  # Gemmi may reallocate its grid during the permutation.
+      ccp4.setup(float("nan"), reorder)
+      shape = tuple(ccp4.grid.shape)
   ccp4.write_ccp4_map(output_path)
-  return tuple(ccp4.grid.shape)
+  return shape
 
 
 def _lowpass_import(path, source, resolution):
@@ -14379,12 +14561,11 @@ def _lowpass_worker_main():
 
 def _lowpass_worker_source():
   """Cache source on the GUI thread rather than inspecting a large script off-thread."""
-  import inspect
   functions = (_lowpass_filter_file, _lowpass_worker_main)
   cached = globals().get("_LOWPASS_WORKER_SOURCE_CACHE")
   if cached is not None and cached[0] == functions:
     return cached[1]
-  source = "\n".join(inspect.getsource(f) for f in functions)+"\n_lowpass_worker_main()\n"
+  source = "\n".join(_worker_function_source(f) for f in functions)+"\n_lowpass_worker_main()\n"
   globals()["_LOWPASS_WORKER_SOURCE_CACHE"] = (functions, source)
   return source
 
@@ -14458,6 +14639,26 @@ def _lowpass_filter_background(input_path, output_path, resolution, taper_fracti
   if process.returncode or "shape" not in result:
     raise RuntimeError(result.get("error", "Low-pass FFT worker did not finish."))
   return tuple(result["shape"])
+
+
+def _map_prepare_worker(payload, progress):
+  source, output = payload["source"], payload["output"]
+  compact = payload["compact"]
+  if compact:
+    progress("Preparing map crop")
+    if _global_multimap_compact_crop(source, compact):
+      source = compact
+  if payload["resolution"] is None:
+    return dict(path=source)
+  shape = _lowpass_filter_file(source, output, payload["resolution"], payload["taper"],
+                              progress=progress, optimize_for_coot=True)
+  return dict(path=output, shape=shape)
+
+
+def _map_prepare_start(source, output, resolution, taper, compact=None):
+  return _compute_start(_map_prepare_worker, (_lowpass_filter_file, _global_multimap_compact_crop),
+                        dict(source=source, output=output, resolution=resolution, taper=taper, compact=compact),
+                        1800, modules=(gemmi, _tq_numpy_module()))
 
 
 def lowpass_filter_map(imol_map, resolution=4.0, taper_fraction=0.10, model_imol=None, padding=20.0):
@@ -14543,7 +14744,7 @@ def lowpass_filter_map_dialog():
   buttons.append(apply)
   buttons.append(close)
   box.append(buttons)
-  state = dict(closed=False, running=False, finished=None, owner=None, result=None)
+  state = dict(closed=False, running=False, worker=None, owner=None, result=None)
   def busy(running):
     state["running"] = running
     for widget in (grid, crop, crop_row, apply):
@@ -14552,44 +14753,42 @@ def lowpass_filter_map_dialog():
     crop_row.set_sensitive(not running and crop.get_active())
     spinner.start() if running else spinner.stop()
   def cleanup():
+    try:
+      _compute_stop(state.pop("worker", None))
+    finally:
+      release_files()
+  def release_files():
     if state["owner"] is not None:
       state["owner"].cleanup()
       state["owner"] = None
   def poll():
-    finished = state["finished"]
-    if finished is None:
-      if not state["closed"]:
-        status.set_text(f"{state.get('phase', 'Filtering map')}... {time.perf_counter()-state['started']:.1f}s")
-      return True
+    if state["closed"]:
+      return False
     try:
-      if not state["closed"]:
-        shape, error = finished
-        if error is not None:
-          raise RuntimeError(error)
-        status.set_text("Loading filtered map...")
-        loading = time.perf_counter()
-        state["result"] = _lowpass_import(state["output"], state["source"], state["resolution"])
-        state["timings"]["load"] = time.perf_counter()-loading
-        state["timings"]["total"] = time.perf_counter()-state["started"]
-        print("Low-pass timing: " + ", ".join(f"{key} {value:.2f}s" for key, value in state["timings"].items()))
-        status.set_text(f"Created map #{state['result']} | {state['resolution']:g} A | " +
-                        " x ".join(map(str, shape)) + f" | {state['timings']['total']:.2f}s")
+      result = _compute_poll(state["worker"])
+      if result is None:
+        phase = state["worker"].get("message") or "Filtering map"
+        status.set_text(f"{phase}... {time.perf_counter()-state['started']:.1f}s")
+        return True
+      status.set_text("Loading filtered map...")
+      loading = time.perf_counter()
+      state["timings"]["filter"] = loading-state["filter_started"]
+      state["result"] = _lowpass_import(result["path"], state["source"], state["resolution"])
+      state["timings"]["load"] = time.perf_counter()-loading
+      state["timings"]["total"] = time.perf_counter()-state["started"]
+      print("Low-pass timing: " + ", ".join(f"{key} {value:.2f}s" for key, value in state["timings"].items()))
+      status.set_text(f"Created map #{state['result']} | {state['resolution']:g} A | " +
+                      " x ".join(map(str, result["shape"])) + f" | {state['timings']['total']:.2f}s")
     except Exception as error:
       status.set_text(f"Filtering failed: {error}")
-    finally:
-      cleanup()
-      if not state["closed"]:
-        busy(False)
+    cleanup()
+    busy(False)
     return False
   def start_worker():
     if state["closed"]:
       busy(False)
       return False
     try:
-      try:
-        _lowpass_worker_source()
-      except (OSError, TypeError, RuntimeError):
-        pass  # The background helper can use the in-process fallback.
       state["owner"] = tempfile.TemporaryDirectory(prefix="coot-lowpass-")
       directory = state["owner"].name
       export_started = time.perf_counter()
@@ -14598,23 +14797,11 @@ def lowpass_filter_map_dialog():
       output = os.path.join(directory, "filtered.map")
       state.update(source=source, output=output)
       status.set_text("Filtering map... (you can continue using Coot)")
-      def worker():
-        try:
-          started = time.perf_counter()
-          shape = _lowpass_filter_background(source["path"], output, state["resolution"], state["taper"],
-              progress=lambda message: state.update(phase=message))
-          state["timings"]["filter"] = time.perf_counter()-started
-          state["finished"] = (shape, None)
-        except Exception as error:
-          # Do not retain a worker traceback containing large FFT arrays.
-          state["finished"] = (None, str(error))
-      import threading
-      thread = threading.Thread(target=worker, name="coot-lowpass", daemon=True)
+      state["filter_started"] = time.perf_counter()
+      state["worker"] = _map_prepare_start(source["path"], output, state["resolution"], state["taper"])
       glib.timeout_add(100, poll)
-      thread.start()
     except Exception as error:
       cleanup()
-      state["finished"] = (None, str(error))
       status.set_text(f"Filtering failed: {error}")
       busy(False)
     return False
@@ -14625,8 +14812,8 @@ def lowpass_filter_map_dialog():
       resolution, taper, pad = _lowpass_parameters(cutoff.get_text(), float(rolloff.get_text())/100, padding.get_text())
       state.update(map=int(map_choice.get_active_id()),
                    model=int(model_choice.get_active_id()) if crop.get_active() else None,
-                   resolution=resolution, taper=taper, padding=pad, finished=None, result=None,
-                   started=time.perf_counter(), phase="Exporting map", timings={})
+                   resolution=resolution, taper=taper, padding=pad, result=None,
+                   started=time.perf_counter(), timings={})
       busy(True)
       status.set_text("Exporting current map...")
       glib.idle_add(start_worker)
@@ -14634,9 +14821,8 @@ def lowpass_filter_map_dialog():
       status.set_text(str(error))
       busy(False)
   def closed(*_args):
-    # A running FFT cannot be interrupted; discard its result and clean up
-    # when it finishes. Never delete files while the worker is using them.
     state["closed"] = True
+    cleanup()
     return False
   apply.connect("clicked", run)
   close.connect("clicked", lambda *_: window.close())
@@ -14732,6 +14918,9 @@ def _global_multimap_snapshot_change(expected, current):
 def _global_multimap_cleanup(state):
   """Remove only this run's map, after native refinement has released it."""
   errors = []
+  worker = state.pop("worker", None)
+  if worker is not None:
+    _compute_stop(worker)
   temporary = state.get("temporary")
   try:
     if temporary is not None:
@@ -14913,7 +15102,6 @@ def start_global_multimap_refinement(model, map_id, start=5., finest=4., repeats
   Timed passes use native intermediate atoms and GUI-thread stop/accept.
   A zero time budget keeps the original synchronous convergence-driven path.
   """
-  import threading
   glib = _coot_gui_repository_module("GLib")
   if glib is None or gemmi is None or _tq_numpy_module() is None:
     raise ValueError("Global multimap refinement requires GLib, Gemmi and NumPy in Coot.")
@@ -14933,10 +15121,6 @@ def start_global_multimap_refinement(model, map_id, start=5., finest=4., repeats
   if max_seconds and not all(callable(getattr(coot, name, None)) for name in
       ('stop_refinement_internal', 'accept_moving_atoms_py', 'backup_state', 'turn_off_backup', 'turn_on_backup')):
     raise ValueError('Timed refinement is unavailable in this build. Set maximum seconds to 0 for unlimited refinement.')
-  try:
-    _lowpass_worker_source()
-  except (OSError, TypeError, RuntimeError):
-    pass
   padding, multiplier = float(padding), float(multiplier)
   if not math.isfinite(padding) or padding < 8 or not math.isfinite(multiplier) or not 0 < multiplier <= 10:
     raise ValueError("Use crop padding >= 8 A and a weight multiplier > 0 and <= 10.")
@@ -14985,11 +15169,16 @@ def start_global_multimap_refinement(model, map_id, start=5., finest=4., repeats
       raise ValueError("Stop the other multimap job first.")
   def tick():
     try:
-      worker = state["worker"]
+      if (state["stop"] or state["closed"]) and state["native"] is None:
+        return finish(f"Stopped after {len(state['history'])}/{len(schedule)} passes. Completed edits remain.")
+      worker = state.get("worker")
       if worker is not None:
-        if worker.is_alive():
+        result = _compute_poll(worker)
+        if result is None:
           return True
+        _compute_stop(worker)
         state["worker"] = None
+        state["prepared"] = (result["path"], None)
       if state.get('native') is not None:
         check()
         elapsed = time.monotonic()-state['native']['started']
@@ -15035,18 +15224,8 @@ def start_global_multimap_refinement(model, map_id, start=5., finest=4., repeats
           state["message"] = f"Preparing pass {state['index']+1}/{len(schedule)}: {label}..."
           state["phase"] = "filtering"
           notify()
-          def filtering():
-            try:
-              compact = os.path.join(state["owner"].name, "compact.map")
-              input_path = compact if _global_multimap_compact_crop(source["path"], compact) else source["path"]
-              if resolution is not None:
-                _lowpass_filter_background(input_path, output, resolution, .10)
-              output_path = output if resolution is not None else input_path
-              state["prepared"] = (output_path, None)
-            except Exception as error:
-              state["prepared"] = (None, str(error))
-          state["worker"] = threading.Thread(target=filtering, name="coot-global-multimap-filter", daemon=True)
-          state["worker"].start()
+          compact = os.path.join(state["owner"].name, "compact.map")
+          state["worker"] = _map_prepare_start(source["path"], output, resolution, .10, compact)
           return True
       if state["phase"] == "filtering":
         state["phase"] = "ready"
@@ -19192,7 +19371,7 @@ def _multimap_workers_start(backend, model, candidates, stages, options):
         source_name=coot.molecule_name(model), expected=snapshot, original=snapshot, resources=resources,
         settings=settings, stages=stages, imported=set(),
         resolutions={s.map_id: _local_em_map_resolution(s.map_id) for s in stages})
-    threading.Thread(target=_register_workers_monitor, args=(pool,), name="coot-multimap-workers", daemon=True).start()
+    _register_workers_schedule(pool)
     return pool
   except Exception:
     owner.cleanup()
@@ -19352,7 +19531,6 @@ def _multimap_worker_main():
 
 
 def _multimap_worker_source():
-  import inspect
   functions = (_coot_text_arg, _coot_int_arg, _coot_residue_spec_tuple, _coot_residue_spec_from_spec,
       _distance_sq, _tq_is_heavy_atom, _tq_residue_atom_records, _local_em_weight_points,
       _local_em_weight_statistics, _local_em_resolution_scale, _local_em_resolution_identity,
@@ -19362,7 +19540,7 @@ def _multimap_worker_source():
             "from coot_utils import residue_spec_to_chain_id, residue_spec_to_res_no, residue_spec_to_ins_code\n"
             "valid_model_molecule_qm = coot.is_valid_model_molecule\n")
   return (header+"_THRESHOLDED_Q_HYDROGEN_ELEMENTS = "+repr(_THRESHOLDED_Q_HYDROGEN_ELEMENTS)+"\n"+
-          _MULTIMAP_REFINEMENT_SOURCE+"\n"+"\n".join(inspect.getsource(f) for f in functions)+
+          _MULTIMAP_REFINEMENT_SOURCE+"\n"+"\n".join(_worker_function_source(f) for f in functions)+
           "\n_multimap_worker_main()\n")
 
 
@@ -20982,14 +21160,6 @@ def _global_fit_crop_search(grid, original, radius, weights=None):
 
 def _global_fit_close_grid(grid):
   if grid is not None:
-    preparing = grid.get("preparing")
-    if preparing is not None and not preparing.is_set():
-      import threading
-      def after_preparation():
-        preparing.wait()
-        _global_fit_close_grid(grid)
-      threading.Thread(target=after_preparation, daemon=True).start()
-      return
     for level in grid.pop("levels", []):
       mapping = getattr(level["data"], "_mmap", None)
       if mapping is not None and level["data"] is not grid["data"]:
@@ -21187,9 +21357,35 @@ def _global_fit_make_level(grid, resolution, path):
   return result
 
 
+def _global_fit_pyramid_worker(payload, progress):
+  import numpy as np
+  grid = dict(payload["grid"], np=np)
+  keys = ("shape", "transform", "starts", "periods", "origin")
+  for key in keys:
+    grid[key] = np.asarray(grid[key])
+  grid["data"] = np.memmap(payload["path"], dtype=payload["dtype"], mode="r",
+                           offset=payload["offset"], shape=tuple(payload["data_shape"]))
+  points = np.asarray(payload["points"], dtype=float)
+  fit_weights = None if payload["weights"] is None else np.asarray(payload["weights"], dtype=float)
+  levels, directory = [], payload["directory"]
+  resolutions = payload["resolutions"]
+  for i, resolution in enumerate(resolutions):
+    progress(f"Preparing coarse fitting map {i+1}/{len(resolutions)} ({resolution:.1f} A)...")
+    path = os.path.join(directory, f"level-{i}.npy")
+    level = _global_fit_make_level(grid, resolution, path)
+    samples, weights = _global_fit_representatives(points, resolution/6, weights=fit_weights)
+    levels.append(dict({key: level[key].tolist() for key in keys}, path=path, resolution=resolution,
+                       center_prior=level.get("center_prior"), samples=samples.tolist(), weights=weights.tolist()))
+  active_points = points if fit_weights is None else points[fit_weights > 0]
+  active_weights = np.ones(len(points)) if fit_weights is None else fit_weights[fit_weights > 0]
+  samples, weights = ((active_points, active_weights) if len(active_points) <= 6000 else
+                      _global_fit_representatives(active_points, .35, 6000, weights=active_weights))
+  levels.append(dict(samples=samples.tolist(), weights=weights.tolist()))
+  return levels
+
+
 def _global_fit_prepare_levels(state):
-  """Keep preprocessing off GTK; cancellation defers cache deletion until completion."""
-  import threading
+  """Generate the FFT pyramid without needing Python worker time in Coot."""
   grid = state["grid"]
   np = grid["np"]
   points = np.asarray(list(state["original"].values()), dtype=float)
@@ -21197,43 +21393,51 @@ def _global_fit_prepare_levels(state):
   resolutions = _global_fit_resolution_levels(points, fit_weights) if state.get("multiscale") and not grid["periodic"] else ()
   if not resolutions:
     return
-  event = threading.Event()
-  grid["preparing"] = event
-  result = {}
-  def prepare():
-    levels = []
-    grid["levels"] = levels
-    try:
-      for i, resolution in enumerate(resolutions):
-        result["message"] = f"Preparing coarse fitting map {i+1}/{len(resolutions)} ({resolution:.1f} A)..."
-        level = _global_fit_make_level(grid, resolution, os.path.join(grid["owner"].name, f"level-{i}.npy"))
-        levels.append(level)
-        level["samples"], level["weights"] = _global_fit_representatives(points, resolution/6, weights=fit_weights)
-      active_points = points if fit_weights is None else points[fit_weights > 0]
-      active_weights = np.ones(len(points)) if fit_weights is None else fit_weights[fit_weights > 0]
-      fine_points, fine_weights = ((active_points, active_weights) if len(active_points) <= 6000 else
-                                  _global_fit_representatives(active_points, .35, 6000, weights=active_weights))
-      final = dict(grid, samples=fine_points, weights=fine_weights, resolution=0.)
-      for key in ("owner", "levels", "preparing", "worker_pool"):
-        final.pop(key, None)
-      levels.append(final)
-    except Exception as error:
-      result["error"] = str(error)
-    finally:
-      event.set()
-  threading.Thread(target=prepare, name="coot-fit-pyramid", daemon=True).start()
-  while not event.is_set():
-    state["message"] = result.get("message", "Preparing coarse fitting maps...")
-    yield
-  if "error" in result:
+  keys = ("shape", "transform", "starts", "periods", "origin")
+  description = {key: grid[key].tolist() for key in keys}
+  description.update(periodic=grid["periodic"], center_prior=grid.get("center_prior"))
+  data = grid["data"]
+  job = None
+  try:
+    job = _compute_start(_global_fit_pyramid_worker, (_global_fit_make_level, _global_fit_representatives,
+                         _global_fit_center_field, _global_fit_grid_values),
+                         dict(grid=description, path=str(data.filename), dtype=data.dtype.str,
+                              offset=int(data.offset), data_shape=list(data.shape), points=points.tolist(),
+                              weights=None if fit_weights is None else fit_weights.tolist(),
+                              resolutions=resolutions, directory=grid["owner"].name), 300, modules=(np,))
+    while True:
+      state["message"] = job.get("message") or "Preparing coarse fitting maps..."
+      yield
+      result = _compute_poll(job)
+      if result is not None:
+        break
+    levels = grid["levels"] = []
+    for row in result[:-1]:
+      level = dict(grid, **{key: np.asarray(row[key]) for key in keys}, periodic=False,
+                   resolution=row["resolution"], samples=np.asarray(row["samples"]), weights=np.asarray(row["weights"]))
+      if row["center_prior"] is not None:
+        level["center_prior"] = row["center_prior"]
+      for key in ("owner", "levels", "worker_pool"):
+        level.pop(key, None)
+      level["data"] = np.load(row["path"], mmap_mode="r")
+      levels.append(level)
+    final = dict(grid, samples=np.asarray(result[-1]["samples"]), weights=np.asarray(result[-1]["weights"]), resolution=0.)
+    for key in ("owner", "levels", "worker_pool"):
+      final.pop(key, None)
+    levels.append(final)
+  except Exception as error:
     for level in grid.pop("levels", []):
       mapping = getattr(level["data"], "_mmap", None)
       if mapping is not None and level["data"] is not grid["data"]:
         mapping.close()
-    state["message"] = "Using the original search: " + result["error"]
+    state["message"] = "Using the original search: " + str(error)
     print("Global fit:", state["message"])
+    _compute_stop(job)
+    job = None
     yield
     return
+  finally:
+    _compute_stop(job)
   state.update(multiscale_active=True, level_index=0, level_done=0,
                stage_fraction=0., level_jobs=None)
   state["pose_moments"] = _global_fit_pose_moments(state["original"], np, fit_weights)
@@ -21569,9 +21773,8 @@ def _global_fit_worker_main():
 
 
 def _global_fit_worker_source():
-  import inspect
   functions = (_global_fit_grid_values, _global_fit_optimize_iter, _global_fit_worker_main)
-  return "import math, time\n" + "\n".join(inspect.getsource(f) for f in functions) + "\n_global_fit_worker_main()\n"
+  return "import math, time\n" + "\n".join(_worker_function_source(f) for f in functions) + "\n_global_fit_worker_main()\n"
 
 
 def _global_fit_workers_stop(pool):
@@ -25882,7 +26085,6 @@ def _af_replace_worker_main():
 
 def _af_replace_start_job(operation, payload):
   """No Python worker thread: Coot's native GTK loop can starve its interpreter."""
-  import inspect
   import shutil
   import subprocess
   import sys
@@ -25894,7 +26096,7 @@ def _af_replace_start_job(operation, payload):
            "_af_replace_provenance", "_af_replace_wire", "_af_replace_job", "_af_replace_worker_main")
   source = "import copy, hashlib, json, math, os, re, tempfile, time\nimport gemmi\n"
   source += "_REGISTER_AA = "+repr(_REGISTER_AA)+"\n"
-  source += "\n\n".join(inspect.getsource(globals()[name]) for name in names)
+  source += "\n\n".join(_worker_function_source(globals()[name]) for name in names)
   source += "\n_af_replace_worker_main()\n"
   version = f"python{sys.version_info.major}.{sys.version_info.minor}"
   candidates = [os.path.join(prefix, "bin", name) for prefix in (sys.prefix, sys.base_prefix)
@@ -26419,12 +26621,28 @@ def _register_worker_stop_process(process):
     process.wait(timeout=5.)
 
 
-def _register_workers_monitor(pool):
-  """Only filesystem/process operations here. Never call Coot or GTK off-thread."""
+def _register_workers_monitor_steps(pool, gui=False):
+  """Launch, poll and reap native workers without depending on a Coot Python thread."""
+  import signal
   import subprocess
   processes = []
   seen = set()
   failures = {}
+  def retire(process):
+    if not gui:
+      _register_worker_stop_process(process)
+      return
+    # These children only own private scratch models. Do not wait in GTK for
+    # a hung launcher to handle SIGTERM, or leave its native child running.
+    try:
+      if os.name == "posix":
+        os.killpg(process.pid, signal.SIGKILL)
+      elif process.poll() is None:
+        process.kill()
+    except ProcessLookupError:
+      pass
+    while process.poll() is None:
+      yield
   def missing_result(process, log, home, started, timed_out):
     elapsed = time.monotonic()-started
     code = process.poll()
@@ -26462,6 +26680,7 @@ def _register_workers_monitor(pool):
     return reason+"; no candidate returned. "+last+(" Details: "+details["path"] if "path" in details else "")
   try:
     for path, jobs in pool["configs"]:
+      yield
       if pool["cancel"].is_set():
         break
       home = os.path.dirname(path)
@@ -26487,7 +26706,7 @@ def _register_workers_monitor(pool):
         running = process.poll() is None
         timed_out = running and time.monotonic()-started > pool.get("timeout", 120+180*len(jobs))
         if timed_out:
-          _register_worker_stop_process(process)
+          yield from retire(process)
           running = False
         active |= running
         for job in jobs:
@@ -26512,14 +26731,14 @@ def _register_workers_monitor(pool):
             pool["events"].put(("result", dict(index=index, error=message)))
       if not active or len(seen) == len(pool["jobs"]):
         break
-      pool["cancel"].wait(.05)
+      yield
   except Exception as error:
     pool["events"].put(("error", str(error)))
   finally:
     for process, log, _home, _jobs, _started in processes:
       try:
         if process.poll() is None or pool["cancel"].is_set():
-          _register_worker_stop_process(process)
+          yield from retire(process)
         else:
           process.wait(timeout=1.)
       except (OSError, subprocess.TimeoutExpired):
@@ -26534,8 +26753,24 @@ def _register_workers_monitor(pool):
       pool["events"].put(("done", pool["cancel"].is_set()))
 
 
+def _register_workers_monitor(pool):
+  """Blocking driver for non-GUI tests and callers."""
+  for _ in _register_workers_monitor_steps(pool):
+    pool["cancel"].wait(.05)
+
+
+def _register_workers_schedule(pool):
+  glib = _coot_gui_repository_module("GLib")
+  if glib is None:
+    raise RuntimeError("Isolated refinement requires GLib.")
+  steps = _register_workers_monitor_steps(pool, gui=True)
+  def tick():
+    return next(steps, False) is not False
+  glib.timeout_add(50, tick)
+
+
 def _register_workers_start(source, chain, start, end, targets, map_id, rigid_fit=False, prepare=True):
-  """Snapshot native state on the GUI thread; start only pure orchestration off-thread."""
+  """Snapshot native state, then schedule isolated native refinement."""
   import queue
   import threading
   required = ("export_map", "python_representation_kk", "add_molecule_py", "set_monomer_restraints_py",
@@ -26598,7 +26833,7 @@ def _register_workers_start(source, chain, start, end, targets, map_id, rigid_fi
                 count=count, probes=probes, fingerprint=fingerprint,
                 source=source, source_name=coot.molecule_name(source), source_snapshot=snapshot,
                 map=map_id, chain=chain, start=start, end=end, prepare=prepare)
-    threading.Thread(target=_register_workers_monitor, args=(pool,), name="coot-register-workers", daemon=True).start()
+    _register_workers_schedule(pool)
     return pool
   except Exception:
     owner.cleanup()
@@ -29766,6 +30001,13 @@ def _ncs_symmetry_merge_copies(record):
   return len(record["added"])
 
 
+def _ncs_symmetry_assignment_status(groups, missing):
+  message = f"Linked {groups} NCS {'group' if groups == 1 else 'groups'}. No atoms moved."
+  if missing:
+    message += f" {missing} {'copy remains' if missing == 1 else 'copies remain'} missing."
+  return message
+
+
 def molecular_symmetry_dialog():
   existing = getattr(coot, "_trimmings_molecular_symmetry_window", None)
   if existing is not None:
@@ -29792,24 +30034,76 @@ def molecular_symmetry_dialog():
     if not all(coot.is_valid_model_molecule(record[field]) for field in ("source", "assembly")):
       builds.pop(key, None)
   window = Gtk.Window(title="Molecular symmetry")
-  window.set_default_size(700, 740)
+  window.set_default_size(760, 850)
   box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
   for side in ("top", "bottom", "start", "end"):
     getattr(box, "set_margin_"+side)(12)
   outer_scroll = Gtk.ScrolledWindow()
   outer_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
   outer_scroll.set_child(box)
-  window.set_child(outer_scroll)
+  outer_scroll.set_vexpand(True)
+  root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  root.append(outer_scroll)
+  window.set_child(root)
   model_label = Gtk.Label(label=f"Model #{mol_id}: {os.path.basename(coot.molecule_name(mol_id))}", xalign=0)
   box.append(model_label)
-  status = Gtk.Label(label="Pick the member chains of one asymmetric unit, then preview.", xalign=0)
+  def explanation(parent, text):
+    label = Gtk.Label(label=text, xalign=0)
+    label.set_wrap(True)
+    parent.append(label)
+    return label
+  def heading(text):
+    label = Gtk.Label(xalign=0)
+    label.set_markup("<b>"+text+"</b>")
+    label.set_margin_top(6)
+    box.append(label)
+  explanation(box, "Preview the symmetry, then link existing chains or generate missing ones.")
+  heading("1. Define the repeating unit")
+  explanation(box, "Pick one repeating unit (ASU), not all symmetry copies. Include every chain in that unit.")
+  status = Gtk.Label(label="Pick a repeating unit to get started.", xalign=0)
   status.set_wrap(True)
+  def update_actions(*_):
+    buttons = state.get("buttons")
+    if not buttons:
+      return
+    picking = state["picker"] is not None
+    available = not picking and state["conversion"] is None and not state["closed"]
+    plan = state["plan"]
+    fresh = plan is not None and state.get("settings") == settings()
+    buttons["preview"].set_sensitive(available and bool(state["asu"]))
+    buttons["assign"].set_sensitive(available and fresh and any(row["peer"] is not None for row in plan["rows"]))
+    buttons["build"].set_sensitive(available and fresh and bool(plan["missing"]))
+    buttons["clear"].set_sensitive(available and state["preview"] is not None)
+    record = builds.get(mol_id)
+    pending = record is not None and coot.is_valid_model_molecule(record["assembly"])
+    buttons["merge"].set_sensitive(available and pending)
+    if picking:
+      preview_hint.set_text("Finish picking the chains, then preview.")
+    elif not state["asu"]:
+      preview_hint.set_text("Pick a repeating unit above to enable Preview.")
+    elif plan is not None and not fresh:
+      preview_hint.set_text("Settings changed. Preview again before linking or generating.")
+    elif fresh:
+      preview_hint.set_text("Matches checked. Choose one of the actions below.")
+    else:
+      preview_hint.set_text("Preview to check existing matches and identify missing chains.")
+    if pending:
+      merge_hint.set_text(f"Assembly #{record['assembly']} has {len(record['added'])} generated chains ready to add to original #{mol_id}.")
+    else:
+      merge_hint.set_text("Available after generating copies. Adds only the new chains and their NCS links.")
+  def picker_finished():
+    state["picker"] = None
+    update_actions()
+  saved_setup = Gtk.Expander(label="Saved NCS setups / nested symmetry")
+  saved_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+  saved_setup.set_child(saved_box)
+  explanation(saved_box, "Manage named relationships, or use a local assembly as a larger repeating unit. Saved for this Coot session.")
   relationship_box = Gtk.Box(spacing=8)
-  relationship_box.append(Gtk.Label(label="Relationship", xalign=0))
+  relationship_box.append(Gtk.Label(label="Saved setup", xalign=0))
   relationships = Gtk.ComboBoxText()
   relationships.set_hexpand(True)
   relationship_box.append(relationships)
-  box.append(relationship_box)
+  saved_box.append(relationship_box)
   name_box = Gtk.Box(spacing=8)
   name_box.append(Gtk.Label(label="Name", xalign=0))
   relationship_name = Gtk.Entry()
@@ -29817,13 +30111,14 @@ def molecular_symmetry_dialog():
   relationship_name.set_hexpand(True)
   relationship_name.set_tooltip_text("For example: AQP tetramer, local trimer, or outer helix.")
   name_box.append(relationship_name)
-  box.append(name_box)
-  asu_label = Gtk.Label(label="ASU: not selected", xalign=0)
+  saved_box.append(name_box)
+  asu_label = Gtk.Label(label="Repeating unit: not selected", xalign=0)
   asu_label.set_wrap(True)
   def accept_asu(chains):
     state["asu"] = chains
-    asu_label.set_text("ASU: "+", ".join(repr(ch) for ch in chains))
-    status.set_text("ASU selected. Preview the symmetry matches.")
+    asu_label.set_text("Repeating unit (ASU): "+", ".join(repr(ch) for ch in chains))
+    status.set_text("Repeating unit selected. Set the symmetry, then preview the matches.")
+    update_actions()
   def pick(*_):
     try:
       if state["picker"] is not None:
@@ -29831,10 +30126,12 @@ def molecular_symmetry_dialog():
       else:
         clear_preview()
         state["picker"] = _ncs_pick_chains(mol_id, accept_asu, window,
-            finished=lambda: state.update(picker=None))
+            finished=picker_finished)
+        update_actions()
     except Exception as error:
       status.set_text(str(error))
-  button = Gtk.Button(label="Pick ASU chains...")
+  button = Gtk.Button(label="Pick repeating unit...")
+  button.set_tooltip_text("Click one atom on each chain in a single repeating unit, then choose Use ASU. No coordinates change.")
   button.connect("clicked", pick)
   box.append(button)
   box.append(asu_label)
@@ -29917,12 +30214,14 @@ def molecular_symmetry_dialog():
       return
     clear_preview()
     state["picker"] = _ncs_pick_chains(mol_id, accepted, window,
-        finished=lambda: state.update(picker=None), title=title, accept_label=accept_label, purpose=purpose)
+        finished=picker_finished, title=title, accept_label=accept_label, purpose=purpose)
+    update_actions()
   def limit_scope(*_):
     def accepted(chains):
       state["scope"] = chains
       scope_label.set_text("Match only: "+", ".join(chains))
       status.set_text("Local chains selected. Other chains will not be matched.")
+      update_actions()
     try:
       choose_chains(accepted, "Pick local chains", "Use local chains", "local")
     except Exception as error:
@@ -29930,6 +30229,7 @@ def molecular_symmetry_dialog():
   def all_chains(*_):
     state["scope"] = None
     scope_label.set_text("Match: all chains")
+    update_actions()
   scope_buttons = Gtk.Box(spacing=8)
   for title, callback in (("Limit to picked chains...", limit_scope), ("All chains", all_chains)):
     button = Gtk.Button(label=title)
@@ -29979,23 +30279,23 @@ def molecular_symmetry_dialog():
     maps.set_active(0)
   if maps.get_active_id() is None:
     map_changed()
-  instructions = Gtk.Label(label="Assign adds this relationship without moving atoms. Build makes a separate model.", xalign=0)
-  instructions.set_wrap(True)
-  instructions.set_tooltip_text("Named relationships are retained; overlapping unlabelled/automatic NCS is replaced. "
-                                "Copies use the entered operators without refitting. Check the RMSDs before assigning.")
-  box.append(instructions)
+  heading("2. Check the matches")
+  explanation(box, "Preview colours existing matches on a temporary copy and lists missing chains. It changes no coordinates or NCS links.")
+  preview_actions = Gtk.Box(spacing=8)
+  box.append(preview_actions)
+  preview_hint = explanation(box, "Pick a repeating unit above to enable Preview.")
   table = Gtk.TextView()
   table.set_editable(False)
   table.set_monospace(True)
   scroll = Gtk.ScrolledWindow()
   scroll.set_vexpand(True)
-  scroll.set_min_content_height(130)
+  scroll.set_min_content_height(100)
   scroll.set_child(table)
+  scroll.set_visible(False)
   box.append(scroll)
-  box.append(status)
   def refresh_relationships(active="new"):
     relationships.remove_all()
-    relationships.append("new", "New relationship")
+    relationships.append("new", "New NCS setup")
     for relation in state["relations"]:
       relationships.append(relation["id"], relation["name"])
     relationships.set_active_id(active)
@@ -30013,6 +30313,7 @@ def molecular_symmetry_dialog():
     relation = selected_relation()
     if relation is None:
       relationship_name.set_text(f"Symmetry {len(state['relations'])+1}")
+      update_actions()
       return
     relationship_name.set_text(relation["name"])
     config = relation.get("config")
@@ -30026,6 +30327,7 @@ def molecular_symmetry_dialog():
       scope_label.set_text("Match: all chains" if state["scope"] is None else "Match only: "+", ".join(state["scope"]))
     else:
       status.set_text("Existing NCS retained. Add a new relationship, or use these chains as an outer ASU.")
+    update_actions()
   relationships.connect("changed", select_relationship)
   refresh_relationships()
   def new_relationship(*_):
@@ -30036,9 +30338,11 @@ def molecular_symmetry_dialog():
     state["plan"] = None
     relationships.set_active_id("new")
     state["asu"] = []
-    asu_label.set_text("ASU: not selected")
+    asu_label.set_text("Repeating unit: not selected")
+    scroll.set_visible(False)
     all_chains()
     status.set_text("Pick an ASU and set the new symmetry. Existing relationships are retained.")
+    update_actions()
   def outer_relationship(*_):
     try:
       if state["picker"] is not None:
@@ -30081,7 +30385,7 @@ def molecular_symmetry_dialog():
     button = Gtk.Button(label=title)
     button.connect("clicked", callback)
     relation_actions.append(button)
-  box.append(relation_actions)
+  saved_box.append(relation_actions)
   def settings():
     values = {key: widget.get_text().strip() for key, widget in entries.items()}
     return (kind.get_active_id(), tuple(state["asu"]), tuple(sorted(values.items())),
@@ -30090,6 +30394,7 @@ def molecular_symmetry_dialog():
   def clear_preview(*_):
     preview = state["preview"]
     state["preview"] = None
+    update_actions()
     if preview is None:
       return
     model = preview["model"]
@@ -30152,6 +30457,7 @@ def molecular_symmetry_dialog():
         lines.append(f"{row['master']!r:11} {str(row['repeat']):>6}   {row['peer'] if row['peer'] is not None else 'MISSING':10} "
                      +(f"{row['rmsd']:.3f}" if row['rmsd'] is not None else ""))
       table.get_buffer().set_text("\n".join(lines))
+      scroll.set_visible(True)
       state.update(plan=plan, snapshot=snapshot, settings=saved_settings)
       source_visible, source_name = coot.mol_is_displayed(mol_id), coot.molecule_name(mol_id)
       view = _capture_view_state()
@@ -30173,8 +30479,11 @@ def molecular_symmetry_dialog():
       coot.set_mol_displayed(model, 1)
       status.set_text(f"Matched {len(plan['rows'])-len(plan['missing'])} copies; {len(plan['missing'])} missing; "
                       f"{len(plan['unassigned'])} unassigned chains (grey). Each ASU-chain orbit has its own colour.")
+      update_actions()
     except Exception as error:
+      state["plan"] = None
       status.set_text(str(error))
+      update_actions()
   def current_plan():
     _ncs_require_idle(mol_id)
     if (state["plan"] is None or state["settings"] != settings()
@@ -30191,7 +30500,7 @@ def molecular_symmetry_dialog():
       plan = current_plan()
       groups = [g for g in plan["groups"] if len(g["chains"]) > 1]
       if not any(row["peer"] is not None for row in plan["rows"]):
-        raise ValueError("No existing copies matched. Check the frame or build missing copies.")
+        raise ValueError("No existing copies matched. Check the frame or generate the missing copies.")
       relations = _ncs_symmetry_extend_relations(plan["relations"], plan, state["snapshot"], strict=False)
       relations = _ncs_symmetry_replace_relation(relations, dict(plan["relationship"], groups=groups))
       combined = _ncs_symmetry_relation_groups(relations)
@@ -30200,8 +30509,8 @@ def molecular_symmetry_dialog():
       state["relations"] = relations
       refresh_relationships(plan["relationship"]["id"])
       clear_preview()
-      status.set_text(f"Assigned {len(groups)} NCS groups using fixed symmetry operators. No atoms moved. "
-                      f"{len(plan['missing'])} missing copies were not created.")
+      status.set_text(_ncs_symmetry_assignment_status(len(groups), len(plan["missing"])))
+      update_actions()
     except Exception as error:
       status.set_text(str(error))
   def build(*_):
@@ -30211,10 +30520,12 @@ def molecular_symmetry_dialog():
         raise ValueError("No missing copies to build.")
       model = _ncs_symmetry_make_model(state["snapshot"], plan, source=mol_id)
       builds[mol_id] = _ncs_symmetry_merge_record(mol_id, model, state["snapshot"])
-      merge_button.set_sensitive(True)
       clear_preview()
+      state["plan"] = None
       status.set_text(f"Created assembly #{model} with {len(plan['missing'])} new chains. Original unchanged. "
-                      "Use Merge built copies to add only the new chains to the original.")
+                      "NCS links are included. Merge the new chains below if you want them in the original model.")
+      update_actions()
+      merge_button.grab_focus()
     except Exception as error:
       status.set_text(str(error))
   def finish_merge(record):
@@ -30231,6 +30542,7 @@ def molecular_symmetry_dialog():
     refresh_relationships()
     status.set_text(f"Merged {count} new chains into original #{mol_id}; NCS groups updated. "
                     f"Assembly #{record['assembly']} retained, hidden.")
+    update_actions()
   def merge_built(*_):
     try:
       if state["conversion"] is not None:
@@ -30240,7 +30552,7 @@ def molecular_symmetry_dialog():
         raise ValueError("Finish picking the ASU first.")
       record = builds.get(mol_id)
       if record is None:
-        raise ValueError("Build the missing copies first.")
+        raise ValueError("Generate the missing copies first.")
       _ncs_require_idle(mol_id)
       if _model_coordinate_snapshot(mol_id) != record["before"]:
         raise ValueError("The original changed since building; preview/build again before merging.")
@@ -30248,7 +30560,7 @@ def molecular_symmetry_dialog():
         def finished():
           state["conversion"] = None
           if not state["closed"]:
-            merge_button.set_sensitive(mol_id in builds)
+            update_actions()
         def ready():
           try:
             finish_merge(record)
@@ -30256,7 +30568,7 @@ def molecular_symmetry_dialog():
             status.set_text(str(error))
         state["conversion"] = _ncs_symmetry_conversion_dialog(window, record, ready, finished,
             lambda: not state["closed"] and builds.get(mol_id) is record)
-        merge_button.set_sensitive(False)
+        update_actions()
         return
       finish_merge(record)
     except Exception as error:
@@ -30274,24 +30586,67 @@ def molecular_symmetry_dialog():
       coot._trimmings_molecular_symmetry_window = None
     window.destroy()
     return True
-  actions = Gtk.Box(spacing=8)
-  for title, callback in (("Preview matches", preview), ("Assign NCS", assign), ("Build missing copies", build)):
-    button = Gtk.Button(label=title)
+  preview_button = Gtk.Button(label="Preview matches")
+  preview_button.add_css_class("suggested-action")
+  preview_button.set_tooltip_text("Check which existing chains match the entered symmetry. Missing chains are listed, not generated.")
+  preview_button.connect("clicked", preview)
+  preview_actions.append(preview_button)
+  clear_button = Gtk.Button(label="Clear match preview")
+  clear_button.set_tooltip_text("Remove only the temporary coloured preview. Generated assemblies and assigned NCS links are kept.")
+  clear_button.connect("clicked", clear_preview)
+  preview_actions.append(clear_button)
+  heading("3. Choose an action")
+  explanation(box, "Link existing chains, or generate missing ones. You do not need to do both.")
+  cards = Gtk.Box(spacing=10)
+  cards.set_homogeneous(True)
+  box.append(cards)
+  def action_card(title, detail, button_text, callback):
+    frame = Gtk.Frame()
+    content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    for side in ("top", "bottom", "start", "end"):
+      getattr(content, "set_margin_"+side)(10)
+    frame.set_child(content)
+    label = explanation(content, title)
+    label.set_markup("<b>"+title+"</b>")
+    explanation(content, detail)
+    button = Gtk.Button(label=button_text)
     button.connect("clicked", callback)
-    actions.append(button)
-  box.append(actions)
-  actions = Gtk.Box(spacing=8)
-  merge_button = Gtk.Button(label="Merge built copies")
+    content.append(button)
+    cards.append(frame)
+    return button
+  assign_button = action_card("Link existing chains",
+      "Enable copying edits between matching chains. No atoms move or get created.",
+      "Link existing chains (NCS)", assign)
+  assign_button.set_tooltip_text("Assign the entered symmetry operators as NCS relationships on the original model. Inspect the RMSDs first. This does not copy edits or refine atoms.")
+  build_button = action_card("Create missing chains",
+      "Generate a separate assembly with NCS links. The original model stays unchanged.",
+      "Generate missing copies", build)
+  build_button.set_tooltip_text("Keep existing chains and fill only missing symmetry positions in a new model. NCS links are assigned in that assembly automatically.")
+  heading("Optional: merge into the original")
+  merge_hint = explanation(box, "Available after generating copies. Adds only the new chains and their NCS links.")
+  merge_button = Gtk.Button(label="Merge new chains into original")
   merge_button.set_sensitive(mol_id in builds)
   merge_button.set_tooltip_text("Add only the generated chains to the original model; keep its existing atoms and restraints. "
                                "The separate assembly is retained. Backups must be enabled.")
   merge_button.connect("clicked", merge_built)
-  actions.append(merge_button)
-  for title, callback in (("Clear preview", clear_preview), ("Close", close)):
-    button = Gtk.Button(label=title)
-    button.connect("clicked", callback)
-    actions.append(button)
-  box.append(actions)
+  box.append(merge_button)
+  box.append(saved_setup)
+  close_button = Gtk.Button(label="Close")
+  close_button.connect("clicked", close)
+  footer = Gtk.Box(spacing=12)
+  for side in ("bottom", "start", "end"):
+    getattr(footer, "set_margin_"+side)(12)
+  status.set_hexpand(True)
+  footer.append(status)
+  footer.append(close_button)
+  root.append(footer)
+  state["buttons"] = dict(preview=preview_button, assign=assign_button, build=build_button,
+                          merge=merge_button, clear=clear_button)
+  for widget in entries.values():
+    widget.connect("changed", update_actions)
+  relationship_name.connect("changed", update_actions)
+  kind.connect("changed", update_actions)
+  update_actions()
   window.connect("close-request", close)
   coot._trimmings_molecular_symmetry_window = window
   window.present()
